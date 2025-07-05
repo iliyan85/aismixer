@@ -1,0 +1,7 @@
+listen_ip: '::'
+listen_port: 50000
+remote_host: 192.0.2.10
+remote_port: 17777
+station_id: boat_001
+aismixer_public_key: aismixer_public.pem
+station_private_key: station_private.key

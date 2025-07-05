@@ -1,0 +1,19 @@
+sec_inputs:
+  - listen_ip: 0.0.0.0
+    listen_port: 19999
+
+udp_inputs:
+  - listen_ip: 0.0.0.0
+    listen_port: 17770
+  - listen_ip: '::'
+    listen_port: 17770
+
+forwarders:
+  - host: 127.0.0.1
+    port: 19000
+  - host: 127.0.0.1
+    port: 19001
+
+station_id: mixstation_1
+
+debug: true
