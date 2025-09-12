@@ -158,13 +158,13 @@ async def mixer_loop(input_queues, output_queue):
 
 async def forward_loop(queue):
     while True:
-        source_name, remote_ip, raw_line = await queue.get()
+        alias_for_s, remote_ip, assembler_key, raw_line = await queue.get()
 
         for clean_line in extract_nmea_sentences(raw_line):
             if not clean_line:
                 continue
 
-            multipart = assembler.feed(source_name, clean_line)
+            multipart = assembler.feed(assembler_key, clean_line)
             if multipart is None:
                 continue  # waiting for more parts or incomplete
 
@@ -176,7 +176,7 @@ async def forward_loop(queue):
                 s_value = choose_s_value(
                     # глобално station_id (може да е '')
                     STATION_ID,
-                    source_name,            # id/alias/name/ANONYMOUS/IP
+                    alias_for_s,            # id/alias/SEC name или None
                     incoming_s,             # ако входът носи свое s:
                     remote_ip               # дефолтен fallback
                 )
@@ -200,10 +200,10 @@ async def handle_socket(sock, queue, fixed_alias=None, alias_map=None):
             source_fmt = format_source(source_ip, source_port)
             print(f"{ts()} INPUT {source_fmt} => {raw_line}")
 
-        alias = fixed_alias or (alias_map.get(
-            source_ip) if alias_map else None)
+        alias_for_s = fixed_alias or (alias_map.get(source_ip) if alias_map else None)
+        assembler_key = f"{source_ip}:{source_port}"
 
-        await queue.put((alias, source_ip, raw_line))
+        await queue.put((alias_for_s, source_ip, assembler_key, raw_line))
 
 
 async def main():

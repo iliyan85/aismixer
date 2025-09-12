@@ -159,8 +159,12 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                         f"{time.time()} [SECURE] From {station_id}: {msg['payload']}")
 
                 src_for_queue = sec_input_id or station_id or "ANONYMOUS"
-                remote_ip = addr[0] if 'addr' in locals() else None
-                await queue.put((src_for_queue, remote_ip, msg["payload"]))
+                peer = addr if 'addr' in locals() else None
+                remote_ip = peer[0] if isinstance(
+                    peer, tuple) and peer else None
+                assembler_key = f"{peer[0]}:{peer[1]}" if isinstance(
+                    peer, tuple) and peer else (remote_ip or "sec")
+                await queue.put((src_for_queue, remote_ip, assembler_key, msg["payload"]))
 
             except Exception as e:
                 print(
