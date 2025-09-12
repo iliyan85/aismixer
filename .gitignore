@@ -1,7 +1,5 @@
 .env
 aismixer_private.key
-aismixer_?.py
-aismixer_secure_?.py
 __pycache__/
 nmea_sproxy/__pycache__/
 nmea_sproxy/station_private.key

@@ -23,7 +23,7 @@ sudo cp aismixer.py aismixer_secure.py meta_cleaner.py dedup.py forwarder.py ass
 
 echo "[+] Installing config to $CONFIG_DIR"
 sudo mkdir -p $CONFIG_DIR
-sudo cp config.yaml $CONFIG_DIR
+sudo cp config.yaml udp_alias_map.yaml $CONFIG_DIR
 
 echo "[+] Creating systemd unit"
 sudo tee $SYSTEMD_UNIT >/dev/null <<EOF

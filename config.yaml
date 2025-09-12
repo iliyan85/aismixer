@@ -4,15 +4,18 @@ sec_inputs:
 
 udp_inputs:
   - listen_ip: 0.0.0.0
-    listen_port: 17770
+    listen_port: 17778
   - listen_ip: '::'
     listen_port: 17770
+    id: udpB
 
 forwarders:
   - host: 127.0.0.1
     port: 19000
   - host: 127.0.0.1
     port: 19001
+
+udp_alias_map_file: udp_alias_map.yaml
 
 station_id: mixstation_1
 
