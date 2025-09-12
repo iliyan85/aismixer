@@ -3,12 +3,13 @@ import socket
 import yaml
 import os
 import time
-import re
 from assembler import AIVDMAssembler
 from meta_writer import wrap_with_meta
 from meta_cleaner import extract_nmea_sentences
 from forwarder import Forwarder
 from dedup import Deduplicator
+from core.event import IngressEvent
+from core.s_policy import choose_s_value
 from aismixer_secure import secure_server
 
 try:
@@ -16,68 +17,6 @@ try:
     setproctitle('aismixer')
 except ImportError:
     pass  # No effect on Windows or if not installed
-
-_ALNUM_SAFE = re.compile(r'[^A-Za-z0-9_]')
-
-
-def _sanitize_s(val: str) -> str:
-    """Допустими за TAG s: [A-Za-z0-9_]; отрежи до 15."""
-    val = (val or "").strip()
-    val = _ALNUM_SAFE.sub('_', val)
-    return val[:15]
-
-
-def _extract_incoming_s(raw: str) -> str | None:
-    if not raw or raw[0] != '\\':
-        return None
-    try:
-        # вземи между първата '\' и следващата '\' (TAG тялото с *CS)
-        end = raw.find('\\', 1)
-        if end == -1:
-            return None
-        body = raw[1:end]           # "k1:v1,k2:v2*CS"
-        body = body.split('*', 1)[0]  # "k1:v1,k2:v2"
-        for pair in body.split(','):
-            if not pair:
-                continue
-            if ':' not in pair:
-                continue
-            k, v = pair.split(':', 1)
-            if k == 's':
-                return v
-    except Exception:
-        return None
-    return None
-
-
-def choose_s_value(global_station_id: str | None,
-                   source_name_or_id: str | None,
-                   incoming_s: str | None,
-                   remote_ip: str | None) -> str:
-    """
-    Прилага приоритета:
-      1) station_id (ако е непразно)
-      2) input.id / alias / SEC client name (ако е непразно и не е 'ANONYMOUS')
-      3) incoming_s от входния TAG (ако има)
-      4) sanitized(remote_ip) като последен fallback
-    Всичко се sanitize-ва и се реже до 15.
-    """
-    # 1) глобален station_id
-    if global_station_id:
-        return _sanitize_s(global_station_id)
-    # 2) id/alias/name (ако имаме смислена стойност)
-    if source_name_or_id and source_name_or_id != "ANONYMOUS":
-        return _sanitize_s(source_name_or_id)
-    # 3) s от входа (ако има)
-    if incoming_s:
-        return _sanitize_s(incoming_s)
-    # 4) по IP
-    if remote_ip:
-        # IPv4: 1.2.3.4 -> 1_2_3_4 ; IPv6: 2001:db8::1 -> 2001_db8__1
-        ip_sanitized = remote_ip.replace('.', '_').replace(':', '_')
-        return _sanitize_s(ip_sanitized)
-    # ако наистина няма нищо
-    return _sanitize_s("ANONYMOUS")
 
 
 def ts() -> str:
@@ -158,13 +97,13 @@ async def mixer_loop(input_queues, output_queue):
 
 async def forward_loop(queue):
     while True:
-        alias_for_s, remote_ip, assembler_key, raw_line = await queue.get()
+        ev: IngressEvent = await queue.get()
 
-        for clean_line in extract_nmea_sentences(raw_line):
+        for clean_line in extract_nmea_sentences(ev.raw_line):
             if not clean_line:
                 continue
 
-            multipart = assembler.feed(assembler_key, clean_line)
+            multipart = assembler.feed(ev.assembler_key, clean_line)
             if multipart is None:
                 continue  # waiting for more parts or incomplete
 
@@ -172,14 +111,8 @@ async def forward_loop(queue):
                 if not deduplicator.is_unique(full_line):
                     continue
                 is_first = i == 0
-                incoming_s = _extract_incoming_s(raw_line)
                 s_value = choose_s_value(
-                    # глобално station_id (може да е '')
-                    STATION_ID,
-                    alias_for_s,            # id/alias/SEC name или None
-                    incoming_s,             # ако входът носи свое s:
-                    remote_ip               # дефолтен fallback
-                )
+                    STATION_ID, ev.alias_for_s, ev.raw_line, ev.remote_ip)
                 wrapped_line = wrap_with_meta(
                     full_line, s_value, is_first=is_first)
 
@@ -200,10 +133,15 @@ async def handle_socket(sock, queue, fixed_alias=None, alias_map=None):
             source_fmt = format_source(source_ip, source_port)
             print(f"{ts()} INPUT {source_fmt} => {raw_line}")
 
-        alias_for_s = fixed_alias or (alias_map.get(source_ip) if alias_map else None)
+        alias_for_s = fixed_alias or (
+            alias_map.get(source_ip) if alias_map else None)
         assembler_key = f"{source_ip}:{source_port}"
 
-        await queue.put((alias_for_s, source_ip, assembler_key, raw_line))
+        await queue.put(IngressEvent(kind="udp",
+                                     alias_for_s=alias_for_s,
+                                     remote_ip=source_ip,
+                                     assembler_key=assembler_key,
+                                     raw_line=raw_line))
 
 
 async def main():

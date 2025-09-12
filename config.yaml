@@ -19,6 +19,6 @@ forwarders:
 
 udp_alias_map_file: udp_alias_map.yaml
 
-station_id: null
+station_id: mixstation_1
 
 debug: true

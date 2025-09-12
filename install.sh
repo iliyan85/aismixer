@@ -8,18 +8,20 @@ CONFIG_DIR=/etc/aismixer
 echo "[+] Checking dependencies..."
 
 for pkg in python3-setproctitle python3-yaml python3-cryptography; do
-    if dpkg -s "$pkg" >/dev/null 2>&1; then
-        echo "  - $pkg is installed"
-    else
-        echo "  - Missing: $pkg"
-        echo "    Run: sudo apt install $pkg"
-        exit 1
-    fi
+	if dpkg -s "$pkg" >/dev/null 2>&1; then
+		echo "  - $pkg is installed"
+	else
+		echo "  - Missing: $pkg"
+		echo "    Run: sudo apt install $pkg"
+		exit 1
+	fi
 done
 
 echo "[+] Installing aismixer to $INSTALL_DIR"
 sudo mkdir -p $INSTALL_DIR
-sudo cp aismixer.py aismixer_secure.py meta_cleaner.py dedup.py forwarder.py assembler.py meta_writer.py $INSTALL_DIR
+sudo cp *.py $INSTALL_DIR
+sudo mkdir $INSTALL_DIR/core
+sudo cp core/*.py $INSTALL_DIR/core
 
 echo "[+] Installing config to $CONFIG_DIR"
 sudo mkdir -p $CONFIG_DIR
