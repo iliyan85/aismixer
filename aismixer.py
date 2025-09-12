@@ -17,6 +17,68 @@ try:
 except ImportError:
     pass  # No effect on Windows or if not installed
 
+_ALNUM_SAFE = re.compile(r'[^A-Za-z0-9_]')
+
+
+def _sanitize_s(val: str) -> str:
+    """Допустими за TAG s: [A-Za-z0-9_]; отрежи до 15."""
+    val = (val or "").strip()
+    val = _ALNUM_SAFE.sub('_', val)
+    return val[:15]
+
+
+def _extract_incoming_s(raw: str) -> str | None:
+    if not raw or raw[0] != '\\':
+        return None
+    try:
+        # вземи между първата '\' и следващата '\' (TAG тялото с *CS)
+        end = raw.find('\\', 1)
+        if end == -1:
+            return None
+        body = raw[1:end]           # "k1:v1,k2:v2*CS"
+        body = body.split('*', 1)[0]  # "k1:v1,k2:v2"
+        for pair in body.split(','):
+            if not pair:
+                continue
+            if ':' not in pair:
+                continue
+            k, v = pair.split(':', 1)
+            if k == 's':
+                return v
+    except Exception:
+        return None
+    return None
+
+
+def choose_s_value(global_station_id: str | None,
+                   source_name_or_id: str | None,
+                   incoming_s: str | None,
+                   remote_ip: str | None) -> str:
+    """
+    Прилага приоритета:
+      1) station_id (ако е непразно)
+      2) input.id / alias / SEC client name (ако е непразно и не е 'ANONYMOUS')
+      3) incoming_s от входния TAG (ако има)
+      4) sanitized(remote_ip) като последен fallback
+    Всичко се sanitize-ва и се реже до 15.
+    """
+    # 1) глобален station_id
+    if global_station_id:
+        return _sanitize_s(global_station_id)
+    # 2) id/alias/name (ако имаме смислена стойност)
+    if source_name_or_id and source_name_or_id != "ANONYMOUS":
+        return _sanitize_s(source_name_or_id)
+    # 3) s от входа (ако има)
+    if incoming_s:
+        return _sanitize_s(incoming_s)
+    # 4) по IP
+    if remote_ip:
+        # IPv4: 1.2.3.4 -> 1_2_3_4 ; IPv6: 2001:db8::1 -> 2001_db8__1
+        ip_sanitized = remote_ip.replace('.', '_').replace(':', '_')
+        return _sanitize_s(ip_sanitized)
+    # ако наистина няма нищо
+    return _sanitize_s("ANONYMOUS")
+
 
 def ts() -> str:
     return str(time.time())
@@ -32,11 +94,6 @@ def load_config():
         config_path = "config.yaml"
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
-
-
-def sanitize_name(s: str) -> str:
-    # безопасно за TAG стойности
-    return re.sub(r'[^A-Za-z0-9._-]', '_', s or '')
 
 
 def load_udp_alias_map(cfg) -> dict:
@@ -101,7 +158,7 @@ async def mixer_loop(input_queues, output_queue):
 
 async def forward_loop(queue):
     while True:
-        source_name, raw_line = await queue.get()
+        source_name, remote_ip, raw_line = await queue.get()
 
         for clean_line in extract_nmea_sentences(raw_line):
             if not clean_line:
@@ -115,9 +172,16 @@ async def forward_loop(queue):
                 if not deduplicator.is_unique(full_line):
                     continue
                 is_first = i == 0
-                s_value = f"{sanitize_name(STATION_ID)}.{sanitize_name(source_name)}"
+                incoming_s = _extract_incoming_s(raw_line)
+                s_value = choose_s_value(
+                    # глобално station_id (може да е '')
+                    STATION_ID,
+                    source_name,            # id/alias/name/ANONYMOUS/IP
+                    incoming_s,             # ако входът носи свое s:
+                    remote_ip               # дефолтен fallback
+                )
                 wrapped_line = wrap_with_meta(
-                    full_line, s_value[:15], is_first=is_first)
+                    full_line, s_value, is_first=is_first)
 
                 if DEBUG:
                     print(f"{ts()} OUTPUT => {wrapped_line}")
@@ -137,8 +201,9 @@ async def handle_socket(sock, queue, fixed_alias=None, alias_map=None):
             print(f"{ts()} INPUT {source_fmt} => {raw_line}")
 
         alias = fixed_alias or (alias_map.get(
-            source_ip) if alias_map else None) or source_ip
-        await queue.put((alias, raw_line))
+            source_ip) if alias_map else None)
+
+        await queue.put((alias, source_ip, raw_line))
 
 
 async def main():
@@ -151,8 +216,9 @@ async def main():
         input_queues.append(q)
         ip = entry["listen_ip"]
         port = entry["listen_port"]
+        sec_id = entry.get("id")
         print(f"{ts()} Secure listening on {format_source(ip, port)}")
-        asyncio.create_task(secure_server(q, ip, port))
+        asyncio.create_task(secure_server(q, ip, port, sec_input_id=sec_id))
 
     # UDP входове
     for entry in UDP_INPUTS:

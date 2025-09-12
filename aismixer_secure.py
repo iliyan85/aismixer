@@ -71,7 +71,7 @@ def derive_session_key(shared_secret, combined_sig):
     return h.finalize()
 
 
-async def secure_server(queue, ip, port):
+async def secure_server(queue, ip, port, sec_input_id=None):
     sock = socket.socket(
         socket.AF_INET6 if ':' in ip else socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((ip, port))
@@ -158,7 +158,9 @@ async def secure_server(queue, ip, port):
                     print(
                         f"{time.time()} [SECURE] From {station_id}: {msg['payload']}")
 
-                await queue.put((station_id, msg["payload"]))
+                src_for_queue = sec_input_id or station_id or "ANONYMOUS"
+                remote_ip = addr[0] if 'addr' in locals() else None
+                await queue.put((src_for_queue, remote_ip, msg["payload"]))
 
             except Exception as e:
                 print(
