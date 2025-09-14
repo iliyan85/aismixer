@@ -10,6 +10,7 @@ from forwarder import Forwarder
 from dedup import Deduplicator
 from core.event import IngressEvent
 from core.s_policy import choose_s_value, parse_tag_pairs_before_index, extract_g_tuple
+from core.state.s_cache import touch_s
 from aismixer_secure import secure_server
 
 try:
@@ -140,6 +141,8 @@ async def forward_loop(queue):
                 # 5) Построй финалното s според приоритета
                 s_value = choose_s_value(
                     STATION_ID, ev.alias_for_s or incoming_s, ev.raw_line, ev.remote_ip)
+                # TTL за s: пипаме финалното s_value, за да се поддържа живo и да се чисти при неактивност
+                touch_s(s_value)
                 wrapped_line = wrap_with_meta(
                     full_line, s_value, is_first=is_first)
 
