@@ -102,55 +102,49 @@ async def forward_loop(queue):
     while True:
         ev: IngressEvent = await queue.get()
 
-        search_from = 0  # за надеждно намиране на всяко clean_line в raw_line
-        for clean_line in extract_nmea_sentences(ev.raw_line):
-            if not clean_line:
-                continue
+        # Zero-copy friendly: взимаме индекси към ev.raw_line, не търсим с find()
+        for sl in extract_nmea_sentences(ev.raw_line, want_idx=True):
+            pos = sl.start
+            clean_line = ev.raw_line[sl.start:sl.end]
 
-            # 1) Намери началния индекс на текущото изречение в raw_line
-            pos = ev.raw_line.find(clean_line, search_from)
-            if pos == -1:
-                # fallback: ако по някаква причина не намерим, нека не чупим логиката
-                pos = len(ev.raw_line)
+            # 1) ТАГ блокът точно преди изречението (ако има)
+            if getattr(sl, "tag_end", -1) >= 0:
+                tag_pairs = parse_tag_pairs_before_index(ev.raw_line, pos)
             else:
-                # следващото търсене започва след това изречение
-                search_from = pos + len(clean_line)
+                tag_pairs = {}
 
-            # 2) Вземи ТАГ блока точно преди това изречение
-            tag_pairs = parse_tag_pairs_before_index(ev.raw_line, pos)
             g_info = extract_g_tuple(tag_pairs)  # (part, total, gid) или None
+
             # ако този фрагмент носи s:, запази го за групата
             if 's' in tag_pairs and g_info:
                 _, _, gid = g_info
                 multipart_s_ctx[(ev.assembler_key, gid)] = tag_pairs['s']
 
-            # 3) Сглоби
+            # 2) Сглобяване на мултипарт
             multipart = assembler.feed(ev.assembler_key, clean_line)
             if multipart is None:
-                continue  # waiting for more parts or incomplete
+                continue  # чакаме още части
 
             for i, full_line in enumerate(multipart):
                 if not deduplicator.is_unique(full_line):
                     continue
                 is_first = i == 0
-                # 4) Определи incoming_s: първо от локалния TAG; ако няма, от кеша incoming_s = tag_pairs.get('s')
+                # 3) Определи incoming_s
                 incoming_s = tag_pairs.get('s')
                 if g_info:
                     part, total, gid = g_info
                     incoming_s = incoming_s or multipart_s_ctx.get((ev.assembler_key, gid))
-                # 5) Построй финалното s според приоритета
-                s_value = choose_s_value(
-                    STATION_ID, ev.alias_for_s or incoming_s, ev.raw_line, ev.remote_ip)
-                # TTL за s: пипаме финалното s_value, за да се поддържа живo и да се чисти при неактивност
-                touch_s(s_value)
-                wrapped_line = wrap_with_meta(
-                    full_line, s_value, is_first=is_first)
+                # 4) Построй финалното s
+                s_value = choose_s_value(STATION_ID, ev.alias_for_s or incoming_s, ev.raw_line, ev.remote_ip)
+                touch_s(s_value)  # TTL поддръжка за s
+                wrapped_line = wrap_with_meta(full_line, s_value, is_first=is_first)
 
                 if DEBUG:
                     print(f"{ts()} OUTPUT => {wrapped_line}")
 
                 await forwarder.send(wrapped_line + '\r\n')
-            # 6) Ако това е била последната част от групата — чистим кеша
+
+            # 5) Ако това е последната част от групата — чистим кеша
             if g_info:
                 part, total, gid = g_info
                 if part == total:
