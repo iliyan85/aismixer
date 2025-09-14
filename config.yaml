@@ -7,7 +7,7 @@ udp_inputs:
   - listen_ip: 0.0.0.0
     listen_port: 17778
     id: null
-  - listen_ip: '::'
+  - listen_ip: "::"
     listen_port: 17770
     id: null
 
@@ -21,8 +21,17 @@ udp_alias_map_file: udp_alias_map.yaml
 
 station_id: mixstation_1
 
-g_preserve_ingress_gid: false
+# --- g policy ---
+# Ако е true и в ingress TAG има \g:x-y-gid\, пазим това gid; иначе винаги генерираме ново.
+g_preserve_ingress_gid: true
+# Дължина на генерираното числово gid (без водещи нули)
 g_id_digits: 18
+# Ако е true, добавяме g и при единични изречения като 1-1-<gid>
 g_always_tag_single: false
+
+# --- c policy ---
+# Ако е true и в ingress TAG има \c:<unix_ts>\, пазим тази стойност;
+# ако е false или няма \c:..., ползваме текущото време на сървъра.
+c_preserve_ingress_c: true
 
 debug: true

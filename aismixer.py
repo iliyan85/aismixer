@@ -85,6 +85,7 @@ DEBUG = config.get("debug", True)
 G_PRESERVE_INGRESS_GID = config.get("g_preserve_ingress_gid", True)
 G_ID_DIGITS = config.get("g_id_digits", 18)
 G_ALWAYS_TAG_SINGLE = config.get("g_always_tag_single", False)
+C_PRESERVE_INGRESS_C = config.get("c_preserve_ingress_c", True)
 
 
 def _gen_numeric_gid_fixed(digits: int) -> str:
@@ -128,6 +129,14 @@ async def forward_loop(queue):
                 tag_pairs = {}
 
             g_info = extract_g_tuple(tag_pairs)  # (part, total, gid) или None
+
+            # --- избиране на timestamp за TAG 'c' ---
+            # ако е позволено и имаме валиден \c:... в ingress TAG → пазим него,
+            # иначе → текущото време на сървъра
+            c_ingress = tag_pairs.get('c')
+            ts_for_header = None
+            if C_PRESERVE_INGRESS_C and c_ingress and c_ingress.isdigit():
+                ts_for_header = int(c_ingress)
 
             # ако този фрагмент носи s:, запази го за групата
             if 's' in tag_pairs and g_info:
@@ -174,7 +183,7 @@ async def forward_loop(queue):
                 else:
                     g_triplet = None
                 wrapped_line = wrap_with_meta(
-                    full_line, s_value, is_first=is_first, g_triplet=g_triplet)
+                    full_line, s_value, ts_for_header, is_first=is_first, g_triplet=g_triplet)
 
                 if DEBUG:
                     print(f"{ts()} OUTPUT => {wrapped_line}")
