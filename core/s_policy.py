@@ -32,6 +32,72 @@ def extract_incoming_s(raw: Optional[str]) -> Optional[str]:
     return None
 
 
+def parse_last_tag_pairs(raw: Optional[str]) -> dict:
+    """
+    Взема последния \...*CS\ TAG блок в реда и го връща като dict {k:v}.
+    Ако няма TAG блок, връща {}.
+    """
+    if not raw:
+        return {}
+    end = raw.rfind('\\')
+    if end <= 0:
+        return {}
+    start = raw.rfind('\\', 0, end)
+    if start == -1:
+        return {}
+    tag = raw[start + 1:end]           # "k1:v1,...*CS"
+    body = tag.split('*', 1)[0]        # "k1:v1,..."
+    out = {}
+    for pair in body.split(','):
+        if not pair:
+            continue
+        k, sep, v = pair.partition(':')
+        if sep:
+            out[k] = v
+    return out
+
+
+def parse_tag_pairs_before_index(raw: Optional[str], idx: int) -> dict:
+    """
+    Връща {k:v} от ТАГ блока, който непосредствено предхожда позиция idx в raw.
+    Подходящо, когато raw съдържа няколко залепени TAG блока + изречения и
+    трябва да намерим TAG за точно това изречение (на което знаем началния индекс).
+    """
+    if not raw or idx <= 0:
+        return {}
+    end = raw.rfind('\\', 0, idx)
+    if end <= 0:
+        return {}
+    start = raw.rfind('\\', 0, end)
+    if start == -1:
+        return {}
+    tag = raw[start + 1:end]         # "k1:v1,...*CS"
+    body = tag.split('*', 1)[0]      # "k1:v1,..."
+    out = {}
+    for pair in body.split(','):
+        if not pair:
+            continue
+        k, sep, v = pair.partition(':')
+        if sep:
+            out[k] = v
+    return out
+
+
+def extract_g_tuple(tag_pairs: dict) -> Optional[tuple[int, int, str]]:
+    """
+    От dict {k:v} извлича g като (part, total, group_id).
+    Пример: g: "1-2-788872464" -> (1, 2, "788872464")
+    """
+    g = tag_pairs.get('g')
+    if not g:
+        return None
+    try:
+        a, b, gid = g.split('-', 2)
+        return int(a), int(b), gid
+    except Exception:
+        return None
+
+
 def ip_to_s(ip: Optional[str]) -> str:
     """ IPv4 -> 1_2_3_4; IPv6 -> колони в '_' и отрязване до 15. """
     if not ip:

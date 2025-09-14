@@ -9,7 +9,7 @@ udp_inputs:
     id: null
   - listen_ip: '::'
     listen_port: 17770
-    id: udpB
+    id: null
 
 forwarders:
   - host: 127.0.0.1
@@ -19,6 +19,6 @@ forwarders:
 
 udp_alias_map_file: udp_alias_map.yaml
 
-station_id: mixstation_1
+station_id: null
 
 debug: true

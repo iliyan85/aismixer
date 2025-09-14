@@ -9,7 +9,7 @@ from meta_cleaner import extract_nmea_sentences
 from forwarder import Forwarder
 from dedup import Deduplicator
 from core.event import IngressEvent
-from core.s_policy import choose_s_value
+from core.s_policy import choose_s_value, parse_tag_pairs_before_index, extract_g_tuple
 from aismixer_secure import secure_server
 
 try:
@@ -96,13 +96,34 @@ async def mixer_loop(input_queues, output_queue):
 
 
 async def forward_loop(queue):
+    # Контекст: (assembler_key, group_id) -> 's' от ранна част на мултипарт
+    multipart_s_ctx: dict[tuple[str, str], str] = {}
     while True:
         ev: IngressEvent = await queue.get()
 
+        search_from = 0  # за надеждно намиране на всяко clean_line в raw_line
         for clean_line in extract_nmea_sentences(ev.raw_line):
             if not clean_line:
                 continue
 
+            # 1) Намери началния индекс на текущото изречение в raw_line
+            pos = ev.raw_line.find(clean_line, search_from)
+            if pos == -1:
+                # fallback: ако по някаква причина не намерим, нека не чупим логиката
+                pos = len(ev.raw_line)
+            else:
+                # следващото търсене започва след това изречение
+                search_from = pos + len(clean_line)
+
+            # 2) Вземи ТАГ блока точно преди това изречение
+            tag_pairs = parse_tag_pairs_before_index(ev.raw_line, pos)
+            g_info = extract_g_tuple(tag_pairs)  # (part, total, gid) или None
+            # ако този фрагмент носи s:, запази го за групата
+            if 's' in tag_pairs and g_info:
+                _, _, gid = g_info
+                multipart_s_ctx[(ev.assembler_key, gid)] = tag_pairs['s']
+
+            # 3) Сглоби
             multipart = assembler.feed(ev.assembler_key, clean_line)
             if multipart is None:
                 continue  # waiting for more parts or incomplete
@@ -111,8 +132,14 @@ async def forward_loop(queue):
                 if not deduplicator.is_unique(full_line):
                     continue
                 is_first = i == 0
+                # 4) Определи incoming_s: първо от локалния TAG; ако няма, от кеша incoming_s = tag_pairs.get('s')
+                incoming_s = tag_pairs.get('s')
+                if g_info:
+                    part, total, gid = g_info
+                    incoming_s = incoming_s or multipart_s_ctx.get((ev.assembler_key, gid))
+                # 5) Построй финалното s според приоритета
                 s_value = choose_s_value(
-                    STATION_ID, ev.alias_for_s, ev.raw_line, ev.remote_ip)
+                    STATION_ID, ev.alias_for_s or incoming_s, ev.raw_line, ev.remote_ip)
                 wrapped_line = wrap_with_meta(
                     full_line, s_value, is_first=is_first)
 
@@ -120,6 +147,11 @@ async def forward_loop(queue):
                     print(f"{ts()} OUTPUT => {wrapped_line}")
 
                 await forwarder.send(wrapped_line + '\r\n')
+            # 6) Ако това е била последната част от групата — чистим кеша
+            if g_info:
+                part, total, gid = g_info
+                if part == total:
+                    multipart_s_ctx.pop((ev.assembler_key, gid), None)
 
 
 async def handle_socket(sock, queue, fixed_alias=None, alias_map=None):
