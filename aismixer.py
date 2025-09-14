@@ -6,6 +6,7 @@ import time
 from assembler import AIVDMAssembler
 from meta_writer import wrap_with_meta
 from meta_cleaner import extract_nmea_sentences
+from secrets import randbelow
 from forwarder import Forwarder
 from dedup import Deduplicator
 from core.event import IngressEvent
@@ -81,6 +82,19 @@ FORWARDERS = config.get("forwarders", [])
 STATION_ID = config.get("station_id", "mixstation_1")
 UDP_ALIAS_MAP = load_udp_alias_map(config)
 DEBUG = config.get("debug", True)
+G_PRESERVE_INGRESS_GID = config.get("g_preserve_ingress_gid", True)
+G_ID_DIGITS = config.get("g_id_digits", 18)
+G_ALWAYS_TAG_SINGLE = config.get("g_always_tag_single", False)
+
+
+def _gen_numeric_gid_fixed(digits: int) -> str:
+    """
+    Криптографски сигурно чисто числово gid с фиксирана дължина (без водещи нули).
+    Равномерно в интервала [10^(d-1) .. 10^d - 1].
+    """
+    base = 10 ** (digits - 1)
+    return str(base + randbelow(9 * base))
+
 
 deduplicator = Deduplicator()
 forwarder = Forwarder(FORWARDERS)
@@ -125,6 +139,20 @@ async def forward_loop(queue):
             if multipart is None:
                 continue  # чакаме още части
 
+            # --- изходно gid за тази група ---
+            incoming_gid: str | None = None
+            if g_info:
+                _, _, in_gid = g_info
+                if in_gid and in_gid.isdigit():
+                    incoming_gid = in_gid
+            if G_PRESERVE_INGRESS_GID and incoming_gid:
+                out_gid = incoming_gid
+            else:
+                out_gid = _gen_numeric_gid_fixed(G_ID_DIGITS)
+
+            total_parts = len(multipart)
+            tag_single = (total_parts == 1 and G_ALWAYS_TAG_SINGLE)
+
             for i, full_line in enumerate(multipart):
                 if not deduplicator.is_unique(full_line):
                     continue
@@ -133,11 +161,20 @@ async def forward_loop(queue):
                 incoming_s = tag_pairs.get('s')
                 if g_info:
                     part, total, gid = g_info
-                    incoming_s = incoming_s or multipart_s_ctx.get((ev.assembler_key, gid))
+                    incoming_s = incoming_s or multipart_s_ctx.get(
+                        (ev.assembler_key, gid))
                 # 4) Построй финалното s
-                s_value = choose_s_value(STATION_ID, ev.alias_for_s or incoming_s, ev.raw_line, ev.remote_ip)
+                s_value = choose_s_value(
+                    STATION_ID, ev.alias_for_s or incoming_s, ev.raw_line, ev.remote_ip)
                 touch_s(s_value)  # TTL поддръжка за s
-                wrapped_line = wrap_with_meta(full_line, s_value, is_first=is_first)
+
+                # g: добавяме при multipart или ако е разрешено и за single
+                if total_parts > 1 or tag_single:
+                    g_triplet = f"{i+1}-{total_parts}-{out_gid}"
+                else:
+                    g_triplet = None
+                wrapped_line = wrap_with_meta(
+                    full_line, s_value, is_first=is_first, g_triplet=g_triplet)
 
                 if DEBUG:
                     print(f"{ts()} OUTPUT => {wrapped_line}")

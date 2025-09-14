@@ -13,7 +13,13 @@ def format_header(content: str) -> str:
     return "\\" + content + "*" + chk + "\\"
 
 
-def wrap_with_meta(nmea_line: str, station_id: str, timestamp=None, is_first=True) -> str:
+def wrap_with_meta(
+        nmea_line: str,
+        station_id: str,
+        timestamp: int | None = None,
+        is_first: bool = True,
+        g_triplet: str | None = None) -> str:
+
     if not timestamp:
         timestamp = int(time.time())
 
@@ -21,19 +27,15 @@ def wrap_with_meta(nmea_line: str, station_id: str, timestamp=None, is_first=Tru
     if len(parts) < 4:
         return nmea_line  # safety fallback
 
-    header = ""
-    if parts[1] == "2":
-        seq_id = parts[3] or "0"
-        frag_index = parts[2]
-        frag_total = parts[1]
-        group_id = f"{frag_index}-{frag_total}-{seq_id}"
-
+    # g се подава отвън (ако е нужно) като triplet "<part>-<total>-<gid>".
+    tag_fields = [f"c:{timestamp}", f"s:{station_id}"]
+    if g_triplet:
+        # при първата част добавяме c,s,g; при следващите може да се подават само g (ако желаеш)
         if is_first:
-            header = format_header(
-                f"c:{timestamp},s:{station_id},g:{group_id}")
+            header = format_header(",".join(tag_fields + [f"g:{g_triplet}"]))
         else:
-            header = format_header(f"g:{group_id}")
+            header = format_header(f"g:{g_triplet}")
     else:
-        header = format_header(f"c:{timestamp},s:{station_id}")
+        header = format_header(",".join(tag_fields))
 
     return header + nmea_line

@@ -19,6 +19,10 @@ forwarders:
 
 udp_alias_map_file: udp_alias_map.yaml
 
-station_id: null
+station_id: mixstation_1
+
+g_preserve_ingress_gid: false
+g_id_digits: 18
+g_always_tag_single: false
 
 debug: true
