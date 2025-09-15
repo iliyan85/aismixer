@@ -1,59 +1,211 @@
-# AISMixer
+**EN | BG below**
 
-**(BG | EN below)**
+# 🛰️ AISMixer — AIS NMEA‑0183 multiplexer / deduplicator / **tag‑aware forwarder**
 
----
+**Keywords:** AIS software, Automatic Identification System, NMEA 0183, AIVDM, AIVDO, multiplexer, deduplication, tag block, `s`/`c`/`g`, UDP, secure UDP, ECDSA, AES‑GCM, Raspberry Pi.
 
-## 🛰️ Какво е AISMixer?
-
-`AISMixer` е Python услуга, която агрегира и миксира AIS NMEA съобщения от множество независими приемници, и ги препраща като единен поток към външни платформи като [MarineTraffic](https://www.marinetraffic.com), [AISHub](https://www.aishub.net), [VesselTracker](https://www.vesseltracker.com) и други.
-
-🔐 Поддържа както обикновен (нешифриран) вход по UDP, така и защитени криптирани входове (NMEA over ECDSA + AES-GCM).
+> **TL;DR**  
+> AISMixer merges multiple AIS receiver feeds, de‑duplicates messages, reliably reassembles multipart via Tag Block **`g`**, and forwards a clean, unified stream.  
+> It is **tag‑aware**: reads `s`/`c`/`g` on ingress and (per policy) **preserves / normalizes / overwrites** them on egress — e.g., pass through `c` or replace with server time; keep/normalize `s`; emit compact `g`.
 
 ---
 
-## 🧭 Основна идея
+## 🧭 What is AISMixer?
 
-- Няколко AIS приемника (физически или софтуерни) подават NMEA съобщения към AISMixer.
-- Потокът може да идва от различни IP адреси, през различни портове, вкл. през защитено криптирано прокси (nmea_sproxy).
-- AISMixer премахва повтарящите се съобщения, добавя мета-информация и ги обединява.
-- Външните платформи получават финален „логически“ поток, все едно идва от една станция.
+**AISMixer** is a Python service that aggregates AIS NMEA‑0183 (AIVDM/AIVDO) from multiple receivers, removes duplicates, reassembles multipart messages, and forwards a single logical feed to marine platforms (e.g., MarineTraffic / AISHub / VesselTracker) or your own services.
 
----
-
-## 📦 Компоненти
-
-| Компонент | Роля |
-|----------|------|
-| `aismixer.py` | Основен процес, слушащ UDP и secure входове |
-| `aismixer_secure.py` | Криптиран handshake, дешифриране и проверка на съобщенията |
-| `nmea_sproxy/` | Лек клиент-прокси за шифроване и изпращане на трафик към миксера |
-| `meta_writer.py` | Добавя NMEA префикси и `CRC` |
-| `dedup.py` | Премахва дублиращи се съобщения |
-| `config.yaml` | Конфигурация на входове, изходи, debug и име на станцията |
-| `authorized_keys.yaml` | Публични ключове на разрешените клиенти (ECDSA) |
+- 🔐 Supports **plain UDP** and **encrypted inputs** via an ECDSA handshake + AES‑GCM transport (with the lightweight client proxy `nmea_sproxy`).  
+- 🧩 Tag‑aware end‑to‑end (reads/manages `s`/`c`/`g`).  
+- 📦 Clean output as if from one logical station.
 
 ---
 
-## 🔀 Схема на потоците
+## 🔀 Core flow
+
+1. Multiple AIS receivers (hardware/software) send NMEA to AISMixer (UDP or secure via `nmea_sproxy`).  
+2. AISMixer **de‑duplicates** identical payloads from different sources.  
+3. AISMixer **reassembles multipart** AIVDM using Tag Block **`g`**.  
+4. AISMixer **forwards** a unified stream downstream (per‑forwarder tag policy).
 
 ```
-   +------------+     UDP     +-----------+           +----------------+
-   | Receiver A | ----------> |           |           |                |
-   +------------+             |           |           |                |
-                              |           | --------> | MarineTraffic  |
-   +------------+  Encrypted  | AISMixer  | --------> | AISHub         |
-   | nmea_sproxy| ----------> |           | --------> | VesselTracker  |
-   +------------+             |           |           | etc.           |
-                              +-----------+           +----------------+
++------------+    UDP      +-----------+      +----------------+
+| Receiver A | ----------> |           | ---> | MarineTraffic  |
++------------+             |           |      | AISHub         |
+                           | AISMixer  | ---> | VesselTracker  |
++------------+ Encrypted   |           |      | etc.           |
+| nmea_sproxy| ----------> |           |      +----------------+
++------------+             +-----------+
 ```
 
 ---
 
-## ⚙️ Конфигурация (`config.yaml`)
+## ⚙️ Tag‑aware forwarding (Tag Block `s` / `c` / `g`)
+
+AISMixer parses Tag Block on ingress and **manages** what to emit on egress **per policy**:
+
+- **`g` (group)** — used to reliably reassemble multipart AIVDM.  
+  When needed, AISMixer generates its own group IDs to ensure contiguous reassembly.
+- **`s` (source)** — preserve incoming `s`, map by IP/authorized key, or set a server‑defined station ID.
+- **`c` (timestamp)** — pass through incoming time **or** replace it with **server time** (for clock normalization).
+
+### 🧭 Egress tag policy (per output; beta)
+
+- `preserve` — pass through incoming field (if present).  
+- `normalize` — rewrite into canonical form (e.g., compact `g`, sanitized `s`).  
+- `overwrite` — ignore ingress and emit server value (e.g., server time for `c`).
+
+---
+
+## 📦 Configuration (`config.yaml`)
 
 ```yaml
-station_id: mixstation_1   # ако е непразно, винаги става s=
+station_id: mixstation_1   # if non-empty, it always becomes s=
+debug: true
+
+sec_inputs:
+  - id: secA               # optional; if station_id empty, s=secA
+    listen_ip: "::"
+    listen_port: 29999
+
+udp_inputs:
+  - listen_ip: "0.0.0.0"
+    listen_port: 17777
+    id: udpA               # optional; if station_id empty, s=udpA
+  - listen_ip: "::"
+    listen_port: 17777
+
+forwarders:
+  - host: 203.0.113.10
+    port: 5000
+
+udp_alias_map_file: udp_alias_map.yaml   # optional
+
+# (beta) Optional tag policy — may land as per-forwarder or global
+# tag_policy:
+#   s: preserve    # preserve | normalize | overwrite
+#   c: overwrite   # use server time
+#   g: normalize   # server-formed compact groups when reassembled
+```
+
+### 🔍 How `s` (source) is formed
+
+Priority:
+
+1. If `station_id` is non‑empty → **s = station_id**  
+2. Else, if the input has an `id` (incl. `sec_inputs[].id`) → **s = input.id**  
+3. Else:
+   - UDP: if remote IP exists in `udp_alias_map.yaml` → **s = alias**  
+   - SEC: if a name exists in `authorized_keys.yaml` → **s = client_name** (else `ANONYMOUS`)  
+4. Else, if the incoming line already carries `\s:…\` → **s = that value**  
+5. Else → **s = IP** (dots/colons replaced with `_`)
+
+All variants are sanitized to `[A–Za–z0–9_]` and limited to **15** characters.
+
+### 📦 UDP IP→alias map (`udp_alias_map.yaml`)
+
+```yaml
+"127.0.0.1": "lo_alias"
+"2001:db8::1234": "dock_gate"
+```
+
+---
+
+## 🧭 Components
+
+| Module/Dir              | Role |
+|-------------------------|------|
+| `aismixer.py`           | Main mixer process (UDP + secure inputs) |
+| `aismixer_secure.py`    | ECDSA handshake, decryption, authentication |
+| `nmea_sproxy/`          | Lightweight client-side secure UDP proxy |
+| `assembler.py`          | Multipart reassembly using Tag Block `g` |
+| `dedup.py`              | Duplicate detection/removal |
+| `meta_writer.py`        | Adds NMEA tag block/prefix and CRC |
+| `meta_cleaner.py`       | Removes non-standard meta headers |
+| `forwarder.py`          | Sends the clean output to destinations |
+| `config.yaml`           | Inputs/outputs, station ID, debug, (tag policy — beta) |
+| `authorized_keys.yaml`  | Allowed client public keys (for secure inputs) |
+
+---
+
+## 🚀 Running
+
+```bash
+python3 aismixer.py
+```
+
+Or install as a **systemd** service using `install.sh` (copies unit to `/etc/systemd/system/`).
+
+---
+
+## 🔐 Security
+
+- **Handshake:** ECDSA-based mutual check; clients are authorized via `authorized_keys.yaml`.  
+- **Transport:** AES-GCM for integrity + confidentiality over UDP.  
+- **Replay resistance:** nonces/timestamps in handshake (client proxy `nmea_sproxy`).
+
+---
+
+
+# 🇧🇬 AISMixer — AIS NMEA‑0183 мултиплексор / дедупликатор / **tag‑aware форурдър**
+
+**Ключови думи:** AIS софтуер, Automatic Identification System, NMEA 0183, AIVDM, AIVDO, multiplexer, deduplication, tag block, `s`/`c`/`g`, UDP, secure UDP, ECDSA, AES‑GCM, Raspberry Pi.
+
+> **TL;DR**  
+> AISMixer обединява няколко AIS приемни потока, премахва дубликати, надеждно сглобява мултипарт чрез Tag Block **`g`** и излъчва чист, обединен поток.  
+> Системата е **tag‑aware**: чете `s`/`c`/`g` на вход и (според политика) **preserve / normalize / overwrite** на изход — напр. запазва `c` или го заменя със сървърно време; запазва/нормализира `s`; излъчва компактен `g`.
+
+---
+
+## 🧭 Какво е AISMixer?
+
+**AISMixer** е Python услуга, която агрегира AIS NMEA‑0183 (AIVDM/AIVDO) от няколко приемника, премахва дубликати, сглобява мултипарт съобщения и препраща един логически поток към външни платформи или ваши услуги.
+
+- 🔐 Поддържа **обикновен UDP** и **защитен вход** чрез ECDSA handshake + AES‑GCM транспорт (клиентско прокси `nmea_sproxy`).  
+- 🧩 Tag‑aware от край до край (чете/управлява `s`/`c`/`g`).  
+- 📦 Чист изход сякаш е от една логическа станция.
+
+---
+
+## 🔀 Основен поток
+
+1. Няколко приемника (хардуерни/софтуерни) изпращат NMEA към AISMixer (UDP или защитено чрез `nmea_sproxy`).  
+2. AISMixer **дедупликира** еднакви полезни товари от различни източници.  
+3. AISMixer **сглобява мултипарт** AIVDM чрез Tag Block **`g`**.  
+4. AISMixer **форурдва** обединения поток (per‑forwarder tag политика).
+
+```
++------------+    UDP      +-----------+      +----------------+
+| Receiver A | ----------> |           | ---> | MarineTraffic  |
++------------+             |           |      | AISHub         |
+                           | AISMixer  | ---> | VesselTracker  |
++------------+ Encrypted   |           |      | и др.          |
+| nmea_sproxy| ----------> |           |      +----------------+
++------------+             +-----------+
+```
+
+---
+
+## ⚙️ Tag‑aware форурдване (Tag Block `s` / `c` / `g`)
+
+AISMixer чете Tag Block на входа и **решава** какво да излъчи на изхода **по политика**:
+
+- **`g` (group)** — за надеждно сглобяване на мултипарт AIVDM.  
+  При нужда AISMixer генерира собствени group ID‑та за последователно сглобяване.
+- **`s` (source)** — запази входния `s`, мапни по IP/ключ, или задай сървърен station ID.
+- **`c` (timestamp)** — пропусни входното време **или** замени със **сървърно време** (нормализация на часовниците).
+
+### 🧭 Политика на изход (per output; beta)
+
+- `preserve` — запази входното поле (ако е налично).  
+- `normalize` — пренапиши в канонична форма (напр. компактен `g`, sanitized `s`).  
+- `overwrite` — игнорирай входа и издай сървърна стойност (напр. сървърно време за `c`).
+
+---
+
+## 📦 Конфигурация (`config.yaml`)
+
+```yaml
+station_id: mixstation_1   # ако е непразно → винаги става s=
 debug: true
 
 sec_inputs:
@@ -69,30 +221,55 @@ udp_inputs:
     listen_port: 17777
 
 forwarders:
-  - host: 5.9.207.224
+  - host: 203.0.113.10
     port: 5000
 
 udp_alias_map_file: udp_alias_map.yaml   # по избор
+
+# (beta) По избор — политика за тагове (per‑forwarder или глобална)
+# tag_policy:
+#   s: preserve
+#   c: overwrite   # сървърно време
+#   g: normalize   # компактни групи при сглобяване
 ```
-@@
-## 🔎 Как се формира `s` (NMEA TAG)
+
+### 🔍 Как се формира `s`
+
 Приоритет:
-1) ако `station_id` е непразно → **s = station_id**;
-2) иначе ако има `input.id` (вкл. `sec_inputs[].id`) → **s = input.id**;
-3) иначе:
-   - UDP: ако IP е в `udp_alias_map.yaml` → **s = alias**;
-   - SEC: ако има име от `authorized_keys.yaml` → **s = client_name** (иначе `ANONYMOUS`);
-4) иначе, ако входящият ред носи `\s:…\` → **s = тази стойност**;
-5) иначе → **s = IP** (точки/двуеточия → `_`).
 
-Всички варианти минават през sanitize **[A–Za–z0–9_]** и твърд лимит **15**.
+1. Ако `station_id` е непразно → **s = station_id**  
+2. Иначе, ако входът има `id` (вкл. `sec_inputs[].id`) → **s = input.id**  
+3. Иначе:
+   - UDP: ако remote IP е в `udp_alias_map.yaml` → **s = alias**  
+   - SEC: ако има име в `authorized_keys.yaml` → **s = client_name** (иначе `ANONYMOUS`)  
+4. Иначе, ако входящият ред вече носи `\s:…\` → **s = тази стойност**  
+5. Иначе → **s = IP** (точки/двуеточия → `_`)
 
-### (по избор) IP→alias мапинг за UDP (`udp_alias_map.yaml`)
+Всички варианти се sanitize‑ват до `[A–Za–z0–9_]` и лимит **15** символа.
+
+### 📦 UDP IP→alias (`udp_alias_map.yaml`)
+
 ```yaml
 "127.0.0.1": "lo_alias"
 "2001:db8::1234": "dock_gate"
 ```
-@@
+
+---
+
+## 🧭 Компоненти
+
+| Компонент              | Роля |
+|------------------------|------|
+| `aismixer.py`          | Основен процес (UDP + secure входове) |
+| `aismixer_secure.py`   | ECDSA handshake, дешифриране, автентикация |
+| `nmea_sproxy/`         | Леко клиентско secure UDP прокси |
+| `assembler.py`         | Сглобяване на мултипарт чрез Tag Block `g` |
+| `dedup.py`             | Премахване на дубликати |
+| `meta_writer.py`       | Добавя NMEA tag block/префикс и CRC |
+| `meta_cleaner.py`      | Премахва нестандартни мета‑хедъри |
+| `forwarder.py`         | Изпраща изчистения изход към дестинациите |
+| `config.yaml`          | Входове/изходи, station ID, debug, (tag политика — beta) |
+| `authorized_keys.yaml` | Публични ключове на разрешените клиенти |
 
 ---
 
@@ -102,126 +279,14 @@ udp_alias_map_file: udp_alias_map.yaml   # по избор
 python3 aismixer.py
 ```
 
-### За systemd:
-
-- Използвайте `install.sh` за инсталация
-- Файлът `aismixer.service` може да се копира в `/etc/systemd/system/`
+Или като **systemd** услуга чрез `install.sh`.
 
 ---
 
-## 🌍 English version
+## 🔐 Сигурност
+
+- **Handshake:** ECDSA взаимна проверка; клиентите се описват в `authorized_keys.yaml`.  
+- **Транспорт:** AES‑GCM за целост и конфиденциалност по UDP.  
+- **Anti‑replay:** nonces/времеви маркери в handshake (клиент `nmea_sproxy`).
 
 ---
-
-## 🛰️ What is AISMixer?
-
-`AISMixer` is a Python-based service that aggregates and merges AIS NMEA messages from multiple independent receivers and forwards the resulting stream to public marine tracking platforms such as [MarineTraffic](https://www.marinetraffic.com), [AISHub](https://www.aishub.net), and others.
-
-🔐 It supports both unencrypted UDP input and encrypted input via ECDSA handshake + AES-GCM encryption (via `nmea_sproxy`).
-
----
-
-## 🧭 Core Idea
-
-- Multiple AIS receivers (hardware or software) send NMEA messages to AISMixer
-- Sources can be UDP or encrypted (via `nmea_sproxy`)
-- AISMixer deduplicates, optionally adds metadata, and forwards as a single logical feed
-- Marine tracking services receive the combined stream from "one virtual station"
-
----
-
-## 📦 Components
-
-| Component | Description |
-|----------|-------------|
-| `aismixer.py` | Main mixer process |
-| `aismixer_secure.py` | Handles secure connections and decryption |
-| `nmea_sproxy/` | Lightweight secure UDP client/proxy |
-| `meta_writer.py` | Adds NMEA prefix and CRC |
-| `dedup.py` | Deduplication engine |
-| `config.yaml` | Config for listeners, forwarders, debug |
-| `authorized_keys.yaml` | List of authorized client public keys |
-
----
-
-## 🔀 Stream Architecture
-
-```
-   +------------+     UDP     +-----------+           +----------------+
-   | Receiver A | ----------> |           |           |                |
-   +------------+             |           |           |                |
-                              |           | --------> | MarineTraffic  |
-   +------------+  Encrypted  | AISMixer  | --------> | AISHub         |
-   | nmea_sproxy| ----------> |           | --------> | VesselTracker  |
-   +------------+             |           |           | etc.           |
-                              +-----------+           +----------------+
-```
-
----
-## ⚙️ Configuration (`config.yaml`)
-
-```yaml
-station_id: mixstation_1   # if non-empty, it always becomes s=
-debug: true
-
-sec_inputs:
-  - id: secA               # optional; if station_id is empty, s=secA
-    listen_ip: "::"
-    listen_port: 29999
-
-udp_inputs:
-  - listen_ip: "0.0.0.0"
-    listen_port: 17777
-    id: udpA               # optional; if station_id is empty, s=udpA
-  - listen_ip: "::"
-    listen_port: 17777
-
-forwarders:
-  - host: 5.9.207.224
-    port: 5000
-
-udp_alias_map_file: udp_alias_map.yaml   # optional
-```
-@@
-## 🔎 How `s` (NMEA TAG) is formed
-
-**Priority:**
-1. If `station_id` is non-empty → **s = station_id**
-2. Else, if the input has an `id` (incl. `sec_inputs[].id`) → **s = input.id**
-3. Else:
-   - **UDP:** if the remote IP exists in `udp_alias_map.yaml` → **s = alias**
-   - **SEC:** if there is a name from `authorized_keys.yaml` → **s = client_name** (otherwise `ANONYMOUS`)
-4. Else, if the incoming line already carries `\s:…\` → **s = that value**
-5. Else → **s = IP** (dots/colons replaced with `_`)
-
-_All variants are sanitized to `[A–Z a–z 0–9 _]` and hard-limited to **15** characters._
-
-### (optional) IP→alias mapping for UDP (`udp_alias_map.yaml`)
-```yaml
-"127.0.0.1": "lo_alias"
-"2001:db8::1234": "dock_gate"
-```
-@@
-
----
-
-## 🚀 Running
-
-```bash
-python3 aismixer.py
-```
-
-Or install as a systemd service using `install.sh`
-
----
-
-📝 Licensed by Iliyan Iliev (c) 2025 
-Contributions welcome.
-
----
-
-## 🛡️ Лиценз
-
-Проектът е публикуван под лиценза **CC BY-NC 4.0**  
-[Прочетете условията тук](https://creativecommons.org/licenses/by-nc/4.0/)  
-За комерсиално използване, моля свържете се с автора.
