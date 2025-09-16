@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="bg">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AISMixer — обединяване, дедупликация и форвард на AIS NMEA потоци</title>
+  <link rel="canonical" href="https://aismixer.net/bg/">
+  <meta name="description" content="AISMixer — обединява, дедуплицира и препраща AIS NMEA потоци. Сигурност по дизайн. Мулти-юзер.">
+  <meta name="robots" content="index,follow">
+  <meta name="theme-color" content="#0b1220">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="AISMixer — обединяване, дедупликация и форвард на AIS NMEA потоци">
+  <meta property="og:description" content="Merge, deduplicate and forward AIS NMEA streams.">
+  <meta property="og:url" content="https://aismixer.net/bg/">
+  <meta property="og:image" content="https://aismixer.net/assets/img/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:locale" content="bg_BG">
+  <meta property="og:locale:alternate" content="en_US">
+  <link rel="alternate" hreflang="en" href="https://aismixer.net/">
+  <link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/">
+  <link rel="alternate" hreflang="x-default" href="https://aismixer.net/">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/assets/img/favicon-32.png" sizes="32x32" type="image/png">
+  <link rel="apple-touch-icon" href="/assets/img/apple-touch-icon.png">
+  <link rel="preload" href="/assets/css/styles.css" as="style">
+  <link rel="stylesheet" href="/assets/css/styles.css">
+</head>
+<body>
+  <nav class="nav">
+    <div class="container nav-inner">
+      <a class="brand" href="/bg/" aria-label="AISMixer начало">
+        <span class="logo" aria-hidden="true">🛰️</span>
+        <span class="brand-name">AISMixer</span>
+        <span class="chip">AIS multiplexer &amp; forward</span>
+      </a>
+      <div class="lang-links">
+        <a href="/bg/" aria-current="page">BG</a> | <a href="/">EN</a>
+      </div>
+    </div>
+  </nav>
+
+  <header class="hero container" id="top">
+    <div class="two-col">
+      <div>
+        <div class="chip">Open-source • Python</div>
+        <h1>AISMixer — обединяване, дедупликация и форвард на AIS NMEA потоци</h1>
+        <p class="lead">
+          Приема потоци от няколко AIS приемника/софтуера, премахва дубликати, нормализира или добавя мета хедъри и изпраща чист обединен NMEA поток към платформи като MarineTraffic / VesselFinder — с планирана криптирана връзка станция→мултиплексор и изолация по потребители.
+        </p>
+        <div class="cta">
+          <a class="button" href="#features">Възможности</a>
+          <a class="button" href="#get-started">Първи стъпки</a>
+        </div>
+      </div>
+      <div class="card tldr">
+        <div class="icons" aria-hidden="true">🛰️ 🧭 📦 🔁 ⚙️ 🔍 🚀 🌍</div>
+        <h3>Накратко</h3>
+        <ul class="list">
+          <li>UDP вход от множество AIS приложения/устройства</li>
+          <li>Multipart <span class="kbd">!AIVDM</span> сглобяване (g-тагове)</li>
+          <li>Дедупликация и почистване/пренаписване на мета хедъри</li>
+          <li>Политика за времевия <span class="kbd">c</span>-таг</li>
+          <li>Форвард към няколко дестинации</li>
+        </ul>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section id="features" class="section">
+      <h2>Основни възможности</h2>
+      <div class="grid">
+        <div class="card"><div class="icons">🔁</div><h3>Multiplex &amp; Deduplicate</h3><p>Обединява входовете и премахва дубликати.</p></div>
+        <div class="card"><div class="icons">⚙️</div><h3>Smart tags</h3><p><span class="kbd">c</span>-таг политика и <span class="kbd">g</span>-таг сглобяване.</p></div>
+        <div class="card"><div class="icons">🧭</div><h3>Forwarding</h3><p>Fan-out към няколко цели.</p></div>
+      </div>
+    </section>
+
+    <section id="get-started" class="section">
+      <h2>Първи стъпки</h2>
+      <div class="card">
+        <p>Виж README в GitHub за инструкции.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer><div class="container"><div class="chip">© 2025 AISMixer project</div></div></footer>
+  <script src="/assets/js/main.js"></script>
+</body>
+</html>
