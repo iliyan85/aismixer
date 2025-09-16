@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1">
+    <stop offset="0%" stop-color="#7aa2ff"/><stop offset="100%" stop-color="#4be0c6"/>
+  </linearGradient></defs>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#g)"/>
+  <text x="32" y="40" text-anchor="middle" font-size="28" font-family="Verdana, Arial, sans-serif" fill="#0b1220" font-weight="700">AI</text>
+</svg>
