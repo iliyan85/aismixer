@@ -1,15 +1,22 @@
-// Language toggle
-document.addEventListener("DOMContentLoaded", () => {
-  const preferred = localStorage.getItem("aismixer:lang") || "en";
-  const setLang = (lang) => {
-    document.querySelectorAll("[data-lang]").forEach(el => {
-      el.style.display = (el.getAttribute("data-lang") === lang) ? "" : "none";
-    });
-    document.getElementById("btn-en").classList.toggle("active", lang==="en");
-    document.getElementById("btn-bg").classList.toggle("active", lang==="bg");
-    localStorage.setItem("aismixer:lang", lang);
-  };
-  document.getElementById("btn-en").addEventListener("click", () => setLang("en"));
-  document.getElementById("btn-bg").addEventListener("click", () => setLang("bg"));
-  setLang(preferred);
+document.addEventListener('DOMContentLoaded', () => {
+  const $html = document.documentElement;
+  const btnEn = document.getElementById('btn-en');
+  const btnBg = document.getElementById('btn-bg');
+  function setLang(lang, {remember=true, updateHash=true} = {}) {
+    $html.setAttribute('data-lang', lang);
+    btnEn?.classList.toggle('active', lang === 'en');
+    btnBg?.classList.toggle('active', lang === 'bg');
+    const ogLocale = document.querySelector('meta[property="og:locale"]');
+    if (ogLocale) ogLocale.setAttribute('content', lang === 'bg' ? 'bg_BG' : 'en_US');
+    if (remember) localStorage.setItem('aismixer_lang', lang);
+    if (updateHash) {
+      if (lang === 'bg') history.replaceState(null, '', '#bg');
+      else history.replaceState(null, '', location.pathname + location.search);
+    }
+  }
+  let start = (location.hash === '#bg' || location.search.includes('lang=bg')) ? 'bg'
+             : (localStorage.getItem('aismixer_lang') || 'en');
+  setLang(start, {updateHash:false});
+  btnEn?.addEventListener('click', () => setLang('en'));
+  btnBg?.addEventListener('click', () => setLang('bg'));
 });
