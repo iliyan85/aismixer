@@ -211,6 +211,20 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                 print(
                     f"[!] Handshake error from {addr}: {type(e).__name__}: {e}")
 
+        elif data.startswith(KEEPALIVE_PREFIX + b"|"):
+            try:
+                station_id, _ = parse_keepalive_packet(data)
+                if handle_keepalive_session(
+                    sessions, addr, station_id, time.time(), SESSION_TTL_SECONDS
+                ):
+                    if DEBUG:
+                        print(f"{time.time()} [SECURE] Keepalive from {station_id} @ {addr}")
+                else:
+                    print(f"[!] Ignored keepalive from {addr}")
+            except Exception as e:
+                print(
+                    f"[!] Keepalive error from {addr}: {type(e).__name__}: {e}")
+
         elif data.startswith(DATA_PREFIX):
             try:
                 session = get_active_session(
