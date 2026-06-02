@@ -51,3 +51,48 @@ def test_feed_assembles_valid_multipart_sentences():
 
     assert assembler.feed("src", first) is None
     assert assembler.feed("src", second) == [first, second]
+
+
+def test_feed_groups_multipart_by_same_source_seq_channel_and_total():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+
+    assert assembler.feed("source-a", first) is None
+    assert assembler.feed("source-a", second) == [first, second]
+
+
+def test_feed_does_not_assemble_fragments_from_different_sources():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+
+    assert assembler.feed("source-a", first) is None
+    assert assembler.feed("source-b", second) is None
+
+
+def test_feed_does_not_assemble_fragments_with_different_seq_id():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,8,A,payload2,0*00"
+
+    assert assembler.feed("source-a", first) is None
+    assert assembler.feed("source-a", second) is None
+
+
+def test_feed_does_not_assemble_fragments_with_different_channel():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,B,payload2,0*00"
+
+    assert assembler.feed("source-a", first) is None
+    assert assembler.feed("source-a", second) is None
+
+
+def test_feed_does_not_assemble_fragments_with_different_total_count():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,3,2,7,A,payload2,0*00"
+
+    assert assembler.feed("source-a", first) is None
+    assert assembler.feed("source-a", second) is None
