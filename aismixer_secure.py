@@ -14,6 +14,7 @@ from core.event import IngressEvent
 
 HANDSHAKE_PREFIX = b"NMEA-H"
 DATA_PREFIX = b"NMEA-D"
+KEEPALIVE_PREFIX = b"KEEPALIVE"
 CONTEXT_STRING = b"NMEA-AUTH-v1"
 SESSION_TTL_SECONDS = 300
 
@@ -68,6 +69,21 @@ def parse_secure_data_packet(data):
     return nonce, ciphertext
 
 
+def parse_keepalive_packet(data):
+    parts = data.split(b"|")
+    if len(parts) != 3 or parts[0] != KEEPALIVE_PREFIX:
+        raise ValueError("Invalid keepalive packet format")
+    if not parts[1]:
+        raise ValueError("Missing keepalive station_id")
+    if not parts[2]:
+        raise ValueError("Missing keepalive timestamp")
+    try:
+        timestamp = int(parts[2].decode())
+    except ValueError as e:
+        raise ValueError("Invalid keepalive timestamp") from e
+    return parts[1].decode(), timestamp
+
+
 def create_session(station_id, aesgcm, now):
     return {
         "station_id": station_id,
@@ -99,6 +115,16 @@ def cleanup_expired_sessions(session_store, now, ttl):
     for addr in expired:
         session_store.pop(addr, None)
     return expired
+
+
+def handle_keepalive_session(session_store, addr, station_id, now, ttl):
+    session = get_active_session(session_store, addr, now, ttl)
+    if not session:
+        return False
+    if session["station_id"] != station_id:
+        return False
+    touch_session(session, now)
+    return True
 
 
 def verify_signature(pub_bytes, signature, message_digest):

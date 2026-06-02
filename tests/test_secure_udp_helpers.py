@@ -144,6 +144,43 @@ def test_secure_data_packet_parser_output_decrypts_valid_proxy_packet(monkeypatc
     assert AESGCM(key).decrypt(nonce, ciphertext, b"NMEA") == plaintext
 
 
+def test_parse_keepalive_packet_accepts_valid_packet(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.parse_keepalive_packet(b"KEEPALIVE|boat_001|1234567890") == (
+        "boat_001",
+        1234567890,
+    )
+
+
+def test_parse_keepalive_packet_rejects_wrong_prefix(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    with pytest.raises(ValueError):
+        secure.parse_keepalive_packet(b"NOTKEEPALIVE|boat_001|1234567890")
+
+
+def test_parse_keepalive_packet_rejects_missing_station_id(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    with pytest.raises(ValueError):
+        secure.parse_keepalive_packet(b"KEEPALIVE||1234567890")
+
+
+def test_parse_keepalive_packet_rejects_missing_timestamp(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    with pytest.raises(ValueError):
+        secure.parse_keepalive_packet(b"KEEPALIVE|boat_001|")
+
+
+def test_parse_keepalive_packet_rejects_non_numeric_timestamp(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    with pytest.raises(ValueError):
+        secure.parse_keepalive_packet(b"KEEPALIVE|boat_001|not-a-timestamp")
+
+
 def test_create_session_stores_identity_crypto_and_timestamps(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     aesgcm = object()
@@ -224,6 +261,49 @@ def test_session_rehandshake_overwrite_uses_normal_dict_assignment(monkeypatch):
     session_store[addr] = new_session
 
     assert session_store == {addr: new_session}
+
+
+def test_handle_keepalive_session_updates_matching_active_session(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr = ("192.0.2.10", 50000)
+    session = secure.create_session("boat_001", object(), now=100.0)
+    session_store = {addr: session}
+
+    assert secure.handle_keepalive_session(
+        session_store, addr, "boat_001", now=120.0, ttl=30.0
+    ) is True
+    assert session["last_seen"] == 120.0
+
+
+def test_handle_keepalive_session_returns_false_for_missing_session(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.handle_keepalive_session(
+        {}, ("192.0.2.10", 50000), "boat_001", now=120.0, ttl=30.0
+    ) is False
+
+
+def test_handle_keepalive_session_removes_expired_session(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr = ("192.0.2.10", 50000)
+    session_store = {addr: secure.create_session("boat_001", object(), now=100.0)}
+
+    assert secure.handle_keepalive_session(
+        session_store, addr, "boat_001", now=131.0, ttl=30.0
+    ) is False
+    assert addr not in session_store
+
+
+def test_handle_keepalive_session_returns_false_for_station_id_mismatch(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr = ("192.0.2.10", 50000)
+    session = secure.create_session("boat_001", object(), now=100.0)
+    session_store = {addr: session}
+
+    assert secure.handle_keepalive_session(
+        session_store, addr, "other_station", now=120.0, ttl=30.0
+    ) is False
+    assert session["last_seen"] == 100.0
 
 
 def test_proxy_load_config_uses_remote_public_key_as_canonical(tmp_path):
