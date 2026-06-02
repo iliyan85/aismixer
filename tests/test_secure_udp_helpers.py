@@ -144,6 +144,82 @@ def test_secure_data_packet_parser_output_decrypts_valid_proxy_packet(monkeypatc
     assert AESGCM(key).decrypt(nonce, ciphertext, b"NMEA") == plaintext
 
 
+def test_create_session_stores_identity_crypto_and_timestamps(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    aesgcm = object()
+
+    session = secure.create_session("boat_001", aesgcm, now=100.0)
+
+    assert session == {
+        "station_id": "boat_001",
+        "aesgcm": aesgcm,
+        "created_at": 100.0,
+        "last_seen": 100.0,
+    }
+
+
+def test_get_active_session_returns_non_expired_session(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr = ("192.0.2.10", 50000)
+    session = secure.create_session("boat_001", object(), now=100.0)
+    session_store = {addr: session}
+
+    assert secure.get_active_session(session_store, addr, now=120.0, ttl=30.0) is session
+    assert addr in session_store
+
+
+def test_get_active_session_returns_none_for_missing_session(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.get_active_session({}, ("192.0.2.10", 50000), now=120.0, ttl=30.0) is None
+
+
+def test_get_active_session_removes_expired_session(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr = ("192.0.2.10", 50000)
+    session_store = {addr: secure.create_session("boat_001", object(), now=100.0)}
+
+    assert secure.get_active_session(session_store, addr, now=131.0, ttl=30.0) is None
+    assert addr not in session_store
+
+
+def test_touch_session_updates_last_seen(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    session = secure.create_session("boat_001", object(), now=100.0)
+
+    secure.touch_session(session, now=125.0)
+
+    assert session["created_at"] == 100.0
+    assert session["last_seen"] == 125.0
+
+
+def test_cleanup_expired_sessions_removes_only_expired_sessions(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    fresh_addr = ("192.0.2.10", 50000)
+    expired_addr = ("192.0.2.11", 50001)
+    session_store = {
+        fresh_addr: secure.create_session("fresh", object(), now=120.0),
+        expired_addr: secure.create_session("expired", object(), now=90.0),
+    }
+
+    removed = secure.cleanup_expired_sessions(session_store, now=121.0, ttl=30.0)
+
+    assert removed == [expired_addr]
+    assert fresh_addr in session_store
+    assert expired_addr not in session_store
+
+
+def test_session_rehandshake_overwrite_uses_normal_dict_assignment(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr = ("192.0.2.10", 50000)
+    session_store = {addr: secure.create_session("old", object(), now=100.0)}
+    new_session = secure.create_session("new", object(), now=150.0)
+
+    session_store[addr] = new_session
+
+    assert session_store == {addr: new_session}
+
+
 def test_proxy_load_config_uses_remote_public_key_as_canonical(tmp_path):
     proxy = load_proxy_module()
     config_path = tmp_path / "config.yaml"

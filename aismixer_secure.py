@@ -67,6 +67,39 @@ def parse_secure_data_packet(data):
     return nonce, ciphertext
 
 
+def create_session(station_id, aesgcm, now):
+    return {
+        "station_id": station_id,
+        "aesgcm": aesgcm,
+        "created_at": now,
+        "last_seen": now,
+    }
+
+
+def get_active_session(session_store, addr, now, ttl):
+    session = session_store.get(addr)
+    if not session:
+        return None
+    if now - session["last_seen"] > ttl:
+        session_store.pop(addr, None)
+        return None
+    return session
+
+
+def touch_session(session, now):
+    session["last_seen"] = now
+
+
+def cleanup_expired_sessions(session_store, now, ttl):
+    expired = [
+        addr for addr, session in session_store.items()
+        if now - session["last_seen"] > ttl
+    ]
+    for addr in expired:
+        session_store.pop(addr, None)
+    return expired
+
+
 def verify_signature(pub_bytes, signature, message_digest):
     pubkey = ec.EllipticCurvePublicKey.from_encoded_point(
         ec.SECP256R1(), pub_bytes)
