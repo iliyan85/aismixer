@@ -56,6 +56,17 @@ server_pub_bytes = server_pub.public_bytes(
 sessions = {}
 
 
+def parse_secure_data_packet(data):
+    min_len = len(DATA_PREFIX) + 12 + 16
+    if not data.startswith(DATA_PREFIX):
+        raise ValueError("Invalid secure data packet prefix")
+    if len(data) < min_len:
+        raise ValueError("Secure data packet too short")
+    nonce = data[len(DATA_PREFIX):len(DATA_PREFIX)+12]
+    ciphertext = data[len(DATA_PREFIX)+12:]
+    return nonce, ciphertext
+
+
 def verify_signature(pub_bytes, signature, message_digest):
     pubkey = ec.EllipticCurvePublicKey.from_encoded_point(
         ec.SECP256R1(), pub_bytes)
@@ -146,8 +157,7 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                     print(f"[!] No session for {addr}")
                     continue
 
-                nonce = data[len(DATA_PREFIX):len(DATA_PREFIX)+12]
-                ciphertext = data[len(DATA_PREFIX)+12:]
+                nonce, ciphertext = parse_secure_data_packet(data)
                 plaintext = aesgcm.decrypt(nonce, ciphertext, b"NMEA")
 
                 msg = json.loads(plaintext.decode())

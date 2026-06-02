@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -95,6 +96,52 @@ def test_proxy_encrypt_message_aes_gcm_uses_12_byte_nonce_and_nmea_aad():
 
     assert len(nonce) == 12
     assert AESGCM(key).decrypt(nonce, ciphertext_and_tag, b"NMEA") == plaintext
+
+
+def test_secure_data_packet_parser_rejects_packet_without_data_prefix(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    with pytest.raises(ValueError):
+        secure.parse_secure_data_packet(b"not secure data")
+
+
+def test_secure_data_packet_parser_rejects_only_data_prefix(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    with pytest.raises(ValueError):
+        secure.parse_secure_data_packet(secure.DATA_PREFIX)
+
+
+def test_secure_data_packet_parser_rejects_nonce_without_gcm_tag(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    with pytest.raises(ValueError):
+        secure.parse_secure_data_packet(secure.DATA_PREFIX + (b"\x00" * 12))
+
+
+def test_secure_data_packet_parser_accepts_minimum_structural_packet(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    nonce = b"\x01" * 12
+    ciphertext_and_tag = b"\x02" * 16
+
+    parsed_nonce, parsed_ciphertext = secure.parse_secure_data_packet(
+        secure.DATA_PREFIX + nonce + ciphertext_and_tag
+    )
+
+    assert parsed_nonce == nonce
+    assert parsed_ciphertext == ciphertext_and_tag
+
+
+def test_secure_data_packet_parser_output_decrypts_valid_proxy_packet(monkeypatch):
+    proxy = load_proxy_module()
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    plaintext = b'{"type":"nmea","payload":"!AIVDM,1,1,,A,payload,0*00"}'
+    encrypted = proxy.encrypt_message_aes_gcm(plaintext, key)
+
+    nonce, ciphertext = secure.parse_secure_data_packet(secure.DATA_PREFIX + encrypted)
+
+    assert AESGCM(key).decrypt(nonce, ciphertext, b"NMEA") == plaintext
 
 
 def test_proxy_load_config_uses_remote_public_key_as_canonical(tmp_path):
