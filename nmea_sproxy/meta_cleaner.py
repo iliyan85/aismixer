@@ -3,8 +3,8 @@ import re
 
 def extract_nmea_sentences(line):
     """
-    Извлича валидни !AIVDM съобщения от комбинирани редове.
-    Съобщението трябва да започва с !AIVDM и да съдържа валиден CRC (*hh).
+    Extract valid !AIVDM and !AIVDO sentences from combined input lines.
+    Sentences must contain a checksum marker in the form *hh.
     """
-    pattern = r'!AIVDM,[^\r\n]*?\*[0-9A-F]{2}'
+    pattern = r'!AIVD[MO],[^\r\n]*?\*[0-9A-F]{2}'
     return re.findall(pattern, line)

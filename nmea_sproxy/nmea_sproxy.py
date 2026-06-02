@@ -160,24 +160,21 @@ def forward_loop(udp_sock, out_sock, config, session_key, remote_addr):
     while True:
         try:
             data, _ = udp_sock.recvfrom(4096)
-            if not data.startswith(b"!"):
-                #continue
-                for clean_line in extract_nmea_sentences(data.decode(errors="replace").strip()):
-                    if not clean_line:
-                        continue
-                
+            for clean_line in extract_nmea_sentences(data.decode(errors="replace").strip()):
+                if not clean_line:
+                    continue
 
-                    json_obj = {
-                        "type": "nmea",
-                        #"payload": data.decode(errors="replace").strip(),
-                        "payload": clean_line,
-                        "timestamp": int(time.time()),
-                        "source_id": config["station_id"]
-                    }
-                    plaintext = json.dumps(json_obj).encode()
-                    encrypted = encrypt_message_aes_gcm(plaintext, session_key)
-                    print(clean_line)
-                    out_sock.sendto(DATA_PREFIX + encrypted, remote_addr)
+                json_obj = {
+                    "type": "nmea",
+                    #"payload": data.decode(errors="replace").strip(),
+                    "payload": clean_line,
+                    "timestamp": int(time.time()),
+                    "source_id": config["station_id"]
+                }
+                plaintext = json.dumps(json_obj).encode()
+                encrypted = encrypt_message_aes_gcm(plaintext, session_key)
+                print(clean_line)
+                out_sock.sendto(DATA_PREFIX + encrypted, remote_addr)
 
         except Exception as e:
             print(f"❌ Forwarding error: {e}")
