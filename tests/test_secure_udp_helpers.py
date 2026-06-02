@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import importlib.util
 import io
@@ -33,7 +34,7 @@ def load_proxy_module():
         sys.path.remove(str(NMEA_SPROXY_DIR))
 
 
-def load_secure_module_with_fake_keys(monkeypatch):
+def load_secure_module_with_fake_keys(monkeypatch, with_client_private_key=False):
     server_private_key = ec.generate_private_key(ec.SECP256R1())
     server_private_bytes = server_private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -70,6 +71,8 @@ def load_secure_module_with_fake_keys(monkeypatch):
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        if with_client_private_key:
+            return module, client_private_key
         return module
 
 
@@ -245,6 +248,95 @@ def test_handshake_replay_constants(monkeypatch):
 
     assert secure.HANDSHAKE_REPLAY_TTL_SECONDS == 60
     assert secure.HANDSHAKE_REPLAY_MAX == 100000
+    assert secure.handshake_replay_cache == {}
+
+
+class _FakeSecureSocket:
+    def __init__(self):
+        self.bound = None
+        self.blocking = None
+        self.sent = []
+
+    def bind(self, addr):
+        self.bound = addr
+
+    def setblocking(self, blocking):
+        self.blocking = blocking
+
+    def sendto(self, data, addr):
+        self.sent.append((data, addr))
+
+
+class _FakeSecureLoop:
+    def __init__(self, packets):
+        self.packets = list(packets)
+
+    async def sock_recvfrom(self, sock, size):
+        if self.packets:
+            return self.packets.pop(0)
+        raise asyncio.CancelledError()
+
+
+class _FakeSocketModule:
+    def __init__(self, fake_socket, real_socket_module):
+        self._fake_socket = fake_socket
+        self.AF_INET6 = real_socket_module.AF_INET6
+        self.AF_INET = real_socket_module.AF_INET
+        self.SOCK_DGRAM = real_socket_module.SOCK_DGRAM
+
+    def socket(self, *args, **kwargs):
+        return self._fake_socket
+
+
+class _FakeAsyncioModule:
+    def __init__(self, fake_loop):
+        self._fake_loop = fake_loop
+
+    def get_running_loop(self):
+        return self._fake_loop
+
+
+def _signed_handshake_packet(secure, client_private_key, station_id, timestamp):
+    digest = secure.hashes.Hash(
+        secure.hashes.SHA256(), backend=secure.default_backend())
+    digest.update(secure.build_current_handshake_payload(station_id, timestamp))
+    to_sign = digest.finalize()
+    signature = client_private_key.sign(
+        to_sign,
+        secure.ec.ECDSA(secure.utils.Prehashed(secure.hashes.SHA256())),
+    )
+    return b"|".join([
+        secure.HANDSHAKE_PREFIX,
+        station_id.encode(),
+        str(timestamp).encode(),
+        base64.b64encode(signature),
+    ])
+
+
+def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True)
+    timestamp = 1000
+    station_id = "boat_001"
+    addr = ("127.0.0.1", 50123)
+    packet = _signed_handshake_packet(
+        secure, client_private_key, station_id, timestamp)
+    fake_socket = _FakeSecureSocket()
+    fake_loop = _FakeSecureLoop([(packet, addr), (packet, addr)])
+
+    monkeypatch.setattr(secure.time, "time", lambda: float(timestamp))
+    monkeypatch.setattr(
+        secure, "socket", _FakeSocketModule(fake_socket, secure.socket))
+    monkeypatch.setattr(secure, "asyncio", _FakeAsyncioModule(fake_loop))
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(secure.secure_server(None, "127.0.0.1", 9999))
+
+    assert len(fake_socket.sent) == 1
+    assert fake_socket.sent[0][0].startswith(b"OK|")
+    assert fake_socket.sent[0][1] == addr
+    assert secure.sessions[addr]["station_id"] == station_id
+    assert len(secure.handshake_replay_cache) == 1
 
 
 def test_mark_handshake_replay_seen_accepts_first_mark(monkeypatch):

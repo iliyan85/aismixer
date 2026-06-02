@@ -58,6 +58,7 @@ server_pub_bytes = server_pub.public_bytes(
 )
 
 sessions = {}
+handshake_replay_cache = {}
 
 
 def _field_bytes(value):
@@ -254,6 +255,18 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                 to_verify = digest.finalize()
 
                 verify_signature(client_pub_bytes, signature, to_verify)
+
+                replay_key = build_handshake_replay_key(
+                    station_id, timestamp, signature)
+                if not mark_handshake_replay_seen(
+                    handshake_replay_cache,
+                    replay_key,
+                    time.time(),
+                    HANDSHAKE_REPLAY_TTL_SECONDS,
+                    HANDSHAKE_REPLAY_MAX,
+                ):
+                    print(f"[!] Rejected {station_id}: handshake replay")
+                    continue
 
                 # build response
                 digest_s = hashes.Hash(
