@@ -15,6 +15,7 @@ from core.event import IngressEvent
 HANDSHAKE_PREFIX = b"NMEA-H"
 DATA_PREFIX = b"NMEA-D"
 CONTEXT_STRING = b"NMEA-AUTH-v1"
+SESSION_TTL_SECONDS = 300
 
 DEBUG = True  # Set to False in production
 
@@ -173,7 +174,8 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                 session_key = derive_session_key(
                     shared_secret, signature + sig_server)
                 aesgcm = AESGCM(session_key)
-                sessions[addr] = (station_id, aesgcm)
+                sessions[addr] = create_session(
+                    station_id, aesgcm, time.time())
 
                 response = b"OK|" + base64.b64encode(sig_server)
                 sock.sendto(response, addr)
@@ -185,10 +187,13 @@ async def secure_server(queue, ip, port, sec_input_id=None):
 
         elif data.startswith(DATA_PREFIX):
             try:
-                station_id, aesgcm = sessions.get(addr, (None, None))
-                if not aesgcm or not station_id:
+                session = get_active_session(
+                    sessions, addr, time.time(), SESSION_TTL_SECONDS)
+                if not session:
                     print(f"[!] No session for {addr}")
                     continue
+                station_id = session["station_id"]
+                aesgcm = session["aesgcm"]
 
                 nonce, ciphertext = parse_secure_data_packet(data)
                 plaintext = aesgcm.decrypt(nonce, ciphertext, b"NMEA")
@@ -197,6 +202,8 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                 if msg["source_id"] != station_id:
                     print(f"[!] source_id mismatch from {addr}")
                     continue
+
+                touch_session(session, time.time())
 
                 if DEBUG:
                     print(

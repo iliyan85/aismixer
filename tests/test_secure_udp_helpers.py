@@ -158,6 +158,12 @@ def test_create_session_stores_identity_crypto_and_timestamps(monkeypatch):
     }
 
 
+def test_session_ttl_seconds_is_300(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.SESSION_TTL_SECONDS == 300
+
+
 def test_get_active_session_returns_non_expired_session(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     addr = ("192.0.2.10", 50000)
