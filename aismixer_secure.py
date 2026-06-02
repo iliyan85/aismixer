@@ -17,6 +17,8 @@ DATA_PREFIX = b"NMEA-D"
 KEEPALIVE_PREFIX = b"KEEPALIVE"
 CONTEXT_STRING = b"NMEA-AUTH-v1"
 SESSION_TTL_SECONDS = 300
+HANDSHAKE_REPLAY_TTL_SECONDS = 60
+HANDSHAKE_REPLAY_MAX = 100000
 
 DEBUG = True  # Set to False in production
 
@@ -98,6 +100,34 @@ def build_session_transcript_v1(handshake_context, client_signature, server_sign
     for value in (handshake_context, client_signature, server_signature):
         _update_framed(digest, value)
     return digest.finalize()
+
+
+def build_handshake_replay_key(station_id, timestamp, signature):
+    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+    for value in (
+        b"NMEA-H-REPLAY",
+        station_id,
+        timestamp.to_bytes(8, "big"),
+        signature,
+    ):
+        _update_framed(digest, value)
+    return digest.finalize()
+
+
+def mark_handshake_replay_seen(cache, key, now, ttl, max_entries):
+    expired = [cached_key for cached_key, expires_at in cache.items()
+               if expires_at <= now]
+    for cached_key in expired:
+        cache.pop(cached_key, None)
+
+    if key in cache:
+        return False
+
+    cache[key] = now + ttl
+    while len(cache) > max_entries:
+        oldest_key = min(cache, key=cache.get)
+        cache.pop(oldest_key, None)
+    return True
 
 
 def parse_secure_data_packet(data):

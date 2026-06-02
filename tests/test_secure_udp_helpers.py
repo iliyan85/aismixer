@@ -197,6 +197,120 @@ def test_v1_session_transcript_changes_when_server_signature_changes(monkeypatch
     ) != secure.build_session_transcript_v1(context, b"client sig", b"other server sig")
 
 
+def test_handshake_replay_key_is_stable_for_same_inputs(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.build_handshake_replay_key(
+        "boat_001", 1234567890, b"client sig"
+    ) == secure.build_handshake_replay_key("boat_001", 1234567890, b"client sig")
+
+
+def test_handshake_replay_key_changes_when_station_changes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.build_handshake_replay_key(
+        "boat_001", 1234567890, b"client sig"
+    ) != secure.build_handshake_replay_key("boat_002", 1234567890, b"client sig")
+
+
+def test_handshake_replay_key_changes_when_timestamp_changes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.build_handshake_replay_key(
+        "boat_001", 1234567890, b"client sig"
+    ) != secure.build_handshake_replay_key("boat_001", 1234567891, b"client sig")
+
+
+def test_handshake_replay_key_changes_when_signature_changes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.build_handshake_replay_key(
+        "boat_001", 1234567890, b"client sig"
+    ) != secure.build_handshake_replay_key("boat_001", 1234567890, b"other client sig")
+
+
+def test_handshake_replay_key_does_not_depend_on_addr(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr_a = ("192.0.2.10", 50000)
+    addr_b = ("192.0.2.11", 50001)
+
+    assert addr_a != addr_b
+    assert secure.build_handshake_replay_key(
+        "boat_001", 1234567890, b"client sig"
+    ) == secure.build_handshake_replay_key("boat_001", 1234567890, b"client sig")
+
+
+def test_handshake_replay_constants(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.HANDSHAKE_REPLAY_TTL_SECONDS == 60
+    assert secure.HANDSHAKE_REPLAY_MAX == 100000
+
+
+def test_mark_handshake_replay_seen_accepts_first_mark(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    cache = {}
+    key = b"key"
+
+    assert secure.mark_handshake_replay_seen(cache, key, now=100.0, ttl=60.0, max_entries=100)
+    assert cache == {key: 160.0}
+
+
+def test_mark_handshake_replay_seen_rejects_second_mark(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    cache = {}
+    key = b"key"
+
+    assert secure.mark_handshake_replay_seen(cache, key, now=100.0, ttl=60.0, max_entries=100)
+    assert not secure.mark_handshake_replay_seen(
+        cache, key, now=120.0, ttl=60.0, max_entries=100
+    )
+
+
+def test_mark_handshake_replay_seen_accepts_expired_key_again(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    cache = {}
+    key = b"key"
+
+    assert secure.mark_handshake_replay_seen(cache, key, now=100.0, ttl=60.0, max_entries=100)
+    assert secure.mark_handshake_replay_seen(cache, key, now=160.0, ttl=60.0, max_entries=100)
+    assert cache == {key: 220.0}
+
+
+def test_mark_handshake_replay_seen_removes_expired_entries_opportunistically(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    cache = {b"expired": 99.0, b"fresh": 130.0}
+
+    assert secure.mark_handshake_replay_seen(
+        cache, b"new", now=100.0, ttl=60.0, max_entries=100
+    )
+
+    assert cache == {b"fresh": 130.0, b"new": 160.0}
+
+
+def test_mark_handshake_replay_seen_enforces_max_entries(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    cache = {}
+
+    assert secure.mark_handshake_replay_seen(cache, b"one", now=100.0, ttl=60.0, max_entries=2)
+    assert secure.mark_handshake_replay_seen(cache, b"two", now=101.0, ttl=60.0, max_entries=2)
+    assert secure.mark_handshake_replay_seen(
+        cache, b"three", now=102.0, ttl=60.0, max_entries=2
+    )
+
+    assert len(cache) == 2
+    assert b"one" not in cache
+    assert set(cache) == {b"two", b"three"}
+
+
+def test_mark_handshake_replay_seen_accepts_different_keys_independently(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    cache = {}
+
+    assert secure.mark_handshake_replay_seen(cache, b"one", now=100.0, ttl=60.0, max_entries=100)
+    assert secure.mark_handshake_replay_seen(cache, b"two", now=100.0, ttl=60.0, max_entries=100)
+
+
 def test_proxy_encrypt_message_aes_gcm_uses_12_byte_nonce_and_nmea_aad():
     proxy = load_proxy_module()
     key = b"\x01" * 32
