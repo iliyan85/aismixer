@@ -32,12 +32,17 @@ DEFAULT_CONFIG = {
 
 
 def load_config(path="/etc/nmea_sproxy/config.yaml"):
-    config = DEFAULT_CONFIG
+    config = dict(DEFAULT_CONFIG)
     if os.path.exists(path):
         with open(path, 'r') as f:
             user_config = yaml.safe_load(f)
             if user_config:
                 config.update(user_config)
+                if (
+                    "aismixer_public_key" in user_config
+                    and "remote_public_key" not in user_config
+                ):
+                    config["remote_public_key"] = user_config["aismixer_public_key"]
     else:
         print(f"⚠️ Config file not found: {path}. Using defaults.")
     return config
