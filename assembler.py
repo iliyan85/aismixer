@@ -14,8 +14,15 @@ class AIVDMAssembler:
         if len(parts) < 7:
             return None  # invalid format
 
-        total = int(parts[1])
-        current = int(parts[2])
+        try:
+            total = int(parts[1])
+            current = int(parts[2])
+        except ValueError:
+            return None
+
+        if total < 1 or current < 1 or current > total:
+            return None
+
         seq_id = parts[3]
         channel = parts[4]
 
