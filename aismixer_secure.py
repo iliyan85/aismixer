@@ -351,11 +351,27 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                 aesgcm = session["aesgcm"]
 
                 nonce, ciphertext = parse_secure_data_packet(data)
+                if data_nonce_seen(
+                    session, nonce, time.time(), DATA_NONCE_TTL_SECONDS
+                ):
+                    print(f"[!] Duplicate secure data nonce from {addr}")
+                    continue
+
                 plaintext = aesgcm.decrypt(nonce, ciphertext, b"NMEA")
 
                 msg = json.loads(plaintext.decode())
                 if msg["source_id"] != station_id:
                     print(f"[!] source_id mismatch from {addr}")
+                    continue
+
+                if not mark_data_nonce_seen(
+                    session,
+                    nonce,
+                    time.time(),
+                    DATA_NONCE_TTL_SECONDS,
+                    DATA_NONCE_MAX_PER_SESSION,
+                ):
+                    print(f"[!] Duplicate secure data nonce from {addr}")
                     continue
 
                 touch_session(session, time.time())

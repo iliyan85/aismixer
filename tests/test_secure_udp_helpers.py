@@ -296,6 +296,14 @@ class _FakeAsyncioModule:
         return self._fake_loop
 
 
+class _FakeQueue:
+    def __init__(self):
+        self.items = []
+
+    async def put(self, item):
+        self.items.append(item)
+
+
 def _signed_handshake_packet(secure, client_private_key, station_id, timestamp):
     digest = secure.hashes.Hash(
         secure.hashes.SHA256(), backend=secure.default_backend())
@@ -311,6 +319,39 @@ def _signed_handshake_packet(secure, client_private_key, station_id, timestamp):
         str(timestamp).encode(),
         base64.b64encode(signature),
     ])
+
+
+def _encrypted_data_packet(
+    secure,
+    key,
+    nonce,
+    source_id="boat_001",
+    payload="!AIVDM,1,1,,A,payload,0*00",
+):
+    plaintext = secure.json.dumps({
+        "type": "nmea",
+        "payload": payload,
+        "timestamp": 1000,
+        "source_id": source_id,
+    }).encode()
+    ciphertext = secure.AESGCM(key).encrypt(nonce, plaintext, b"NMEA")
+    return secure.DATA_PREFIX + nonce + ciphertext
+
+
+def _run_secure_server_with_packets(monkeypatch, secure, packets, now=1010.0):
+    fake_socket = _FakeSecureSocket()
+    fake_loop = _FakeSecureLoop(packets)
+    fake_queue = _FakeQueue()
+
+    monkeypatch.setattr(secure.time, "time", lambda: now)
+    monkeypatch.setattr(
+        secure, "socket", _FakeSocketModule(fake_socket, secure.socket))
+    monkeypatch.setattr(secure, "asyncio", _FakeAsyncioModule(fake_loop))
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(secure.secure_server(fake_queue, "127.0.0.1", 9999))
+
+    return fake_queue, fake_socket
 
 
 def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
@@ -337,6 +378,74 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
     assert fake_socket.sent[0][1] == addr
     assert secure.sessions[addr]["station_id"] == station_id
     assert len(secure.handshake_replay_cache) == 1
+
+
+def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    secure.sessions[addr] = secure.create_session(
+        "boat_001", secure.AESGCM(key), now=1000.0)
+    packet = _encrypted_data_packet(secure, key, nonce)
+
+    fake_queue, _ = _run_secure_server_with_packets(
+        monkeypatch, secure, [(packet, addr)])
+
+    assert len(fake_queue.items) == 1
+    assert fake_queue.items[0].raw_line == "!AIVDM,1,1,,A,payload,0*00"
+    assert secure.sessions[addr]["last_seen"] == 1010.0
+    assert secure.sessions[addr]["seen_data_nonces"] == {nonce: 1310.0}
+
+
+def test_secure_server_rejects_duplicate_data_nonce_after_first_valid_packet(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    secure.sessions[addr] = secure.create_session(
+        "boat_001", secure.AESGCM(key), now=1000.0)
+    packet = _encrypted_data_packet(secure, key, nonce)
+
+    fake_queue, _ = _run_secure_server_with_packets(
+        monkeypatch, secure, [(packet, addr), (packet, addr)])
+
+    assert len(fake_queue.items) == 1
+    assert secure.sessions[addr]["seen_data_nonces"] == {nonce: 1310.0}
+
+
+def test_secure_server_failed_decrypt_does_not_record_data_nonce(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    secure.sessions[addr] = secure.create_session(
+        "boat_001", secure.AESGCM(key), now=1000.0)
+    packet = secure.DATA_PREFIX + nonce + (b"\x00" * 16)
+
+    fake_queue, _ = _run_secure_server_with_packets(
+        monkeypatch, secure, [(packet, addr)])
+
+    assert fake_queue.items == []
+    assert secure.sessions[addr]["last_seen"] == 1000.0
+    assert secure.sessions[addr]["seen_data_nonces"] == {}
+
+
+def test_secure_server_source_mismatch_does_not_record_data_nonce_or_touch(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    secure.sessions[addr] = secure.create_session(
+        "boat_001", secure.AESGCM(key), now=1000.0)
+    packet = _encrypted_data_packet(secure, key, nonce, source_id="other_station")
+
+    fake_queue, _ = _run_secure_server_with_packets(
+        monkeypatch, secure, [(packet, addr)])
+
+    assert fake_queue.items == []
+    assert secure.sessions[addr]["last_seen"] == 1000.0
+    assert secure.sessions[addr]["seen_data_nonces"] == {}
 
 
 def test_mark_handshake_replay_seen_accepts_first_mark(monkeypatch):
