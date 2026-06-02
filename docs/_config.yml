@@ -1,0 +1,5 @@
+title: AISMixer
+description: AIS multiplexer, deduplicator and forwarder
+url: https://aismixer.net
+baseurl: ""
+markdown: kramdown
