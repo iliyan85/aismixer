@@ -1,0 +1,146 @@
+import base64
+import importlib.util
+import io
+import os
+import sys
+from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+ROOT = Path(__file__).resolve().parents[1]
+NMEA_SPROXY_DIR = ROOT / "nmea_sproxy"
+
+SERVER_PRIVATE_KEY_FILENAME = "aismixer_private.key"
+SERVER_PUBLIC_KEY_FOR_PROXY_FILENAME = "aismixer_public.pem"
+STATION_PRIVATE_KEY_FILENAME = "station_private.key"
+STATION_PUBLIC_KEY_FILENAME = "station_public.pem"
+
+
+def load_proxy_module():
+    sys.path.insert(0, str(NMEA_SPROXY_DIR))
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "nmea_sproxy_helpers", NMEA_SPROXY_DIR / "nmea_sproxy.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path.remove(str(NMEA_SPROXY_DIR))
+
+
+def load_secure_module_with_fake_keys(monkeypatch):
+    server_private_key = ec.generate_private_key(ec.SECP256R1())
+    server_private_bytes = server_private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    client_private_key = ec.generate_private_key(ec.SECP256R1())
+    client_public_bytes = client_private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.CompressedPoint,
+    )
+    authorized_yaml = (
+        "authorized_clients:\n"
+        "  - name: boat_001\n"
+        f"    pubkey: {base64.b64encode(client_public_bytes).decode()}\n"
+    )
+
+    real_open = open
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        name = os.path.basename(os.fspath(path))
+        if name == "authorized_keys.yaml":
+            return io.StringIO(authorized_yaml)
+        if name == SERVER_PRIVATE_KEY_FILENAME:
+            return io.BytesIO(server_private_bytes)
+        return real_open(path, mode, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os.path, "exists", lambda path: False)
+        patch.setattr("builtins.open", fake_open)
+        spec = importlib.util.spec_from_file_location(
+            "aismixer_secure_test_helpers", ROOT / "aismixer_secure.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
+def test_proxy_and_server_derive_session_key_are_compatible(monkeypatch):
+    proxy = load_proxy_module()
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    shared_secret = b"fixed shared secret"
+    client_signature = b"client signature bytes"
+    server_signature = b"server signature bytes"
+
+    assert proxy.derive_session_key(
+        shared_secret, client_signature, server_signature
+    ) == secure.derive_session_key(shared_secret, client_signature + server_signature)
+
+
+def test_proxy_encrypt_message_aes_gcm_uses_12_byte_nonce_and_nmea_aad():
+    proxy = load_proxy_module()
+    key = b"\x01" * 32
+    plaintext = b'{"type":"nmea","payload":"!AIVDM,1,1,,A,payload,0*00"}'
+
+    encrypted = proxy.encrypt_message_aes_gcm(plaintext, key)
+    nonce = encrypted[:12]
+    ciphertext_and_tag = encrypted[12:]
+
+    assert len(nonce) == 12
+    assert AESGCM(key).decrypt(nonce, ciphertext_and_tag, b"NMEA") == plaintext
+
+
+def test_proxy_load_config_uses_remote_public_key_as_canonical(tmp_path):
+    proxy = load_proxy_module()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("remote_public_key: canonical.pem\n", encoding="utf-8")
+
+    config = proxy.load_config(str(config_path))
+
+    assert config["remote_public_key"] == "canonical.pem"
+
+
+def test_proxy_load_config_supports_legacy_aismixer_public_key_as_fallback(tmp_path):
+    proxy = load_proxy_module()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("aismixer_public_key: legacy.pem\n", encoding="utf-8")
+
+    config = proxy.load_config(str(config_path))
+
+    assert config["remote_public_key"] == "legacy.pem"
+
+
+def test_proxy_load_config_prefers_canonical_key_when_both_names_are_present(tmp_path):
+    proxy = load_proxy_module()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "remote_public_key: canonical.pem\n"
+        "aismixer_public_key: legacy.pem\n",
+        encoding="utf-8",
+    )
+
+    config = proxy.load_config(str(config_path))
+
+    assert config["remote_public_key"] == "canonical.pem"
+
+
+def test_current_secure_udp_key_filename_expectations():
+    proxy = load_proxy_module()
+
+    assert SERVER_PRIVATE_KEY_FILENAME == "aismixer_private.key"
+    assert SERVER_PUBLIC_KEY_FOR_PROXY_FILENAME == "aismixer_public.pem"
+    assert STATION_PRIVATE_KEY_FILENAME == "station_private.key"
+    assert STATION_PUBLIC_KEY_FILENAME == "station_public.pem"
+    assert proxy.DEFAULT_CONFIG["remote_public_key"].endswith(
+        SERVER_PUBLIC_KEY_FOR_PROXY_FILENAME
+    )
+    assert proxy.DEFAULT_CONFIG["station_private_key"].endswith(
+        STATION_PRIVATE_KEY_FILENAME
+    )
