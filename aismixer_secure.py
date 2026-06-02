@@ -19,6 +19,8 @@ CONTEXT_STRING = b"NMEA-AUTH-v1"
 SESSION_TTL_SECONDS = 300
 HANDSHAKE_REPLAY_TTL_SECONDS = 60
 HANDSHAKE_REPLAY_MAX = 100000
+DATA_NONCE_TTL_SECONDS = SESSION_TTL_SECONDS
+DATA_NONCE_MAX_PER_SESSION = 100000
 
 DEBUG = True  # Set to False in production
 
@@ -163,7 +165,37 @@ def create_session(station_id, aesgcm, now):
         "aesgcm": aesgcm,
         "created_at": now,
         "last_seen": now,
+        "seen_data_nonces": {},
     }
+
+
+def cleanup_expired_data_nonces(session, now, ttl):
+    seen_nonces = session["seen_data_nonces"]
+    expired = [
+        nonce for nonce, expires_at in seen_nonces.items()
+        if expires_at <= now
+    ]
+    for nonce in expired:
+        seen_nonces.pop(nonce, None)
+    return expired
+
+
+def data_nonce_seen(session, nonce, now, ttl):
+    cleanup_expired_data_nonces(session, now, ttl)
+    return nonce in session["seen_data_nonces"]
+
+
+def mark_data_nonce_seen(session, nonce, now, ttl, max_entries):
+    cleanup_expired_data_nonces(session, now, ttl)
+    seen_nonces = session["seen_data_nonces"]
+    if nonce in seen_nonces:
+        return False
+
+    seen_nonces[nonce] = now + ttl
+    while len(seen_nonces) > max_entries:
+        oldest_nonce = min(seen_nonces, key=seen_nonces.get)
+        seen_nonces.pop(oldest_nonce, None)
+    return True
 
 
 def get_active_session(session_store, addr, now, ttl):

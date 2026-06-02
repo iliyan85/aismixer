@@ -510,6 +510,7 @@ def test_create_session_stores_identity_crypto_and_timestamps(monkeypatch):
         "aesgcm": aesgcm,
         "created_at": 100.0,
         "last_seen": 100.0,
+        "seen_data_nonces": {},
     }
 
 
@@ -517,6 +518,111 @@ def test_session_ttl_seconds_is_300(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
 
     assert secure.SESSION_TTL_SECONDS == 300
+
+
+def test_data_nonce_constants(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.DATA_NONCE_TTL_SECONDS == secure.SESSION_TTL_SECONDS
+    assert secure.DATA_NONCE_MAX_PER_SESSION == 100000
+
+
+def test_mark_data_nonce_seen_accepts_first_mark(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    session = secure.create_session("boat_001", object(), now=100.0)
+    nonce = b"\x01" * 12
+
+    assert secure.mark_data_nonce_seen(
+        session, nonce, now=100.0, ttl=60.0, max_entries=100
+    ) is True
+    assert session["seen_data_nonces"] == {nonce: 160.0}
+    assert secure.data_nonce_seen(session, nonce, now=100.0, ttl=60.0) is True
+
+
+def test_mark_data_nonce_seen_rejects_second_mark(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    session = secure.create_session("boat_001", object(), now=100.0)
+    nonce = b"\x01" * 12
+
+    assert secure.mark_data_nonce_seen(
+        session, nonce, now=100.0, ttl=60.0, max_entries=100
+    ) is True
+    assert secure.mark_data_nonce_seen(
+        session, nonce, now=120.0, ttl=60.0, max_entries=100
+    ) is False
+    assert session["seen_data_nonces"] == {nonce: 160.0}
+
+
+def test_mark_data_nonce_seen_accepts_expired_nonce_again(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    session = secure.create_session("boat_001", object(), now=100.0)
+    nonce = b"\x01" * 12
+
+    assert secure.mark_data_nonce_seen(
+        session, nonce, now=100.0, ttl=60.0, max_entries=100
+    ) is True
+    assert secure.data_nonce_seen(session, nonce, now=160.0, ttl=60.0) is False
+    assert secure.mark_data_nonce_seen(
+        session, nonce, now=160.0, ttl=60.0, max_entries=100
+    ) is True
+    assert session["seen_data_nonces"] == {nonce: 220.0}
+
+
+def test_data_nonce_helpers_remove_expired_entries_opportunistically(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    session = secure.create_session("boat_001", object(), now=100.0)
+    expired_nonce = b"\x01" * 12
+    active_nonce = b"\x02" * 12
+    session["seen_data_nonces"] = {
+        expired_nonce: 120.0,
+        active_nonce: 180.0,
+    }
+
+    removed = secure.cleanup_expired_data_nonces(session, now=120.0, ttl=60.0)
+
+    assert removed == [expired_nonce]
+    assert session["seen_data_nonces"] == {active_nonce: 180.0}
+
+
+def test_mark_data_nonce_seen_enforces_max_entries(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    session = secure.create_session("boat_001", object(), now=100.0)
+    one = b"\x01" * 12
+    two = b"\x02" * 12
+    three = b"\x03" * 12
+
+    assert secure.mark_data_nonce_seen(session, one, now=100.0, ttl=60.0, max_entries=2)
+    assert secure.mark_data_nonce_seen(session, two, now=101.0, ttl=60.0, max_entries=2)
+    assert secure.mark_data_nonce_seen(
+        session, three, now=102.0, ttl=60.0, max_entries=2
+    )
+
+    assert session["seen_data_nonces"] == {two: 161.0, three: 162.0}
+
+
+def test_mark_data_nonce_seen_accepts_different_nonces_independently(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    session = secure.create_session("boat_001", object(), now=100.0)
+    one = b"\x01" * 12
+    two = b"\x02" * 12
+
+    assert secure.mark_data_nonce_seen(session, one, now=100.0, ttl=60.0, max_entries=100)
+    assert secure.mark_data_nonce_seen(session, two, now=100.0, ttl=60.0, max_entries=100)
+    assert secure.data_nonce_seen(session, one, now=100.0, ttl=60.0)
+    assert secure.data_nonce_seen(session, two, now=100.0, ttl=60.0)
+
+
+def test_data_nonce_caches_are_independent_per_session(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    first = secure.create_session("boat_001", object(), now=100.0)
+    second = secure.create_session("boat_002", object(), now=100.0)
+    nonce = b"\x01" * 12
+
+    assert secure.mark_data_nonce_seen(first, nonce, now=100.0, ttl=60.0, max_entries=100)
+
+    assert secure.data_nonce_seen(first, nonce, now=100.0, ttl=60.0)
+    assert not secure.data_nonce_seen(second, nonce, now=100.0, ttl=60.0)
+    assert second["seen_data_nonces"] == {}
 
 
 def test_get_active_session_returns_non_expired_session(monkeypatch):
