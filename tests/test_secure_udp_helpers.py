@@ -85,6 +85,118 @@ def test_proxy_and_server_derive_session_key_are_compatible(monkeypatch):
     ) == secure.derive_session_key(shared_secret, client_signature + server_signature)
 
 
+def test_current_handshake_payload_matches_existing_signed_bytes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    timestamp = 1234567890
+
+    assert secure.build_current_handshake_payload("boat_001", timestamp) == (
+        secure.HANDSHAKE_PREFIX + b"boat_001" + timestamp.to_bytes(8, "big")
+    )
+
+
+def test_context_string_is_not_part_of_current_handshake_payload(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    payload = secure.build_current_handshake_payload("boat_001", 1234567890)
+
+    assert secure.CONTEXT_STRING == b"NMEA-AUTH-v1"
+    assert secure.CONTEXT_STRING not in payload
+
+
+def test_v1_handshake_context_is_deterministic_for_identical_inputs(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    args = ("boat_001", 1234567890, b"client pub", b"server pub")
+
+    assert secure.build_handshake_context_v1(*args) == secure.build_handshake_context_v1(*args)
+
+
+def test_v1_handshake_context_changes_when_context_string_changes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.build_handshake_context_v1(
+        "boat_001", 1234567890, b"client pub", b"server pub"
+    ) != secure.build_handshake_context_v1(
+        "boat_001",
+        1234567890,
+        b"client pub",
+        b"server pub",
+        context_string=b"OTHER-CONTEXT",
+    )
+
+
+def test_v1_handshake_context_changes_when_station_id_changes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.build_handshake_context_v1(
+        "boat_001", 1234567890, b"client pub", b"server pub"
+    ) != secure.build_handshake_context_v1(
+        "boat_002", 1234567890, b"client pub", b"server pub"
+    )
+
+
+def test_v1_handshake_context_changes_when_timestamp_changes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.build_handshake_context_v1(
+        "boat_001", 1234567890, b"client pub", b"server pub"
+    ) != secure.build_handshake_context_v1(
+        "boat_001", 1234567891, b"client pub", b"server pub"
+    )
+
+
+def test_v1_handshake_context_changes_when_client_public_key_changes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.build_handshake_context_v1(
+        "boat_001", 1234567890, b"client pub", b"server pub"
+    ) != secure.build_handshake_context_v1(
+        "boat_001", 1234567890, b"other client pub", b"server pub"
+    )
+
+
+def test_v1_handshake_context_changes_when_server_public_key_changes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure.build_handshake_context_v1(
+        "boat_001", 1234567890, b"client pub", b"server pub"
+    ) != secure.build_handshake_context_v1(
+        "boat_001", 1234567890, b"client pub", b"other server pub"
+    )
+
+
+def test_v1_session_transcript_is_deterministic_for_identical_inputs(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    context = secure.build_handshake_context_v1(
+        "boat_001", 1234567890, b"client pub", b"server pub"
+    )
+
+    assert secure.build_session_transcript_v1(
+        context, b"client sig", b"server sig"
+    ) == secure.build_session_transcript_v1(context, b"client sig", b"server sig")
+
+
+def test_v1_session_transcript_changes_when_client_signature_changes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    context = secure.build_handshake_context_v1(
+        "boat_001", 1234567890, b"client pub", b"server pub"
+    )
+
+    assert secure.build_session_transcript_v1(
+        context, b"client sig", b"server sig"
+    ) != secure.build_session_transcript_v1(context, b"other client sig", b"server sig")
+
+
+def test_v1_session_transcript_changes_when_server_signature_changes(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    context = secure.build_handshake_context_v1(
+        "boat_001", 1234567890, b"client pub", b"server pub"
+    )
+
+    assert secure.build_session_transcript_v1(
+        context, b"client sig", b"server sig"
+    ) != secure.build_session_transcript_v1(context, b"client sig", b"other server sig")
+
+
 def test_proxy_encrypt_message_aes_gcm_uses_12_byte_nonce_and_nmea_aad():
     proxy = load_proxy_module()
     key = b"\x01" * 32

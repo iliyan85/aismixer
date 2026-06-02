@@ -58,6 +58,48 @@ server_pub_bytes = server_pub.public_bytes(
 sessions = {}
 
 
+def _field_bytes(value):
+    if isinstance(value, str):
+        return value.encode()
+    return value
+
+
+def _update_framed(digest, value):
+    data = _field_bytes(value)
+    digest.update(len(data).to_bytes(4, "big"))
+    digest.update(data)
+
+
+def build_current_handshake_payload(station_id, timestamp):
+    return HANDSHAKE_PREFIX + station_id.encode() + timestamp.to_bytes(8, "big")
+
+
+def build_handshake_context_v1(
+    station_id,
+    timestamp,
+    client_pub_bytes,
+    server_pub_bytes,
+    context_string=CONTEXT_STRING,
+):
+    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+    for value in (
+        context_string,
+        station_id,
+        timestamp.to_bytes(8, "big"),
+        client_pub_bytes,
+        server_pub_bytes,
+    ):
+        _update_framed(digest, value)
+    return digest.finalize()
+
+
+def build_session_transcript_v1(handshake_context, client_signature, server_signature):
+    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+    for value in (handshake_context, client_signature, server_signature):
+        _update_framed(digest, value)
+    return digest.finalize()
+
+
 def parse_secure_data_packet(data):
     min_len = len(DATA_PREFIX) + 12 + 16
     if not data.startswith(DATA_PREFIX):
@@ -178,8 +220,7 @@ async def secure_server(queue, ip, port, sec_input_id=None):
 
                 digest = hashes.Hash(
                     hashes.SHA256(), backend=default_backend())
-                digest.update(
-                    HANDSHAKE_PREFIX + station_id.encode() + timestamp.to_bytes(8, "big"))
+                digest.update(build_current_handshake_payload(station_id, timestamp))
                 to_verify = digest.finalize()
 
                 verify_signature(client_pub_bytes, signature, to_verify)
@@ -187,8 +228,7 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                 # build response
                 digest_s = hashes.Hash(
                     hashes.SHA256(), backend=default_backend())
-                digest_s.update(
-                    HANDSHAKE_PREFIX + station_id.encode() + timestamp.to_bytes(8, "big"))
+                digest_s.update(build_current_handshake_payload(station_id, timestamp))
                 to_sign = digest_s.finalize()
                 sig_server = server_priv.sign(
                     to_sign, ec.ECDSA(utils.Prehashed(hashes.SHA256())))
