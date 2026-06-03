@@ -1,32 +1,42 @@
-import os
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import serialization
-import base64
+#!/usr/bin/env python3
+"""Compatibility wrapper for generating nmea_sproxy station keys."""
 
-# 1. Генериране на ключова двойка
-private_key = ec.generate_private_key(ec.SECP256R1())
+from __future__ import annotations
 
-# 2. Запис на частния ключ
-with open(os.path.join('nmea_sproxy', 'station_private.key'), 'wb') as f:
-    f.write(private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption()
-    ))
+import sys
+from pathlib import Path
 
-# 3. Извличане и запис на публичния ключ (PEM формат)
-public_key = private_key.public_key()
-with open(os.path.join('nmea_sproxy', 'station_public.pem'), 'wb') as f:
-    f.write(public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    ))
 
-# 4. Извличане на публичния ключ в компресиран X962 формат
-compressed = public_key.public_bytes(
-    encoding=serialization.Encoding.X962,
-    format=serialization.PublicFormat.CompressedPoint
-)
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+LEGACY_PRIVATE_NAME = "station_private.key"
+LEGACY_PUBLIC_NAME = "station_public.pem"
 
-print("📦 Base64-компресиран публичен ключ:")
-print(base64.b64encode(compressed).decode())
+
+def _load_key_tool():
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from tools import aismixer_keys
+
+    return aismixer_keys
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    key_tool = _load_key_tool()
+    return key_tool.main(
+        [
+            "station",
+            "--keys-dir",
+            str(SCRIPT_DIR),
+            "--private-name",
+            LEGACY_PRIVATE_NAME,
+            "--public-name",
+            LEGACY_PUBLIC_NAME,
+            *argv,
+        ]
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

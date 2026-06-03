@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import subprocess
 import stat
 import sys
 from pathlib import Path
@@ -10,6 +11,10 @@ from cryptography.hazmat.primitives import serialization
 
 ROOT = Path(__file__).resolve().parents[1]
 KEY_TOOL_PATH = ROOT / "tools" / "aismixer_keys.py"
+NMEA_SPROXY_DIR = ROOT / "nmea_sproxy"
+STATION_WRAPPER_PATH = NMEA_SPROXY_DIR / "station_keys_gen.py"
+LEGACY_STATION_PRIVATE_NAME = "station_private.key"
+LEGACY_STATION_PUBLIC_NAME = "station_public.pem"
 
 
 def load_key_tool():
@@ -26,6 +31,22 @@ def load_private_key(path):
 
 def load_public_key(path):
     return serialization.load_pem_public_key(path.read_bytes())
+
+
+def run_station_wrapper(cwd, script, keys_dir, *extra_args):
+    return subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--keys-dir",
+            str(keys_dir),
+            *extra_args,
+        ],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def test_server_key_files_are_created(tmp_path):
@@ -143,3 +164,56 @@ def test_station_cli_prints_authorized_keys_guidance(tmp_path, capsys):
     assert "authorized_clients:" in captured.out
     assert "name: dock_001" in captured.out
     assert "pubkey:" in captured.out
+
+
+def test_station_keys_gen_runs_from_repo_root(tmp_path):
+    result = run_station_wrapper(ROOT, STATION_WRAPPER_PATH, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / LEGACY_STATION_PRIVATE_NAME).exists()
+    assert (tmp_path / LEGACY_STATION_PUBLIC_NAME).exists()
+    assert "authorized_clients:" in result.stdout
+
+
+def test_station_keys_gen_runs_from_nmea_sproxy_dir(tmp_path):
+    result = run_station_wrapper(NMEA_SPROXY_DIR, "station_keys_gen.py", tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / LEGACY_STATION_PRIVATE_NAME).exists()
+    assert (tmp_path / LEGACY_STATION_PUBLIC_NAME).exists()
+    assert "authorized_clients:" in result.stdout
+
+
+def test_station_keys_gen_does_not_overwrite_existing_keys_by_default(tmp_path):
+    first = run_station_wrapper(ROOT, STATION_WRAPPER_PATH, tmp_path)
+    assert first.returncode == 0, first.stderr
+
+    private_path = tmp_path / LEGACY_STATION_PRIVATE_NAME
+    public_path = tmp_path / LEGACY_STATION_PUBLIC_NAME
+    original_private = private_path.read_bytes()
+    original_public = public_path.read_bytes()
+
+    second = run_station_wrapper(ROOT, STATION_WRAPPER_PATH, tmp_path)
+
+    assert second.returncode == 1
+    assert "Refusing to overwrite" in second.stderr
+    assert private_path.read_bytes() == original_private
+    assert public_path.read_bytes() == original_public
+
+
+def test_station_keys_gen_force_overwrites_existing_keys(tmp_path):
+    first = run_station_wrapper(ROOT, STATION_WRAPPER_PATH, tmp_path)
+    assert first.returncode == 0, first.stderr
+
+    private_path = tmp_path / LEGACY_STATION_PRIVATE_NAME
+    public_path = tmp_path / LEGACY_STATION_PUBLIC_NAME
+    original_private = private_path.read_bytes()
+    original_public = public_path.read_bytes()
+
+    second = run_station_wrapper(ROOT, STATION_WRAPPER_PATH, tmp_path, "--force")
+
+    assert second.returncode == 0, second.stderr
+    assert private_path.read_bytes() != original_private
+    assert public_path.read_bytes() != original_public
+    load_private_key(private_path)
+    load_public_key(public_path)
