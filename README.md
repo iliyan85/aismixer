@@ -6,7 +6,19 @@
 
 > **TL;DR**
 > AISMixer merges multiple AIS receiver feeds, de‑duplicates messages, reassembles multipart using NMEA fragment fields, and forwards a clean, unified stream.
-> It is **tag‑aware**: reads `s`/`c`/`g` on ingress and (per policy) **preserves / normalizes / overwrites** them on egress — e.g., pass through `c` or replace with server time; keep/normalize `s`; preserve or emit compact `g`.
+> It is **tag‑aware**: reads `s`/`c`/`g` on ingress and (per policy) **preserves / normalizes / overwrites** them on egress — e.g., pass through `c` or replace with server time; keep/normalize `s`; preserve or emit compact `g` metadata. TAG `g` is not used as the multipart assembler key.
+
+---
+
+## 🌿 Branches and website
+
+This `main` branch is the primary runtime and development branch. It contains
+the Python service, secure proxy helpers, runtime configuration examples, and
+the test suite under `tests/`.
+
+The public website lives on the long-lived `website` branch. GitHub Pages
+deploys from that branch using `/docs` as the site root, so `docs/` is
+intentionally not present on `main`.
 
 ---
 
@@ -24,7 +36,7 @@
 
 1. Multiple AIS receivers (hardware/software) send NMEA to AISMixer (UDP or secure via `nmea_sproxy`).
 2. AISMixer **de‑duplicates** identical payloads from different sources.
-3. AISMixer **reassembles multipart** AIVDM using NMEA fragment fields: source/assembler key, `seq_id`, radio channel, and total fragment count.
+3. AISMixer **reassembles multipart** AIVDM using NMEA fragment fields: ingress source/assembler key, sequential message ID (`seq_id`), radio channel, current fragment number, and total fragment count.
 4. AISMixer **forwards** a unified stream downstream (per‑forwarder tag policy).
 
 ```
@@ -43,8 +55,8 @@
 
 AISMixer parses Tag Block on ingress and **manages** what to emit on egress **per policy**:
 
-- **`g` (group)** — used for ingress/output metadata preservation or regeneration.
-  It is currently **not** the assembler grouping key; multipart assembly uses the NMEA source/assembler key, `seq_id`, radio channel, and total fragment count.
+- **`g` (group)** — ingress/output metadata that may be preserved or regenerated for downstream readers.
+  It is **not** the assembler grouping key; multipart assembly uses NMEA fragment fields plus the ingress source/assembler key.
 - **`s` (source)** — preserve incoming `s`, map by IP/authorized key, or set a server‑defined station ID.
 - **`c` (timestamp)** — pass through incoming time **or** replace it with **server time** (for clock normalization).
 
@@ -84,7 +96,7 @@ udp_alias_map_file: udp_alias_map.yaml   # optional
 # tag_policy:
 #   s: preserve    # preserve | normalize | overwrite
 #   c: overwrite   # use server time
-#   g: normalize   # server-formed compact groups when reassembled
+#   g: normalize   # preserve/regenerate output TAG g metadata; not assembler key
 ```
 
 ### 🔍 How `s` (source) is formed
@@ -139,9 +151,22 @@ Or install as a **systemd** service using `install.sh` (copies unit to `/etc/sys
 
 ## 🔐 Security
 
-- **Handshake:** ECDSA-based mutual check; clients are authorized via `authorized_keys.yaml`.
-- **Transport:** AES-GCM for integrity + confidentiality over UDP.
-- **Replay resistance:** nonces/timestamps in handshake (client proxy `nmea_sproxy`).
+- **Handshake:** ECDSA-based station authentication; clients are authorized via `authorized_keys.yaml`.
+- **Context:** secure UDP helpers include the `NMEA-AUTH-v1` context and transcript-building helpers for the hardened handshake path; the current compatible handshake signs station identity plus timestamp.
+- **Transport:** AES-GCM for integrity + confidentiality over UDP data packets.
+- **Replay/session hardening:** handshakes are timestamp-window checked, handshake replay keys and data nonces are tracked with bounded TTL caches, sessions expire, and keepalives refresh active sessions.
+
+---
+
+## ✅ Tests
+
+Focused pytest coverage lives under `tests/` and covers multipart assembly,
+TAG `s`/`c`/`g` helpers, metadata writing, `nmea_sproxy` extraction, secure UDP
+helpers, and forwarding-loop behavior.
+
+```bash
+python -m pytest
+```
 
 ---
 
@@ -152,7 +177,19 @@ Or install as a **systemd** service using `install.sh` (copies unit to `/etc/sys
 
 > **TL;DR**
 > AISMixer обединява няколко AIS приемни потока, премахва дубликати, сглобява мултипарт чрез NMEA fragment полета и излъчва чист, обединен поток.
-> Системата е **tag‑aware**: чете `s`/`c`/`g` на вход и (според политика) **preserve / normalize / overwrite** на изход — напр. запазва `c` или го заменя със сървърно време; запазва/нормализира `s`; запазва или излъчва компактен `g`.
+> Системата е **tag‑aware**: чете `s`/`c`/`g` на вход и (според политика) **preserve / normalize / overwrite** на изход — напр. запазва `c` или го заменя със сървърно време; запазва/нормализира `s`; запазва или излъчва компактен `g` като metadata. TAG `g` не се използва като ключ за multipart сглобяване.
+
+---
+
+## 🌿 Клонове и сайт
+
+Този `main` клон е основният runtime/development клон. Тук са Python услугата,
+secure proxy помощните файлове, примерните runtime конфигурации и тестовете в
+`tests/`.
+
+Публичният сайт е в дългоживеещия `website` клон. GitHub Pages deploy-ва от
+този клон, като използва `/docs` за site root, затова `docs/` умишлено не
+присъства в `main`.
 
 ---
 
@@ -170,7 +207,7 @@ Or install as a **systemd** service using `install.sh` (copies unit to `/etc/sys
 
 1. Няколко приемника (хардуерни/софтуерни) изпращат NMEA към AISMixer (UDP или защитено чрез `nmea_sproxy`).
 2. AISMixer **дедупликира** еднакви полезни товари от различни източници.
-3. AISMixer **сглобява мултипарт** AIVDM чрез NMEA fragment полета: source/assembler key, `seq_id`, radio channel и total fragment count.
+3. AISMixer **сглобява мултипарт** AIVDM чрез NMEA fragment полета: ingress source/assembler key, sequential message ID (`seq_id`), radio channel, current fragment number и total fragment count.
 4. AISMixer **форурдва** обединения поток (per‑forwarder tag политика).
 
 ```
@@ -189,8 +226,8 @@ Or install as a **systemd** service using `install.sh` (copies unit to `/etc/sys
 
 AISMixer чете Tag Block на входа и **решава** какво да излъчи на изхода **по политика**:
 
-- **`g` (group)** — използва се за запазване или регенериране на ingress/output metadata.
-  В момента не е assembler grouping key; multipart assembly използва NMEA source/assembler key, `seq_id`, radio channel и total fragment count.
+- **`g` (group)** — ingress/output metadata, която може да бъде запазена или регенерирана за downstream получатели.
+  Не е assembler grouping key; multipart assembly използва NMEA fragment полета плюс ingress source/assembler key.
 - **`s` (source)** — запази входния `s`, мапни по IP/ключ, или задай сървърен station ID.
 - **`c` (timestamp)** — пропусни входното време **или** замени със **сървърно време** (нормализация на часовниците).
 
@@ -230,7 +267,7 @@ udp_alias_map_file: udp_alias_map.yaml   # по избор
 # tag_policy:
 #   s: preserve
 #   c: overwrite   # сървърно време
-#   g: normalize   # компактни групи при сглобяване
+#   g: normalize   # preserve/regenerate output TAG g metadata; not assembler key
 ```
 
 ### 🔍 Как се формира `s`
@@ -285,8 +322,21 @@ python3 aismixer.py
 
 ## 🔐 Сигурност
 
-- **Handshake:** ECDSA взаимна проверка; клиентите се описват в `authorized_keys.yaml`.
-- **Транспорт:** AES‑GCM за целост и конфиденциалност по UDP.
-- **Anti‑replay:** nonces/времеви маркери в handshake (клиент `nmea_sproxy`).
+- **Handshake:** ECDSA station authentication; клиентите се описват в `authorized_keys.yaml`.
+- **Context:** secure UDP helper-ите включват `NMEA-AUTH-v1` context и transcript-building helpers за hardened handshake path; текущият compatible handshake подписва station identity плюс timestamp.
+- **Транспорт:** AES‑GCM за целост и конфиденциалност на UDP data packets.
+- **Replay/session hardening:** handshakes се проверяват с timestamp window, handshake replay keys и data nonces се пазят в bounded TTL caches, sessions expire-ват, а keepalive packets обновяват активни sessions.
+
+---
+
+## ✅ Тестове
+
+Focused pytest coverage живее в `tests/` и покрива multipart assembly, TAG
+`s`/`c`/`g` helper-и, metadata writing, `nmea_sproxy` extraction, secure UDP
+helper-и и forwarding-loop behavior.
+
+```bash
+python -m pytest
+```
 
 ---
