@@ -25,20 +25,38 @@ DATA_NONCE_MAX_PER_SESSION = 100000
 DEBUG = True  # Set to False in production
 
 
-def resolve_path(primary, fallback):
-    return primary if os.path.exists(primary) else fallback
+SERVER_PRIVATE_KEY_PATHS = (
+    "/etc/aismixer/keys/aismixer_private.pem",
+    "/etc/aismixer/aismixer_private.key",
+    "aismixer_private.pem",
+    "aismixer_private.key",
+)
+
+
+def resolve_existing_path(candidates):
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[-1]
+
+
+def resolve_local_path(path):
+    if os.path.isabs(path) or path.startswith("/"):
+        return path
+    return os.path.join(base_dir, path)
 
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
-auth_keys_path = resolve_path(
-    "/etc/aismixer/authorized_keys.yaml",
-    os.path.join(base_dir, "authorized_keys.yaml")
+auth_keys_path = resolve_existing_path(
+    (
+        "/etc/aismixer/authorized_keys.yaml",
+        os.path.join(base_dir, "authorized_keys.yaml"),
+    )
 )
 
-priv_key_path = resolve_path(
-    "/etc/aismixer/aismixer_private.key",
-    os.path.join(base_dir, "aismixer_private.key")
+priv_key_path = resolve_existing_path(
+    tuple(resolve_local_path(path) for path in SERVER_PRIVATE_KEY_PATHS)
 )
 
 with open(auth_keys_path, 'r') as f:

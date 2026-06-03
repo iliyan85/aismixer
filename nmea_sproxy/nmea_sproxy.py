@@ -17,6 +17,10 @@ from cryptography.exceptions import InvalidSignature
 HANDSHAKE_PREFIX = b"NMEA-H"
 DATA_PREFIX = b"NMEA-D"
 KEEPALIVE_INTERVAL = 30  # секунди
+CANONICAL_STATION_PRIVATE_KEY_PATH = "/etc/nmea_sproxy/keys/station_private.pem"
+LEGACY_STATION_PRIVATE_KEY_PATH = "nmea_sproxy/station_private.key"
+CANONICAL_REMOTE_PUBLIC_KEY_PATH = "/etc/nmea_sproxy/keys/aismixer_public.pem"
+LEGACY_REMOTE_PUBLIC_KEY_PATH = "nmea_sproxy/aismixer_public.pem"
 
 DEFAULT_CONFIG = {
     "listen_ip": "192.168.190.214",
@@ -24,15 +28,47 @@ DEFAULT_CONFIG = {
     "remote_host": "127.0.0.1",
     "remote_port": 19999,
     "station_id": "boat_001",
-    "remote_public_key": "nmea_sproxy/aismixer_public.pem",
-    "station_private_key": "nmea_sproxy/station_private.key",
+    "remote_public_key": LEGACY_REMOTE_PUBLIC_KEY_PATH,
+    "station_private_key": LEGACY_STATION_PRIVATE_KEY_PATH,
     "reconnect_delay": 5,
     "log_level": "INFO",
 }
 
 
+def resolve_existing_path(candidates):
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[-1]
+
+
+def apply_default_key_paths(config, user_config=None):
+    user_config = user_config or {}
+    if "station_private_key" not in user_config:
+        config["station_private_key"] = resolve_existing_path(
+            (
+                CANONICAL_STATION_PRIVATE_KEY_PATH,
+                LEGACY_STATION_PRIVATE_KEY_PATH,
+            )
+        )
+
+    remote_key_configured = (
+        "remote_public_key" in user_config
+        or "aismixer_public_key" in user_config
+    )
+    if not remote_key_configured:
+        config["remote_public_key"] = resolve_existing_path(
+            (
+                CANONICAL_REMOTE_PUBLIC_KEY_PATH,
+                LEGACY_REMOTE_PUBLIC_KEY_PATH,
+            )
+        )
+    return config
+
+
 def load_config(path="/etc/nmea_sproxy/config.yaml"):
     config = dict(DEFAULT_CONFIG)
+    user_config = None
     if os.path.exists(path):
         with open(path, 'r') as f:
             user_config = yaml.safe_load(f)
@@ -45,6 +81,7 @@ def load_config(path="/etc/nmea_sproxy/config.yaml"):
                     config["remote_public_key"] = user_config["aismixer_public_key"]
     else:
         print(f"⚠️ Config file not found: {path}. Using defaults.")
+    apply_default_key_paths(config, user_config)
     return config
 
 

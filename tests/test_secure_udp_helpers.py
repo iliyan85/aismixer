@@ -15,10 +15,15 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 ROOT = Path(__file__).resolve().parents[1]
 NMEA_SPROXY_DIR = ROOT / "nmea_sproxy"
 
+SERVER_CANONICAL_PRIVATE_KEY_PATH = "/etc/aismixer/keys/aismixer_private.pem"
+SERVER_LEGACY_ETC_PRIVATE_KEY_PATH = "/etc/aismixer/aismixer_private.key"
+SERVER_LOCAL_CANONICAL_PRIVATE_KEY_FILENAME = "aismixer_private.pem"
 SERVER_PRIVATE_KEY_FILENAME = "aismixer_private.key"
 SERVER_PUBLIC_KEY_FOR_PROXY_FILENAME = "aismixer_public.pem"
+STATION_CANONICAL_PRIVATE_KEY_PATH = "/etc/nmea_sproxy/keys/station_private.pem"
 STATION_PRIVATE_KEY_FILENAME = "station_private.key"
 STATION_PUBLIC_KEY_FILENAME = "station_public.pem"
+REMOTE_CANONICAL_PUBLIC_KEY_PATH = "/etc/nmea_sproxy/keys/aismixer_public.pem"
 
 
 def load_proxy_module():
@@ -34,7 +39,15 @@ def load_proxy_module():
         sys.path.remove(str(NMEA_SPROXY_DIR))
 
 
-def load_secure_module_with_fake_keys(monkeypatch, with_client_private_key=False):
+def _normalize_path(path):
+    return os.path.normcase(os.path.normpath(os.fspath(path)))
+
+
+def load_secure_module_with_fake_keys(
+    monkeypatch,
+    with_client_private_key=False,
+    existing_paths=None,
+):
     server_private_key = ec.generate_private_key(ec.SECP256R1())
     server_private_bytes = server_private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -59,12 +72,20 @@ def load_secure_module_with_fake_keys(monkeypatch, with_client_private_key=False
         name = os.path.basename(os.fspath(path))
         if name == "authorized_keys.yaml":
             return io.StringIO(authorized_yaml)
-        if name == SERVER_PRIVATE_KEY_FILENAME:
+        if name in (
+            SERVER_LOCAL_CANONICAL_PRIVATE_KEY_FILENAME,
+            SERVER_PRIVATE_KEY_FILENAME,
+        ):
             return io.BytesIO(server_private_bytes)
         return real_open(path, mode, *args, **kwargs)
 
+    existing = {
+        _normalize_path(path)
+        for path in (existing_paths or ())
+    }
+
     with monkeypatch.context() as patch:
-        patch.setattr(os.path, "exists", lambda path: False)
+        patch.setattr(os.path, "exists", lambda path: _normalize_path(path) in existing)
         patch.setattr("builtins.open", fake_open)
         spec = importlib.util.spec_from_file_location(
             "aismixer_secure_test_helpers", ROOT / "aismixer_secure.py"
@@ -839,6 +860,75 @@ def test_handle_keepalive_session_returns_false_for_station_id_mismatch(monkeypa
     assert session["last_seen"] == 100.0
 
 
+def test_secure_server_private_key_prefers_canonical_path(monkeypatch):
+    secure = load_secure_module_with_fake_keys(
+        monkeypatch,
+        existing_paths=[
+            SERVER_CANONICAL_PRIVATE_KEY_PATH,
+            SERVER_LEGACY_ETC_PRIVATE_KEY_PATH,
+        ],
+    )
+
+    assert secure.priv_key_path == SERVER_CANONICAL_PRIVATE_KEY_PATH
+
+
+def test_secure_server_private_key_uses_legacy_etc_when_canonical_absent(monkeypatch):
+    secure = load_secure_module_with_fake_keys(
+        monkeypatch,
+        existing_paths=[SERVER_LEGACY_ETC_PRIVATE_KEY_PATH],
+    )
+
+    assert secure.priv_key_path == SERVER_LEGACY_ETC_PRIVATE_KEY_PATH
+
+
+def test_secure_server_private_key_uses_local_legacy_fallback(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert _normalize_path(secure.priv_key_path) == _normalize_path(
+        ROOT / SERVER_PRIVATE_KEY_FILENAME
+    )
+
+
+def test_proxy_default_station_private_key_prefers_canonical_path(monkeypatch, tmp_path):
+    proxy = load_proxy_module()
+    monkeypatch.setattr(
+        proxy.os.path,
+        "exists",
+        lambda path: _normalize_path(path) == _normalize_path(
+            STATION_CANONICAL_PRIVATE_KEY_PATH
+        ),
+    )
+
+    config = proxy.load_config(str(tmp_path / "missing.yaml"))
+
+    assert config["station_private_key"] == STATION_CANONICAL_PRIVATE_KEY_PATH
+
+
+def test_proxy_configured_legacy_station_private_key_still_works(tmp_path):
+    proxy = load_proxy_module()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("station_private_key: station_private.key\n", encoding="utf-8")
+
+    config = proxy.load_config(str(config_path))
+
+    assert config["station_private_key"] == "station_private.key"
+
+
+def test_proxy_default_remote_public_key_prefers_canonical_path(monkeypatch, tmp_path):
+    proxy = load_proxy_module()
+    monkeypatch.setattr(
+        proxy.os.path,
+        "exists",
+        lambda path: _normalize_path(path) == _normalize_path(
+            REMOTE_CANONICAL_PUBLIC_KEY_PATH
+        ),
+    )
+
+    config = proxy.load_config(str(tmp_path / "missing.yaml"))
+
+    assert config["remote_public_key"] == REMOTE_CANONICAL_PUBLIC_KEY_PATH
+
+
 def test_proxy_load_config_uses_remote_public_key_as_canonical(tmp_path):
     proxy = load_proxy_module()
     config_path = tmp_path / "config.yaml"
@@ -876,10 +966,15 @@ def test_proxy_load_config_prefers_canonical_key_when_both_names_are_present(tmp
 def test_current_secure_udp_key_filename_expectations():
     proxy = load_proxy_module()
 
+    assert SERVER_CANONICAL_PRIVATE_KEY_PATH.endswith("aismixer_private.pem")
     assert SERVER_PRIVATE_KEY_FILENAME == "aismixer_private.key"
     assert SERVER_PUBLIC_KEY_FOR_PROXY_FILENAME == "aismixer_public.pem"
+    assert STATION_CANONICAL_PRIVATE_KEY_PATH.endswith("station_private.pem")
     assert STATION_PRIVATE_KEY_FILENAME == "station_private.key"
     assert STATION_PUBLIC_KEY_FILENAME == "station_public.pem"
+    assert REMOTE_CANONICAL_PUBLIC_KEY_PATH.endswith("aismixer_public.pem")
+    assert proxy.CANONICAL_STATION_PRIVATE_KEY_PATH == STATION_CANONICAL_PRIVATE_KEY_PATH
+    assert proxy.CANONICAL_REMOTE_PUBLIC_KEY_PATH == REMOTE_CANONICAL_PUBLIC_KEY_PATH
     assert proxy.DEFAULT_CONFIG["remote_public_key"].endswith(
         SERVER_PUBLIC_KEY_FOR_PROXY_FILENAME
     )
