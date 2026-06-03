@@ -4,9 +4,9 @@ set -e
 INSTALL_DIR=/opt/aismixer
 
 echo "[+] Updating Python source files in $INSTALL_DIR"
-sudo cp *.py $INSTALL_DIR
-sudo mkdir -p $INSTALL_DIR/core
-sudo cp core/*.py $INSTALL_DIR/core
+sudo cp *.py "$INSTALL_DIR"/
+sudo mkdir -p "$INSTALL_DIR/core"
+sudo cp -R core/. "$INSTALL_DIR/core"/
 
 echo "[+] Restarting aismixer service"
 sudo systemctl restart aismixer

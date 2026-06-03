@@ -18,10 +18,10 @@ for pkg in python3-setproctitle python3-yaml python3-cryptography; do
 done
 
 echo "[+] Installing aismixer to $INSTALL_DIR"
-sudo mkdir -p $INSTALL_DIR
-sudo cp *.py $INSTALL_DIR
-sudo mkdir $INSTALL_DIR/core
-sudo cp core/*.py $INSTALL_DIR/core
+sudo mkdir -p "$INSTALL_DIR"
+sudo cp *.py "$INSTALL_DIR"/
+sudo mkdir -p "$INSTALL_DIR/core"
+sudo cp -R core/. "$INSTALL_DIR/core"/
 
 echo "[+] Installing config to $CONFIG_DIR"
 sudo mkdir -p $CONFIG_DIR
