@@ -69,10 +69,28 @@ Do not commit changes automatically. Prepare changes for human review.
 Before making changes, inspect the current state:
 
 ```bash
-git status
+git status -sb
 ```
 
 If there are existing user changes, do not overwrite them. Treat uncommitted changes as belonging to the user.
+
+Branch responsibilities:
+
+* `main` is the primary runtime/development branch.
+* `website` is the dedicated GitHub Pages branch.
+* GitHub Pages deploys from the `website` branch, using `/docs` as the site root.
+* `docs/` must not be reintroduced on `main`.
+* `tests/` must remain on `main`; tests are part of development and CI.
+* Production Python code changes normally happen on `main`.
+* Website, Jekyll, and GitHub Pages changes normally happen on `website`.
+
+Before any commit, pull, merge, delete, reset, branch switch, or other branch-sensitive operation, run:
+
+```bash
+git status -sb
+```
+
+Read and report the current branch before proceeding. If the requested operation involves a commit or push, the instructions and response must explicitly name the target branch.
 
 When presenting work, summarize:
 
