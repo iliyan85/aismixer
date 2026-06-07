@@ -7,6 +7,8 @@ echo "[+] Updating Python source files in $INSTALL_DIR"
 sudo cp *.py "$INSTALL_DIR"/
 sudo mkdir -p "$INSTALL_DIR/core"
 sudo cp -R core/. "$INSTALL_DIR/core"/
+sudo mkdir -p "$INSTALL_DIR/tools"
+sudo cp -R tools/. "$INSTALL_DIR/tools"/
 
 echo "[+] Restarting aismixer service"
 sudo systemctl restart aismixer
