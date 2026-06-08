@@ -20,6 +20,25 @@ This repository is not a toy example. Treat it as production-oriented infrastruc
 
 ---
 
+## Project context
+
+* `aismixer` is a Python service for receiving AIS NMEA 0183 messages from multiple UDP and secure inputs.
+* It normalizes or removes optional metadata, deduplicates AIS messages, handles multipart `AIVDM` / `AIVDO` messages, and forwards a unified NMEA stream.
+* Service-code work and repository documentation that governs the service belong on the `main` branch; public website work belongs on the `website` branch.
+* The long-term direction includes multiple logical stations/users and secure station-to-mixer communication.
+
+---
+
+## Mobile / camping workflow
+
+* Keep mobile tasks small and PR-sized.
+* Always state the target branch: `main` or `website`.
+* Do not mix website and service-code changes.
+* Do not modify Python code during documentation-only mobile tasks unless explicitly requested.
+* For documentation-only changes, run `git diff --check`.
+
+---
+
 ## General behavior for Codex
 
 When working in this repository:
