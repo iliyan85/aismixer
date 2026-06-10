@@ -12,7 +12,7 @@ def sanitize_s(val: Optional[str]) -> str:
 
 
 def extract_incoming_s(raw: Optional[str]) -> Optional[str]:
-    """ Взима s: от водещ TAG блок \k:v,...*CS\..., ако има. Връща стойността без checksum. """
+    r""" Взима s: от водещ TAG блок \k:v,...*CS\..., ако има. Връща стойността без checksum. """
     if not raw or not raw.startswith('\\'):
         return None
     try:
@@ -33,7 +33,7 @@ def extract_incoming_s(raw: Optional[str]) -> Optional[str]:
 
 
 def parse_last_tag_pairs(raw: Optional[str]) -> dict:
-    """
+    r"""
     Взема последния \...*CS\ TAG блок в реда и го връща като dict {k:v}.
     Ако няма TAG блок, връща {}.
     """
