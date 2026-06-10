@@ -38,6 +38,9 @@ Config resolution order is:
 5. built-in defaults
 
 An explicitly selected CLI or environment config must exist.
+Relative `station_private_key`, `remote_public_key`, and legacy
+`aismixer_public_key` values are resolved relative to the selected config
+file, not the process working directory.
 
 ## systemd services
 
@@ -74,6 +77,11 @@ Default key paths are:
 ```
 
 Instance configs may override key paths when needed.
+
+The repository's `config.yaml` is the manual-use template and uses local
+relative key paths. During installation, `config.system.yaml` is copied to
+`/etc/nmea_sproxy/config.yaml` only when that system config does not already
+exist.
 
 The installer preserves `/etc/nmea_sproxy/keys`. It generates station keys
 only when both `station_private.pem` and `station_public.pem` are absent. When

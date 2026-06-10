@@ -6,8 +6,5 @@ remote_host: 192.0.2.10
 remote_port: 17777
 station_id: boat_001
 
-station_private_key: /etc/nmea_sproxy/keys/station_private.pem
-remote_public_key: /etc/nmea_sproxy/keys/aismixer_public.pem
-
-# Manual runs from this directory fall back to the legacy local key filenames
-# when the service key paths above do not exist.
+station_private_key: station_private.key
+remote_public_key: aismixer_public.pem

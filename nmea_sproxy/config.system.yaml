@@ -1,0 +1,9 @@
+# Singleton systemd service config: one local input -> one secure remote output.
+listen_ip: '::'
+listen_port: 50000
+remote_host: 192.0.2.10
+remote_port: 17777
+station_id: boat_001
+
+station_private_key: /etc/nmea_sproxy/keys/station_private.pem
+remote_public_key: /etc/nmea_sproxy/keys/aismixer_public.pem

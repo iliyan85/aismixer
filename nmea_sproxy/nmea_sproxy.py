@@ -50,19 +50,9 @@ def resolve_existing_path(candidates):
     return candidates[-1]
 
 
-def apply_default_key_paths(
-    config,
-    user_config=None,
-    *,
-    allow_legacy_fallback=False,
-):
+def apply_default_key_paths(config, user_config=None):
     user_config = user_config or {}
-    station_uses_service_default = (
-        user_config.get("station_private_key") == CANONICAL_STATION_PRIVATE_KEY_PATH
-    )
-    if "station_private_key" not in user_config or (
-        allow_legacy_fallback and station_uses_service_default
-    ):
+    if "station_private_key" not in user_config:
         config["station_private_key"] = resolve_existing_path(
             (
                 CANONICAL_STATION_PRIVATE_KEY_PATH,
@@ -74,19 +64,31 @@ def apply_default_key_paths(
         "remote_public_key" in user_config
         or "aismixer_public_key" in user_config
     )
-    remote_uses_service_default = (
-        user_config.get("remote_public_key") == CANONICAL_REMOTE_PUBLIC_KEY_PATH
-        and "aismixer_public_key" not in user_config
-    )
-    if not remote_key_configured or (
-        allow_legacy_fallback and remote_uses_service_default
-    ):
+    if not remote_key_configured:
         config["remote_public_key"] = resolve_existing_path(
             (
                 CANONICAL_REMOTE_PUBLIC_KEY_PATH,
                 LEGACY_REMOTE_PUBLIC_KEY_PATH,
             )
         )
+    return config
+
+
+def resolve_configured_key_paths(config, user_config, config_path):
+    if not user_config or not config_path:
+        return config
+
+    config_dir = os.path.dirname(os.path.abspath(config_path))
+    configured_keys = []
+    if "station_private_key" in user_config:
+        configured_keys.append("station_private_key")
+    if "remote_public_key" in user_config or "aismixer_public_key" in user_config:
+        configured_keys.append("remote_public_key")
+
+    for key in configured_keys:
+        path = os.fspath(config[key])
+        if not os.path.isabs(path) and not path.startswith("/"):
+            config[key] = os.path.normpath(os.path.join(config_dir, path))
     return config
 
 
@@ -123,15 +125,8 @@ def load_config(path=None):
         print(f"⚠️ Config file not found: {selected_path}. Using defaults.")
     else:
         print("⚠️ No config file found. Using built-in defaults.")
-    local_config_selected = selected_path is not None and (
-        os.path.normcase(os.path.abspath(selected_path))
-        == os.path.normcase(os.path.abspath(LOCAL_CONFIG_PATH))
-    )
-    apply_default_key_paths(
-        config,
-        user_config,
-        allow_legacy_fallback=local_config_selected,
-    )
+    apply_default_key_paths(config, user_config)
+    resolve_configured_key_paths(config, user_config, selected_path)
     return config
 
 

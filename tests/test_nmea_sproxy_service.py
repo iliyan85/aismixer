@@ -49,6 +49,42 @@ def test_install_creates_layout_repairs_keys_and_only_enables_singleton():
     assert not any("enable nmea_sproxy@" in command for command in commands)
 
 
+def test_install_creates_absolute_system_config_when_missing():
+    install = read_proxy_file("install.sh")
+    system_config = read_proxy_file("config.system.yaml")
+
+    assert (
+        'sudo install -m 0644 "$SCRIPT_DIR/config.system.yaml" "$CONFIG_FILE"'
+        in install
+    )
+    assert (
+        "station_private_key: /etc/nmea_sproxy/keys/station_private.pem"
+        in system_config
+    )
+    assert (
+        "remote_public_key: /etc/nmea_sproxy/keys/aismixer_public.pem"
+        in system_config
+    )
+
+
+def test_manual_config_uses_local_relative_key_paths():
+    manual_config = read_proxy_file("config.yaml")
+
+    assert "station_private_key: station_private.pem" in manual_config
+    assert "remote_public_key: aismixer_public.pem" in manual_config
+    assert "/etc/nmea_sproxy/keys/" not in manual_config
+
+
+def test_install_preserves_existing_system_config():
+    install = read_proxy_file("install.sh")
+    preserve = 'if path_exists "$CONFIG_FILE"; then'
+    create = 'sudo install -m 0644 "$SCRIPT_DIR/config.system.yaml" "$CONFIG_FILE"'
+
+    assert preserve in install
+    assert "Preserving existing singleton config" in install
+    assert install.index(preserve) < install.index(create)
+
+
 def test_update_does_not_write_proxy_configs_or_keys():
     commands = shell_commands(read_proxy_file("update.sh"))
 
@@ -68,6 +104,7 @@ def test_operator_chosen_instance_examples_do_not_use_numbered_placeholders():
     names = (
         "README.md",
         "config.yaml",
+        "config.system.yaml",
         "install.sh",
         "update.sh",
         "uninstall.sh",

@@ -45,7 +45,7 @@ sudo install -d -m 0700 "$KEYS_DIR"
 if path_exists "$CONFIG_FILE"; then
 	echo "  - Preserving existing singleton config: $CONFIG_FILE"
 else
-	sudo install -m 0644 "$SCRIPT_DIR/config.yaml" "$CONFIG_FILE"
+	sudo install -m 0644 "$SCRIPT_DIR/config.system.yaml" "$CONFIG_FILE"
 	echo "  - Installed singleton config: $CONFIG_FILE"
 fi
 echo "  - Instance configs are operator-created under: $INSTANCES_DIR"

@@ -912,26 +912,20 @@ def test_proxy_configured_legacy_station_private_key_still_works(tmp_path):
 
     config = proxy.load_config(str(config_path))
 
-    assert config["station_private_key"] == "station_private.key"
+    assert config["station_private_key"] == str(tmp_path / "station_private.key")
 
 
-def test_proxy_local_default_config_supports_manual_legacy_keys(monkeypatch):
+def test_proxy_manual_local_config_resolves_local_key_paths():
     proxy = load_proxy_module()
-    existing_paths = {
-        proxy.LOCAL_CONFIG_PATH,
-        proxy.LEGACY_STATION_PRIVATE_KEY_PATH,
-        proxy.LEGACY_REMOTE_PUBLIC_KEY_PATH,
-    }
-    monkeypatch.setattr(
-        proxy.os.path,
-        "exists",
-        lambda path: os.fspath(path) in existing_paths,
-    )
 
     config = proxy.load_config(proxy.LOCAL_CONFIG_PATH)
 
-    assert config["station_private_key"] == proxy.LEGACY_STATION_PRIVATE_KEY_PATH
-    assert config["remote_public_key"] == proxy.LEGACY_REMOTE_PUBLIC_KEY_PATH
+    assert config["station_private_key"] == str(
+        NMEA_SPROXY_DIR / "station_private.pem"
+    )
+    assert config["remote_public_key"] == str(
+        NMEA_SPROXY_DIR / "aismixer_public.pem"
+    )
 
 
 def test_proxy_default_remote_public_key_prefers_canonical_path(monkeypatch, tmp_path):
@@ -956,7 +950,7 @@ def test_proxy_load_config_uses_remote_public_key_as_canonical(tmp_path):
 
     config = proxy.load_config(str(config_path))
 
-    assert config["remote_public_key"] == "canonical.pem"
+    assert config["remote_public_key"] == str(tmp_path / "canonical.pem")
 
 
 def test_proxy_load_config_supports_legacy_aismixer_public_key_as_fallback(tmp_path):
@@ -966,7 +960,7 @@ def test_proxy_load_config_supports_legacy_aismixer_public_key_as_fallback(tmp_p
 
     config = proxy.load_config(str(config_path))
 
-    assert config["remote_public_key"] == "legacy.pem"
+    assert config["remote_public_key"] == str(tmp_path / "legacy.pem")
 
 
 def test_proxy_load_config_prefers_canonical_key_when_both_names_are_present(tmp_path):
@@ -980,7 +974,47 @@ def test_proxy_load_config_prefers_canonical_key_when_both_names_are_present(tmp
 
     config = proxy.load_config(str(config_path))
 
-    assert config["remote_public_key"] == "canonical.pem"
+    assert config["remote_public_key"] == str(tmp_path / "canonical.pem")
+
+
+def test_proxy_explicit_system_config_keeps_absolute_key_paths(tmp_path):
+    proxy = load_proxy_module()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"station_private_key: {STATION_CANONICAL_PRIVATE_KEY_PATH}\n"
+        f"remote_public_key: {REMOTE_CANONICAL_PUBLIC_KEY_PATH}\n",
+        encoding="utf-8",
+    )
+
+    config = proxy.load_config(str(config_path))
+
+    assert config["station_private_key"] == STATION_CANONICAL_PRIVATE_KEY_PATH
+    assert config["remote_public_key"] == REMOTE_CANONICAL_PUBLIC_KEY_PATH
+
+
+def test_proxy_relative_key_paths_resolve_from_instance_config_directory(
+    monkeypatch,
+    tmp_path,
+):
+    proxy = load_proxy_module()
+    instance_dir = tmp_path / "instances"
+    instance_dir.mkdir()
+    config_path = instance_dir / "boat.yaml"
+    config_path.write_text(
+        "station_private_key: ../keys/station_private.pem\n"
+        "remote_public_key: local/aismixer_public.pem\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path.parent)
+
+    config = proxy.load_config(str(config_path))
+
+    assert config["station_private_key"] == os.path.normpath(
+        str(instance_dir / "../keys/station_private.pem")
+    )
+    assert config["remote_public_key"] == os.path.normpath(
+        str(instance_dir / "local/aismixer_public.pem")
+    )
 
 
 def test_proxy_config_resolution_prefers_cli_path():
