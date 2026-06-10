@@ -1,3 +1,4 @@
+import argparse
 import socket
 import yaml
 import os
@@ -17,6 +18,13 @@ from cryptography.exceptions import InvalidSignature
 HANDSHAKE_PREFIX = b"NMEA-H"
 DATA_PREFIX = b"NMEA-D"
 KEEPALIVE_INTERVAL = 30  # секунди
+CONFIG_ENV_VAR = "NMEA_SPROXY_CONFIG"
+DEFAULT_PROCESS_TITLE = "nmea_sproxy"
+SYSTEM_CONFIG_PATH = "/etc/nmea_sproxy/config.yaml"
+LOCAL_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "config.yaml",
+)
 CANONICAL_STATION_PRIVATE_KEY_PATH = "/etc/nmea_sproxy/keys/station_private.pem"
 LEGACY_STATION_PRIVATE_KEY_PATH = "station_private.key"
 CANONICAL_REMOTE_PUBLIC_KEY_PATH = "/etc/nmea_sproxy/keys/aismixer_public.pem"
@@ -28,8 +36,8 @@ DEFAULT_CONFIG = {
     "remote_host": "192.168.190.53",
     "remote_port": 19999,
     "station_id": "boat_001",
-    "remote_public_key": LEGACY_REMOTE_PUBLIC_KEY_PATH,
-    "station_private_key": LEGACY_STATION_PRIVATE_KEY_PATH,
+    "remote_public_key": CANONICAL_REMOTE_PUBLIC_KEY_PATH,
+    "station_private_key": CANONICAL_STATION_PRIVATE_KEY_PATH,
     "reconnect_delay": 5,
     "log_level": "INFO",
 }
@@ -42,9 +50,19 @@ def resolve_existing_path(candidates):
     return candidates[-1]
 
 
-def apply_default_key_paths(config, user_config=None):
+def apply_default_key_paths(
+    config,
+    user_config=None,
+    *,
+    allow_legacy_fallback=False,
+):
     user_config = user_config or {}
-    if "station_private_key" not in user_config:
+    station_uses_service_default = (
+        user_config.get("station_private_key") == CANONICAL_STATION_PRIVATE_KEY_PATH
+    )
+    if "station_private_key" not in user_config or (
+        allow_legacy_fallback and station_uses_service_default
+    ):
         config["station_private_key"] = resolve_existing_path(
             (
                 CANONICAL_STATION_PRIVATE_KEY_PATH,
@@ -56,7 +74,13 @@ def apply_default_key_paths(config, user_config=None):
         "remote_public_key" in user_config
         or "aismixer_public_key" in user_config
     )
-    if not remote_key_configured:
+    remote_uses_service_default = (
+        user_config.get("remote_public_key") == CANONICAL_REMOTE_PUBLIC_KEY_PATH
+        and "aismixer_public_key" not in user_config
+    )
+    if not remote_key_configured or (
+        allow_legacy_fallback and remote_uses_service_default
+    ):
         config["remote_public_key"] = resolve_existing_path(
             (
                 CANONICAL_REMOTE_PUBLIC_KEY_PATH,
@@ -66,11 +90,27 @@ def apply_default_key_paths(config, user_config=None):
     return config
 
 
-def load_config(path="/etc/nmea_sproxy/config.yaml"):
+def resolve_config_path(cli_path=None, environ=None):
+    if cli_path:
+        return os.fspath(cli_path)
+
+    environ = os.environ if environ is None else environ
+    env_path = environ.get(CONFIG_ENV_VAR)
+    if env_path:
+        return env_path
+
+    for path in (SYSTEM_CONFIG_PATH, LOCAL_CONFIG_PATH):
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_config(path=None):
     config = dict(DEFAULT_CONFIG)
     user_config = None
-    if os.path.exists(path):
-        with open(path, 'r') as f:
+    selected_path = os.fspath(path) if path is not None else resolve_config_path()
+    if selected_path and os.path.exists(selected_path):
+        with open(selected_path, 'r') as f:
             user_config = yaml.safe_load(f)
             if user_config:
                 config.update(user_config)
@@ -79,10 +119,28 @@ def load_config(path="/etc/nmea_sproxy/config.yaml"):
                     and "remote_public_key" not in user_config
                 ):
                     config["remote_public_key"] = user_config["aismixer_public_key"]
+    elif selected_path:
+        print(f"⚠️ Config file not found: {selected_path}. Using defaults.")
     else:
-        print(f"⚠️ Config file not found: {path}. Using defaults.")
-    apply_default_key_paths(config, user_config)
+        print("⚠️ No config file found. Using built-in defaults.")
+    local_config_selected = selected_path is not None and (
+        os.path.normcase(os.path.abspath(selected_path))
+        == os.path.normcase(os.path.abspath(LOCAL_CONFIG_PATH))
+    )
+    apply_default_key_paths(
+        config,
+        user_config,
+        allow_legacy_fallback=local_config_selected,
+    )
     return config
+
+
+def set_process_title(title):
+    try:
+        from setproctitle import setproctitle
+        setproctitle(title)
+    except ImportError:
+        pass
 
 
 def load_private_key(path):
@@ -218,8 +276,36 @@ def forward_loop(udp_sock, out_sock, config, session_key, remote_addr):
             break
 
 
-def main():
-    config = load_config()
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Forward one local AIS UDP input to one encrypted remote secure output."
+        )
+    )
+    parser.add_argument(
+        "--config",
+        help=(
+            "config file path; overrides NMEA_SPROXY_CONFIG and automatic "
+            "system/local config discovery"
+        ),
+    )
+    parser.add_argument(
+        "--process-title",
+        default=DEFAULT_PROCESS_TITLE,
+        help=f"process title shown by system tools (default: {DEFAULT_PROCESS_TITLE})",
+    )
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    set_process_title(args.process_title)
+    config_path = resolve_config_path(args.config)
+    if config_path and not os.path.exists(config_path):
+        print(f"Config file not found: {config_path}", file=sys.stderr)
+        return 1
+
+    config = load_config(config_path)
     private_key = load_private_key(config["station_private_key"])
     server_pubkey = load_public_key(config["remote_public_key"])
     remote_addr = (config["remote_host"], config["remote_port"])
@@ -250,7 +336,6 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except KeyboardInterrupt:
         print("👋 Exit by user.")
-        sys.exit(0)

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import builtins
 import importlib.util
 import io
 import os
@@ -914,6 +915,25 @@ def test_proxy_configured_legacy_station_private_key_still_works(tmp_path):
     assert config["station_private_key"] == "station_private.key"
 
 
+def test_proxy_local_default_config_supports_manual_legacy_keys(monkeypatch):
+    proxy = load_proxy_module()
+    existing_paths = {
+        proxy.LOCAL_CONFIG_PATH,
+        proxy.LEGACY_STATION_PRIVATE_KEY_PATH,
+        proxy.LEGACY_REMOTE_PUBLIC_KEY_PATH,
+    }
+    monkeypatch.setattr(
+        proxy.os.path,
+        "exists",
+        lambda path: os.fspath(path) in existing_paths,
+    )
+
+    config = proxy.load_config(proxy.LOCAL_CONFIG_PATH)
+
+    assert config["station_private_key"] == proxy.LEGACY_STATION_PRIVATE_KEY_PATH
+    assert config["remote_public_key"] == proxy.LEGACY_REMOTE_PUBLIC_KEY_PATH
+
+
 def test_proxy_default_remote_public_key_prefers_canonical_path(monkeypatch, tmp_path):
     proxy = load_proxy_module()
     monkeypatch.setattr(
@@ -963,6 +983,144 @@ def test_proxy_load_config_prefers_canonical_key_when_both_names_are_present(tmp
     assert config["remote_public_key"] == "canonical.pem"
 
 
+def test_proxy_config_resolution_prefers_cli_path():
+    proxy = load_proxy_module()
+
+    assert proxy.resolve_config_path(
+        "cli.yaml",
+        {proxy.CONFIG_ENV_VAR: "environment.yaml"},
+    ) == "cli.yaml"
+
+
+def test_proxy_config_resolution_uses_environment_before_discovery(monkeypatch):
+    proxy = load_proxy_module()
+    monkeypatch.setattr(proxy.os.path, "exists", lambda path: True)
+
+    assert proxy.resolve_config_path(
+        environ={proxy.CONFIG_ENV_VAR: "environment.yaml"},
+    ) == "environment.yaml"
+
+
+def test_proxy_config_resolution_prefers_system_config_over_local(monkeypatch):
+    proxy = load_proxy_module()
+    monkeypatch.setattr(
+        proxy.os.path,
+        "exists",
+        lambda path: path in (proxy.SYSTEM_CONFIG_PATH, proxy.LOCAL_CONFIG_PATH),
+    )
+
+    assert proxy.resolve_config_path(environ={}) == proxy.SYSTEM_CONFIG_PATH
+
+
+def test_proxy_config_resolution_uses_local_config_when_system_missing(monkeypatch):
+    proxy = load_proxy_module()
+    monkeypatch.setattr(
+        proxy.os.path,
+        "exists",
+        lambda path: path == proxy.LOCAL_CONFIG_PATH,
+    )
+
+    assert proxy.resolve_config_path(environ={}) == proxy.LOCAL_CONFIG_PATH
+
+
+def test_proxy_config_resolution_returns_none_for_built_in_defaults(monkeypatch):
+    proxy = load_proxy_module()
+    monkeypatch.setattr(proxy.os.path, "exists", lambda path: False)
+
+    assert proxy.resolve_config_path(environ={}) is None
+
+
+def test_proxy_parser_defaults_process_title():
+    proxy = load_proxy_module()
+
+    args = proxy.build_parser().parse_args([])
+
+    assert args.process_title == "nmea_sproxy"
+
+
+def test_proxy_parser_accepts_custom_process_title():
+    proxy = load_proxy_module()
+
+    args = proxy.build_parser().parse_args(
+        ["--process-title", "nmea_sproxy@balchik_roof"]
+    )
+
+    assert args.process_title == "nmea_sproxy@balchik_roof"
+
+
+def test_proxy_sets_process_title_when_optional_dependency_is_available(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    titles = []
+    fake_module = type(
+        "FakeSetproctitle",
+        (),
+        {"setproctitle": staticmethod(titles.append)},
+    )
+    monkeypatch.setitem(sys.modules, "setproctitle", fake_module)
+
+    proxy.set_process_title("nmea_sproxy@yacht")
+
+    assert titles == ["nmea_sproxy@yacht"]
+
+
+def test_proxy_ignores_missing_optional_setproctitle(monkeypatch):
+    proxy = load_proxy_module()
+    real_import = builtins.__import__
+
+    def import_without_setproctitle(name, *args, **kwargs):
+        if name == "setproctitle":
+            raise ImportError
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_setproctitle)
+
+    proxy.set_process_title("nmea_sproxy")
+
+
+def test_proxy_main_applies_custom_process_title(monkeypatch, tmp_path):
+    proxy = load_proxy_module()
+    missing = tmp_path / "missing.yaml"
+    titles = []
+    monkeypatch.setattr(proxy, "set_process_title", titles.append)
+
+    rc = proxy.main(
+        [
+            "--config",
+            str(missing),
+            "--process-title",
+            "nmea_sproxy@boat",
+        ]
+    )
+
+    assert rc == 1
+    assert titles == ["nmea_sproxy@boat"]
+
+
+def test_proxy_main_rejects_missing_explicit_config(tmp_path, capsys):
+    proxy = load_proxy_module()
+    missing = tmp_path / "missing.yaml"
+
+    rc = proxy.main(["--config", str(missing)])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert f"Config file not found: {missing}" in captured.err
+
+
+def test_proxy_main_rejects_missing_environment_config(monkeypatch, tmp_path, capsys):
+    proxy = load_proxy_module()
+    missing = tmp_path / "missing.yaml"
+    monkeypatch.setenv(proxy.CONFIG_ENV_VAR, str(missing))
+
+    rc = proxy.main([])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert f"Config file not found: {missing}" in captured.err
+
+
 def test_current_secure_udp_key_filename_expectations():
     proxy = load_proxy_module()
 
@@ -975,9 +1133,5 @@ def test_current_secure_udp_key_filename_expectations():
     assert REMOTE_CANONICAL_PUBLIC_KEY_PATH.endswith("aismixer_public.pem")
     assert proxy.CANONICAL_STATION_PRIVATE_KEY_PATH == STATION_CANONICAL_PRIVATE_KEY_PATH
     assert proxy.CANONICAL_REMOTE_PUBLIC_KEY_PATH == REMOTE_CANONICAL_PUBLIC_KEY_PATH
-    assert proxy.DEFAULT_CONFIG["remote_public_key"].endswith(
-        SERVER_PUBLIC_KEY_FOR_PROXY_FILENAME
-    )
-    assert proxy.DEFAULT_CONFIG["station_private_key"].endswith(
-        STATION_PRIVATE_KEY_FILENAME
-    )
+    assert proxy.DEFAULT_CONFIG["remote_public_key"] == REMOTE_CANONICAL_PUBLIC_KEY_PATH
+    assert proxy.DEFAULT_CONFIG["station_private_key"] == STATION_CANONICAL_PRIVATE_KEY_PATH

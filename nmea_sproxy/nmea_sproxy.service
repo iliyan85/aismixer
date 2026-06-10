@@ -1,0 +1,15 @@
+[Unit]
+Description=NMEA secure UDP proxy shovel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nmea_sproxy
+ExecStart=/usr/bin/python3 /opt/nmea_sproxy/nmea_sproxy.py --config /etc/nmea_sproxy/config.yaml --process-title nmea_sproxy
+Restart=always
+RestartSec=5
+SyslogIdentifier=nmea_sproxy
+
+[Install]
+WantedBy=multi-user.target
