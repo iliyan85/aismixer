@@ -18,14 +18,14 @@ HANDSHAKE_PREFIX = b"NMEA-H"
 DATA_PREFIX = b"NMEA-D"
 KEEPALIVE_INTERVAL = 30  # секунди
 CANONICAL_STATION_PRIVATE_KEY_PATH = "/etc/nmea_sproxy/keys/station_private.pem"
-LEGACY_STATION_PRIVATE_KEY_PATH = "nmea_sproxy/station_private.key"
+LEGACY_STATION_PRIVATE_KEY_PATH = "station_private.key"
 CANONICAL_REMOTE_PUBLIC_KEY_PATH = "/etc/nmea_sproxy/keys/aismixer_public.pem"
-LEGACY_REMOTE_PUBLIC_KEY_PATH = "nmea_sproxy/aismixer_public.pem"
+LEGACY_REMOTE_PUBLIC_KEY_PATH = "aismixer_public.pem"
 
 DEFAULT_CONFIG = {
-    "listen_ip": "192.168.190.214",
-    "listen_port": 17778,
-    "remote_host": "127.0.0.1",
+    "listen_ip": "::",
+    "listen_port": 50000,
+    "remote_host": "192.168.190.53",
     "remote_port": 19999,
     "station_id": "boat_001",
     "remote_public_key": LEGACY_REMOTE_PUBLIC_KEY_PATH,

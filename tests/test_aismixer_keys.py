@@ -131,6 +131,114 @@ def test_key_file_permissions_are_set_on_posix(tmp_path):
     assert stat.S_IMODE(result.public_path.stat().st_mode) == 0o644
 
 
+def test_repair_public_creates_missing_public_without_replacing_private(tmp_path):
+    tool = load_key_tool()
+    generated = tool.generate_key_pair(
+        tmp_path,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+    )
+    original_private = generated.private_path.read_bytes()
+    generated.public_path.unlink()
+
+    result = tool.repair_public_key(
+        tmp_path,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+    )
+
+    assert result.repaired is True
+    assert result.private_path.read_bytes() == original_private
+    assert (
+        load_private_key(result.private_path).public_key().public_numbers()
+        == load_public_key(result.public_path).public_numbers()
+    )
+
+
+def test_repair_public_overwrites_only_mismatched_public(tmp_path):
+    tool = load_key_tool()
+    generated = tool.generate_key_pair(
+        tmp_path,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+    )
+    original_private = generated.private_path.read_bytes()
+    other_keys = tmp_path / "other"
+    other = tool.generate_key_pair(
+        other_keys,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+    )
+    generated.public_path.write_bytes(other.public_path.read_bytes())
+
+    result = tool.repair_public_key(
+        tmp_path,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+    )
+
+    assert result.repaired is True
+    assert result.private_path.read_bytes() == original_private
+    assert (
+        load_private_key(result.private_path).public_key().public_numbers()
+        == load_public_key(result.public_path).public_numbers()
+    )
+
+
+def test_repair_public_reports_noop_when_public_matches(tmp_path, capsys):
+    tool = load_key_tool()
+    generated = tool.generate_key_pair(
+        tmp_path,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+    )
+    original_private = generated.private_path.read_bytes()
+    original_public = generated.public_path.read_bytes()
+
+    rc = tool.main(["server", "--keys-dir", str(tmp_path), "--repair-public"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "already matches private key; no repair needed" in captured.out
+    assert generated.private_path.read_bytes() == original_private
+    assert generated.public_path.read_bytes() == original_public
+
+
+def test_repair_public_does_not_generate_missing_private_key(tmp_path, capsys):
+    tool = load_key_tool()
+
+    rc = tool.main(["server", "--keys-dir", str(tmp_path), "--repair-public"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Unable to repair public key" in captured.err
+    assert not (tmp_path / tool.SERVER_PRIVATE_NAME).exists()
+    assert not (tmp_path / tool.SERVER_PUBLIC_NAME).exists()
+
+
+def test_repair_public_key_permissions_are_set_on_posix(tmp_path):
+    if os.name != "posix":
+        pytest.skip("POSIX file modes are not portable on this platform")
+
+    tool = load_key_tool()
+    generated = tool.generate_key_pair(
+        tmp_path,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+    )
+    generated.private_path.chmod(0o644)
+    generated.public_path.chmod(0o600)
+
+    tool.repair_public_key(
+        tmp_path,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+    )
+
+    assert stat.S_IMODE(generated.private_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(generated.public_path.stat().st_mode) == 0o644
+
+
 def test_cli_returns_nonzero_on_unsafe_overwrite(tmp_path, capsys):
     tool = load_key_tool()
     tool.generate_key_pair(
@@ -164,6 +272,36 @@ def test_station_cli_prints_authorized_keys_guidance(tmp_path, capsys):
     assert "authorized_clients:" in captured.out
     assert "name: dock_001" in captured.out
     assert "pubkey:" in captured.out
+
+
+def test_station_repair_prints_authorized_keys_guidance(tmp_path, capsys):
+    tool = load_key_tool()
+    generated = tool.generate_key_pair(
+        tmp_path,
+        tool.STATION_PRIVATE_NAME,
+        tool.STATION_PUBLIC_NAME,
+    )
+    generated.public_path.unlink()
+    private_key = load_private_key(generated.private_path)
+    expected_b64 = tool._compressed_public_b64(private_key.public_key())
+
+    rc = tool.main(
+        [
+            "station",
+            "--keys-dir",
+            str(tmp_path),
+            "--station-id",
+            "dock_001",
+            "--repair-public",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Repaired nmea_sproxy station public key" in captured.out
+    assert "authorized_clients:" in captured.out
+    assert "name: dock_001" in captured.out
+    assert f"pubkey: {expected_b64}" in captured.out
 
 
 def test_station_keys_gen_runs_from_repo_root(tmp_path):
