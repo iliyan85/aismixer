@@ -6,7 +6,7 @@ remote_port: 17777
 station_id: boat_001
 keepalive_interval: 30
 peer_timeout: 90
-session_refresh_interval: 240
+session_refresh_interval: 0
 
 station_private_key: /etc/nmea_sproxy/keys/station_private.pem
 remote_public_key: /etc/nmea_sproxy/keys/aismixer_public.pem

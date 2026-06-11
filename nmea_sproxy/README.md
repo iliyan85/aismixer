@@ -51,13 +51,15 @@ lifecycle settings are:
 ```yaml
 keepalive_interval: 30
 peer_timeout: 90
-session_refresh_interval: 240
+session_refresh_interval: 0
 ```
 
 `keepalive_interval` controls encrypted ping frequency, `peer_timeout`
 reconnects when authenticated replies stop, and `session_refresh_interval`
-proactively creates a new session before the server's current 300-second
-session TTL.
+optionally triggers an immediate planned re-handshake without waiting for
+`reconnect_delay`. The default value `0` disables proactive refresh, leaving
+authenticated ping/pong plus `peer_timeout` as the primary recovery mechanism
+for server restarts, NAT rebinding, and long outages.
 
 ## systemd services
 

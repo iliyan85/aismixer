@@ -815,7 +815,9 @@ def test_proxy_invalidates_session_on_peer_timeout():
     proxy = load_proxy_module()
     config = {"peer_timeout": 90, "session_refresh_interval": 240}
 
-    assert proxy.session_expiration_reason(190, 100, 100, config) == "peer_timeout"
+    assert proxy.session_expiration_reason(
+        190, 100, 100, config
+    ) == proxy.SESSION_END_PEER_TIMEOUT
 
 
 def test_proxy_invalidates_session_on_session_refresh_interval():
@@ -824,7 +826,51 @@ def test_proxy_invalidates_session_on_session_refresh_interval():
 
     assert proxy.session_expiration_reason(
         340, 100, 300, config
-    ) == "session_refresh_interval"
+    ) == proxy.SESSION_END_PLANNED_REFRESH
+
+
+def test_proxy_session_refresh_interval_zero_disables_planned_refresh():
+    proxy = load_proxy_module()
+    config = {"peer_timeout": 90, "session_refresh_interval": 0}
+
+    assert proxy.session_expiration_reason(10000, 100, 9990, config) is None
+
+
+def test_proxy_normal_ping_pong_does_not_trigger_periodic_reconnect():
+    proxy = load_proxy_module()
+    config = {
+        "keepalive_interval": 30,
+        "peer_timeout": 90,
+        "session_refresh_interval": 0,
+    }
+
+    assert proxy.session_expiration_reason(3600, 0, 3595, config) is None
+    assert proxy.session_poll_timeout(3600, 0, 3595, 3595, config) == 25
+
+
+def test_proxy_planned_refresh_does_not_wait_reconnect_delay():
+    proxy = load_proxy_module()
+    config = {"reconnect_delay": 5}
+
+    assert proxy.retry_delay_for_reason(
+        proxy.SESSION_END_PLANNED_REFRESH, config
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "peer_timeout",
+        "nosession",
+        "socket_error",
+        "handshake_failure",
+    ],
+)
+def test_proxy_failure_reasons_wait_before_retry(reason):
+    proxy = load_proxy_module()
+    config = {"reconnect_delay": 5}
+
+    assert proxy.retry_delay_for_reason(reason, config) == 5
 
 
 def _run_idle_proxy_session(monkeypatch, config):
@@ -866,12 +912,12 @@ def test_proxy_forward_loop_exits_on_peer_timeout_without_local_udp(monkeypatch)
 
     proxy, reason, out_sock = _run_idle_proxy_session(monkeypatch, config)
 
-    assert reason == "peer_timeout"
+    assert reason == proxy.SESSION_END_PEER_TIMEOUT
     assert out_sock.sent
     assert all(packet.startswith(proxy.DATA_PREFIX) for packet, _ in out_sock.sent)
 
 
-def test_proxy_forward_loop_exits_on_session_refresh_without_local_udp(monkeypatch):
+def test_proxy_forward_loop_exits_for_planned_refresh_without_local_udp(monkeypatch):
     config = {
         "station_id": "boat_001",
         "keepalive_interval": 30,
@@ -879,9 +925,132 @@ def test_proxy_forward_loop_exits_on_session_refresh_without_local_udp(monkeypat
         "session_refresh_interval": 60,
     }
 
-    _, reason, _ = _run_idle_proxy_session(monkeypatch, config)
+    proxy, reason, _ = _run_idle_proxy_session(monkeypatch, config)
 
-    assert reason == "session_refresh_interval"
+    assert reason == proxy.SESSION_END_PLANNED_REFRESH
+
+
+def test_proxy_forward_loop_exits_on_no_session(monkeypatch):
+    proxy = load_proxy_module()
+    remote_addr = ("192.0.2.10", 17777)
+
+    class FakeLocalSocket:
+        pass
+
+    class FakeOutSocket:
+        def recvfrom(self, size):
+            return b"NOSESSION|boat_001", remote_addr
+
+    udp_sock = FakeLocalSocket()
+    out_sock = FakeOutSocket()
+    monkeypatch.setattr(
+        proxy.select,
+        "select",
+        lambda readable, writable, exceptional, timeout: ([out_sock], [], []),
+    )
+
+    reason = proxy.forward_loop(
+        udp_sock,
+        out_sock,
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 30,
+            "peer_timeout": 90,
+            "session_refresh_interval": 0,
+        },
+        b"\x01" * 32,
+        remote_addr,
+    )
+
+    assert reason == proxy.SESSION_END_NOSESSION
+
+
+def test_proxy_forward_loop_reports_socket_error(monkeypatch):
+    proxy = load_proxy_module()
+    monkeypatch.setattr(
+        proxy.select,
+        "select",
+        lambda *args: (_ for _ in ()).throw(OSError("network unavailable")),
+    )
+
+    reason = proxy.forward_loop(
+        object(),
+        object(),
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 30,
+            "peer_timeout": 90,
+            "session_refresh_interval": 0,
+        },
+        b"\x01" * 32,
+        ("192.0.2.10", 17777),
+    )
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+
+
+def test_proxy_healthy_ping_pong_runs_past_old_refresh_interval(monkeypatch):
+    proxy = load_proxy_module()
+    key = b"\x01" * 32
+    remote_addr = ("192.0.2.10", 17777)
+    clock = [0.0]
+
+    class FakeLocalSocket:
+        pass
+
+    class FakeOutSocket:
+        def __init__(self):
+            self.responses = []
+            self.pong_count = 0
+
+        def sendto(self, data, addr):
+            ping = proxy.decrypt_secure_json_message(data, key)
+            self.responses.append(
+                proxy.encrypt_secure_json_message(
+                    {
+                        "type": "pong",
+                        "seq": ping["seq"],
+                        "timestamp": int(clock[0]),
+                        "source_id": "boat_001",
+                    },
+                    key,
+                )
+            )
+
+        def recvfrom(self, size):
+            self.pong_count += 1
+            return self.responses.pop(0), remote_addr
+
+    udp_sock = FakeLocalSocket()
+    out_sock = FakeOutSocket()
+
+    def fake_select(readable, writable, exceptional, timeout):
+        if out_sock.responses:
+            return [out_sock], [], []
+        if out_sock.pong_count >= 12:
+            raise OSError("end test")
+        clock[0] += timeout
+        return [], [], []
+
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    reason = proxy.forward_loop(
+        udp_sock,
+        out_sock,
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 30,
+            "peer_timeout": 90,
+            "session_refresh_interval": 0,
+        },
+        key,
+        remote_addr,
+    )
+
+    assert clock[0] >= 360
+    assert out_sock.pong_count == 12
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
 
 
 def test_proxy_reconnect_lifecycle_has_no_keepalive_worker():
@@ -1355,7 +1524,7 @@ def test_proxy_lifecycle_config_defaults():
 
     assert proxy.DEFAULT_CONFIG["keepalive_interval"] == 30
     assert proxy.DEFAULT_CONFIG["peer_timeout"] == 90
-    assert proxy.DEFAULT_CONFIG["session_refresh_interval"] == 240
+    assert proxy.DEFAULT_CONFIG["session_refresh_interval"] == 0
 
 
 def test_proxy_explicit_system_config_keeps_absolute_key_paths(tmp_path):
