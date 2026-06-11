@@ -15,6 +15,8 @@ from core.event import IngressEvent
 HANDSHAKE_PREFIX = b"NMEA-H"
 DATA_PREFIX = b"NMEA-D"
 KEEPALIVE_PREFIX = b"KEEPALIVE"
+NOSESSION_PREFIX = b"NOSESSION"
+DATA_AAD = b"NMEA"
 CONTEXT_STRING = b"NMEA-AUTH-v1"
 SESSION_TTL_SECONDS = 300
 HANDSHAKE_REPLAY_TTL_SECONDS = 60
@@ -175,6 +177,28 @@ def parse_keepalive_packet(data):
     except ValueError as e:
         raise ValueError("Invalid keepalive timestamp") from e
     return parts[1].decode(), timestamp
+
+
+def parse_keepalive_station_id(data):
+    parts = data.split(b"|", 2)
+    if len(parts) < 2 or parts[0] != KEEPALIVE_PREFIX or not parts[1]:
+        return None
+    try:
+        return parts[1].decode()
+    except UnicodeDecodeError:
+        return None
+
+
+def build_no_session_hint(station_id=None):
+    if station_id:
+        return NOSESSION_PREFIX + b"|" + station_id.encode()
+    return NOSESSION_PREFIX
+
+
+def encrypt_secure_json_message(aesgcm, message):
+    nonce = os.urandom(12)
+    plaintext = json.dumps(message, separators=(",", ":")).encode()
+    return DATA_PREFIX + nonce + aesgcm.encrypt(nonce, plaintext, DATA_AAD)
 
 
 def create_session(station_id, aesgcm, now):
@@ -344,7 +368,8 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                 print(
                     f"[!] Handshake error from {addr}: {type(e).__name__}: {e}")
 
-        elif data.startswith(KEEPALIVE_PREFIX + b"|"):
+        elif data == KEEPALIVE_PREFIX or data.startswith(KEEPALIVE_PREFIX + b"|"):
+            station_id = parse_keepalive_station_id(data)
             try:
                 station_id, _ = parse_keepalive_packet(data)
                 if handle_keepalive_session(
@@ -354,9 +379,11 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                         print(f"{time.time()} [SECURE] Keepalive from {station_id} @ {addr}")
                 else:
                     print(f"[!] Ignored keepalive from {addr}")
+                    sock.sendto(build_no_session_hint(station_id), addr)
             except Exception as e:
                 print(
                     f"[!] Keepalive error from {addr}: {type(e).__name__}: {e}")
+                sock.sendto(build_no_session_hint(station_id), addr)
 
         elif data.startswith(DATA_PREFIX):
             try:
@@ -364,6 +391,7 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                     sessions, addr, time.time(), SESSION_TTL_SECONDS)
                 if not session:
                     print(f"[!] No session for {addr}")
+                    sock.sendto(build_no_session_hint(), addr)
                     continue
                 station_id = session["station_id"]
                 aesgcm = session["aesgcm"]
@@ -375,11 +403,24 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                     print(f"[!] Duplicate secure data nonce from {addr}")
                     continue
 
-                plaintext = aesgcm.decrypt(nonce, ciphertext, b"NMEA")
+                plaintext = aesgcm.decrypt(nonce, ciphertext, DATA_AAD)
 
                 msg = json.loads(plaintext.decode())
-                if msg["source_id"] != station_id:
+                if msg.get("source_id") != station_id:
                     print(f"[!] source_id mismatch from {addr}")
+                    continue
+
+                message_type = msg.get("type")
+                if message_type == "ping":
+                    if "seq" not in msg:
+                        print(f"[!] Invalid ping from {addr}")
+                        continue
+                elif message_type == "nmea":
+                    if "payload" not in msg:
+                        print(f"[!] Invalid NMEA data from {addr}")
+                        continue
+                else:
+                    print(f"[!] Unknown secure message type from {addr}")
                     continue
 
                 if not mark_data_nonce_seen(
@@ -393,6 +434,16 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                     continue
 
                 touch_session(session, time.time())
+
+                if message_type == "ping":
+                    response = {
+                        "type": "pong",
+                        "seq": msg["seq"],
+                        "timestamp": int(time.time()),
+                        "source_id": station_id,
+                    }
+                    sock.sendto(encrypt_secure_json_message(aesgcm, response), addr)
+                    continue
 
                 if DEBUG:
                     print(

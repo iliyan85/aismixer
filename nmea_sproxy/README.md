@@ -40,7 +40,24 @@ Config resolution order is:
 An explicitly selected CLI or environment config must exist.
 Relative `station_private_key`, `remote_public_key`, and legacy
 `aismixer_public_key` values are resolved relative to the selected config
-file, not the process working directory.
+file, not the process working directory. When a configured canonical
+`station_private.pem` is absent, an existing `station_private.key` beside it
+is still accepted for compatibility.
+
+After a successful handshake, the proxy sends encrypted pings and requires
+authenticated encrypted pongs from the configured remote address. The
+lifecycle settings are:
+
+```yaml
+keepalive_interval: 30
+peer_timeout: 90
+session_refresh_interval: 240
+```
+
+`keepalive_interval` controls encrypted ping frequency, `peer_timeout`
+reconnects when authenticated replies stop, and `session_refresh_interval`
+proactively creates a new session before the server's current 300-second
+session TTL.
 
 ## systemd services
 

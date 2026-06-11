@@ -5,6 +5,9 @@ listen_port: 50000
 remote_host: 192.0.2.10
 remote_port: 17777
 station_id: boat_001
+keepalive_interval: 30
+peer_timeout: 90
+session_refresh_interval: 240
 
-station_private_key: station_private.key
+station_private_key: station_private.pem
 remote_public_key: aismixer_public.pem

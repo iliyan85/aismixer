@@ -6,18 +6,23 @@ import time
 import base64
 import sys
 import json
-import threading
+import select
 from meta_cleaner import extract_nmea_sentences
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidSignature
 
 
 # Константи
 HANDSHAKE_PREFIX = b"NMEA-H"
 DATA_PREFIX = b"NMEA-D"
-KEEPALIVE_INTERVAL = 30  # секунди
+NOSESSION_PREFIX = b"NOSESSION"
+DATA_AAD = b"NMEA"
+SERVER_PACKET_IGNORED = "ignored"
+SERVER_PACKET_AUTHENTICATED = "authenticated"
+SERVER_PACKET_NO_SESSION = "no_session"
 CONFIG_ENV_VAR = "NMEA_SPROXY_CONFIG"
 DEFAULT_PROCESS_TITLE = "nmea_sproxy"
 SYSTEM_CONFIG_PATH = "/etc/nmea_sproxy/config.yaml"
@@ -39,6 +44,9 @@ DEFAULT_CONFIG = {
     "remote_public_key": CANONICAL_REMOTE_PUBLIC_KEY_PATH,
     "station_private_key": CANONICAL_STATION_PRIVATE_KEY_PATH,
     "reconnect_delay": 5,
+    "keepalive_interval": 30,
+    "peer_timeout": 90,
+    "session_refresh_interval": 240,
     "log_level": "INFO",
 }
 
@@ -89,6 +97,17 @@ def resolve_configured_key_paths(config, user_config, config_path):
         path = os.fspath(config[key])
         if not os.path.isabs(path) and not path.startswith("/"):
             config[key] = os.path.normpath(os.path.join(config_dir, path))
+
+    station_path = os.fspath(config["station_private_key"])
+    if (
+        os.path.basename(station_path) == "station_private.pem"
+        and not os.path.exists(station_path)
+    ):
+        legacy_path = os.path.join(
+            os.path.dirname(station_path), LEGACY_STATION_PRIVATE_KEY_PATH
+        )
+        if os.path.exists(legacy_path):
+            config["station_private_key"] = legacy_path
     return config
 
 
@@ -189,17 +208,97 @@ def encrypt_message_aes_gcm(plaintext, key):
         algorithms.AES(key),
         modes.GCM(iv)
     ).encryptor()
-    encryptor.authenticate_additional_data(b"NMEA")
+    encryptor.authenticate_additional_data(DATA_AAD)
     ciphertext = encryptor.update(plaintext) + encryptor.finalize()
     return iv + ciphertext + encryptor.tag
 
 
-def send_keepalive_loop(sock, remote_addr, station_id):
-    while True:
-        time.sleep(KEEPALIVE_INTERVAL)
-        timestamp = int(time.time())
-        message = f"KEEPALIVE|{station_id}|{timestamp}".encode()
-        sock.sendto(message, remote_addr)
+def decrypt_secure_json_message(data, key):
+    min_len = len(DATA_PREFIX) + 12 + 16
+    if not data.startswith(DATA_PREFIX) or len(data) < min_len:
+        raise ValueError("Invalid secure server packet")
+    nonce = data[len(DATA_PREFIX):len(DATA_PREFIX)+12]
+    ciphertext = data[len(DATA_PREFIX)+12:]
+    plaintext = AESGCM(key).decrypt(nonce, ciphertext, DATA_AAD)
+    return json.loads(plaintext.decode())
+
+
+def encrypt_secure_json_message(message, key):
+    plaintext = json.dumps(message, separators=(",", ":")).encode()
+    return DATA_PREFIX + encrypt_message_aes_gcm(plaintext, key)
+
+
+def remote_addresses_match(addr, remote_addr):
+    return (
+        isinstance(addr, tuple)
+        and isinstance(remote_addr, tuple)
+        and len(addr) >= 2
+        and len(remote_addr) >= 2
+        and addr[0] == remote_addr[0]
+        and addr[1] == remote_addr[1]
+    )
+
+
+def resolve_remote_addr(host, port, family):
+    addresses = socket.getaddrinfo(host, port, family, socket.SOCK_DGRAM)
+    if not addresses:
+        raise OSError(f"Could not resolve remote address: {host}:{port}")
+    return addresses[0][4]
+
+
+def is_no_session_hint(data):
+    return data == NOSESSION_PREFIX or data.startswith(NOSESSION_PREFIX + b"|")
+
+
+def handle_server_packet(
+    data,
+    addr,
+    remote_addr,
+    session_key,
+    station_id,
+    expected_ping_seq,
+):
+    if not remote_addresses_match(addr, remote_addr):
+        return SERVER_PACKET_IGNORED
+
+    if is_no_session_hint(data):
+        return SERVER_PACKET_NO_SESSION
+
+    try:
+        message = decrypt_secure_json_message(data, session_key)
+    except Exception:
+        return SERVER_PACKET_IGNORED
+
+    if (
+        message.get("type") == "pong"
+        and message.get("source_id") == station_id
+        and message.get("seq") == expected_ping_seq
+    ):
+        return SERVER_PACKET_AUTHENTICATED
+    return SERVER_PACKET_IGNORED
+
+
+def session_expiration_reason(
+    now,
+    session_started_at,
+    last_authenticated_peer,
+    config,
+):
+    if now - last_authenticated_peer >= float(config["peer_timeout"]):
+        return "peer_timeout"
+    if now - session_started_at >= float(config["session_refresh_interval"]):
+        return "session_refresh_interval"
+    return None
+
+
+def send_ping(sock, remote_addr, session_key, station_id, seq):
+    message = {
+        "type": "ping",
+        "seq": seq,
+        "timestamp": int(time.time()),
+        "source_id": station_id,
+    }
+    sock.sendto(encrypt_secure_json_message(message, session_key), remote_addr)
 
 
 def perform_handshake(sock, config, private_key, server_pubkey, remote_addr):
@@ -213,62 +312,169 @@ def perform_handshake(sock, config, private_key, server_pubkey, remote_addr):
         str(timestamp).encode(),
         base64.b64encode(signature),
     ])
-    sock.sendto(packet, remote_addr)
+    try:
+        sock.sendto(packet, remote_addr)
+    except OSError as e:
+        print(f"❌ Handshake send error: {e}")
+        return None
+
+    gettimeout = getattr(sock, "gettimeout", None)
+    settimeout = getattr(sock, "settimeout", None)
+    original_timeout = gettimeout() if gettimeout else 5.0
+    handshake_timeout = (
+        5.0 if original_timeout is None else max(float(original_timeout), 0.1)
+    )
+    deadline = time.monotonic() + handshake_timeout
 
     try:
-        response, _ = sock.recvfrom(2048)
-    except socket.timeout:
-        print("⚠️ No response from server during handshake.")
-        return None
-    except ConnectionResetError as e:
-        print(f"❌ Connection reset by peer (likely no listener yet): {e}")
-        return None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("⚠️ No response from server during handshake.")
+                return None
+            if settimeout:
+                settimeout(remaining)
 
-    if not response.startswith(b"OK|"):
-        print(f"⚠️ Handshake failed: {response.decode(errors='ignore')}")
-        return None
+            try:
+                response, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                print("⚠️ No response from server during handshake.")
+                return None
+            except ConnectionResetError as e:
+                print(f"❌ Connection reset by peer (likely no listener yet): {e}")
+                return None
+            except OSError as e:
+                print(f"❌ Handshake receive error: {e}")
+                return None
 
-    try:
-        _, server_sig_b64 = response.split(b"|", 1)
-        server_signature = base64.b64decode(server_sig_b64)
-    except Exception as e:
-        print(f"⚠️ Invalid handshake response format: {e}")
-        return None
+            if not remote_addresses_match(addr, remote_addr):
+                continue
+            if not response.startswith(b"OK|"):
+                print(
+                    f"⚠️ Ignored handshake response: "
+                    f"{response.decode(errors='ignore')}"
+                )
+                continue
 
-    if not verify_signature(payload, server_signature, server_pubkey):
-        print("❌ Server signature verification failed.")
-        return None
+            try:
+                _, server_sig_b64 = response.split(b"|", 1)
+                server_signature = base64.b64decode(server_sig_b64)
+            except Exception as e:
+                print(f"⚠️ Invalid handshake response format: {e}")
+                continue
 
-    shared_secret = private_key.exchange(ec.ECDH(), server_pubkey)
-    session_key = derive_session_key(
-        shared_secret, signature, server_signature)
-    print(f"✅ Mutual handshake OK. Session hash: {session_key.hex()[:16]}...")
-    return session_key
+            if not verify_signature(payload, server_signature, server_pubkey):
+                print("❌ Server signature verification failed.")
+                continue
+
+            shared_secret = private_key.exchange(ec.ECDH(), server_pubkey)
+            session_key = derive_session_key(
+                shared_secret, signature, server_signature)
+            print(
+                f"✅ Mutual handshake OK. "
+                f"Session hash: {session_key.hex()[:16]}..."
+            )
+            return session_key
+    finally:
+        if settimeout:
+            settimeout(original_timeout)
 
 
 def forward_loop(udp_sock, out_sock, config, session_key, remote_addr):
+    session_started_at = time.monotonic()
+    last_authenticated_peer = session_started_at
+    last_ping_at = session_started_at
+    expected_ping_seq = None
+    next_ping_seq = 1
+
     while True:
+        now = time.monotonic()
+        expiration_reason = session_expiration_reason(
+            now, session_started_at, last_authenticated_peer, config
+        )
+        if expiration_reason:
+            print(f"Secure session invalidated: {expiration_reason}")
+            return expiration_reason
+
+        keepalive_interval = float(config["keepalive_interval"])
+        deadlines = (
+            last_ping_at + keepalive_interval,
+            last_authenticated_peer + float(config["peer_timeout"]),
+            session_started_at + float(config["session_refresh_interval"]),
+        )
+        poll_timeout = max(0.0, min(deadlines) - now)
+
         try:
-            data, _ = udp_sock.recvfrom(4096)
-            for clean_line in extract_nmea_sentences(data.decode(errors="replace").strip()):
-                if not clean_line:
-                    continue
-
-                json_obj = {
-                    "type": "nmea",
-                    #"payload": data.decode(errors="replace").strip(),
-                    "payload": clean_line,
-                    "timestamp": int(time.time()),
-                    "source_id": config["station_id"]
-                }
-                plaintext = json.dumps(json_obj).encode()
-                encrypted = encrypt_message_aes_gcm(plaintext, session_key)
-                print(clean_line)
-                out_sock.sendto(DATA_PREFIX + encrypted, remote_addr)
-
+            readable, _, _ = select.select(
+                [udp_sock, out_sock], [], [], poll_timeout
+            )
         except Exception as e:
             print(f"❌ Forwarding error: {e}")
-            break
+            return "forwarding_error"
+
+        if out_sock in readable:
+            try:
+                response, addr = out_sock.recvfrom(8192)
+            except Exception as e:
+                print(f"❌ Secure peer receive error: {e}")
+                return "forwarding_error"
+
+            result = handle_server_packet(
+                response,
+                addr,
+                remote_addr,
+                session_key,
+                config["station_id"],
+                expected_ping_seq,
+            )
+            if result == SERVER_PACKET_NO_SESSION:
+                print("Secure server reported NOSESSION.")
+                return SERVER_PACKET_NO_SESSION
+            if result == SERVER_PACKET_AUTHENTICATED:
+                last_authenticated_peer = time.monotonic()
+                expected_ping_seq = None
+
+        if udp_sock in readable:
+            try:
+                data, _ = udp_sock.recvfrom(4096)
+                clean_lines = extract_nmea_sentences(
+                    data.decode(errors="replace").strip()
+                )
+                for clean_line in clean_lines:
+                    if not clean_line:
+                        continue
+
+                    json_obj = {
+                        "type": "nmea",
+                        "payload": clean_line,
+                        "timestamp": int(time.time()),
+                        "source_id": config["station_id"],
+                    }
+                    print(clean_line)
+                    out_sock.sendto(
+                        encrypt_secure_json_message(json_obj, session_key),
+                        remote_addr,
+                    )
+            except Exception as e:
+                print(f"❌ Forwarding error: {e}")
+                return "forwarding_error"
+
+        now = time.monotonic()
+        if now - last_ping_at >= keepalive_interval:
+            try:
+                send_ping(
+                    out_sock,
+                    remote_addr,
+                    session_key,
+                    config["station_id"],
+                    next_ping_seq,
+                )
+            except Exception as e:
+                print(f"❌ Secure ping error: {e}")
+                return "forwarding_error"
+            expected_ping_seq = next_ping_seq
+            next_ping_seq += 1
+            last_ping_at = now
 
 
 def build_parser():
@@ -303,10 +509,12 @@ def main(argv=None):
     config = load_config(config_path)
     private_key = load_private_key(config["station_private_key"])
     server_pubkey = load_public_key(config["remote_public_key"])
-    remote_addr = (config["remote_host"], config["remote_port"])
 
     udp_family = socket.AF_INET6 if ':' in config["listen_ip"] else socket.AF_INET
     out_family = socket.AF_INET6 if ':' in config["remote_host"] else socket.AF_INET
+    remote_addr = resolve_remote_addr(
+        config["remote_host"], config["remote_port"], out_family
+    )
 
     udp_sock = socket.socket(udp_family, socket.SOCK_DGRAM)
     udp_sock.bind((config["listen_ip"], config["listen_port"]))
@@ -322,8 +530,6 @@ def main(argv=None):
         session_key = perform_handshake(
             out_sock, config, private_key, server_pubkey, remote_addr)
         if session_key:
-            threading.Thread(target=send_keepalive_loop, args=(
-                out_sock, remote_addr, config["station_id"]), daemon=True).start()
             forward_loop(udp_sock, out_sock, config, session_key, remote_addr)
         print(f"🔁 Retrying in {config['reconnect_delay']} seconds...")
         time.sleep(config["reconnect_delay"])

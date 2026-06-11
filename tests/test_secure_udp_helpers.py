@@ -360,6 +360,12 @@ def _encrypted_data_packet(
     return secure.DATA_PREFIX + nonce + ciphertext
 
 
+def _encrypted_control_packet(secure, key, nonce, message):
+    plaintext = secure.json.dumps(message).encode()
+    ciphertext = secure.AESGCM(key).encrypt(nonce, plaintext, secure.DATA_AAD)
+    return secure.DATA_PREFIX + nonce + ciphertext
+
+
 def _run_secure_server_with_packets(monkeypatch, secure, packets, now=1010.0):
     fake_socket = _FakeSecureSocket()
     fake_loop = _FakeSecureLoop(packets)
@@ -400,6 +406,90 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
     assert fake_socket.sent[0][1] == addr
     assert secure.sessions[addr]["station_id"] == station_id
     assert len(secure.handshake_replay_cache) == 1
+
+
+def test_secure_server_sends_no_session_for_data_without_session(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr = ("127.0.0.1", 50123)
+    packet = secure.DATA_PREFIX + (b"\x00" * 28)
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch, secure, [(packet, addr)]
+    )
+
+    assert fake_queue.items == []
+    assert fake_socket.sent == [(secure.NOSESSION_PREFIX, addr)]
+
+
+def test_secure_server_sends_station_no_session_for_keepalive_without_session(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr = ("127.0.0.1", 50123)
+    packet = b"KEEPALIVE|boat_001|1000"
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch, secure, [(packet, addr)]
+    )
+
+    assert fake_queue.items == []
+    assert fake_socket.sent == [(b"NOSESSION|boat_001", addr)]
+    assert secure.sessions == {}
+
+
+def test_secure_server_sends_bare_no_session_for_unparseable_keepalive(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr = ("127.0.0.1", 50123)
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch, secure, [(b"KEEPALIVE", addr)]
+    )
+
+    assert fake_queue.items == []
+    assert fake_socket.sent == [(secure.NOSESSION_PREFIX, addr)]
+
+
+def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    secure.sessions[addr] = secure.create_session(
+        "boat_001", secure.AESGCM(key), now=1000.0
+    )
+    packet = _encrypted_control_packet(
+        secure,
+        key,
+        nonce,
+        {
+            "type": "ping",
+            "seq": 123,
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+    )
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch, secure, [(packet, addr)]
+    )
+
+    assert fake_queue.items == []
+    assert len(fake_socket.sent) == 1
+    response, response_addr = fake_socket.sent[0]
+    response_nonce, ciphertext = secure.parse_secure_data_packet(response)
+    pong = secure.json.loads(
+        secure.AESGCM(key).decrypt(
+            response_nonce, ciphertext, secure.DATA_AAD
+        ).decode()
+    )
+    assert response_addr == addr
+    assert pong == {
+        "type": "pong",
+        "seq": 123,
+        "timestamp": 1010,
+        "source_id": "boat_001",
+    }
+    assert secure.sessions[addr]["last_seen"] == 1010.0
 
 
 def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
@@ -545,6 +635,260 @@ def test_proxy_encrypt_message_aes_gcm_uses_12_byte_nonce_and_nmea_aad():
 
     assert len(nonce) == 12
     assert AESGCM(key).decrypt(nonce, ciphertext_and_tag, b"NMEA") == plaintext
+
+
+def test_proxy_treats_no_session_from_configured_remote_as_invalidation():
+    proxy = load_proxy_module()
+    remote_addr = ("192.0.2.10", 17777)
+
+    assert proxy.handle_server_packet(
+        b"NOSESSION|boat_001",
+        remote_addr,
+        remote_addr,
+        b"\x01" * 32,
+        "boat_001",
+        1,
+    ) == proxy.SERVER_PACKET_NO_SESSION
+
+
+def test_proxy_ignores_no_session_from_unexpected_address():
+    proxy = load_proxy_module()
+
+    assert proxy.handle_server_packet(
+        b"NOSESSION|boat_001",
+        ("192.0.2.11", 17777),
+        ("192.0.2.10", 17777),
+        b"\x01" * 32,
+        "boat_001",
+        1,
+    ) == proxy.SERVER_PACKET_IGNORED
+
+
+def test_proxy_resolves_configured_remote_for_address_filtering(monkeypatch):
+    proxy = load_proxy_module()
+    resolved = ("192.0.2.10", 17777)
+    monkeypatch.setattr(
+        proxy.socket,
+        "getaddrinfo",
+        lambda *args: [
+            (
+                proxy.socket.AF_INET,
+                proxy.socket.SOCK_DGRAM,
+                17,
+                "",
+                resolved,
+            )
+        ],
+    )
+
+    assert proxy.resolve_remote_addr(
+        "mixer.example", 17777, proxy.socket.AF_INET
+    ) == resolved
+
+
+def test_proxy_accepts_only_authenticated_matching_pong_as_liveness():
+    proxy = load_proxy_module()
+    key = b"\x01" * 32
+    remote_addr = ("192.0.2.10", 17777)
+    packet = proxy.encrypt_secure_json_message(
+        {
+            "type": "pong",
+            "seq": 123,
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+        key,
+    )
+
+    assert proxy.handle_server_packet(
+        packet, remote_addr, remote_addr, key, "boat_001", 123
+    ) == proxy.SERVER_PACKET_AUTHENTICATED
+    assert proxy.handle_server_packet(
+        b"PONG|123", remote_addr, remote_addr, key, "boat_001", 123
+    ) == proxy.SERVER_PACKET_IGNORED
+    assert proxy.handle_server_packet(
+        packet, remote_addr, remote_addr, key, "boat_001", 124
+    ) == proxy.SERVER_PACKET_IGNORED
+
+
+class _FakeHandshakeSocket:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.sent = []
+        self.timeout = 5.0
+
+    def sendto(self, data, addr):
+        self.sent.append((data, addr))
+
+    def recvfrom(self, size):
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def gettimeout(self):
+        return self.timeout
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+
+def test_proxy_handshake_succeeds_after_stale_no_session_hint(monkeypatch):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    station_id = "boat_001"
+    remote_addr = ("192.0.2.10", 17777)
+    client_private_key = ec.generate_private_key(ec.SECP256R1())
+    server_private_key = ec.generate_private_key(ec.SECP256R1())
+    server_public_key = server_private_key.public_key()
+    payload = (
+        proxy.HANDSHAKE_PREFIX
+        + station_id.encode()
+        + timestamp.to_bytes(8, "big")
+    )
+    server_signature = proxy.sign_message(payload, server_private_key)
+    sock = _FakeHandshakeSocket([
+        (b"NOSESSION|boat_001", remote_addr),
+        (b"OK|" + base64.b64encode(server_signature), remote_addr),
+    ])
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+
+    session_key = proxy.perform_handshake(
+        sock,
+        {"station_id": station_id},
+        client_private_key,
+        server_public_key,
+        remote_addr,
+    )
+
+    client_signature = base64.b64decode(sock.sent[0][0].split(b"|")[3])
+    shared_secret = client_private_key.exchange(ec.ECDH(), server_public_key)
+    assert session_key == proxy.derive_session_key(
+        shared_secret, client_signature, server_signature
+    )
+    assert sock.timeout == 5.0
+
+
+def test_proxy_handshake_timeout_returns_to_retry_loop(monkeypatch):
+    proxy = load_proxy_module()
+    client_private_key = ec.generate_private_key(ec.SECP256R1())
+    server_public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
+    sock = _FakeHandshakeSocket([proxy.socket.timeout()])
+    monkeypatch.setattr(proxy.time, "time", lambda: 1000)
+
+    session_key = proxy.perform_handshake(
+        sock,
+        {"station_id": "boat_001"},
+        client_private_key,
+        server_public_key,
+        ("192.0.2.10", 17777),
+    )
+
+    assert session_key is None
+    assert len(sock.sent) == 1
+    assert sock.timeout == 5.0
+
+
+def test_proxy_handshake_socket_error_returns_to_retry_loop(monkeypatch):
+    proxy = load_proxy_module()
+    client_private_key = ec.generate_private_key(ec.SECP256R1())
+    server_public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
+
+    class FailingSocket:
+        def sendto(self, data, addr):
+            raise OSError("network unavailable")
+
+    monkeypatch.setattr(proxy.time, "time", lambda: 1000)
+
+    session_key = proxy.perform_handshake(
+        FailingSocket(),
+        {"station_id": "boat_001"},
+        client_private_key,
+        server_public_key,
+        ("192.0.2.10", 17777),
+    )
+
+    assert session_key is None
+
+
+def test_proxy_invalidates_session_on_peer_timeout():
+    proxy = load_proxy_module()
+    config = {"peer_timeout": 90, "session_refresh_interval": 240}
+
+    assert proxy.session_expiration_reason(190, 100, 100, config) == "peer_timeout"
+
+
+def test_proxy_invalidates_session_on_session_refresh_interval():
+    proxy = load_proxy_module()
+    config = {"peer_timeout": 1000, "session_refresh_interval": 240}
+
+    assert proxy.session_expiration_reason(
+        340, 100, 300, config
+    ) == "session_refresh_interval"
+
+
+def _run_idle_proxy_session(monkeypatch, config):
+    proxy = load_proxy_module()
+    clock = [0.0]
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        def sendto(self, data, addr):
+            self.sent.append((data, addr))
+
+    def fake_select(readable, writable, exceptional, timeout):
+        clock[0] += timeout
+        return [], [], []
+
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+    udp_sock = FakeSocket()
+    out_sock = FakeSocket()
+    reason = proxy.forward_loop(
+        udp_sock,
+        out_sock,
+        config,
+        b"\x01" * 32,
+        ("192.0.2.10", 17777),
+    )
+    return proxy, reason, out_sock
+
+
+def test_proxy_forward_loop_exits_on_peer_timeout_without_local_udp(monkeypatch):
+    config = {
+        "station_id": "boat_001",
+        "keepalive_interval": 30,
+        "peer_timeout": 90,
+        "session_refresh_interval": 240,
+    }
+
+    proxy, reason, out_sock = _run_idle_proxy_session(monkeypatch, config)
+
+    assert reason == "peer_timeout"
+    assert out_sock.sent
+    assert all(packet.startswith(proxy.DATA_PREFIX) for packet, _ in out_sock.sent)
+
+
+def test_proxy_forward_loop_exits_on_session_refresh_without_local_udp(monkeypatch):
+    config = {
+        "station_id": "boat_001",
+        "keepalive_interval": 30,
+        "peer_timeout": 1000,
+        "session_refresh_interval": 60,
+    }
+
+    _, reason, _ = _run_idle_proxy_session(monkeypatch, config)
+
+    assert reason == "session_refresh_interval"
+
+
+def test_proxy_reconnect_lifecycle_has_no_keepalive_worker():
+    proxy = load_proxy_module()
+
+    assert not hasattr(proxy, "send_keepalive_loop")
+    assert not hasattr(proxy, "threading")
 
 
 def test_secure_data_packet_parser_rejects_packet_without_data_prefix(monkeypatch):
@@ -915,14 +1259,43 @@ def test_proxy_configured_legacy_station_private_key_still_works(tmp_path):
     assert config["station_private_key"] == str(tmp_path / "station_private.key")
 
 
+def test_proxy_canonical_station_private_key_falls_back_to_legacy_sibling(
+    monkeypatch,
+    tmp_path,
+):
+    proxy = load_proxy_module()
+    config_path = tmp_path / "config.yaml"
+    canonical_path = tmp_path / "station_private.pem"
+    legacy_path = tmp_path / "station_private.key"
+    config_path.write_text(
+        "station_private_key: station_private.pem\n",
+        encoding="utf-8",
+    )
+    real_exists = proxy.os.path.exists
+    monkeypatch.setattr(
+        proxy.os.path,
+        "exists",
+        lambda path: (
+            os.path.normpath(os.fspath(path)) == os.path.normpath(str(legacy_path))
+            or real_exists(path)
+        ),
+    )
+
+    config = proxy.load_config(str(config_path))
+
+    assert not canonical_path.exists()
+    assert config["station_private_key"] == str(legacy_path)
+
+
 def test_proxy_manual_local_config_resolves_local_key_paths():
     proxy = load_proxy_module()
 
     config = proxy.load_config(proxy.LOCAL_CONFIG_PATH)
 
-    assert config["station_private_key"] == str(
-        NMEA_SPROXY_DIR / "station_private.pem"
-    )
+    canonical_path = NMEA_SPROXY_DIR / "station_private.pem"
+    legacy_path = NMEA_SPROXY_DIR / "station_private.key"
+    expected_station_path = legacy_path if legacy_path.exists() else canonical_path
+    assert config["station_private_key"] == str(expected_station_path)
     assert config["remote_public_key"] == str(
         NMEA_SPROXY_DIR / "aismixer_public.pem"
     )
@@ -975,6 +1348,14 @@ def test_proxy_load_config_prefers_canonical_key_when_both_names_are_present(tmp
     config = proxy.load_config(str(config_path))
 
     assert config["remote_public_key"] == str(tmp_path / "canonical.pem")
+
+
+def test_proxy_lifecycle_config_defaults():
+    proxy = load_proxy_module()
+
+    assert proxy.DEFAULT_CONFIG["keepalive_interval"] == 30
+    assert proxy.DEFAULT_CONFIG["peer_timeout"] == 90
+    assert proxy.DEFAULT_CONFIG["session_refresh_interval"] == 240
 
 
 def test_proxy_explicit_system_config_keeps_absolute_key_paths(tmp_path):
