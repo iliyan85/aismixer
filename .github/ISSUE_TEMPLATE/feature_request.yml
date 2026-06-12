@@ -1,0 +1,51 @@
+name: Feature request
+description: Suggest a practical improvement to aismixer or nmea_sproxy
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the operational use case first. Focused proposals with clear compatibility impact are easiest to review.
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: What problem or operational need would this feature address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_behavior
+    attributes:
+      label: Proposed behavior
+      description: Describe how the feature should work from an operator or downstream consumer perspective.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe existing workarounds or alternative approaches.
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      description: Note effects on configs, protocols, TAG behavior, existing deployments, or downstream consumers.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I checked for an existing issue covering this request.
+          required: true
+        - label: This request does not include private keys or sensitive operational details.
+          required: true
+

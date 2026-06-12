@@ -1,0 +1,93 @@
+name: Bug report
+description: Report a reproducible problem with aismixer or nmea_sproxy
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Remove private keys and sanitize configs, logs, IP addresses, station IDs, and AIS data before submitting.
+
+  - type: input
+    id: version
+    attributes:
+      label: aismixer version or commit
+      description: Provide a release version, branch and commit, or commit SHA.
+      placeholder: "main at abc1234"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: OS and Python version
+      placeholder: "Debian 12, Python 3.11.8"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: input_type
+    attributes:
+      label: Input type
+      description: Select the input path most closely related to the problem.
+      options:
+        - UDP
+        - secure UDP
+        - nmea_sproxy
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: sanitized_config
+    attributes:
+      label: Sanitized configuration
+      description: Remove private keys, credentials, public IPs, and sensitive station details.
+      render: yaml
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Include relevant logs with secrets and sensitive operational details removed.
+      render: text
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reliable sequence that demonstrates the problem.
+      placeholder: |
+        1. Start aismixer with ...
+        2. Send ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I removed private keys, credentials, and sensitive station or network details.
+          required: true
+        - label: This is not a security vulnerability that should be reported privately.
+          required: true
+
