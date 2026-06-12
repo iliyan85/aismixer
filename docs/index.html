@@ -34,11 +34,6 @@
   <link rel="apple-touch-icon" href="assets/img/apple-touch-icon.png">
   <link rel="manifest" href="site.webmanifest">
 
-  <!-- Language alternates -->
-  <link rel="alternate" hreflang="en" href="https://aismixer.net/">
-  <link rel="alternate" hreflang="bg" href="https://aismixer.net/#bg">
-  <link rel="alternate" hreflang="x-default" href="https://aismixer.net/">
-
   <link rel="preload" href="assets/css/styles.css" as="style">
   <link rel="stylesheet" href="assets/css/styles.css">
 
@@ -87,10 +82,10 @@
         <h1 class="only-en" data-lang="en">AISMixer — merge, deduplicate &amp; forward AIS NMEA streams</h1>
         <h1 class="only-bg" data-lang="bg">AISMixer — обединяване, дедупликация и форуърд на AIS NMEA потоци</h1>
         <p class="lead only-en" data-lang="en">
-          Ingest multiple AIS receivers &amp; apps, remove duplicates, normalize or add meta headers, and forward a clean unified NMEA stream to platforms like AISHUB / MarineTraffic / VesselFinder — with planned secure station‑to‑mixer encryption and multi‑user isolation.
+          Ingest multiple AIS receivers &amp; apps, remove duplicates, normalize or add meta headers, and forward a clean unified NMEA stream to platforms like AISHUB / MarineTraffic / VesselFinder. Stations can use <span class="kbd">nmea_sproxy</span> for an authenticated, encrypted, NAT‑friendly secure UDP path to AISMixer.
         </p>
         <p class="lead only-bg" data-lang="bg">
-          Приема потоци от няколко AIS приемника/софтуера, премахва дубликати, нормализира или добавя мета хедъри и изпраща чист обединен NMEA поток към платформи като AISHUB / MarineTraffic / VesselFinder — с планирана криптирана връзка станция→мултиплексор и изолация по потребители.
+          Приема потоци от няколко AIS приемника/софтуера, премахва дубликати, нормализира или добавя мета хедъри и изпраща чист обединен NMEA поток към платформи като AISHUB / MarineTraffic / VesselFinder. Станциите могат да използват <span class="kbd">nmea_sproxy</span> за автентикирана, криптирана и удобна за NAT secure UDP връзка към AISMixer.
         </p>
         <div class="cta">
           <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">⭐ Star on GitHub</a>
@@ -108,7 +103,9 @@
           <li>Deduplication and meta‑header cleaning/rewriting</li>
           <li>Configurable <span class="kbd">c</span>-tag time policy (preserve vs server time)</li>
           <li>Forward to multiple targets (per user / per station)</li>
-          <li>Planned end‑to‑end signed handshake (ECDSA), anti‑replay</li>
+          <li><span class="kbd">AISMixer</span> mixes, deduplicates, manages tags, and forwards</li>
+          <li><span class="kbd">nmea_sproxy</span> securely shovels one local UDP input to one SEC input</li>
+          <li>ECDSA authentication, AES‑GCM data, encrypted ping/pong, and reconnect recovery</li>
         </ul>
         <ul class="list only-bg" data-lang="bg">
           <li>UDP вход от множество AIS приложения/устройства</li>
@@ -116,7 +113,9 @@
           <li>Дедупликация и почистване/пренаписване на мета хедъри</li>
           <li>Политика за времевия <span class="kbd">c</span>-таг (запазване vs време на сървъра)</li>
           <li>Форуърд към няколко дестинации (по потребител/станция)</li>
-          <li>Планиран подписан handshake (ECDSA), защита от повторение</li>
+          <li><span class="kbd">AISMixer</span> смесва, дедупликира, управлява тагове и препраща</li>
+          <li><span class="kbd">nmea_sproxy</span> препраща сигурно един локален UDP вход към един SEC вход</li>
+          <li>ECDSA автентикация, AES‑GCM данни, криптиран ping/pong и възстановяване на връзката</li>
         </ul>
       </div>
     </div>
@@ -147,9 +146,10 @@
         </div>
         <div class="card">
           <div class="icons">🛡️</div>
-          <h3>Security by design (planned)</h3>
-          <p class="only-en" data-lang="en">Signed handshake with ECDSA, prefixed context ("NMEA-AUTH-v1"), final hash, and anti‑replay (nonce/timestamp).</p>
-          <p class="only-bg" data-lang="bg">Подписан handshake с ECDSA, префикс за контекст ("NMEA-AUTH-v1"), финален хеш и anti‑replay (nonce/timestamp).</p>
+          <h3 class="only-en" data-lang="en">Implemented secure transport</h3>
+          <h3 class="only-bg" data-lang="bg">Реализиран защитен транспорт</h3>
+          <p class="only-en" data-lang="en">ECDSA station authentication, AES‑GCM encrypted data and ping/pong liveness, replay checks, and <span class="kbd">NOSESSION</span>/<span class="kbd">peer_timeout</span> recovery for NAT, CGNAT, and mobile clients.</p>
+          <p class="only-bg" data-lang="bg">ECDSA автентикация на станцията, AES‑GCM криптирани данни и ping/pong liveness, replay проверки и <span class="kbd">NOSESSION</span>/<span class="kbd">peer_timeout</span> възстановяване за NAT, CGNAT и мобилни клиенти.</p>
         </div>
         <div class="card">
           <div class="icons">📦</div>
@@ -185,20 +185,42 @@
         <div class="card">
           <h3 class="only-en" data-lang="en">High‑level flow</h3>
           <h3 class="only-bg" data-lang="bg">Общ поток</h3>
-          <ol class="list">
-            <li><span class="kbd">UDP/secure‑UDP ingress</span> from multiple stations/apps</li>
+          <ol class="list only-en" data-lang="en">
+            <li>AIS receiver/app → local UDP → <span class="kbd">nmea_sproxy</span> → encrypted SEC input → AISMixer</li>
+            <li>Direct plain UDP inputs can also feed AISMixer</li>
             <li>Tag parsing (<span class="kbd">c</span>/<span class="kbd">g</span>) and multipart reassembly</li>
             <li>Deduplication + meta cleaning (strip vendor headers)</li>
             <li>Optional meta add/normalize</li>
             <li>Fan‑out forwarding (per user / per target)</li>
           </ol>
+          <ol class="list only-bg" data-lang="bg">
+            <li>AIS приемник/приложение → локален UDP → <span class="kbd">nmea_sproxy</span> → криптиран SEC вход → AISMixer</li>
+            <li>Директни plain UDP входове също могат да подават към AISMixer</li>
+            <li>Парсинг на тагове (<span class="kbd">c</span>/<span class="kbd">g</span>) и сглобяване на multipart</li>
+            <li>Дедупликация + почистване на мета хедъри</li>
+            <li>Добавяне/нормализиране на мета по избор</li>
+            <li>Форуърд към няколко цели (по потребител / дестинация)</li>
+          </ol>
         </div>
         <div class="card">
-          <h3>Roadmap</h3>
-          <ul class="list">
-            <li>Hardened secure handshake (ECDSA + anti‑replay)</li>
+          <h3 class="only-en" data-lang="en">Focused roles</h3>
+          <h3 class="only-bg" data-lang="bg">Ясни роли</h3>
+          <p class="only-en" data-lang="en"><span class="kbd">AISMixer</span> is the mixer, deduplicator, tag‑aware normalizer, and fan‑out forwarder.</p>
+          <p class="only-bg" data-lang="bg"><span class="kbd">AISMixer</span> е миксерът, дедупликаторът, tag‑aware нормализаторът и fan‑out форурдърът.</p>
+          <p class="only-en" data-lang="en"><span class="kbd">nmea_sproxy</span> is a client‑side secure shovel/proxy: one process maps one local UDP input to one encrypted AISMixer SEC input. It does not mix streams.</p>
+          <p class="only-bg" data-lang="bg"><span class="kbd">nmea_sproxy</span> е клиентско secure shovel/proxy: един процес свързва един локален UDP вход с един криптиран AISMixer SEC вход. То не смесва потоци.</p>
+        </div>
+        <div class="card">
+          <h3 class="only-en" data-lang="en">Roadmap</h3>
+          <h3 class="only-bg" data-lang="bg">План за развитие</h3>
+          <ul class="list only-en" data-lang="en">
             <li>Per‑user cloud control panel (manage local stations remotely)</li>
-            <li>Docker images &amp; systemd units</li>
+            <li>Docker images</li>
+            <li>Metrics &amp; health endpoints</li>
+          </ul>
+          <ul class="list only-bg" data-lang="bg">
+            <li>Cloud панел по потребители за отдалечено управление на станции</li>
+            <li>Docker images</li>
             <li>Metrics &amp; health endpoints</li>
           </ul>
         </div>
@@ -209,12 +231,17 @@
       <h2 class="only-en" data-lang="en">Get started</h2>
       <h2 class="only-bg" data-lang="bg">Първи стъпки</h2>
       <div class="card">
-        <p class="only-en" data-lang="en">Clone the repository and check the README for current modules and examples. The project is evolving; follow issues and commits for latest integration details.</p>
-        <p class="only-bg" data-lang="bg">Клонирай репозитория и прегледай README за текущите модули и примери. Проектът се развива; следи issues и комитите за най‑новите детайли.</p>
+        <p class="only-en" data-lang="en">Run AISMixer directly, run one manual <span class="kbd">nmea_sproxy</span> relation, or start an installed singleton/template systemd service:</p>
+        <p class="only-bg" data-lang="bg">Стартирай AISMixer директно, пусни една ръчна <span class="kbd">nmea_sproxy</span> връзка или стартирай инсталирана singleton/template systemd услуга:</p>
         <pre class="mono">$ git clone https://github.com/iliyan85/aismixer
 $ cd aismixer
-# create venv, install, run according to README
+$ python3 aismixer.py
+$ cd nmea_sproxy &amp;&amp; python3 nmea_sproxy.py
+$ sudo systemctl start nmea_sproxy
+$ sudo systemctl start nmea_sproxy@boat
 </pre>
+        <p class="only-en" data-lang="en">Template instance names such as <span class="kbd">boat</span>, <span class="kbd">yacht</span>, or <span class="kbd">balchik_roof</span> are operator‑chosen labels. Each instance config defines its own one‑input‑to‑one‑secure‑output relation.</p>
+        <p class="only-bg" data-lang="bg">Template instance имена като <span class="kbd">boat</span>, <span class="kbd">yacht</span> или <span class="kbd">balchik_roof</span> са етикети, избрани от оператора. Конфигурацията на всяка инстанция описва собствена връзка от един вход към един защитен изход.</p>
         <div class="note only-en" data-lang="en">Have an AIS feed to contribute or a dataset with pre‑labeled duplicates? <a href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Open an Issue</a>.</div>
         <div class="note only-bg" data-lang="bg">Имаш AIS фийд за тестове или набор с предварително отбелязани дубликати? <a href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Отвори Issue</a>.</div>
       </div>
