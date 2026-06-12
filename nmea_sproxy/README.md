@@ -1,35 +1,68 @@
-# nmea_sproxy secure proxy
+# nmea_sproxy operator guide
 
-`nmea_sproxy` is a secure UDP proxy, or shovel. It is not a mixer.
+`nmea_sproxy` is a client-side secure UDP shovel/proxy. It is not a mixer,
+deduplicator, or multi-input forwarder. AISMixer performs those jobs.
 
-Each process represents exactly one relation:
+Each `nmea_sproxy` process represents exactly one relation:
 
 ```text
-one local UDP input -> one encrypted remote secure output
+one local UDP input -> one encrypted AISMixer SEC input
+listen_ip/listen_port -> remote_host/remote_port
 ```
 
-The relation is configured with `listen_ip` / `listen_port` and
-`remote_host` / `remote_port`.
+Run separate processes or systemd template instances for separate relations.
 
-## Manual use
+## Secure UDP behavior and limits
 
-From this directory, the existing no-argument workflow remains supported:
+The station authenticates to AISMixer with its ECDSA identity key. The station
+also verifies the AISMixer server key. After the handshake, AIS data is sent in
+AES-GCM authenticated encrypted packets.
 
-```bash
-cd nmea_sproxy
-python3 nmea_sproxy.py
+The proxy sends authenticated encrypted pings and accepts matching
+authenticated encrypted pongs from the configured remote peer. These messages
+provide liveness and help keep NAT, CGNAT, and mobile-client UDP mappings alive.
+
+AISMixer may send `NOSESSION` when it receives traffic for a session it no
+longer has. `NOSESSION` is unauthenticated and is only a reconnect hint; the
+proxy accepts it only from the configured remote address, ends the local
+session, and attempts a new handshake after `reconnect_delay`.
+
+Secure session recovery does not make UDP reliable:
+
+- UDP packet loss is still possible.
+- Recovery does not guarantee delivery of every AIS sentence.
+- A changed client source IP or source port requires a new handshake.
+- No session migration is implemented.
+
+The design assumes that the station client behind NAT, CGNAT, or a mobile
+network is the active side: it initiates the handshake and sends keepalive
+traffic to the reachable AISMixer SEC input.
+
+## Configuration
+
+A minimal relation looks like this:
+
+```yaml
+listen_ip: "::"
+listen_port: 50000
+remote_host: 192.0.2.10
+remote_port: 17777
+station_id: boat_001
+
+keepalive_interval: 30
+peer_timeout: 90
+session_refresh_interval: 0
+
+station_private_key: station_private.pem
+remote_public_key: aismixer_public.pem
 ```
 
-An explicit config can be selected with:
+`listen_ip` / `listen_port` select the one local UDP input.
+`remote_host` / `remote_port` select the one remote AISMixer SEC input.
 
-```bash
-python3 nmea_sproxy.py --config /path/to/shovel.yaml
-```
+### Config resolution order
 
-The optional `--process-title TEXT` argument controls the name shown by
-process tools when `setproctitle` is installed. Its default is `nmea_sproxy`.
-
-Config resolution order is:
+The proxy selects configuration in this order:
 
 1. `--config PATH`
 2. `NMEA_SPROXY_CONFIG`
@@ -37,16 +70,157 @@ Config resolution order is:
 4. `config.yaml` next to `nmea_sproxy.py`
 5. built-in defaults
 
-An explicitly selected CLI or environment config must exist.
-Relative `station_private_key`, `remote_public_key`, and legacy
-`aismixer_public_key` values are resolved relative to the selected config
-file, not the process working directory. When a configured canonical
-`station_private.pem` is absent, an existing `station_private.key` beside it
-is still accepted for compatibility.
+An explicitly selected `--config` or `NMEA_SPROXY_CONFIG` path must exist or
+the process exits. Relative `station_private_key`, `remote_public_key`, and
+legacy `aismixer_public_key` paths are resolved from the directory containing
+the selected YAML file, not from the process working directory. For
+compatibility, if a configured `station_private.pem` is absent, an existing
+`station_private.key` beside it is accepted.
 
-After a successful handshake, the proxy sends encrypted pings and requires
-authenticated encrypted pongs from the configured remote address. The
-lifecycle settings are:
+The repository files have separate purposes:
+
+- `config.yaml` is the local/manual-use template and uses relative key paths.
+- `config.system.yaml` is the source template installed as
+  `/etc/nmea_sproxy/config.yaml` and uses system key paths.
+
+The installer copies `config.system.yaml` only when the system config does not
+already exist.
+
+## Manual mode
+
+From the repository:
+
+```bash
+cd nmea_sproxy
+python3 nmea_sproxy.py
+```
+
+Select a specific config with the CLI or environment:
+
+```bash
+python3 nmea_sproxy.py --config /path/to/shovel.yaml
+NMEA_SPROXY_CONFIG=/path/to/shovel.yaml python3 nmea_sproxy.py
+```
+
+Use `--process-title TEXT` to choose the name shown by process tools when
+`setproctitle` is installed:
+
+```bash
+python3 nmea_sproxy.py --process-title nmea_sproxy@boat
+```
+
+The no-argument workflow remains supported and follows the config resolution
+order above.
+
+## systemd services
+
+### Singleton service
+
+From the `nmea_sproxy` directory:
+
+```bash
+sudo ./install.sh
+sudo systemctl start nmea_sproxy
+```
+
+The installer installs and enables `nmea_sproxy.service`, using:
+
+```text
+/etc/nmea_sproxy/config.yaml
+```
+
+It does not start the service automatically.
+
+### Template services
+
+Template services use one YAML file per relation:
+
+```text
+/etc/nmea_sproxy/instances/<operator-name>.yaml
+```
+
+For example:
+
+```bash
+sudo cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
+sudo cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/yacht.yaml
+sudo cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/balchik_roof.yaml
+
+sudo systemctl start nmea_sproxy@boat
+sudo systemctl start nmea_sproxy@yacht
+sudo systemctl start nmea_sproxy@balchik_roof
+```
+
+`boat`, `yacht`, and names such as `balchik_roof` are operator-chosen labels.
+They are not predefined or numbered instance names. Each instance config must
+define its own 1:1 `listen_ip` / `listen_port` to `remote_host` /
+`remote_port` relation.
+
+The installer creates `/etc/nmea_sproxy/instances/` but does not create
+instance configs or enable template instances.
+
+## Keys and trust setup
+
+The standard system key files are:
+
+```text
+/etc/nmea_sproxy/keys/station_private.pem
+/etc/nmea_sproxy/keys/station_public.pem
+/etc/nmea_sproxy/keys/aismixer_public.pem
+```
+
+- `station_private.pem` is the station identity private key. Keep it private
+  and never copy it to AISMixer.
+- `station_public.pem` is derived from the station private key and is used to
+  create the station entry in AISMixer's `authorized_keys.yaml`.
+- `aismixer_public.pem` is the trusted AISMixer server public key copied to the
+  station. It lets the station verify the server handshake.
+
+### Generation, preservation, and repair
+
+During `sudo ./install.sh`:
+
+- If both station key files are absent, a new station key pair is generated.
+- If `station_private.pem` exists, it is preserved and
+  `station_public.pem` is checked and repaired from it when needed.
+- If only `station_public.pem` exists, installation stops rather than
+  generating or overwriting private-key material.
+- Existing `/etc/nmea_sproxy` configs and keys are preserved.
+- A missing `aismixer_public.pem` produces a warning; copy the trusted server
+  public key before starting the proxy.
+
+To repair the public key manually without replacing the private key:
+
+```bash
+sudo python3 /opt/nmea_sproxy/tools/aismixer_keys.py station \
+  --keys-dir /etc/nmea_sproxy/keys \
+  --station-id boat_001 \
+  --repair-public
+```
+
+The key tool prints the compressed public key value needed by AISMixer.
+Do not use force-overwrite options casually; replacing the station private key
+changes its identity and requires updating AISMixer authorization.
+
+### Authorize the station in AISMixer
+
+Add the printed station public-key value to AISMixer's `authorized_keys.yaml`
+(normally `/etc/aismixer/authorized_keys.yaml`). The `name` must match the
+proxy's configured `station_id`:
+
+```yaml
+authorized_clients:
+  - name: boat_001
+    pubkey: <compressed-public-key-base64>
+```
+
+Restart AISMixer after changing its authorization file. Trust material is not
+exchanged automatically: copy the AISMixer public key to the station as
+`aismixer_public.pem`, and add the station public-key value to AISMixer.
+
+## Session lifecycle
+
+The defaults are:
 
 ```yaml
 keepalive_interval: 30
@@ -54,68 +228,81 @@ peer_timeout: 90
 session_refresh_interval: 0
 ```
 
-`keepalive_interval` controls encrypted ping frequency, `peer_timeout`
-reconnects when authenticated replies stop, and `session_refresh_interval`
-optionally triggers an immediate planned re-handshake without waiting for
-`reconnect_delay`. The default value `0` disables proactive refresh, leaving
-authenticated ping/pong plus `peer_timeout` as the primary recovery mechanism
-for server restarts, NAT rebinding, and long outages.
+- `keepalive_interval` is the interval between authenticated encrypted pings.
+- `peer_timeout` ends the session and reconnects when matching authenticated
+  pongs stop arriving.
+- `session_refresh_interval` optionally schedules a planned re-handshake.
+  The default `0` disables planned periodic refresh.
+- `reconnect_delay` controls the delay after handshake failures, socket
+  failures, `peer_timeout`, and `NOSESSION`. A planned refresh re-handshakes
+  immediately.
 
-## systemd services
+The ping traffic helps preserve a NAT mapping, but the server associates a
+session with the observed client source IP and port. NAT rebinding, changing
+networks, or changing the source port therefore requires a new handshake.
+There is no session migration between addresses.
 
-`install.sh` installs:
+## Troubleshooting
 
-- `nmea_sproxy.service`, using `/etc/nmea_sproxy/config.yaml`
-- `nmea_sproxy@.service`, using `/etc/nmea_sproxy/instances/%i.yaml`
+### `Server signature verification failed`
 
-The singleton service is enabled during install but is not started
-automatically.
+The configured `aismixer_public.pem` does not verify the responding server.
+Confirm that the station has the trusted public key matching the AISMixer
+private key and that `remote_host` / `remote_port` point to the intended
+server. Do not bypass this check.
 
-Template instance labels are chosen by the operator. For example:
+### `No response from server during handshake`
 
-```bash
-sudo cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
-sudo systemctl enable --now nmea_sproxy@boat.service
+Check:
 
-sudo cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/yacht.yaml
-sudo systemctl enable --now nmea_sproxy@yacht.service
+- AISMixer is running and its SEC input is listening on the configured port.
+- Firewalls and port forwarding allow UDP traffic in both directions.
+- The station `station_id` and public key are present in AISMixer's
+  `authorized_keys.yaml`.
+- Station and server clocks are reasonably synchronized.
+- `remote_host` / `remote_port` are correct.
 
-sudo cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/balchik_roof.yaml
-sudo systemctl enable --now nmea_sproxy@balchik_roof.service
-```
+### `NOSESSION` or repeated reconnects
 
-Each instance config must define its own 1:1 input/output relation. The
-installer creates `/etc/nmea_sproxy/instances/` but does not create instance
-configs.
+An occasional `NOSESSION` can follow an AISMixer restart, server-side session
+expiry, or a client source-address change. The proxy treats it as a reconnect
+hint and performs a new handshake after `reconnect_delay`.
 
-Default key paths are:
+For repeated reconnects, verify bidirectional UDP reachability, NAT timeout
+behavior, the configured `keepalive_interval` / `peer_timeout`, and AISMixer
+logs. Remember that `NOSESSION` itself is not authenticated.
 
-```text
-/etc/nmea_sproxy/keys/station_private.pem
-/etc/nmea_sproxy/keys/aismixer_public.pem
-```
+### Missing key files
 
-Instance configs may override key paths when needed.
-
-The repository's `config.yaml` is the manual-use template and uses local
-relative key paths. During installation, `config.system.yaml` is copied to
-`/etc/nmea_sproxy/config.yaml` only when that system config does not already
-exist.
-
-The installer preserves `/etc/nmea_sproxy/keys`. It generates station keys
-only when both `station_private.pem` and `station_public.pem` are absent. When
-the private key exists, the installer derives and repairs the public key
-without replacing the private key. It also warns when the trusted
-`aismixer_public.pem` is missing.
-
-## Lifecycle scripts
-
-Run these scripts from the repository:
+Check that all three standard key files exist and that the service user can
+read the station private key and AISMixer public key:
 
 ```bash
-sudo bash ./nmea_sproxy/install.sh
-sudo bash ./nmea_sproxy/update.sh
-sudo bash ./nmea_sproxy/uninstall.sh
+sudo ls -l /etc/nmea_sproxy/keys
+```
+
+From the `nmea_sproxy` directory, re-run `sudo ./install.sh` to generate a
+missing station key pair or repair a station public key while preserving an
+existing private key. Copy the trusted AISMixer public key separately; the
+installer does not fetch it.
+
+### systemd status and logs
+
+```bash
+sudo systemctl status nmea_sproxy
+sudo journalctl -u nmea_sproxy -f
+
+sudo systemctl status nmea_sproxy@boat
+sudo journalctl -u nmea_sproxy@boat -f
+```
+
+## Update and uninstall
+
+From the repository:
+
+```bash
+sudo ./nmea_sproxy/update.sh
+sudo ./nmea_sproxy/uninstall.sh
 ```
 
 `update.sh` does not modify `/etc/nmea_sproxy` configs or keys.
