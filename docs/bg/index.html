@@ -3,28 +3,56 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AISMixer — обединяване, дедупликация и форуърд на AIS NMEA потоци</title>
+  <title>AISMixer | AIS NMEA 0183 мултиплексор с отворен код</title>
   <link rel="canonical" href="https://aismixer.net/bg/">
-  <meta name="description" content="AISMixer — обединява, дедуплицира и препраща AIS NMEA потоци. Сигурност по дизайн. Мулти-юзер.">
+  <meta name="description" content="AISMixer е Python услуга с отворен код за обединяване, дедупликация, multipart сглобяване и сигурно препращане на AIVDM/AIVDO AIS NMEA 0183 потоци.">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="AISMixer — обединяване, дедупликация и форуърд на AIS NMEA потоци">
-  <meta property="og:description" content="Merge, deduplicate and forward AIS NMEA streams.">
+  <meta property="og:site_name" content="AISMixer">
+  <meta property="og:title" content="AISMixer | AIS NMEA 0183 мултиплексор с отворен код">
+  <meta property="og:description" content="Обединява AIVDM/AIVDO потоци, премахва дубликати, сглобява multipart AIS съобщения и препраща сигурно чист NMEA 0183 изход.">
   <meta property="og:url" content="https://aismixer.net/bg/">
   <meta property="og:image" content="https://aismixer.net/assets/img/og.png">
+  <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/og.png">
+  <meta property="og:image:type" content="image/png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="AISMixer AIS NMEA 0183 мултиплексор с отворен код">
   <meta property="og:locale" content="bg_BG">
   <meta property="og:locale:alternate" content="en_US">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="AISMixer | AIS NMEA 0183 мултиплексор с отворен код">
+  <meta name="twitter:description" content="Обединява AIVDM/AIVDO потоци, премахва дубликати, сглобява multipart AIS съобщения и препраща сигурно чист NMEA 0183 изход.">
+  <meta name="twitter:image" content="https://aismixer.net/assets/img/og.png">
+  <meta name="twitter:image:alt" content="AISMixer AIS NMEA 0183 мултиплексор с отворен код">
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
   <link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/">
   <link rel="alternate" hreflang="x-default" href="https://aismixer.net/">
   <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
   <link rel="icon" href="/assets/img/favicon-32.png" sizes="32x32" type="image/png">
   <link rel="apple-touch-icon" href="/assets/img/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
   <link rel="preload" href="/assets/css/styles.css" as="style">
   <link rel="stylesheet" href="/assets/css/styles.css">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "AISMixer",
+    "alternateName": "aismixer",
+    "applicationCategory": "DeveloperApplication",
+    "programmingLanguage": "Python",
+    "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
+    "description": "AISMixer е AIS NMEA 0183 мултиплексор с отворен код, който премахва дубликати, сглобява multipart съобщения и препраща сигурно AIVDM/AIVDO потоци.",
+    "url": "https://aismixer.net/bg/",
+    "codeRepository": "https://github.com/iliyan85/aismixer",
+    "inLanguage": "bg",
+    "isAccessibleForFree": true,
+    "keywords": ["AIS", "NMEA 0183", "AIVDM", "AIVDO", "multiplexer", "deduplication", "marine traffic", "secure UDP", "nmea_sproxy", "Raspberry Pi", "Python"]
+  }
+  </script>
 </head>
 <body>
   <nav class="nav">
@@ -44,9 +72,9 @@
     <div class="two-col">
       <div>
         <div class="chip">Open-source • Python</div>
-        <h1>AISMixer — обединяване, дедупликация и форуърд на AIS NMEA потоци</h1>
+        <h1>AISMixer — AIS NMEA 0183 мултиплексор с отворен код и сигурно препращане</h1>
         <p class="lead">
-          Приема потоци от няколко AIS приемника/софтуера, премахва дубликати, нормализира или добавя мета хедъри и изпраща чист обединен NMEA поток към платформи като MarineTraffic / VesselFinder. Станциите могат да използват <span class="kbd">nmea_sproxy</span> за автентикирана, криптирана и удобна за NAT secure UDP връзка към AISMixer.
+          AISMixer е Python услуга с отворен код за AIVDM/AIVDO AIS NMEA 0183 потоци. Тя приема данни от няколко приемника и приложения, премахва дубликати, сглобява multipart съобщения, нормализира мета хедъри и препраща чист обединен поток. Станциите могат да използват <span class="kbd">nmea_sproxy</span> за автентикирана, криптирана и удобна за NAT secure UDP връзка към AISMixer.
         </p>
         <div class="cta">
           <a class="button" href="#features">Възможности</a>

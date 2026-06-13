@@ -1,6 +1,7 @@
 ---
 layout: default
 title: Secure UDP Protocol
+description: AISMixer secure UDP protocol for authenticated, encrypted, NAT-friendly forwarding of AIS NMEA 0183 streams with nmea_sproxy.
 permalink: /technical/secure-udp-protocol/
 ---
 

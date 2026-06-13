@@ -1,5 +1,5 @@
 title: AISMixer
-description: AIS multiplexer, deduplicator and forwarder
+description: Open-source Python service for merging, deduplicating, reassembling, and securely forwarding AIVDM/AIVDO AIS NMEA 0183 streams.
 url: https://aismixer.net
 baseurl: ""
 markdown: kramdown

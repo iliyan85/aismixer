@@ -3,30 +3,35 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AISMixer — AIS multiplexer, deduplicator & forward</title>
+  <title>AISMixer | Open-Source AIS NMEA 0183 Multiplexer</title>
   <link rel="canonical" href="https://aismixer.net/">
-  <meta name="description" content="AISMixer — merge, deduplicate and forward AIS NMEA streams. Secure by design. Multi-user.">
-  <meta name="keywords" content="AISMixer, AIS, NMEA, AIVDM, multiplexer, deduplication, g-tag, c-tag, UDP, IPv6, AISHUB, MarineTraffic, VesselFinder, Python">
+  <meta name="description" content="AISMixer is an open-source Python service for merging, deduplicating, reassembling, and securely forwarding AIVDM/AIVDO AIS NMEA 0183 streams.">
+  <meta name="keywords" content="AISMixer, AIS, NMEA 0183, AIVDM, AIVDO, multiplexer, deduplication, marine traffic, secure UDP, nmea_sproxy, Raspberry Pi, Python">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
 
   <!-- Open Graph -->
   <meta property="og:type" content="website">
-  <meta property="og:title" content="AISMixer — AIS multiplexer, deduplicator & forward">
-  <meta property="og:description" content="Merge, deduplicate and forward AIS NMEA streams.">
+  <meta property="og:site_name" content="AISMixer">
+  <meta property="og:title" content="AISMixer | Open-Source AIS NMEA 0183 Multiplexer">
+  <meta property="og:description" content="Merge AIVDM/AIVDO streams, remove duplicates, reassemble multipart AIS messages, and securely forward clean NMEA 0183 output.">
   <meta property="og:url" content="https://aismixer.net/">
   <meta property="og:image" content="https://aismixer.net/assets/img/og.png">
+  <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/og.png">
+  <meta property="og:image:type" content="image/png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="AISMixer open-source AIS NMEA 0183 multiplexer">
   <meta property="og:locale" content="en_US">
   <meta property="og:locale:alternate" content="bg_BG">
 
   <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="AISMixer — AIS multiplexer, deduplicator & forward">
-  <meta name="twitter:description" content="Merge, deduplicate and forward AIS NMEA streams.">
+  <meta name="twitter:title" content="AISMixer | Open-Source AIS NMEA 0183 Multiplexer">
+  <meta name="twitter:description" content="Merge AIVDM/AIVDO streams, remove duplicates, reassemble multipart AIS messages, and securely forward clean NMEA 0183 output.">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/og.png">
+  <meta name="twitter:image:alt" content="AISMixer open-source AIS NMEA 0183 multiplexer">
 
   <!-- Icons & manifest -->
   <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -41,15 +46,18 @@
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
-    "@type": "SoftwareSourceCode",
+    "@type": "SoftwareApplication",
     "name": "AISMixer",
-    "description": "Merge, deduplicate and forward AIS NMEA streams.",
+    "alternateName": "aismixer",
+    "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
-    "applicationCategory": "NetworkingApplication",
-    "codeRepository": "https://github.com/iliyan85/aismixer",
+    "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
+    "description": "Open-source AIS NMEA 0183 multiplexer, deduplicator, multipart reassembler and secure forwarder for AIVDM/AIVDO streams.",
     "url": "https://aismixer.net/",
+    "codeRepository": "https://github.com/iliyan85/aismixer",
     "inLanguage": ["en","bg"],
-    "keywords": ["AIS","NMEA","AIVDM","multiplexer","deduplication","UDP","IPv6","AISHUB","MarineTraffic","VesselFinder","Python"]
+    "isAccessibleForFree": true,
+    "keywords": ["AIS", "NMEA 0183", "AIVDM", "AIVDO", "multiplexer", "deduplication", "marine traffic", "secure UDP", "nmea_sproxy", "Raspberry Pi", "Python"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -79,13 +87,13 @@
     <div class="two-col">
       <div>
         <div class="chip">Open‑source • Python</div>
-        <h1 class="only-en" data-lang="en">AISMixer — merge, deduplicate &amp; forward AIS NMEA streams</h1>
-        <h1 class="only-bg" data-lang="bg">AISMixer — обединяване, дедупликация и форуърд на AIS NMEA потоци</h1>
+        <h1 class="only-en" data-lang="en">AISMixer — open-source AIS NMEA 0183 multiplexer and secure forwarder</h1>
+        <h1 class="only-bg" data-lang="bg">AISMixer — AIS NMEA 0183 мултиплексор с отворен код и сигурно препращане</h1>
         <p class="lead only-en" data-lang="en">
-          Ingest multiple AIS receivers &amp; apps, remove duplicates, normalize or add meta headers, and forward a clean unified NMEA stream to platforms like AISHUB / MarineTraffic / VesselFinder. Stations can use <span class="kbd">nmea_sproxy</span> for an authenticated, encrypted, NAT‑friendly secure UDP path to AISMixer.
+          AISMixer is an open-source Python service for AIVDM/AIVDO AIS NMEA 0183 streams. It ingests multiple receivers and apps, removes duplicates, reassembles multipart messages, normalizes meta headers, and forwards a clean unified stream. Stations can use <span class="kbd">nmea_sproxy</span> for an authenticated, encrypted, NAT‑friendly secure UDP path to AISMixer.
         </p>
         <p class="lead only-bg" data-lang="bg">
-          Приема потоци от няколко AIS приемника/софтуера, премахва дубликати, нормализира или добавя мета хедъри и изпраща чист обединен NMEA поток към платформи като AISHUB / MarineTraffic / VesselFinder. Станциите могат да използват <span class="kbd">nmea_sproxy</span> за автентикирана, криптирана и удобна за NAT secure UDP връзка към AISMixer.
+          AISMixer е Python услуга с отворен код за AIVDM/AIVDO AIS NMEA 0183 потоци. Тя приема данни от няколко приемника и приложения, премахва дубликати, сглобява multipart съобщения, нормализира мета хедъри и препраща чист обединен поток. Станциите могат да използват <span class="kbd">nmea_sproxy</span> за автентикирана, криптирана и удобна за NAT secure UDP връзка към AISMixer.
         </p>
         <div class="cta">
           <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">⭐ Star on GitHub</a>
