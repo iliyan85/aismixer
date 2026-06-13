@@ -7,3 +7,5 @@ a{color:var(--primary)}a:hover{text-decoration:underline}.container{width:min(11
 .lang-switch button.active{background:color-mix(in oklab,var(--primary) 25%, var(--el));}
 html[data-lang="en"] .only-bg{display:none !important;}
 html[data-lang="bg"] .only-en{display:none !important;}
+.nav-inner{flex-wrap:wrap;gap:10px}
+.nav .toggles{flex-wrap:wrap;justify-content:flex-end;margin-left:auto}
