@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-lang="en">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -55,7 +55,7 @@
     "description": "Open-source AIS NMEA 0183 multiplexer, deduplicator, multipart reassembler and secure forwarder for AIVDM/AIVDO streams.",
     "url": "https://aismixer.net/",
     "codeRepository": "https://github.com/iliyan85/aismixer",
-    "inLanguage": ["en","bg"],
+    "inLanguage": "en",
     "isAccessibleForFree": true,
     "keywords": ["AIS", "NMEA 0183", "AIVDM", "AIVDO", "multiplexer", "deduplication", "marine traffic", "secure UDP", "nmea_sproxy", "Raspberry Pi", "Python"]
   }
@@ -73,10 +73,7 @@
         <span class="chip">AIS multiplexer &amp; forward</span>
       </a>
       <div class="toggles">
-        <div class="lang-switch" role="group" aria-label="Language">
-          <button data-lang="en" id="btn-en" class="active">EN</button>
-          <button data-lang="bg" id="btn-bg">BG</button>
-        </div>
+        <a class="btn" href="/bg/" lang="bg">Български</a>
         <a class="btn" href="/technical/secure-udp-protocol/">Secure UDP</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
@@ -87,13 +84,9 @@
     <div class="two-col">
       <div>
         <div class="chip">Open‑source • Python</div>
-        <h1 class="only-en" data-lang="en">AISMixer — open-source AIS NMEA 0183 multiplexer and secure forwarder</h1>
-        <h1 class="only-bg" data-lang="bg">AISMixer — AIS NMEA 0183 мултиплексор с отворен код и сигурно препращане</h1>
-        <p class="lead only-en" data-lang="en">
+        <h1>AISMixer — open-source AIS NMEA 0183 multiplexer and secure forwarder</h1>
+        <p class="lead">
           AISMixer is an open-source Python service for AIVDM/AIVDO AIS NMEA 0183 streams. It ingests multiple receivers and apps, removes duplicates, reassembles multipart messages, normalizes meta headers, and forwards a clean unified stream. Stations can use <span class="kbd">nmea_sproxy</span> for an authenticated, encrypted, NAT‑friendly secure UDP path to AISMixer.
-        </p>
-        <p class="lead only-bg" data-lang="bg">
-          AISMixer е Python услуга с отворен код за AIVDM/AIVDO AIS NMEA 0183 потоци. Тя приема данни от няколко приемника и приложения, премахва дубликати, сглобява multipart съобщения, нормализира мета хедъри и препраща чист обединен поток. Станциите могат да използват <span class="kbd">nmea_sproxy</span> за автентикирана, криптирана и удобна за NAT secure UDP връзка към AISMixer.
         </p>
         <div class="cta">
           <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">⭐ Star on GitHub</a>
@@ -103,9 +96,8 @@
       </div>
       <div class="card tldr">
         <div class="icons" aria-hidden="true">🛰️ 🧭 📦 🔁 ⚙️ 🔍 🚀 🌍</div>
-        <h3 class="only-en" data-lang="en">TL;DR</h3>
-        <h3 class="only-bg" data-lang="bg">Накратко</h3>
-        <ul class="list only-en" data-lang="en">
+        <h3>TL;DR</h3>
+        <ul class="list">
           <li>UDP ingest from many AIS apps/devices</li>
           <li>Zero‑copy parsing, multipart <span class="kbd">!AIVDM</span> reassembly (g‑tags)</li>
           <li>Deduplication and meta‑header cleaning/rewriting</li>
@@ -115,85 +107,63 @@
           <li><span class="kbd">nmea_sproxy</span> securely shovels one local UDP input to one SEC input</li>
           <li>ECDSA authentication, AES‑GCM data, encrypted ping/pong, and reconnect recovery</li>
         </ul>
-        <ul class="list only-bg" data-lang="bg">
-          <li>UDP вход от множество AIS приложения/устройства</li>
-          <li>Zero‑copy парсинг, сглобяване на multipart <span class="kbd">!AIVDM</span> (g‑тагове)</li>
-          <li>Дедупликация и почистване/пренаписване на мета хедъри</li>
-          <li>Политика за времевия <span class="kbd">c</span>-таг (запазване vs време на сървъра)</li>
-          <li>Форуърд към няколко дестинации (по потребител/станция)</li>
-          <li><span class="kbd">AISMixer</span> смесва, дедупликира, управлява тагове и препраща</li>
-          <li><span class="kbd">nmea_sproxy</span> препраща сигурно един локален UDP вход към един SEC вход</li>
-          <li>ECDSA автентикация, AES‑GCM данни, криптиран ping/pong и възстановяване на връзката</li>
-        </ul>
       </div>
     </div>
   </header>
 
   <main class="container">
     <section id="features" class="section">
-      <h2 class="only-en" data-lang="en">Key features</h2>
-      <h2 class="only-bg" data-lang="bg">Основни възможности</h2>
+      <h2>Key features</h2>
       <div class="grid">
         <div class="card">
           <div class="icons">🔁</div>
           <h3>Multiplex &amp; Deduplicate</h3>
-          <p class="only-en" data-lang="en">Merge many inputs, strip vendor meta, resolve duplicates, and keep the freshest message per MMSI/timestamp.</p>
-          <p class="only-bg" data-lang="bg">Обединява входовете, премахва vendor мета, открива дубликати и запазва най-актуалното съобщение по MMSI/време.</p>
+          <p>Merge many inputs, strip vendor meta, resolve duplicates, and keep the freshest message per MMSI/timestamp.</p>
         </div>
         <div class="card">
           <div class="icons">⚙️</div>
           <h3>Smart tags</h3>
-          <p class="only-en" data-lang="en">Control <span class="kbd">c</span>-tag policy and reassemble multipart via <span class="kbd">g</span>-tags; handles glued lines and out-of-band headers.</p>
-          <p class="only-bg" data-lang="bg">Контрол на политиката за <span class="kbd">c</span>-таг и сглобяване на multipart чрез <span class="kbd">g</span>-таг; справя се със „залепени“ редове и външни хедъри.</p>
+          <p>Control <span class="kbd">c</span>-tag policy and reassemble multipart via <span class="kbd">g</span>-tags; handles glued lines and out-of-band headers.</p>
         </div>
         <div class="card">
           <div class="icons">🧭</div>
           <h3>Forwarding</h3>
-          <p class="only-en" data-lang="en">Fan-out to multiple UDP/TCP targets; per-user isolation (vhost-like model) and per-station mapping.</p>
-          <p class="only-bg" data-lang="bg">Изпраща към множество UDP/TCP цели; изолация по потребител (vhost‑подобен модел) и мапване по станции.</p>
+          <p>Fan-out to multiple UDP/TCP targets; per-user isolation (vhost-like model) and per-station mapping.</p>
         </div>
         <div class="card">
           <div class="icons">🛡️</div>
-          <h3 class="only-en" data-lang="en">Implemented secure transport</h3>
-          <h3 class="only-bg" data-lang="bg">Реализиран защитен транспорт</h3>
-          <p class="only-en" data-lang="en">ECDSA station authentication, AES‑GCM encrypted data and ping/pong liveness, replay checks, and <span class="kbd">NOSESSION</span>/<span class="kbd">peer_timeout</span> recovery for NAT, CGNAT, and mobile clients.</p>
-          <p class="only-bg" data-lang="bg">ECDSA автентикация на станцията, AES‑GCM криптирани данни и ping/pong liveness, replay проверки и <span class="kbd">NOSESSION</span>/<span class="kbd">peer_timeout</span> възстановяване за NAT, CGNAT и мобилни клиенти.</p>
+          <h3>Implemented secure transport</h3>
+          <p>ECDSA station authentication, AES‑GCM encrypted data and ping/pong liveness, replay checks, and <span class="kbd">NOSESSION</span>/<span class="kbd">peer_timeout</span> recovery for NAT, CGNAT, and mobile clients.</p>
         </div>
         <div class="card">
           <div class="icons">📦</div>
           <h3>Queues &amp; performance</h3>
-          <p class="only-en" data-lang="en">Independent queues per port (plain/secure), zero‑copy friendly parsing, and TTL cache tuning.</p>
-          <p class="only-bg" data-lang="bg">Отделни опашки по порт (plain/secure), zero‑copy парсинг и оптимизации на TTL кеш.</p>
+          <p>Independent queues per port (plain/secure), zero‑copy friendly parsing, and TTL cache tuning.</p>
         </div>
         <div class="card">
           <div class="icons">🌍</div>
           <h3>IPv4 + IPv6</h3>
-          <p class="only-en" data-lang="en">Full dual‑stack UDP for ingress/egress; station naming <span class="kbd">station_private.pem</span>/<span class="kbd">station_public.pem</span>.</p>
-          <p class="only-bg" data-lang="bg">Пълен dual‑stack UDP за вход/изход; именуване на ключовете <span class="kbd">station_private.pem</span>/<span class="kbd">station_public.pem</span>.</p>
+          <p>Full dual‑stack UDP for ingress/egress; station naming <span class="kbd">station_private.pem</span>/<span class="kbd">station_public.pem</span>.</p>
         </div>
         <div class="card">
           <div class="icons">🔍</div>
           <h3>Observability</h3>
-          <p class="only-en" data-lang="en">Planned metrics/health endpoints and test harness with known duplicate sets.</p>
-          <p class="only-bg" data-lang="bg">Планирани metrics/health endpoints и тестови сет с известни дубликати.</p>
+          <p>Planned metrics/health endpoints and test harness with known duplicate sets.</p>
         </div>
         <div class="card">
           <div class="icons">🚀</div>
           <h3>Cloud control</h3>
-          <p class="only-en" data-lang="en">Future per‑user cloud panel to manage local stations remotely.</p>
-          <p class="only-bg" data-lang="bg">Бъдещ cloud панел за управление на локални станции по потребител.</p>
+          <p>Future per‑user cloud panel to manage local stations remotely.</p>
         </div>
       </div>
     </section>
 
     <section class="section">
-      <h2 class="only-en" data-lang="en">Architecture</h2>
-      <h2 class="only-bg" data-lang="bg">Архитектура</h2>
+      <h2>Architecture</h2>
       <div class="grid">
         <div class="card">
-          <h3 class="only-en" data-lang="en">High‑level flow</h3>
-          <h3 class="only-bg" data-lang="bg">Общ поток</h3>
-          <ol class="list only-en" data-lang="en">
+          <h3>High‑level flow</h3>
+          <ol class="list">
             <li>AIS receiver/app → local UDP → <span class="kbd">nmea_sproxy</span> → encrypted SEC input → AISMixer</li>
             <li>Direct plain UDP inputs can also feed AISMixer</li>
             <li>Tag parsing (<span class="kbd">c</span>/<span class="kbd">g</span>) and multipart reassembly</li>
@@ -201,33 +171,16 @@
             <li>Optional meta add/normalize</li>
             <li>Fan‑out forwarding (per user / per target)</li>
           </ol>
-          <ol class="list only-bg" data-lang="bg">
-            <li>AIS приемник/приложение → локален UDP → <span class="kbd">nmea_sproxy</span> → криптиран SEC вход → AISMixer</li>
-            <li>Директни plain UDP входове също могат да подават към AISMixer</li>
-            <li>Парсинг на тагове (<span class="kbd">c</span>/<span class="kbd">g</span>) и сглобяване на multipart</li>
-            <li>Дедупликация + почистване на мета хедъри</li>
-            <li>Добавяне/нормализиране на мета по избор</li>
-            <li>Форуърд към няколко цели (по потребител / дестинация)</li>
-          </ol>
         </div>
         <div class="card">
-          <h3 class="only-en" data-lang="en">Focused roles</h3>
-          <h3 class="only-bg" data-lang="bg">Ясни роли</h3>
-          <p class="only-en" data-lang="en"><span class="kbd">AISMixer</span> is the mixer, deduplicator, tag‑aware normalizer, and fan‑out forwarder.</p>
-          <p class="only-bg" data-lang="bg"><span class="kbd">AISMixer</span> е миксерът, дедупликаторът, tag‑aware нормализаторът и fan‑out форурдърът.</p>
-          <p class="only-en" data-lang="en"><span class="kbd">nmea_sproxy</span> is a client‑side secure shovel/proxy: one process maps one local UDP input to one encrypted AISMixer SEC input. It does not mix streams.</p>
-          <p class="only-bg" data-lang="bg"><span class="kbd">nmea_sproxy</span> е клиентско secure shovel/proxy: един процес свързва един локален UDP вход с един криптиран AISMixer SEC вход. То не смесва потоци.</p>
+          <h3>Focused roles</h3>
+          <p><span class="kbd">AISMixer</span> is the mixer, deduplicator, tag‑aware normalizer, and fan‑out forwarder.</p>
+          <p><span class="kbd">nmea_sproxy</span> is a client‑side secure shovel/proxy: one process maps one local UDP input to one encrypted AISMixer SEC input. It does not mix streams.</p>
         </div>
         <div class="card">
-          <h3 class="only-en" data-lang="en">Roadmap</h3>
-          <h3 class="only-bg" data-lang="bg">План за развитие</h3>
-          <ul class="list only-en" data-lang="en">
+          <h3>Roadmap</h3>
+          <ul class="list">
             <li>Per‑user cloud control panel (manage local stations remotely)</li>
-            <li>Docker images</li>
-            <li>Metrics &amp; health endpoints</li>
-          </ul>
-          <ul class="list only-bg" data-lang="bg">
-            <li>Cloud панел по потребители за отдалечено управление на станции</li>
             <li>Docker images</li>
             <li>Metrics &amp; health endpoints</li>
           </ul>
@@ -236,11 +189,9 @@
     </section>
 
     <section id="get-started" class="section">
-      <h2 class="only-en" data-lang="en">Get started</h2>
-      <h2 class="only-bg" data-lang="bg">Първи стъпки</h2>
+      <h2>Get started</h2>
       <div class="card">
-        <p class="only-en" data-lang="en">Run AISMixer directly, run one manual <span class="kbd">nmea_sproxy</span> relation, or start an installed singleton/template systemd service:</p>
-        <p class="only-bg" data-lang="bg">Стартирай AISMixer директно, пусни една ръчна <span class="kbd">nmea_sproxy</span> връзка или стартирай инсталирана singleton/template systemd услуга:</p>
+        <p>Run AISMixer directly, run one manual <span class="kbd">nmea_sproxy</span> relation, or start an installed singleton/template systemd service:</p>
         <pre class="mono">$ git clone https://github.com/iliyan85/aismixer
 $ cd aismixer
 $ python3 aismixer.py
@@ -248,18 +199,15 @@ $ cd nmea_sproxy &amp;&amp; python3 nmea_sproxy.py
 $ sudo systemctl start nmea_sproxy
 $ sudo systemctl start nmea_sproxy@boat
 </pre>
-        <p class="only-en" data-lang="en">Template instance names such as <span class="kbd">boat</span>, <span class="kbd">yacht</span>, or <span class="kbd">balchik_roof</span> are operator‑chosen labels. Each instance config defines its own one‑input‑to‑one‑secure‑output relation.</p>
-        <p class="only-bg" data-lang="bg">Template instance имена като <span class="kbd">boat</span>, <span class="kbd">yacht</span> или <span class="kbd">balchik_roof</span> са етикети, избрани от оператора. Конфигурацията на всяка инстанция описва собствена връзка от един вход към един защитен изход.</p>
-        <div class="note only-en" data-lang="en">Have an AIS feed to contribute or a dataset with pre‑labeled duplicates? <a href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Open an Issue</a>.</div>
-        <div class="note only-bg" data-lang="bg">Имаш AIS фийд за тестове или набор с предварително отбелязани дубликати? <a href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Отвори Issue</a>.</div>
+        <p>Template instance names such as <span class="kbd">boat</span>, <span class="kbd">yacht</span>, or <span class="kbd">balchik_roof</span> are operator‑chosen labels. Each instance config defines its own one‑input‑to‑one‑secure‑output relation.</p>
+        <div class="note">Have an AIS feed to contribute or a dataset with pre‑labeled duplicates? <a href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Open an Issue</a>.</div>
       </div>
     </section>
 
     <section class="section">
       <h2>Contact</h2>
       <div class="card">
-        <p class="only-en" data-lang="en">Project home: <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">https://github.com/iliyan85/aismixer</a></p>
-        <p class="only-bg" data-lang="bg">Проектът в GitHub: <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">https://github.com/iliyan85/aismixer</a></p>
+        <p>Project home: <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">https://github.com/iliyan85/aismixer</a></p>
         <p class="muted">© 2025 AISMixer project</p>
       </div>
     </section>
@@ -270,7 +218,5 @@ $ sudo systemctl start nmea_sproxy@boat
       <div class="chip">🧑‍🚀 Built with plain HTML/CSS/JS — no frameworks</div>
     </div>
   </footer>
-
-  <script src="assets/js/main.js"></script>
 </body>
 </html>

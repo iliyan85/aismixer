@@ -142,10 +142,10 @@ session_refresh_interval: 0
 
 - `peer_timeout` ends the client session and starts a new handshake when
   matching authenticated pongs stop arriving.
-- `session_refresh_interval` optionally schedules a planned re-handshake. Its
-  default value is `0`, which disables planned periodic refresh.
+- `session_refresh_interval` optionally schedules a re-handshake. Its default
+  value is `0`, which disables periodic refresh.
 - `reconnect_delay` applies after handshake failures, socket failures,
-  `peer_timeout`, and `NOSESSION`. A configured planned refresh re-handshakes
+  `peer_timeout`, and `NOSESSION`. A configured scheduled refresh re-handshakes
   immediately.
 
 AISMixer expires an inactive server-side session after 300 seconds. When it
@@ -188,6 +188,10 @@ carry a JSON `source_id` that matches the station id stored in the active
 session. A mismatch is rejected and does not refresh the session or record the
 data nonce.
 
+The operator-facing station key-pair names are `station_private.pem` and
+`station_public.pem`. The private key stays on the station; the public key is
+used for the station entry in AISMixer's `authorized_keys.yaml`.
+
 When accepted data is queued, the secure input source identifier is the
 configured secure input id if provided, otherwise the station id.
 
@@ -199,7 +203,8 @@ configured secure input id if provided, otherwise the station id.
   bounded, process-local caches.
 - The current live handshake does not yet bind the existing `NMEA-AUTH-v1`
   transcript helper or public-key material into a full versioned transcript.
-- The JSON payload `timestamp` is carried but freshness is not currently
+- The handshake timestamp is checked against a 30-second server-time window.
+  The encrypted JSON payload `timestamp` is carried but its freshness is not
   validated.
 - Replay caches are not persistent across service restarts.
 - `NOSESSION` is intentionally an unauthenticated reconnect hint, not proof of

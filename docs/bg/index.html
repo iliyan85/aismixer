@@ -60,10 +60,10 @@
       <a class="brand" href="/bg/" aria-label="AISMixer начало">
         <span class="logo" aria-hidden="true">🛰️</span>
         <span class="brand-name">AISMixer</span>
-        <span class="chip">AIS multiplexer &amp; forward</span>
+        <span class="chip">AIS мултиплексор и препращане</span>
       </a>
       <div class="lang-links">
-        <a href="/bg/" aria-current="page">BG</a> | <a href="/">EN</a> | <a href="/technical/secure-udp-protocol/">Secure UDP</a>
+        <a href="/" lang="en">English</a> | <a href="/technical/secure-udp-protocol/">Защитен UDP</a>
       </div>
     </div>
   </nav>
@@ -71,10 +71,10 @@
   <header class="hero container" id="top">
     <div class="two-col">
       <div>
-        <div class="chip">Open-source • Python</div>
+        <div class="chip">Отворен код • Python</div>
         <h1>AISMixer — AIS NMEA 0183 мултиплексор с отворен код и сигурно препращане</h1>
         <p class="lead">
-          AISMixer е Python услуга с отворен код за AIVDM/AIVDO AIS NMEA 0183 потоци. Тя приема данни от няколко приемника и приложения, премахва дубликати, сглобява multipart съобщения, нормализира мета хедъри и препраща чист обединен поток. Станциите могат да използват <span class="kbd">nmea_sproxy</span> за автентикирана, криптирана и удобна за NAT secure UDP връзка към AISMixer.
+          AISMixer е Python услуга с отворен код за AIVDM/AIVDO AIS NMEA 0183 потоци. Тя приема данни от няколко приемника и приложения, премахва дубликати, сглобява multipart съобщения, нормализира мета хедъри и препраща чист обединен поток. Станциите могат да използват <span class="kbd">nmea_sproxy</span> за автентикирана, криптирана и удобна за NAT защитена UDP връзка към AISMixer.
         </p>
         <div class="cta">
           <a class="button" href="#features">Възможности</a>
@@ -101,21 +101,21 @@
     <section id="features" class="section">
       <h2>Основни възможности</h2>
       <div class="grid">
-        <div class="card"><div class="icons">🔁</div><h3>Multiplex &amp; Deduplicate</h3><p>Обединява входовете и премахва дубликати.</p></div>
-        <div class="card"><div class="icons">⚙️</div><h3>Smart tags</h3><p><span class="kbd">c</span>-таг политика и <span class="kbd">g</span>-таг сглобяване.</p></div>
-        <div class="card"><div class="icons">🧭</div><h3>Forwarding</h3><p>Fan-out към няколко цели.</p></div>
+        <div class="card"><div class="icons">🔁</div><h3>Обединяване и дедупликация</h3><p>Обединява входовете и премахва дубликати.</p></div>
+        <div class="card"><div class="icons">⚙️</div><h3>Интелигентни тагове</h3><p><span class="kbd">c</span>-таг политика и <span class="kbd">g</span>-таг сглобяване.</p></div>
+        <div class="card"><div class="icons">🧭</div><h3>Препращане</h3><p>Разпределя потока към няколко цели.</p></div>
+        <div class="card"><div class="icons">🛡️</div><h3>Реализиран защитен транспорт</h3><p>ECDSA автентикация, AES‑GCM криптирани данни, ping/pong проверка на връзката и възстановяване на сесията. Ключовете на станцията са <span class="kbd">station_private.pem</span> и <span class="kbd">station_public.pem</span>.</p></div>
       </div>
     </section>
 
     <section id="get-started" class="section">
       <h2>Първи стъпки</h2>
       <div class="card">
-        <p>Виж README в GitHub за инструкции.</p>
+        <p>Виж README документацията в GitHub за инструкции.</p>
       </div>
     </section>
   </main>
 
-  <footer><div class="container"><div class="chip">© 2025 AISMixer project</div></div></footer>
-  <script src="/assets/js/main.js"></script>
+  <footer><div class="container"><div class="chip">© 2025 проект AISMixer</div></div></footer>
 </body>
 </html>
