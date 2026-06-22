@@ -57,6 +57,10 @@ class RouteDefinition:
     to: tuple[TargetId, ...]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not isinstance(self.from_zone, str):
+            raise TypeError("Route 'name' and 'from_zone' values must be strings.")
+        if not isinstance(self.to, Sequence) or isinstance(self.to, str):
+            raise TypeError("Route 'to' must be a sequence of strings.")
         object.__setattr__(self, "to", _as_string_tuple(self.to, "to"))
 
 
@@ -71,6 +75,46 @@ class RoutingResult:
 ZoneConfig: TypeAlias = ZoneDefinition | Mapping[str, Iterable[str]]
 RouteConfig: TypeAlias = RouteDefinition | Mapping[str, object]
 ResolvedZones: TypeAlias = dict[ZoneName, frozenset[SourceId]]
+
+
+def load_zone_definitions(config: Mapping[str, object]) -> dict[str, ZoneDefinition]:
+    """Convert plain zone config mappings into validated definitions."""
+
+    if not isinstance(config, Mapping):
+        raise TypeError("Zones config must be a mapping.")
+
+    definitions: dict[str, ZoneDefinition] = {}
+    for name, value in config.items():
+        definition = _coerce_zone_definition(name, value)
+        _zone_expression(name, definition)
+        definitions[name] = definition
+    return definitions
+
+
+def load_route_definitions(config: Sequence[RouteConfig]) -> list[RouteDefinition]:
+    """Convert plain route config mappings into validated definitions."""
+
+    if not isinstance(config, Sequence) or isinstance(config, str):
+        raise TypeError("Routes config must be a sequence.")
+    return [_coerce_route_definition(route) for route in config]
+
+
+def validate_routing_config(
+    zones_config: Mapping[str, object], routes_config: Sequence[RouteConfig]
+) -> ResolvedZones:
+    """Validate zone and route config and return fully resolved zones."""
+
+    zone_definitions = load_zone_definitions(zones_config)
+    route_definitions = load_route_definitions(routes_config)
+    resolved_zones = resolve_zones(zone_definitions)
+
+    for route in route_definitions:
+        if route.from_zone not in resolved_zones:
+            raise UnknownZoneError(
+                f"Route {route.name!r} references unknown zone {route.from_zone!r}."
+            )
+
+    return resolved_zones
 
 
 def resolve_zones(zones: Mapping[ZoneName, ZoneConfig]) -> ResolvedZones:
@@ -217,6 +261,12 @@ def _coerce_route_definition(value: RouteConfig) -> RouteDefinition:
     if not isinstance(value, Mapping):
         raise TypeError("Routes must be mappings or RouteDefinition instances.")
 
+    valid_fields = {"name", "from_zone", "to"}
+    unknown_fields = set(value) - valid_fields
+    if unknown_fields:
+        unknown = ", ".join(sorted(str(field) for field in unknown_fields))
+        raise ValueError(f"Route has unknown field(s): {unknown}.")
+
     try:
         name = value["name"]
         from_zone = value["from_zone"]
@@ -226,6 +276,6 @@ def _coerce_route_definition(value: RouteConfig) -> RouteDefinition:
 
     if not isinstance(name, str) or not isinstance(from_zone, str):
         raise TypeError("Route 'name' and 'from_zone' values must be strings.")
-    if not isinstance(targets, Iterable):
+    if not isinstance(targets, Sequence) or isinstance(targets, str):
         raise TypeError("Route 'to' must be a sequence of strings.")
     return RouteDefinition(name=name, from_zone=from_zone, to=targets)
