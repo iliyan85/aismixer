@@ -8,6 +8,7 @@ their namespaces.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence, TypeAlias
 
 
@@ -77,6 +78,57 @@ RouteConfig: TypeAlias = RouteDefinition | Mapping[str, object]
 ResolvedZones: TypeAlias = dict[ZoneName, frozenset[SourceId]]
 
 
+@dataclass(frozen=True, slots=True)
+class RoutingTable:
+    """A compiled, reusable snapshot of zones and ordered routes."""
+
+    resolved_zones: Mapping[ZoneName, frozenset[SourceId]]
+    route_definitions: tuple[RouteDefinition, ...]
+
+    def __post_init__(self) -> None:
+        resolved_zones = {
+            name: frozenset(source_ids)
+            for name, source_ids in self.resolved_zones.items()
+        }
+        route_definitions = tuple(self.route_definitions)
+        _validate_route_zone_references(resolved_zones, route_definitions)
+        object.__setattr__(self, "resolved_zones", MappingProxyType(resolved_zones))
+        object.__setattr__(self, "route_definitions", route_definitions)
+
+    @classmethod
+    def from_definitions(
+        cls,
+        zones: Mapping[ZoneName, ZoneConfig],
+        routes: Sequence[RouteConfig],
+    ) -> RoutingTable:
+        """Compile already structured zone and route definitions."""
+
+        return cls(
+            resolved_zones=resolve_zones(zones),
+            route_definitions=tuple(load_route_definitions(routes)),
+        )
+
+    @classmethod
+    def from_config(
+        cls,
+        zones_config: Mapping[str, object],
+        routes_config: Sequence[RouteConfig],
+    ) -> RoutingTable:
+        """Load and compile plain YAML/JSON-shaped routing config."""
+
+        zone_definitions = load_zone_definitions(zones_config)
+        route_definitions = load_route_definitions(routes_config)
+        return cls(
+            resolved_zones=resolve_zones(zone_definitions),
+            route_definitions=tuple(route_definitions),
+        )
+
+    def match(self, source_id: SourceId) -> RoutingResult:
+        """Match a source against the compiled zones and routes."""
+
+        return match_routes(source_id, self.resolved_zones, self.route_definitions)
+
+
 def load_zone_definitions(config: Mapping[str, object]) -> dict[str, ZoneDefinition]:
     """Convert plain zone config mappings into validated definitions."""
 
@@ -108,11 +160,7 @@ def validate_routing_config(
     route_definitions = load_route_definitions(routes_config)
     resolved_zones = resolve_zones(zone_definitions)
 
-    for route in route_definitions:
-        if route.from_zone not in resolved_zones:
-            raise UnknownZoneError(
-                f"Route {route.name!r} references unknown zone {route.from_zone!r}."
-            )
+    _validate_route_zone_references(resolved_zones, route_definitions)
 
     return resolved_zones
 
@@ -203,6 +251,17 @@ def _as_string_tuple(value: Iterable[str], field_name: str) -> tuple[str, ...]:
     if not all(isinstance(item, str) for item in result):
         raise TypeError(f"{field_name!r} must contain only strings.")
     return result
+
+
+def _validate_route_zone_references(
+    resolved_zones: Mapping[ZoneName, frozenset[SourceId]],
+    routes: Sequence[RouteDefinition],
+) -> None:
+    for route in routes:
+        if route.from_zone not in resolved_zones:
+            raise UnknownZoneError(
+                f"Route {route.name!r} references unknown zone {route.from_zone!r}."
+            )
 
 
 def _coerce_zone_definition(zone_name: ZoneName, value: ZoneConfig) -> ZoneDefinition:
