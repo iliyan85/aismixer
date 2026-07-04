@@ -11,6 +11,7 @@ from forwarder import Forwarder
 from dedup import Deduplicator
 from core.event import IngressEvent
 from core.runtime_routing import load_optional_routing_table
+from core.routing_state import RoutingState
 from core.s_policy import choose_s_value, parse_tag_pairs_before_index, extract_g_tuple
 from core.source_identity import build_udp_source_id
 from core.state.s_cache import touch_s
@@ -101,7 +102,8 @@ def _gen_numeric_gid_fixed(digits: int) -> str:
 
 deduplicator = Deduplicator()
 forwarder = Forwarder(FORWARDERS)
-routing_table = load_optional_routing_table(config, forwarder.target_ids)
+initial_routing_table = load_optional_routing_table(config, forwarder.target_ids)
+routing_state = RoutingState(initial_routing_table)
 assembler = AIVDMAssembler()
 
 
@@ -114,14 +116,23 @@ async def mixer_loop(input_queues, output_queue):
     await asyncio.gather(*tasks)
 
 
-async def forward_loop(queue, routing_table=None):
+async def forward_loop(queue, routing_state=None):
+    """Forward events using one immutable routing snapshot per IngressEvent.
+
+    RoutingState replacements affect the next event pulled from the queue, not
+    the event currently being processed.
+    """
+
     # Контекст: (assembler_key, group_id) -> 's' от ранна част на мултипарт
     multipart_s_ctx: dict[tuple[str, str], str] = {}
     while True:
         ev: IngressEvent = await queue.get()
+        event_routing_table = None
+        if routing_state is not None:
+            event_routing_table = routing_state.snapshot().table
         route_target_ids = ()
-        if routing_table is not None:
-            route_target_ids = routing_table.match(ev.source_id).target_ids
+        if event_routing_table is not None:
+            route_target_ids = event_routing_table.match(ev.source_id).target_ids
 
         # Zero-copy friendly: взимаме индекси към ev.raw_line, не търсим с find()
         for sl in extract_nmea_sentences(ev.raw_line, want_idx=True):
@@ -170,7 +181,7 @@ async def forward_loop(queue, routing_table=None):
 
             for i, full_line in enumerate(multipart):
                 eligible_target_ids = None
-                if routing_table is None:
+                if event_routing_table is None:
                     if not deduplicator.is_unique(full_line):
                         continue
                 else:
@@ -204,7 +215,7 @@ async def forward_loop(queue, routing_table=None):
                 if DEBUG:
                     print(f"{ts()} OUTPUT => {wrapped_line}")
 
-                if routing_table is None:
+                if event_routing_table is None:
                     await forwarder.send(wrapped_line + '\r\n')
                 else:
                     await forwarder.send_to(
@@ -276,7 +287,7 @@ async def main():
 
     # Mixer + Forwarder
     asyncio.create_task(mixer_loop(input_queues, mixer_queue))
-    await forward_loop(mixer_queue, routing_table=routing_table)
+    await forward_loop(mixer_queue, routing_state=routing_state)
 
 if __name__ == '__main__':
     try:

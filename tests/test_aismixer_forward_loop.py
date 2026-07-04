@@ -7,6 +7,7 @@ import aismixer
 from assembler import AIVDMAssembler
 from core.event import IngressEvent
 from core.routing import RoutingResult, RoutingTable
+from core.routing_state import RoutingSnapshot, RoutingState
 from dedup import Deduplicator
 
 
@@ -17,15 +18,18 @@ MULTIPART_SECOND = "!AIVDM,2,2,7,A,payload2,0*00"
 
 
 class FakeForwarder:
-    def __init__(self):
+    def __init__(self, on_send_to=None):
         self.messages = []
         self.targeted_messages = []
+        self.on_send_to = on_send_to
 
     async def send(self, message):
         self.messages.append(message)
 
     async def send_to(self, target_ids, message):
         self.targeted_messages.append((tuple(target_ids), message))
+        if self.on_send_to is not None:
+            self.on_send_to(tuple(target_ids), message)
 
 
 class _OnePacketLoop:
@@ -94,6 +98,19 @@ def make_routing_table(routes=None, zones=None):
     )
 
 
+def make_single_target_table(target_id, source_id="udp:source_a"):
+    return RoutingTable.from_definitions(
+        {"source": {"include": [source_id]}},
+        [
+            {
+                "name": f"source_to_{target_id}",
+                "from_zone": "source",
+                "to": [target_id],
+            }
+        ],
+    )
+
+
 class RecordingRoutingTable:
     def __init__(self, target_ids):
         self.target_ids = tuple(target_ids)
@@ -102,6 +119,16 @@ class RecordingRoutingTable:
     def match(self, source_id):
         self.source_ids.append(source_id)
         return RoutingResult(("recorded",), self.target_ids)
+
+
+class RecordingRoutingState:
+    def __init__(self, table):
+        self.snapshot_calls = 0
+        self._snapshot = RoutingSnapshot(generation=0, table=table)
+
+    def snapshot(self):
+        self.snapshot_calls += 1
+        return self._snapshot
 
 
 def test_handle_socket_creates_ingress_event_with_udp_source_id(monkeypatch):
@@ -203,22 +230,15 @@ async def run_forward_loop_capture(
     events,
     expected_broadcast_sends=0,
     expected_targeted_sends=0,
-    routing_table=None,
+    routing_state=None,
     station_id="test_station",
+    on_send_to=None,
 ):
-    fake_forwarder = FakeForwarder()
-    monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
-    monkeypatch.setattr(aismixer, "assembler", AIVDMAssembler())
-    monkeypatch.setattr(aismixer, "deduplicator", Deduplicator())
-    monkeypatch.setattr(aismixer, "STATION_ID", station_id)
-    monkeypatch.setattr(aismixer, "DEBUG", False)
-    monkeypatch.setattr(aismixer, "C_PRESERVE_INGRESS_C", True)
-    monkeypatch.setattr(aismixer, "G_PRESERVE_INGRESS_GID", True)
-    monkeypatch.setattr(aismixer, "G_ALWAYS_TAG_SINGLE", False)
-
-    queue = asyncio.Queue()
-    task = asyncio.create_task(
-        aismixer.forward_loop(queue, routing_table=routing_table)
+    queue, task, fake_forwarder = await start_forward_loop_capture(
+        monkeypatch,
+        routing_state=routing_state,
+        station_id=station_id,
+        on_send_to=on_send_to,
     )
     try:
         for event in events:
@@ -238,6 +258,29 @@ async def run_forward_loop_capture(
         return fake_forwarder
     finally:
         await cancel_task(task)
+
+
+async def start_forward_loop_capture(
+    monkeypatch,
+    routing_state=None,
+    station_id="test_station",
+    on_send_to=None,
+):
+    fake_forwarder = FakeForwarder(on_send_to=on_send_to)
+    monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
+    monkeypatch.setattr(aismixer, "assembler", AIVDMAssembler())
+    monkeypatch.setattr(aismixer, "deduplicator", Deduplicator())
+    monkeypatch.setattr(aismixer, "STATION_ID", station_id)
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+    monkeypatch.setattr(aismixer, "C_PRESERVE_INGRESS_C", True)
+    monkeypatch.setattr(aismixer, "G_PRESERVE_INGRESS_GID", True)
+    monkeypatch.setattr(aismixer, "G_ALWAYS_TAG_SINGLE", False)
+
+    queue = asyncio.Queue()
+    task = asyncio.create_task(
+        aismixer.forward_loop(queue, routing_state=routing_state)
+    )
+    return queue, task, fake_forwarder
 
 
 async def run_multipart_forward_loop(monkeypatch):
@@ -355,8 +398,23 @@ def test_forward_loop_legacy_mode_keeps_global_deduplication(monkeypatch):
     assert fake_forwarder.targeted_messages == []
 
 
+def test_forward_loop_routing_state_with_no_table_uses_legacy_mode(monkeypatch):
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(SENTENCE)],
+            expected_broadcast_sends=1,
+            routing_state=RoutingState(None),
+        )
+    )
+
+    assert len(fake_forwarder.messages) == 1
+    assert fake_forwarder.targeted_messages == []
+
+
 def test_forward_loop_routing_mode_matches_event_source_id(monkeypatch):
     routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_state = RecordingRoutingState(routing_table)
     event = make_event(SENTENCE, source_id="udp:source_a")
 
     fake_forwarder = asyncio.run(
@@ -364,11 +422,12 @@ def test_forward_loop_routing_mode_matches_event_source_id(monkeypatch):
             monkeypatch,
             [event],
             expected_targeted_sends=1,
-            routing_table=routing_table,
+            routing_state=routing_state,
         )
     )
 
     assert routing_table.source_ids == ["udp:source_a"]
+    assert routing_state.snapshot_calls == 1
     assert fake_forwarder.messages == []
 
 
@@ -381,7 +440,7 @@ def test_forward_loop_routing_mode_sends_to_matched_targets(monkeypatch):
             monkeypatch,
             [event],
             expected_targeted_sends=1,
-            routing_table=routing_table,
+            routing_state=RoutingState(routing_table),
         )
     )
 
@@ -400,7 +459,7 @@ def test_forward_loop_routing_mode_no_matching_route_produces_no_output(monkeypa
         run_forward_loop_capture(
             monkeypatch,
             [event],
-            routing_table=routing_table,
+            routing_state=RoutingState(routing_table),
         )
     )
 
@@ -420,7 +479,7 @@ def test_forward_loop_routing_mode_suppresses_duplicate_for_same_target(monkeypa
             monkeypatch,
             events,
             expected_targeted_sends=1,
-            routing_table=routing_table,
+            routing_state=RoutingState(routing_table),
         )
     )
 
@@ -445,7 +504,7 @@ def test_forward_loop_routing_mode_allows_same_sentence_to_two_targets(monkeypat
             monkeypatch,
             [event],
             expected_targeted_sends=1,
-            routing_table=routing_table,
+            routing_state=RoutingState(routing_table),
         )
     )
 
@@ -480,7 +539,7 @@ def test_forward_loop_routing_mode_dedups_two_sources_to_same_target(monkeypatch
             monkeypatch,
             events,
             expected_targeted_sends=1,
-            routing_table=routing_table,
+            routing_state=RoutingState(routing_table),
         )
     )
 
@@ -513,7 +572,7 @@ def test_forward_loop_routing_mode_keeps_two_sources_to_different_targets(monkey
             monkeypatch,
             events,
             expected_targeted_sends=2,
-            routing_table=routing_table,
+            routing_state=RoutingState(routing_table),
         )
     )
 
@@ -547,7 +606,7 @@ def test_forward_loop_routing_mode_overlapping_routes_do_not_duplicate_target(
             monkeypatch,
             [event],
             expected_targeted_sends=1,
-            routing_table=routing_table,
+            routing_state=RoutingState(routing_table),
         )
     )
 
@@ -566,7 +625,7 @@ def test_forward_loop_routing_mode_preserves_multipart_and_tag_behavior(monkeypa
             monkeypatch,
             events,
             expected_targeted_sends=2,
-            routing_table=routing_table,
+            routing_state=RoutingState(routing_table),
         )
     )
 
@@ -586,6 +645,7 @@ def test_forward_loop_routing_mode_preserves_multipart_and_tag_behavior(monkeypa
 
 def test_forward_loop_routing_matches_once_for_multi_sentence_event(monkeypatch):
     routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_state = RecordingRoutingState(routing_table)
     raw_line = f"{SENTENCE}\n{SECOND_SENTENCE}"
 
     fake_forwarder = asyncio.run(
@@ -593,11 +653,12 @@ def test_forward_loop_routing_matches_once_for_multi_sentence_event(monkeypatch)
             monkeypatch,
             [make_event(raw_line, source_id="udp:source_a")],
             expected_targeted_sends=2,
-            routing_table=routing_table,
+            routing_state=routing_state,
         )
     )
 
     assert routing_table.source_ids == ["udp:source_a"]
+    assert routing_state.snapshot_calls == 1
     assert fake_forwarder.messages == []
     assert len(fake_forwarder.targeted_messages) == 2
     assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
@@ -606,6 +667,201 @@ def test_forward_loop_routing_matches_once_for_multi_sentence_event(monkeypatch)
     ]
     assert SENTENCE in fake_forwarder.targeted_messages[0][1]
     assert SECOND_SENTENCE in fake_forwarder.targeted_messages[1][1]
+
+
+def test_forward_loop_snapshot_called_once_per_ingress_event(monkeypatch):
+    routing_table = make_routing_table()
+    routing_state = RecordingRoutingState(routing_table)
+    events = [
+        make_event(SENTENCE, source_id="udp:source_a", assembler_key="a:1"),
+        make_event(SECOND_SENTENCE, source_id="udp:source_a", assembler_key="a:2"),
+    ]
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            events,
+            expected_targeted_sends=2,
+            routing_state=routing_state,
+        )
+    )
+
+    assert routing_state.snapshot_calls == 2
+    assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
+        ("udp:aishub",),
+        ("udp:aishub",),
+    ]
+
+
+def test_forward_loop_replacement_between_events_uses_new_snapshot(monkeypatch):
+    async def run():
+        routing_state = RoutingState(make_single_target_table("udp:first"))
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            routing_state=routing_state,
+        )
+        try:
+            await queue.put(make_event(SENTENCE, source_id="udp:source_a"))
+            await wait_for_forwarder_activity(
+                fake_forwarder, task, targeted_count=1
+            )
+
+            routing_state.replace(make_single_target_table("udp:second"))
+
+            await queue.put(make_event(SENTENCE, source_id="udp:source_a"))
+            await wait_for_forwarder_activity(
+                fake_forwarder, task, targeted_count=2
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+
+    assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
+        ("udp:first",),
+        ("udp:second",),
+    ]
+
+
+def test_forward_loop_mid_event_replacement_affects_next_event_only(monkeypatch):
+    first_table = make_single_target_table("udp:first")
+    second_table = make_single_target_table("udp:second")
+    routing_state = RoutingState(first_table)
+    replaced = {"done": False}
+
+    def replace_on_first_send(_target_ids, _message):
+        if not replaced["done"]:
+            replaced["done"] = True
+            routing_state.replace(second_table)
+
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            routing_state=routing_state,
+            on_send_to=replace_on_first_send,
+        )
+        try:
+            await queue.put(
+                make_event(
+                    f"{SENTENCE}\n{SECOND_SENTENCE}",
+                    source_id="udp:source_a",
+                )
+            )
+            await wait_for_forwarder_activity(
+                fake_forwarder, task, targeted_count=2
+            )
+
+            assert routing_state.snapshot().table is second_table
+
+            await queue.put(make_event(SENTENCE, source_id="udp:source_a"))
+            await wait_for_forwarder_activity(
+                fake_forwarder, task, targeted_count=3
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+
+    assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
+        ("udp:first",),
+        ("udp:first",),
+        ("udp:second",),
+    ]
+
+
+def test_forward_loop_replace_none_returns_next_event_to_legacy_mode(monkeypatch):
+    async def run():
+        routing_state = RoutingState(make_single_target_table("udp:first"))
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            routing_state=routing_state,
+        )
+        try:
+            await queue.put(make_event(SENTENCE, source_id="udp:source_a"))
+            await wait_for_forwarder_activity(
+                fake_forwarder, task, targeted_count=1
+            )
+
+            routing_state.replace(None)
+
+            await queue.put(make_event(SECOND_SENTENCE, source_id="udp:source_a"))
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=1,
+                targeted_count=1,
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+
+    assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
+        ("udp:first",)
+    ]
+    assert len(fake_forwarder.messages) == 1
+    assert SECOND_SENTENCE in fake_forwarder.messages[0]
+
+
+def test_forward_loop_replacement_generation_preserves_tag_behavior(monkeypatch):
+    group_id = "424242"
+    first = f"\\c:1234567890,s:incoming,g:1-2-{group_id}*00\\{MULTIPART_FIRST}"
+    second = f"\\g:2-2-{group_id}*00\\{MULTIPART_SECOND}"
+
+    async def run():
+        routing_state = RoutingState(make_single_target_table("udp:first"))
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            routing_state=routing_state,
+        )
+        try:
+            await queue.put(
+                make_event(first, source_id="udp:source_a", assembler_key="a:1")
+            )
+            await queue.put(
+                make_event(second, source_id="udp:source_a", assembler_key="a:1")
+            )
+            await wait_for_forwarder_activity(
+                fake_forwarder, task, targeted_count=2
+            )
+
+            routing_state.replace(make_single_target_table("udp:second"))
+
+            await queue.put(
+                make_event(first, source_id="udp:source_a", assembler_key="a:2")
+            )
+            await queue.put(
+                make_event(second, source_id="udp:source_a", assembler_key="a:2")
+            )
+            await wait_for_forwarder_activity(
+                fake_forwarder, task, targeted_count=4
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    messages = [message for _target_ids, message in fake_forwarder.targeted_messages]
+
+    assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
+        ("udp:first",),
+        ("udp:first",),
+        ("udp:second",),
+        ("udp:second",),
+    ]
+    assert re.fullmatch(
+        rf"c:\d+,s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+        leading_tag(messages[0]),
+    )
+    assert leading_tag(messages[1]).startswith(f"g:2-2-{group_id}*")
+    assert re.fullmatch(
+        rf"c:\d+,s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+        leading_tag(messages[2]),
+    )
+    assert leading_tag(messages[3]).startswith(f"g:2-2-{group_id}*")
 
 
 def test_forward_loop_routing_cleans_multipart_context_when_no_route_matches(
@@ -620,38 +876,59 @@ def test_forward_loop_routing_cleans_multipart_context_when_no_route_matches(
     second_unrouted = f"\\g:2-2-{group_id}*00\\{MULTIPART_SECOND}"
     first_routed = f"\\g:1-2-{group_id}*00\\{MULTIPART_FIRST}"
     second_routed = f"\\g:2-2-{group_id}*00\\{MULTIPART_SECOND}"
-    events = [
-        make_event(
-            first_unrouted,
-            source_id="udp:unmatched",
-            assembler_key=assembler_key,
-        ),
-        make_event(
-            second_unrouted,
-            source_id="udp:unmatched",
-            assembler_key=assembler_key,
-        ),
-        make_event(
-            first_routed,
-            source_id="udp:source_a",
-            assembler_key=assembler_key,
-        ),
-        make_event(
-            second_routed,
-            source_id="udp:source_a",
-            assembler_key=assembler_key,
-        ),
-    ]
 
-    fake_forwarder = asyncio.run(
-        run_forward_loop_capture(
+    async def run():
+        routing_state = RoutingState(routing_table)
+        queue, task, fake_forwarder = await start_forward_loop_capture(
             monkeypatch,
-            events,
-            expected_targeted_sends=2,
-            routing_table=routing_table,
+            routing_state=routing_state,
             station_id="",
         )
-    )
+        try:
+            await queue.put(
+                make_event(
+                    first_unrouted,
+                    source_id="udp:unmatched",
+                    assembler_key=assembler_key,
+                )
+            )
+            await queue.put(
+                make_event(
+                    second_unrouted,
+                    source_id="udp:unmatched",
+                    assembler_key=assembler_key,
+                )
+            )
+            await asyncio.sleep(0.05)
+            if task.done():
+                task.result()
+            assert fake_forwarder.messages == []
+            assert fake_forwarder.targeted_messages == []
+
+            routing_state.replace(routing_table)
+
+            await queue.put(
+                make_event(
+                    first_routed,
+                    source_id="udp:source_a",
+                    assembler_key=assembler_key,
+                )
+            )
+            await queue.put(
+                make_event(
+                    second_routed,
+                    source_id="udp:source_a",
+                    assembler_key=assembler_key,
+                )
+            )
+            await wait_for_forwarder_activity(
+                fake_forwarder, task, targeted_count=2
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
 
     assert fake_forwarder.messages == []
     assert len(fake_forwarder.targeted_messages) == 2

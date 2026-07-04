@@ -10,6 +10,7 @@ from assembler import AIVDMAssembler
 from core.event import IngressEvent
 from core.routing import RoutingTable
 from core.runtime_routing import load_optional_routing_table
+from core.routing_state import RoutingState
 from dedup import Deduplicator
 from forwarder import Forwarder
 
@@ -168,8 +169,9 @@ async def run_routed_events(
     monkeypatch.setattr(aismixer, "G_ALWAYS_TAG_SINGLE", False)
 
     queue = real_asyncio.Queue()
+    routing_state = RoutingState(routing_table)
     task = real_asyncio.create_task(
-        aismixer.forward_loop(queue, routing_table=routing_table)
+        aismixer.forward_loop(queue, routing_state=routing_state)
     )
     try:
         for event in events:
