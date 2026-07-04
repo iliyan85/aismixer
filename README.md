@@ -124,6 +124,57 @@ All variants are sanitized to `[A–Za–z0–9_]` and limited to **15** charact
 "2001:db8::1234": "dock_gate"
 ```
 
+### Optional runtime routing
+
+By default AISMixer runs in legacy broadcast mode. If `config.yaml` has no
+`routing:` section, behavior is unchanged: deduplication is global and every
+accepted output sentence is sent to every configured forwarder with
+`Forwarder.send()`. Existing unnamed forwarders remain valid in this mode.
+
+Routing mode is enabled only by adding a valid `routing:` section. In routing
+mode, AISMixer matches each internal `IngressEvent.source_id` against the
+compiled routing table, deduplicates per logical target ID, and sends only to
+matched named UDP forwarders with `Forwarder.send_to()`. Route matching uses the
+internal source ID, not the emitted NMEA TAG `s` value.
+
+Important identity rules:
+
+- `udp_inputs[].id` becomes the preferred UDP source ID, for example
+  `id: balchik_roof` -> `udp:balchik_roof`.
+- If a UDP input has no `id`, an alias from `udp_alias_map.yaml` may become the
+  UDP source ID; otherwise the remote IP is used.
+- Secure UDP routing source IDs use the authenticated station ID, for example
+  `udpsec:rPiAIS002`.
+- `sec_inputs[].id` may affect emitted TAG `s` aliasing, but it does not replace
+  the authenticated secure routing source ID.
+- `forwarders[].id` creates a canonical UDP target ID, for example
+  `id: aishub` -> `udp:aishub`.
+
+Routing mode requires named forwarders for every referenced UDP target. Unknown
+or currently unsupported targets such as `udp:missing`, `mqtt:clean_stream`, or
+`mongo:raw_archive` cause startup configuration failure instead of being
+silently ignored.
+
+Zones are logical source-ID sets, not geographic AIS areas. Geographic filtering
+is not implemented. Supported zone operations are:
+
+- `include`: directly list source IDs.
+- `union`: combine named zones.
+- `intersection`: keep sources present in all referenced zones.
+- `difference`: start with the first zone and remove sources from later zones.
+
+Deduplication semantics:
+
+- Legacy mode: one global deduplication scope.
+- Routing mode: one deduplication scope per logical target ID. The same NMEA
+  sentence may be delivered once to `udp:aishub` and once to `udp:local_debug`,
+  while overlapping routes to the same target still produce one delivery within
+  the TTL.
+
+See [`examples/config-routing.yaml`](examples/config-routing.yaml) for an
+inactive routing example. Do not add that section to production config until
+your forwarder IDs and route target IDs match.
+
 ---
 
 ## 🧭 Components
