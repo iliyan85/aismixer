@@ -10,6 +10,7 @@ from secrets import randbelow
 from forwarder import Forwarder
 from dedup import Deduplicator
 from core.event import IngressEvent
+from core.runtime_routing import load_optional_routing_table
 from core.s_policy import choose_s_value, parse_tag_pairs_before_index, extract_g_tuple
 from core.source_identity import build_udp_source_id
 from core.state.s_cache import touch_s
@@ -100,6 +101,7 @@ def _gen_numeric_gid_fixed(digits: int) -> str:
 
 deduplicator = Deduplicator()
 forwarder = Forwarder(FORWARDERS)
+routing_table = load_optional_routing_table(config, forwarder.target_ids)
 assembler = AIVDMAssembler()
 
 
@@ -112,11 +114,14 @@ async def mixer_loop(input_queues, output_queue):
     await asyncio.gather(*tasks)
 
 
-async def forward_loop(queue):
+async def forward_loop(queue, routing_table=None):
     # Контекст: (assembler_key, group_id) -> 's' от ранна част на мултипарт
     multipart_s_ctx: dict[tuple[str, str], str] = {}
     while True:
         ev: IngressEvent = await queue.get()
+        route_target_ids = ()
+        if routing_table is not None:
+            route_target_ids = routing_table.match(ev.source_id).target_ids
 
         # Zero-copy friendly: взимаме индекси към ev.raw_line, не търсим с find()
         for sl in extract_nmea_sentences(ev.raw_line, want_idx=True):
@@ -164,8 +169,18 @@ async def forward_loop(queue):
             tag_single = (total_parts == 1 and G_ALWAYS_TAG_SINGLE)
 
             for i, full_line in enumerate(multipart):
-                if not deduplicator.is_unique(full_line):
-                    continue
+                eligible_target_ids = None
+                if routing_table is None:
+                    if not deduplicator.is_unique(full_line):
+                        continue
+                else:
+                    eligible_target_ids = tuple(
+                        target_id
+                        for target_id in route_target_ids
+                        if deduplicator.is_unique(full_line, scope=target_id)
+                    )
+                    if not eligible_target_ids:
+                        continue
                 is_first = i == 0
                 # 3) Определи incoming_s
                 incoming_s = tag_pairs.get('s')
@@ -189,7 +204,13 @@ async def forward_loop(queue):
                 if DEBUG:
                     print(f"{ts()} OUTPUT => {wrapped_line}")
 
-                await forwarder.send(wrapped_line + '\r\n')
+                if routing_table is None:
+                    await forwarder.send(wrapped_line + '\r\n')
+                else:
+                    await forwarder.send_to(
+                        eligible_target_ids,
+                        wrapped_line + '\r\n',
+                    )
 
             # 5) Ако това е последната част от групата — чистим кеша
             if g_info:
@@ -255,7 +276,7 @@ async def main():
 
     # Mixer + Forwarder
     asyncio.create_task(mixer_loop(input_queues, mixer_queue))
-    await forward_loop(mixer_queue)
+    await forward_loop(mixer_queue, routing_table=routing_table)
 
 if __name__ == '__main__':
     try:
