@@ -3,6 +3,7 @@ import pytest
 from core.routing import RoutingTable
 from core.runtime_routing import (
     RuntimeRoutingConfigError,
+    compile_routing_section,
     load_optional_routing_table,
 )
 
@@ -50,9 +51,38 @@ def test_valid_routing_section_creates_routing_table():
     assert table.match("udp:balchik_roof").target_ids == AVAILABLE_TARGETS
 
 
+def test_compile_routing_section_matches_optional_loader_output():
+    config = routing_config()
+
+    direct = compile_routing_section(config["routing"], AVAILABLE_TARGETS)
+    optional = load_optional_routing_table(config, AVAILABLE_TARGETS)
+
+    assert direct.resolved_zones == optional.resolved_zones
+    assert direct.route_definitions == optional.route_definitions
+    assert direct.match("udp:balchik_roof") == optional.match("udp:balchik_roof")
+
+
 def test_invalid_routing_section_type_is_rejected():
     with pytest.raises(RuntimeRoutingConfigError, match="must be a mapping"):
         load_optional_routing_table({"routing": []}, AVAILABLE_TARGETS)
+
+
+def test_compile_routing_section_rejects_invalid_section_type():
+    with pytest.raises(RuntimeRoutingConfigError, match="must be a mapping"):
+        compile_routing_section([], AVAILABLE_TARGETS)
+
+
+def test_compile_routing_section_reuses_optional_loader_validation_errors():
+    config = routing_config()
+    config["routing"]["enabled"] = True
+
+    with pytest.raises(RuntimeRoutingConfigError) as direct_exc:
+        compile_routing_section(config["routing"], AVAILABLE_TARGETS)
+
+    with pytest.raises(RuntimeRoutingConfigError) as optional_exc:
+        load_optional_routing_table(config, AVAILABLE_TARGETS)
+
+    assert str(direct_exc.value) == str(optional_exc.value)
 
 
 def test_unknown_routing_fields_are_rejected():
@@ -86,6 +116,19 @@ def test_multiple_unknown_targets_are_reported_deterministically():
 
     with pytest.raises(RuntimeRoutingConfigError) as exc_info:
         load_optional_routing_table(config, AVAILABLE_TARGETS)
+
+    assert str(exc_info.value).endswith(
+        "mongo:raw_archive, mqtt:clean_stream, udp:missing_target."
+    )
+
+
+def test_compile_routing_section_target_errors_are_deterministic():
+    config = routing_config(
+        targets=("mongo:raw_archive", "udp:missing_target", "mqtt:clean_stream")
+    )
+
+    with pytest.raises(RuntimeRoutingConfigError) as exc_info:
+        compile_routing_section(config["routing"], AVAILABLE_TARGETS)
 
     assert str(exc_info.value).endswith(
         "mongo:raw_archive, mqtt:clean_stream, udp:missing_target."

@@ -11,16 +11,12 @@ class RuntimeRoutingConfigError(ValueError):
     """Raised when optional runtime routing config is invalid."""
 
 
-def load_optional_routing_table(
-    config: Mapping[str, object],
+def compile_routing_section(
+    routing_config: Mapping[str, object],
     available_target_ids: Iterable[str],
-) -> RoutingTable | None:
-    """Compile optional runtime routing config and validate route targets."""
+) -> RoutingTable:
+    """Compile a top-level ``routing`` section and validate route targets."""
 
-    if "routing" not in config or config["routing"] is None:
-        return None
-
-    routing_config = config["routing"]
     if not isinstance(routing_config, Mapping):
         raise RuntimeRoutingConfigError("'routing' config must be a mapping.")
 
@@ -45,6 +41,18 @@ def load_optional_routing_table(
     )
     _validate_available_targets(table, available_target_ids)
     return table
+
+
+def load_optional_routing_table(
+    config: Mapping[str, object],
+    available_target_ids: Iterable[str],
+) -> RoutingTable | None:
+    """Compile optional runtime routing config and validate route targets."""
+
+    if "routing" not in config or config["routing"] is None:
+        return None
+
+    return compile_routing_section(config["routing"], available_target_ids)
 
 
 def _validate_available_targets(
