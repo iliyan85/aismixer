@@ -11,9 +11,13 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-from core.routing import RoutingTable
+from core.routing import RoutingTable, ZoneResolutionError
 from core.routing_state import RoutingSnapshot, RoutingState
-from core.runtime_routing import compile_routing_section
+from core.runtime_routing import RuntimeRoutingConfigError, compile_routing_section
+
+
+class RoutingCandidateConfigError(ValueError):
+    """Raised when a candidate routing section cannot be compiled or validated."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,10 +62,19 @@ class RoutingControlService:
     ) -> RoutingControlStatus:
         """Compile, validate, and atomically install a candidate config."""
 
-        candidate_table = compile_routing_section(
-            routing_config,
-            self._available_target_ids,
-        )
+        try:
+            candidate_table = compile_routing_section(
+                routing_config,
+                self._available_target_ids,
+            )
+        except (
+            RuntimeRoutingConfigError,
+            ZoneResolutionError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise RoutingCandidateConfigError(str(exc)) from exc
+
         snapshot = self._routing_state.replace(
             candidate_table,
             expected_generation=expected_generation,

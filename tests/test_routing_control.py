@@ -1,9 +1,12 @@
 import pytest
 
-from core.routing_control import RoutingControlService, RoutingControlStatus
+from core.routing_control import (
+    RoutingCandidateConfigError,
+    RoutingControlService,
+    RoutingControlStatus,
+)
 from core.routing_state import RoutingState, StaleRoutingGenerationError
 from core.runtime_routing import (
-    RuntimeRoutingConfigError,
     compile_routing_section,
 )
 
@@ -38,7 +41,7 @@ def test_constructor_copies_available_target_ids():
     service = RoutingControlService(RoutingState(), available_target_ids)
     available_target_ids.append("udp:b")
 
-    with pytest.raises(RuntimeRoutingConfigError, match="udp:b"):
+    with pytest.raises(RoutingCandidateConfigError, match="udp:b"):
         service.replace_from_config(
             routing_section(
                 routes=[
@@ -166,10 +169,17 @@ def test_invalid_routing_config_leaves_state_unchanged():
     service = RoutingControlService(state, AVAILABLE_TARGETS)
     before = state.snapshot()
 
-    with pytest.raises(RuntimeRoutingConfigError, match="missing required"):
+    with pytest.raises(RoutingCandidateConfigError, match="missing required"):
         service.replace_from_config({"zones": {"source": {"include": ["udp:source"]}}})
 
     assert state.snapshot() is before
+
+
+def test_malformed_candidate_config_raises_candidate_config_error():
+    service = RoutingControlService(RoutingState(), AVAILABLE_TARGETS)
+
+    with pytest.raises(RoutingCandidateConfigError, match="missing required"):
+        service.replace_from_config({"zones": {"source": {"include": ["udp:source"]}}})
 
 
 def test_unknown_target_leaves_state_unchanged():
@@ -177,7 +187,7 @@ def test_unknown_target_leaves_state_unchanged():
     service = RoutingControlService(state, AVAILABLE_TARGETS)
     before = state.snapshot()
 
-    with pytest.raises(RuntimeRoutingConfigError, match="udp:missing"):
+    with pytest.raises(RoutingCandidateConfigError, match="udp:missing"):
         service.replace_from_config(
             routing_section(
                 routes=[
@@ -191,6 +201,44 @@ def test_unknown_target_leaves_state_unchanged():
         )
 
     assert state.snapshot() is before
+
+
+def test_unavailable_target_raises_candidate_config_error():
+    service = RoutingControlService(RoutingState(), AVAILABLE_TARGETS)
+
+    with pytest.raises(RoutingCandidateConfigError, match="udp:missing"):
+        service.replace_from_config(
+            routing_section(
+                routes=[
+                    {
+                        "name": "source_to_missing",
+                        "from_zone": "source",
+                        "to": ["udp:missing"],
+                    }
+                ]
+            )
+        )
+
+
+def test_candidate_config_error_retains_original_message():
+    service = RoutingControlService(RoutingState(), AVAILABLE_TARGETS)
+
+    with pytest.raises(RoutingCandidateConfigError) as exc_info:
+        service.replace_from_config(
+            routing_section(
+                routes=[
+                    {
+                        "name": "source_to_missing",
+                        "from_zone": "source",
+                        "to": ["udp:missing"],
+                    }
+                ]
+            )
+        )
+
+    assert str(exc_info.value) == (
+        "Routing target ID(s) are unavailable or unsupported: udp:missing."
+    )
 
 
 def test_stale_expected_generation_raises_stale_error():
@@ -223,6 +271,27 @@ def test_stale_update_leaves_state_unchanged():
 
     assert state.snapshot() is before
     assert state.snapshot().table.match("udp:source").target_ids == ("udp:a",)
+
+
+def test_stale_generation_is_not_wrapped_as_candidate_config_error():
+    service = RoutingControlService(RoutingState(), AVAILABLE_TARGETS)
+    service.replace_from_config(routing_section())
+
+    with pytest.raises(StaleRoutingGenerationError):
+        service.replace_from_config(routing_section(), expected_generation=0)
+
+
+def test_routing_state_replace_failure_is_not_wrapped(monkeypatch):
+    state = RoutingState()
+    service = RoutingControlService(state, AVAILABLE_TARGETS)
+
+    def replace_raises(_table, expected_generation=None):
+        raise RuntimeError("replace failed")
+
+    monkeypatch.setattr(state, "replace", replace_raises)
+
+    with pytest.raises(RuntimeError, match="replace failed"):
+        service.replace_from_config(routing_section())
 
 
 def test_matching_expected_generation_succeeds():
