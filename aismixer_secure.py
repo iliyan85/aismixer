@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 from core.event import IngressEvent
+from core.source_identity import build_udpsec_source_id
 
 
 HANDSHAKE_PREFIX = b"NMEA-H"
@@ -456,6 +457,7 @@ async def secure_server(queue, ip, port, sec_input_id=None):
                 assembler_key = f"{peer[0]}:{peer[1]}" if isinstance(
                     peer, tuple) and peer else (remote_ip or "sec")
                 await queue.put(IngressEvent(kind="sec",
+                                             source_id=build_udpsec_source_id(station_id),
                                              alias_for_s=src_for_queue,
                                              remote_ip=remote_ip,
                                              assembler_key=assembler_key,

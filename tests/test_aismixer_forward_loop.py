@@ -1,6 +1,8 @@
 import asyncio
 import re
 
+import pytest
+
 import aismixer
 from assembler import AIVDMAssembler
 from core.event import IngressEvent
@@ -20,9 +22,38 @@ class FakeForwarder:
         self.messages.append(message)
 
 
+class _OnePacketLoop:
+    def __init__(self, packet):
+        self.packet = packet
+
+    async def sock_recvfrom(self, sock, size):
+        if self.packet is not None:
+            packet = self.packet
+            self.packet = None
+            return packet
+        raise asyncio.CancelledError()
+
+
+class _FakeAsyncioModule:
+    def __init__(self, loop):
+        self._loop = loop
+
+    def get_running_loop(self):
+        return self._loop
+
+
+class _FakeQueue:
+    def __init__(self):
+        self.items = []
+
+    async def put(self, item):
+        self.items.append(item)
+
+
 def make_event(raw_line):
     return IngressEvent(
         kind="udp",
+        source_id="udp:192.0.2.10",
         alias_for_s=None,
         remote_ip="192.0.2.10",
         assembler_key="192.0.2.10:17778",
@@ -33,6 +64,35 @@ def make_event(raw_line):
 def leading_tag(message):
     end = message.find("\\", 1)
     return message[1:end]
+
+
+def test_handle_socket_creates_ingress_event_with_udp_source_id(monkeypatch):
+    queue = _FakeQueue()
+    fake_loop = _OnePacketLoop(
+        (SENTENCE.encode(), ("192.0.2.10", 17778))
+    )
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                queue,
+                fixed_alias="balchik_roof",
+                alias_map={"192.0.2.10": "dock_gate"},
+            )
+        )
+
+    assert len(queue.items) == 1
+    event = queue.items[0]
+    assert event.kind == "udp"
+    assert event.source_id == "udp:balchik_roof"
+    assert event.alias_for_s == "balchik_roof"
+    assert event.remote_ip == "192.0.2.10"
+    assert event.assembler_key == "192.0.2.10:17778"
+    assert event.raw_line == SENTENCE
 
 
 async def wait_for_sends(fake_forwarder, task, count, timeout=0.5):

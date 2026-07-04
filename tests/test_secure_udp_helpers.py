@@ -366,7 +366,9 @@ def _encrypted_control_packet(secure, key, nonce, message):
     return secure.DATA_PREFIX + nonce + ciphertext
 
 
-def _run_secure_server_with_packets(monkeypatch, secure, packets, now=1010.0):
+def _run_secure_server_with_packets(
+    monkeypatch, secure, packets, now=1010.0, sec_input_id=None
+):
     fake_socket = _FakeSecureSocket()
     fake_loop = _FakeSecureLoop(packets)
     fake_queue = _FakeQueue()
@@ -377,7 +379,11 @@ def _run_secure_server_with_packets(monkeypatch, secure, packets, now=1010.0):
     monkeypatch.setattr(secure, "asyncio", _FakeAsyncioModule(fake_loop))
 
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(secure.secure_server(fake_queue, "127.0.0.1", 9999))
+        asyncio.run(
+            secure.secure_server(
+                fake_queue, "127.0.0.1", 9999, sec_input_id=sec_input_id
+            )
+        )
 
     return fake_queue, fake_socket
 
@@ -505,9 +511,32 @@ def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
         monkeypatch, secure, [(packet, addr)])
 
     assert len(fake_queue.items) == 1
+    assert fake_queue.items[0].source_id == "udpsec:boat_001"
     assert fake_queue.items[0].raw_line == "!AIVDM,1,1,,A,payload,0*00"
     assert secure.sessions[addr]["last_seen"] == 1010.0
     assert secure.sessions[addr]["seen_data_nonces"] == {nonce: 1310.0}
+
+
+def test_secure_server_source_id_uses_station_not_sec_input_id(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    secure.sessions[addr] = secure.create_session(
+        "boat_001", secure.AESGCM(key), now=1000.0)
+    packet = _encrypted_data_packet(secure, key, nonce)
+
+    fake_queue, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        sec_input_id="configured_listener_alias",
+    )
+
+    assert len(fake_queue.items) == 1
+    event = fake_queue.items[0]
+    assert event.source_id == "udpsec:boat_001"
+    assert event.alias_for_s == "configured_listener_alias"
 
 
 def test_secure_server_rejects_duplicate_data_nonce_after_first_valid_packet(monkeypatch):

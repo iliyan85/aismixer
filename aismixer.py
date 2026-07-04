@@ -11,6 +11,7 @@ from forwarder import Forwarder
 from dedup import Deduplicator
 from core.event import IngressEvent
 from core.s_policy import choose_s_value, parse_tag_pairs_before_index, extract_g_tuple
+from core.source_identity import build_udp_source_id
 from core.state.s_cache import touch_s
 from aismixer_secure import secure_server
 
@@ -208,11 +209,13 @@ async def handle_socket(sock, queue, fixed_alias=None, alias_map=None):
             source_fmt = format_source(source_ip, source_port)
             print(f"{ts()} INPUT {source_fmt} => {raw_line}")
 
-        alias_for_s = fixed_alias or (
-            alias_map.get(source_ip) if alias_map else None)
+        mapped_alias = alias_map.get(source_ip) if alias_map else None
+        alias_for_s = fixed_alias or mapped_alias
         assembler_key = f"{source_ip}:{source_port}"
+        source_id = build_udp_source_id(fixed_alias, mapped_alias, source_ip)
 
         await queue.put(IngressEvent(kind="udp",
+                                     source_id=source_id,
                                      alias_for_s=alias_for_s,
                                      remote_ip=source_ip,
                                      assembler_key=assembler_key,
