@@ -16,6 +16,7 @@ from core.routing_control_protocol import (
     ERROR_UNSUPPORTED_VERSION,
     ROUTING_CONTROL_PROTOCOL_VERSION,
     RoutingControlProtocol,
+    build_error_response,
     decode_json_request,
     encode_json_response,
 )
@@ -553,6 +554,26 @@ def test_encode_json_response_is_compact_and_deterministic():
     encoded = encode_json_response({"b": 2, "a": 1})
 
     assert encoded == b'{"a":1,"b":2}'
+
+
+def test_build_error_response_uses_protocol_error_envelope():
+    response = build_error_response(
+        None,
+        "transport_error",
+        "Transport failed.",
+        details={"retryable": False},
+    )
+
+    assert response == {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": None,
+        "ok": False,
+        "error": {
+            "code": "transport_error",
+            "message": "Transport failed.",
+            "retryable": False,
+        },
+    }
 
 
 def test_unicode_content_round_trips():

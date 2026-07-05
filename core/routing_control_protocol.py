@@ -86,6 +86,17 @@ def encode_json_response(response: Mapping[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def build_error_response(
+    request_id: str | None,
+    code: str,
+    message: str,
+    details: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Build a stable routing-control error response envelope."""
+
+    return _error_response(request_id, code, message, details=details)
+
+
 class RoutingControlProtocol:
     """Validate JSON control requests and delegate to RoutingControlService.
 
