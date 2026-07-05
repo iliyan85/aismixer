@@ -10,6 +10,7 @@ from secrets import randbelow
 from forwarder import Forwarder
 from dedup import Deduplicator
 from core.event import IngressEvent
+from core.runtime_control import build_optional_routing_control_server
 from core.runtime_routing import load_optional_routing_table
 from core.routing_state import RoutingState
 from core.s_policy import choose_s_value, parse_tag_pairs_before_index, extract_g_tuple
@@ -114,6 +115,14 @@ async def mixer_loop(input_queues, output_queue):
             await output_queue.put(item)
     tasks = [asyncio.create_task(reader(q)) for q in input_queues]
     await asyncio.gather(*tasks)
+
+
+async def _cancel_and_await_tasks(tasks):
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def forward_loop(queue, routing_state=None):
@@ -257,37 +266,67 @@ async def handle_socket(sock, queue, fixed_alias=None, alias_map=None):
 async def main():
     input_queues = []
     mixer_queue = asyncio.Queue()
+    runtime_tasks = []
+    udp_sockets = []
+    control_server = build_optional_routing_control_server(
+        config,
+        routing_state,
+        forwarder.target_ids,
+    )
+    control_server_started = False
 
-    # Secure входове
-    for entry in SEC_INPUTS:
-        q = asyncio.Queue()
-        input_queues.append(q)
-        ip = entry["listen_ip"]
-        port = entry["listen_port"]
-        sec_id = entry.get("id")
-        print(f"{ts()} Secure listening on {format_source(ip, port)}")
-        asyncio.create_task(secure_server(q, ip, port, sec_input_id=sec_id))
+    try:
+        if control_server is not None:
+            await control_server.start()
+            control_server_started = True
 
-    # UDP входове
-    for entry in UDP_INPUTS:
-        q = asyncio.Queue()
-        input_queues.append(q)
-        ip = entry["listen_ip"]
-        port = entry["listen_port"]
-        family = socket.AF_INET6 if ':' in ip else socket.AF_INET
-        sock = socket.socket(family, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((ip, port))
-        sock.setblocking(False)
-        print(f"{ts()} Listening on {format_source(ip, port)}")
-        # ако има id -> фиксиран alias за целия вход
-        fixed_alias = entry.get("id")
-        asyncio.create_task(handle_socket(
-            sock, q, fixed_alias, alias_map=UDP_ALIAS_MAP if not fixed_alias else None))
+        # Secure входове
+        for entry in SEC_INPUTS:
+            q = asyncio.Queue()
+            input_queues.append(q)
+            ip = entry["listen_ip"]
+            port = entry["listen_port"]
+            sec_id = entry.get("id")
+            print(f"{ts()} Secure listening on {format_source(ip, port)}")
+            runtime_tasks.append(
+                asyncio.create_task(secure_server(q, ip, port, sec_input_id=sec_id))
+            )
 
-    # Mixer + Forwarder
-    asyncio.create_task(mixer_loop(input_queues, mixer_queue))
-    await forward_loop(mixer_queue, routing_state=routing_state)
+        # UDP входове
+        for entry in UDP_INPUTS:
+            q = asyncio.Queue()
+            input_queues.append(q)
+            ip = entry["listen_ip"]
+            port = entry["listen_port"]
+            family = socket.AF_INET6 if ':' in ip else socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+            udp_sockets.append(sock)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((ip, port))
+            sock.setblocking(False)
+            print(f"{ts()} Listening on {format_source(ip, port)}")
+            # ако има id -> фиксиран alias за целия вход
+            fixed_alias = entry.get("id")
+            runtime_tasks.append(
+                asyncio.create_task(
+                    handle_socket(
+                        sock,
+                        q,
+                        fixed_alias,
+                        alias_map=UDP_ALIAS_MAP if not fixed_alias else None,
+                    )
+                )
+            )
+
+        # Mixer + Forwarder
+        runtime_tasks.append(asyncio.create_task(mixer_loop(input_queues, mixer_queue)))
+        await forward_loop(mixer_queue, routing_state=routing_state)
+    finally:
+        await _cancel_and_await_tasks(runtime_tasks)
+        for sock in udp_sockets:
+            sock.close()
+        if control_server_started:
+            await control_server.close()
 
 if __name__ == '__main__':
     try:
