@@ -1,50 +1,88 @@
 name: Bug report
-description: Report a reproducible problem with aismixer or nmea_sproxy
+description: Report a reproducible problem with AISMixer or nmea_sproxy
 title: "[Bug]: "
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting a problem. Remove private keys and sanitize configs, logs, IP addresses, station IDs, and AIS data before submitting.
+        Thanks for reporting a problem. Do not paste private keys. Redact station identifiers, public IP addresses, credentials, and sensitive operational data. Do not report security vulnerabilities through a public issue; use the repository Security policy instead.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem summary
+      description: Describe the problem concisely.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affected_area
+    attributes:
+      label: Affected area
+      description: Select the area most closely related to the problem.
+      options:
+        - UDP ingress
+        - UDPSEC / nmea_sproxy
+        - TAG handling
+        - multipart assembly
+        - deduplication
+        - routing/zones
+        - runtime control
+        - aismixerctl
+        - installer/systemd
+        - documentation/examples
+        - other
+    validations:
+      required: true
 
   - type: input
-    id: version
+    id: os_version
     attributes:
-      label: aismixer version or commit
+      label: Operating system and version
+      placeholder: "Debian 12, Raspberry Pi OS Bookworm, Ubuntu 24.04, Windows 11"
+    validations:
+      required: true
+
+  - type: input
+    id: architecture
+    attributes:
+      label: Architecture or device
+      placeholder: "x86_64 server, Raspberry Pi 4, ARM64 VM"
+
+  - type: input
+    id: python_version
+    attributes:
+      label: Python version
+      placeholder: "Python 3.11.8"
+    validations:
+      required: true
+
+  - type: input
+    id: aismixer_version
+    attributes:
+      label: AISMixer commit or version
       description: Provide a release version, branch and commit, or commit SHA.
       placeholder: "main at abc1234"
     validations:
       required: true
 
-  - type: input
-    id: environment
-    attributes:
-      label: OS and Python version
-      placeholder: "Debian 12, Python 3.11.8"
-    validations:
-      required: true
-
   - type: dropdown
-    id: input_type
+    id: mode
     attributes:
-      label: Input type
-      description: Select the input path most closely related to the problem.
+      label: Runtime mode
+      description: Choose the active mode if relevant.
       options:
-        - UDP
-        - secure UDP
-        - nmea_sproxy
-        - other
-    validations:
-      required: true
+        - not sure / not relevant
+        - legacy broadcast mode
+        - routing mode from startup configuration
+        - routing mode with runtime control enabled
 
-  - type: textarea
-    id: sanitized_config
+  - type: input
+    id: routing_generation
     attributes:
-      label: Sanitized configuration
-      description: Remove private keys, credentials, public IPs, and sensitive station details.
-      render: yaml
-    validations:
-      required: true
+      label: Routing generation, if applicable
+      description: Optional. Include the generation reported by aismixerctl or the control API when the bug involves runtime routing.
+      placeholder: "generation 3"
 
   - type: textarea
     id: expected
@@ -63,31 +101,48 @@ body:
       required: true
 
   - type: textarea
-    id: logs
-    attributes:
-      label: Sanitized logs
-      description: Include relevant logs with secrets and sensitive operational details removed.
-      render: text
-
-  - type: textarea
     id: reproduction
     attributes:
       label: Reproduction steps
       description: Provide the smallest reliable sequence that demonstrates the problem.
       placeholder: |
-        1. Start aismixer with ...
+        1. Start AISMixer with ...
         2. Send ...
         3. Observe ...
     validations:
       required: true
+
+  - type: textarea
+    id: sanitized_config
+    attributes:
+      label: Sanitized configuration excerpt
+      description: Include only relevant config. Remove private keys, credentials, public IPs, station identifiers, and sensitive deployment details.
+      render: yaml
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or traceback
+      description: Include relevant logs or traceback with secrets and sensitive operational details removed.
+      render: text
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation or tests attempted
+      description: List commands, packet captures, manual checks, or retries already attempted.
+      placeholder: |
+        python -m pytest
+        aismixerctl --socket ... status
 
   - type: checkboxes
     id: checks
     attributes:
       label: Submission checks
       options:
-        - label: I removed private keys, credentials, and sensitive station or network details.
+        - label: I did not paste private keys, credentials, or sensitive operator data.
+          required: true
+        - label: I redacted station identifiers, public IPs, and operational details where necessary.
           required: true
         - label: This is not a security vulnerability that should be reported privately.
           required: true
-

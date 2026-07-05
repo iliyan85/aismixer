@@ -1,8 +1,20 @@
-# Contributing To aismixer
+# Contributing To AISMixer
 
-Thank you for helping improve aismixer. Contributions should be focused,
+Thank you for helping improve AISMixer. Contributions should be focused,
 reviewable, and compatible with its role as a long-running AIS NMEA 0183
 service.
+
+## Repository Boundaries
+
+Every commit, pull request, or agent change instruction must explicitly name
+its target branch or repository.
+
+- `main`: runtime code, tests, examples, policies, templates, and the primary
+  README.
+- `website`: bilingual public website under `docs/`.
+- `aismixer.wiki.git` `master`: detailed GitHub Wiki documentation.
+
+Do not mix website, Wiki, and runtime repository changes in one pull request.
 
 ## Development Setup
 
@@ -26,54 +38,96 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
 ```
 
-## Running Tests
+## Development Workflow
 
-Run the full test suite before submitting a pull request:
+- Create a focused branch from the current `main` branch unless the change is
+  explicitly for `website` or the Wiki repository.
+- Keep changes atomic and reviewable.
+- Avoid unrelated formatting churn.
+- Do not commit automatically when operating through an agent.
+- Inspect `git status -sb` and `git diff` before committing.
+- Never commit secrets, private keys, credentials, production configuration, or
+  unsanitized operational logs.
+- Preserve existing comments and documentation that explain protocol behavior.
+
+## Required Checks
+
+Run the smallest relevant checks while developing, then include the commands and
+results in the pull request.
+
+For most repository changes:
 
 ```bash
 python -m pytest
+git diff --check
 ```
 
-Changes should include focused tests when practical, especially when modifying
-NMEA extraction, multipart assembly, TAG handling, deduplication, secure UDP,
-configuration, or forwarding behavior.
+For Python changes, also run syntax checks for changed Python files when useful:
 
-## Coding Style
+```bash
+python -m py_compile <changed-python-files>
+```
 
-- Follow the existing Python style and module boundaries.
-- Use four spaces for indentation and keep code readable and explicit.
-- Prefer small, testable helpers over coupling protocol logic to network I/O.
-- Keep comments concise and use them where behavior is not self-explanatory.
-- Preserve backward compatibility unless a change intentionally documents an
-  incompatible behavior.
-- Do not introduce dependencies without a clear reason.
-- Never commit private keys, credentials, production configuration, or
-  unsanitized operational logs.
+For YAML changes:
 
-The repository does not currently enforce a specific formatter. Keep unrelated
-formatting changes out of your contribution.
+- parse edited YAML files with `yaml.safe_load`;
+- validate routing/control YAML through the applicable loader where practical.
 
-## Branches And Commits
+For POSIX Unix-domain control transport changes, verify on Linux, WSL,
+Raspberry Pi OS, or another POSIX environment with asyncio Unix-socket support.
+Use the focused POSIX command documented in the Wiki for that transport before
+claiming Unix control integration is verified:
 
-- Use `main` for service code, tests, operator documentation, and repository
-  governance files.
-- Use `website` for the public GitHub Pages site under `docs/`.
-- Do not mix website and runtime changes in one pull request.
-- Create a focused topic branch from the appropriate target branch.
-- Keep commits small and logically grouped, with clear imperative summaries.
-- Do not rewrite unrelated code while addressing a focused issue.
+```bash
+python -m pytest tests/test_routing_control_unix.py tests/test_routing_control_unix_client.py tests/test_runtime_control.py
+```
 
-## Pull Requests
+Do not hardcode a test count in documentation or pull requests.
 
-Before opening a pull request:
+## Compatibility Expectations
 
-1. Explain the problem and the chosen approach.
-2. Describe compatibility or configuration impact.
-3. Add or update tests when practical.
-4. Run `python -m pytest`.
-5. Run `git diff --check`.
-6. Remove secrets and sanitize configs, logs, addresses, and station details.
+- Preserve legacy broadcast behavior unless the change intentionally alters it
+  and documents the impact.
+- Consider both legacy mode and routing mode.
+- Preserve the separation between internal `source_id` and emitted NMEA TAG
+  `s`.
+- Preserve `target_id` semantics and target-scoped deduplication in routing
+  mode.
+- Treat the Unix-domain control transport as POSIX-specific.
+- Pure code and tests may run on Windows, but POSIX socket integration requires
+  Linux-compatible verification.
+- Avoid public behavior changes unless they are intentional, reviewed, tested,
+  and documented.
+
+## Documentation Expectations
+
+User-facing changes may require coordinated updates to one or more of:
+
+- `README.md`;
+- examples under `examples/`;
+- the GitHub Wiki;
+- `SECURITY.md` or `ROADMAP.md`;
+- the `website` branch.
+
+Not every code change needs every document. Update the documents that operators
+or contributors need in order to understand changed behavior.
+
+## Canonical Terminology
+
+Use the established terminology consistently:
+
+- ingress;
+- egress;
+- UDPSEC;
+- `nmea_sproxy`;
+- `source_id`;
+- `target_id`;
+- logical zone;
+- routing snapshot;
+- generation;
+- data plane;
+- control plane;
+- `aismixerctl`.
 
 For security vulnerabilities, follow [SECURITY.md](SECURITY.md) instead of
 opening a public issue.
-

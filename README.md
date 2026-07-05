@@ -121,10 +121,11 @@ AISMixer keeps the **data plane** and **control plane** separate.
 
 ### 📡 Data plane
 
-The data plane receives AIS data, builds internal `IngressEvent` objects,
-extracts NMEA sentences, assembles multipart messages, applies TAG metadata,
-deduplicates output, matches the event against one immutable routing snapshot,
-and forwards the resulting sentences.
+The data plane receives AIS data, builds an internal `IngressEvent`, captures one
+immutable routing snapshot and matches `source_id` once for that event, extracts
+NMEA sentences, assembles multipart messages, applies global or target-scoped
+deduplication, constructs outbound TAG metadata, and forwards accepted
+sentences to UDP egress destinations.
 
 - **Legacy mode:** global deduplication and broadcast to all forwarders.
 - **Routing mode:** logical source matching, per-target deduplication, and
@@ -498,6 +499,9 @@ POSIX environment with asyncio Unix-socket support.
 
 - [Examples](examples/README.md)
 - [`nmea_sproxy` operator guide](nmea_sproxy/README.md)
+- [GitHub Wiki](https://github.com/iliyan85/aismixer/wiki)
+- [Contributing guide](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
 - [Project roadmap](ROADMAP.md)
 - [Public website](https://aismixer.net)
 
@@ -628,10 +632,11 @@ AISMixer разделя **data plane** и **control plane**.
 
 ### 📡 Data plane
 
-Data plane приема AIS данните, създава вътрешни `IngressEvent` обекти, извлича
-NMEA изреченията, сглобява multipart съобщенията, прилага TAG metadata,
-дедупликира изхода, съпоставя event-а срещу един immutable routing snapshot и
-препраща получените изречения.
+Data plane приема AIS данните, създава вътрешен `IngressEvent`, взема един
+immutable routing snapshot и съпоставя `source_id` веднъж за този event, извлича
+NMEA изреченията, сглобява multipart съобщенията, прилага глобална или
+target-scoped дедупликация, изгражда изходната TAG metadata и препраща приетите
+изречения към UDP egress дестинациите.
 
 - **Legacy режим:** глобална дедупликация и broadcast към всички forwarder-и.
 - **Routing режим:** логическо source matching, дедупликация по target и целево
@@ -1003,6 +1008,9 @@ python -m pytest
 
 - [Примерни конфигурации](examples/README.md)
 - [Операторско ръководство за `nmea_sproxy`](nmea_sproxy/README.md)
+- [GitHub Wiki](https://github.com/iliyan85/aismixer/wiki)
+- [Ръководство за принос](CONTRIBUTING.md)
+- [Политика за сигурност](SECURITY.md)
 - [План за развитие](ROADMAP.md)
 - [Публичен уебсайт](https://aismixer.net)
 

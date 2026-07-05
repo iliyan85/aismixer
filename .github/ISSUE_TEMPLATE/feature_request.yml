@@ -1,43 +1,95 @@
 name: Feature request
-description: Suggest a practical improvement to aismixer or nmea_sproxy
+description: Suggest a practical improvement to AISMixer or nmea_sproxy
 title: "[Feature]: "
 body:
   - type: markdown
     attributes:
       value: |
-        Describe the operational use case first. Focused proposals with clear compatibility impact are easiest to review.
+        Describe the operational need first. Feature requests do not imply acceptance, priority, or delivery dates.
 
   - type: textarea
-    id: use_case
+    id: problem
     attributes:
-      label: Use case
-      description: What problem or operational need would this feature address?
+      label: Problem or operational need
+      description: What real-world workflow, deployment, or data-quality problem should this address?
     validations:
       required: true
 
   - type: textarea
-    id: proposed_behavior
+    id: outcome
     attributes:
-      label: Proposed behavior
-      description: Describe how the feature should work from an operator or downstream consumer perspective.
+      label: Proposed outcome
+      description: Describe the desired behavior from an operator or downstream consumer perspective.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: Affected subsystem
+      options:
+        - ingress
+        - egress
+        - UDPSEC
+        - routing/zones
+        - deduplication
+        - control plane
+        - process architecture
+        - installation/systemd
+        - observability
+        - maritime security/data quality
+        - documentation/website
+        - other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: model_status
+    attributes:
+      label: Relationship to the current model
+      options:
+        - current implemented behavior
+        - extension of the current model
+        - roadmap/planned functionality
+        - not sure
     validations:
       required: true
 
   - type: textarea
-    id: alternatives
+    id: workaround
     attributes:
-      label: Alternatives considered
-      description: Describe existing workarounds or alternative approaches.
-    validations:
-      required: true
+      label: Current workaround
+      description: How are you handling this today, if at all?
 
   - type: textarea
     id: compatibility
     attributes:
       label: Compatibility impact
-      description: Note effects on configs, protocols, TAG behavior, existing deployments, or downstream consumers.
-    validations:
-      required: true
+      description: Note expected effects on existing configs, protocols, routing, TAG behavior, deployments, or downstream consumers.
+
+  - type: textarea
+    id: data_control_plane
+    attributes:
+      label: Data-plane or control-plane impact
+      description: Would this affect AIS packet handling, forwarding, routing state, runtime control, or operator commands?
+
+  - type: textarea
+    id: security
+    attributes:
+      label: Security considerations
+      description: Mention authentication, authorization, key handling, spoofing/anomaly risk, or sensitive operational data.
+
+  - type: textarea
+    id: operations
+    attributes:
+      label: Deployment or operations considerations
+      description: Mention systemd, Raspberry Pi, service ownership, control sockets, monitoring, upgrades, or rollback needs.
+
+  - type: textarea
+    id: documentation
+    attributes:
+      label: Documentation impact
+      description: Which README, examples, Wiki, website, or policy pages would need updates?
 
   - type: checkboxes
     id: checks
@@ -46,6 +98,5 @@ body:
       options:
         - label: I checked for an existing issue covering this request.
           required: true
-        - label: This request does not include private keys or sensitive operational details.
+        - label: This request does not include private keys, credentials, or sensitive operational details.
           required: true
-
