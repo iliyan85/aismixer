@@ -1,0 +1,45 @@
+# Direct routing-section example for aismixerctl replace --file.
+#
+# This file is not a full AISMixer config. It contains only the routing section
+# shape accepted by aismixerctl and the routing-control service:
+#
+#   python3 aismixerctl.py --socket /run/aismixer/control.sock replace --file examples/routing-update.yaml
+#
+# Target IDs must already exist as named forwarders in the running process.
+# This example uses only target IDs from config-routing-control.yaml.
+
+zones:
+  fixed_udp:
+    include:
+      - udp:balchik_roof
+      - udp:dock_gate
+
+  secure_stations:
+    include:
+      - udpsec:rPiAIS002
+      - udpsec:vitara_mobile
+
+  debug_sources:
+    union:
+      - fixed_udp
+      - secure_stations
+
+  local_only:
+    include:
+      - udp:dock_gate
+
+  public_platform_sources:
+    difference:
+      - debug_sources
+      - local_only
+
+routes:
+  - name: debug_everything
+    from_zone: debug_sources
+    to:
+      - udp:local_debug
+
+  - name: public_platforms
+    from_zone: public_platform_sources
+    to:
+      - udp:aishub

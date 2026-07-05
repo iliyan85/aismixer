@@ -1,455 +1,1009 @@
-**EN | BG below**
+<a id="english"></a>
 
-# 🛰️ AISMixer — AIS NMEA‑0183 multiplexer / deduplicator / **tag‑aware forwarder**
+**English · [Български](#bulgarian)**
 
-**Keywords:** AIS software, Automatic Identification System, NMEA 0183, AIVDM, AIVDO, multiplexer, deduplication, tag block, `s`/`c`/`g`, UDP, secure UDP, ECDSA, AES‑GCM, Raspberry Pi.
+# 🛰️ AISMixer — AIS NMEA 0183 stream mixer and routing engine
 
-> **TL;DR**
-> AISMixer merges multiple AIS receiver feeds, de‑duplicates messages, reassembles multipart using NMEA fragment fields, and forwards a clean, unified stream.
-> It is **tag‑aware**: reads `s`/`c`/`g` on ingress and (per policy) **preserves / normalizes / overwrites** them on egress — e.g., pass through `c` or replace with server time; keep/normalize `s`; preserve or emit compact `g` metadata. TAG `g` is not used as the multipart assembler key.
+**Normalize · Deduplicate · Tag · Route · Forward**
+
+AISMixer processes AIS NMEA 0183 streams with UDP/UDPSEC ingress, multipart
+assembly, deduplication, logical routing, and targeted UDP forwarding.
+
+[🌐 Website](https://aismixer.net) · [📚 Examples](examples/README.md) ·
+[🔐 UDPSEC guide](nmea_sproxy/README.md) · [🗺️ Roadmap](ROADMAP.md)
+
+**Keywords:** AIS software, Automatic Identification System, NMEA 0183, AIVDM,
+AIVDO, multiplexer, deduplication, NMEA TAG block, `s`/`c`/`g`, routing, UDP,
+UDPSEC, ECDSA, AES-GCM, Raspberry Pi.
+
+> ### ⚡ TL;DR
+> AISMixer receives AIS feeds from multiple receivers, extracts `!AIVDM` and
+> `!AIVDO`, reassembles multipart messages, removes near-real-time duplicates,
+> manages NMEA TAG metadata, and forwards one clean logical stream. Optional
+> logical routing can direct each ingress source to selected named UDP targets,
+> while `aismixerctl` can atomically replace or disable the active routing
+> snapshot through a local Unix-domain control socket.
 
 ---
 
 ## 🌿 Branches and website
 
-This `main` branch is the primary runtime and development branch. It contains
-the Python service, secure proxy helpers, runtime configuration examples, and
-the test suite under `tests/`.
+The `main` branch is the primary runtime and development branch. It contains the
+Python service, secure proxy helpers, configuration examples, control-plane
+components, and the test suite under `tests/`.
 
 The public website lives on the long-lived `website` branch. GitHub Pages
-deploys from that branch using `/docs` as the site root, so `docs/` is
+deploys from that branch using `/docs` as its site root, so `docs/` is
 intentionally not present on `main`.
 
 ---
 
 ## 🧭 What is AISMixer?
 
-**AISMixer** is a Python service that aggregates AIS NMEA‑0183 (AIVDM/AIVDO) from multiple receivers, removes duplicates, reassembles multipart messages, and forwards a single logical feed to marine platforms (e.g., MarineTraffic / AISHub / VesselTracker) or your own services.
+**AISMixer** is a Python service for receiving, normalizing, deduplicating,
+tagging, routing, and forwarding AIS NMEA 0183 streams.
 
-- **`aismixer`** is the mixer, deduplicator, normalizer, and tag‑aware forwarder.
-- **`nmea_sproxy`** is a client-side secure UDP shovel/proxy. It does not mix
-  streams; one process forwards one local UDP input to one encrypted AISMixer
-  SEC input.
-- 🔐 Supports **plain UDP** and **encrypted inputs** via an ECDSA handshake + AES‑GCM transport (with the lightweight client proxy `nmea_sproxy`).
-- 🧩 Tag‑aware end‑to‑end (reads/manages `s`/`c`/`g`).
-- 📦 Clean output as if from one logical station.
+- **`aismixer.py`** is the long-running mixer and data-plane service.
+- **`nmea_sproxy`** is the station-side UDPSEC proxy. One process forwards one
+  local UDP input to one authenticated encrypted AISMixer secure input.
+- **`aismixerctl.py`** is the operator CLI for the optional local routing-control
+  socket.
 
----
-
-## 🔀 Core flow
-
-1. Multiple AIS receivers (hardware/software) send NMEA to AISMixer (UDP or secure via `nmea_sproxy`).
-2. AISMixer **de‑duplicates** identical payloads from different sources.
-3. AISMixer **reassembles multipart** AIVDM using NMEA fragment fields: ingress source/assembler key, sequential message ID (`seq_id`), radio channel, current fragment number, and total fragment count.
-4. AISMixer **forwards** a unified stream downstream (per‑forwarder tag policy).
-
-```
-+------------+    UDP      +-----------+      +----------------+
-| Receiver A | ----------> |           | ---> | MarineTraffic  |
-+------------+             |           |      | AISHub         |
-                           | AISMixer  | ---> | VesselTracker  |
-+------------+ Encrypted   |           |      | etc.           |
-| nmea_sproxy| ----------> |           |      +----------------+
-+------------+             +-----------+
+```text
+AIS receiver UDP      \
+AIS receiver UDP       \        +----------------+       +----------------+
+nmea_sproxy UDPSEC ---->------> |    AISMixer    | ----> | UDP targets    |
+                                |   data plane   |       +----------------+
+                                +----------------+
+                                         ^
+                                         |
+                                optional Unix control plane
+                                         |
+                                   aismixerctl
 ```
 
 ---
 
-## ⚙️ Tag‑aware forwarding (Tag Block `s` / `c` / `g`)
+## ✅ Current capabilities
 
-AISMixer parses Tag Block on ingress and **manages** what to emit on egress **per policy**:
+### ✅ Implemented
 
-- **`g` (group)** — ingress/output metadata that may be preserved or regenerated for downstream readers.
-  It is **not** the assembler grouping key; multipart assembly uses NMEA fragment fields plus the ingress source/assembler key.
-- **`s` (source)** — preserve incoming `s`, map by IP/authorized key, or set a server‑defined station ID.
-- **`c` (timestamp)** — pass through incoming time **or** replace it with **server time** (for clock normalization).
+- UDP ingress over IPv4 and IPv6.
+- Authenticated encrypted UDPSEC ingress through `nmea_sproxy`.
+- `!AIVDM` and `!AIVDO` extraction.
+- Multipart assembly using NMEA fragment fields and ingress assembler identity.
+- NMEA TAG `s`/`c`/`g` handling.
+- Global deduplication in legacy broadcast mode.
+- Legacy forwarding to every configured UDP forwarder.
+- Named UDP egress targets.
+- Static logical routing loaded at startup.
+- Logical `source_id` and `target_id` matching.
+- Logical source zones with `include`, `union`, `intersection`, and
+  `difference`.
+- Target-scoped deduplication in routing mode.
+- Immutable routing tables and process-local routing generations.
+- Atomic runtime replacement of the active routing snapshot.
+- Versioned JSON routing-control protocol.
+- `routing.status`, `routing.replace`, and `routing.disable`.
+- Unix-domain NDJSON control server and client.
+- `aismixerctl` CLI.
 
-### 🧭 Egress tag policy (per output; beta)
+### 🧪 Opt-in operational interface
 
-- `preserve` — pass through incoming field (if present).
-- `normalize` — rewrite into canonical form (e.g., compact `g`, sanitized `s`).
-- `overwrite` — ignore ingress and emit server value (e.g., server time for `c`).
+The runtime control plane is implemented but deliberately opt-in:
+
+- `control.unix.enabled: true` is required.
+- The listener requires POSIX Unix-domain socket support.
+- Filesystem ownership, group, and mode on the socket path are the current
+  authorization boundary.
+- There is no application-level control token.
+- Runtime routing updates are process-local and are not persisted across
+  service restart.
+
+### 🧭 Planned or not implemented
+
+- Persistence of runtime routing state.
+- Automatic config-file watching or reload.
+- Dynamic creation/removal of ingress or egress adapters.
+- Multiprocessing coordinator and IPC synchronization.
+- P2P routing exchange.
+- HTTP or TCP control APIs.
+- MQTT, AMQP, MongoDB, or HTTP egress adapters.
+- Geographic, vessel, or MMSI filtering.
+- Spoof detection.
+- Long-term AIS storage and analytics.
 
 ---
 
-## 📦 Configuration (`config.yaml`)
+## 🔀 Architecture
+
+AISMixer keeps the **data plane** and **control plane** separate.
+
+### 📡 Data plane
+
+The data plane receives AIS data, builds internal `IngressEvent` objects,
+extracts NMEA sentences, assembles multipart messages, applies TAG metadata,
+deduplicates output, matches the event against one immutable routing snapshot,
+and forwards the resulting sentences.
+
+- **Legacy mode:** global deduplication and broadcast to all forwarders.
+- **Routing mode:** logical source matching, per-target deduplication, and
+  targeted forwarding to named UDP egress destinations.
+- One routing snapshot is captured per `IngressEvent`; a concurrent control
+  update affects the next event, not the one already being processed.
+
+### 🎛️ Control plane
+
+When enabled, the local Unix-domain socket accepts newline-delimited JSON
+requests. The control service validates a candidate routing section against the
+currently available target IDs, compiles a new immutable table, and atomically
+replaces the process-local routing state.
+
+```text
+aismixerctl
+    ↓ Unix-domain NDJSON
+RoutingControlProtocol
+    ↓
+RoutingControlService
+    ↓
+RoutingState (generation + immutable snapshot)
+    ↓
+next IngressEvent
+```
+
+### 🧩 Main components
+
+| Component | Role |
+|---|---|
+| `aismixer.py` | Main runtime, ingress tasks, mixer loop, forwarding loop, optional control lifecycle |
+| `core/routing.py` | Logical zones, set operations, routes, immutable routing table |
+| `core/routing_state.py` | Thread-safe process-local generation and snapshot replacement |
+| `core/routing_control.py` | Transport-neutral status/replace/disable service |
+| `core/routing_control_protocol.py` | Versioned JSON request/response contract |
+| `core/routing_control_unix.py` | Async Unix-domain NDJSON server |
+| `core/routing_control_unix_client.py` | One-request Unix-domain client |
+| `aismixerctl.py` | Operator CLI for runtime routing control |
+| `aismixer_secure.py` | UDPSEC handshake, authentication, and decryption |
+| `nmea_sproxy/` | Station-side one-input-to-one-secure-output proxy |
+| `assembler.py` | Multipart AIVDM/AIVDO reassembly |
+| `dedup.py` | Global or target-scoped duplicate suppression |
+| `meta_writer.py` / `meta_cleaner.py` | NMEA TAG output and ingress cleanup |
+| `forwarder.py` | UDP broadcast and targeted egress |
+
+---
+
+## 🚀 Quick start: legacy broadcast mode
+
+When no top-level `routing:` section is configured, AISMixer keeps its original
+broadcast behavior:
+
+- deduplication is global;
+- every accepted output sentence is sent to every configured forwarder;
+- unnamed forwarders remain valid;
+- routing-control generations may exist, but the active routing table is
+  disabled.
+
+Minimal example:
 
 ```yaml
-station_id: mixstation_1   # if non-empty, it always becomes s=
-debug: true
-
-sec_inputs:
-  - id: secA               # optional; if station_id empty, s=secA
-    listen_ip: "::"
-    listen_port: 29999
+station_id: mixstation_1
 
 udp_inputs:
-  - listen_ip: "0.0.0.0"
-    listen_port: 17777
-    id: udpA               # optional; if station_id empty, s=udpA
-  - listen_ip: "::"
+  - id: roof_receiver
+    listen_ip: "0.0.0.0"
     listen_port: 17777
 
 forwarders:
   - host: 203.0.113.10
     port: 5000
-
-udp_alias_map_file: udp_alias_map.yaml   # optional
-
-# (beta) Optional tag policy — may land as per-forwarder or global
-# tag_policy:
-#   s: preserve    # preserve | normalize | overwrite
-#   c: overwrite   # use server time
-#   g: normalize   # preserve/regenerate output TAG g metadata; not assembler key
+  - host: 127.0.0.1
+    port: 19000
 ```
 
-### 🔍 How `s` (source) is formed
-
-Priority:
-
-1. If `station_id` is non‑empty → **s = station_id**
-2. Else, if the input has an `id` (incl. `sec_inputs[].id`) → **s = input.id**
-3. Else:
-   - UDP: if remote IP exists in `udp_alias_map.yaml` → **s = alias**
-   - SEC: if a name exists in `authorized_keys.yaml` → **s = client_name** (else `ANONYMOUS`)
-4. Else, if the incoming line already carries `\s:…\` → **s = that value**
-5. Else → **s = IP** (dots/colons replaced with `_`)
-
-All variants are sanitized to `[A–Za–z0–9_]` and limited to **15** characters.
-
-### 📦 UDP IP→alias map (`udp_alias_map.yaml`)
-
-```yaml
-"127.0.0.1": "lo_alias"
-"2001:db8::1234": "dock_gate"
-```
-
-### Optional runtime routing
-
-By default AISMixer runs in legacy broadcast mode. If `config.yaml` has no
-`routing:` section, behavior is unchanged: deduplication is global and every
-accepted output sentence is sent to every configured forwarder with
-`Forwarder.send()`. Existing unnamed forwarders remain valid in this mode.
-
-Routing mode is enabled only by adding a valid `routing:` section. In routing
-mode, AISMixer matches each internal `IngressEvent.source_id` against the
-compiled routing table, deduplicates per logical target ID, and sends only to
-matched named UDP forwarders with `Forwarder.send_to()`. Route matching uses the
-internal source ID, not the emitted NMEA TAG `s` value.
-
-Important identity rules:
-
-- `udp_inputs[].id` becomes the preferred UDP source ID, for example
-  `id: balchik_roof` -> `udp:balchik_roof`.
-- If a UDP input has no `id`, an alias from `udp_alias_map.yaml` may become the
-  UDP source ID; otherwise the remote IP is used.
-- Secure UDP routing source IDs use the authenticated station ID, for example
-  `udpsec:rPiAIS002`.
-- `sec_inputs[].id` may affect emitted TAG `s` aliasing, but it does not replace
-  the authenticated secure routing source ID.
-- `forwarders[].id` creates a canonical UDP target ID, for example
-  `id: aishub` -> `udp:aishub`.
-
-Routing mode requires named forwarders for every referenced UDP target. Unknown
-or currently unsupported targets such as `udp:missing`, `mqtt:clean_stream`, or
-`mongo:raw_archive` cause startup configuration failure instead of being
-silently ignored.
-
-Zones are logical source-ID sets, not geographic AIS areas. Geographic filtering
-is not implemented. Supported zone operations are:
-
-- `include`: directly list source IDs.
-- `union`: combine named zones.
-- `intersection`: keep sources present in all referenced zones.
-- `difference`: start with the first zone and remove sources from later zones.
-
-Deduplication semantics:
-
-- Legacy mode: one global deduplication scope.
-- Routing mode: one deduplication scope per logical target ID. The same NMEA
-  sentence may be delivered once to `udp:aishub` and once to `udp:local_debug`,
-  while overlapping routes to the same target still produce one delivery within
-  the TTL.
-
-See [`examples/config-routing.yaml`](examples/config-routing.yaml) for an
-inactive routing example. Do not add that section to production config until
-your forwarder IDs and route target IDs match.
-
----
-
-## 🧭 Components
-
-| Module/Dir              | Role |
-|-------------------------|------|
-| `aismixer.py`           | Main mixer process (UDP + secure inputs) |
-| `aismixer_secure.py`    | ECDSA handshake, decryption, authentication |
-| `nmea_sproxy/`          | One-input-to-one-secure-output client-side UDP shovel/proxy |
-| `assembler.py`          | Multipart reassembly using NMEA fragment fields |
-| `dedup.py`              | Duplicate detection/removal |
-| `meta_writer.py`        | Adds NMEA tag block/prefix and CRC |
-| `meta_cleaner.py`       | Removes non-standard meta headers |
-| `forwarder.py`          | Sends the clean output to destinations |
-| `config.yaml`           | Inputs/outputs, station ID, debug, (tag policy — beta) |
-| `authorized_keys.yaml`  | Allowed client public keys (for secure inputs) |
-
----
-
-## 🚀 Running
+Run from the repository:
 
 ```bash
 python3 aismixer.py
 ```
 
-Or install as a **systemd** service using `install.sh` (copies unit to `/etc/systemd/system/`).
+---
+
+## 🗺️ Static logical routing
+
+Routing mode is enabled by adding a valid top-level `routing:` section.
+
+In routing mode:
+
+- matching uses the internal `IngressEvent.source_id`;
+- matching does **not** use the emitted NMEA TAG `s` value;
+- route targets must reference named forwarders;
+- unknown or unsupported target IDs fail startup validation;
+- zones are logical source-ID sets, not geographic AIS areas;
+- deduplication is scoped per logical `target_id`.
+
+### 🪪 Canonical source and target IDs
+
+- `udp:<input-id>` when `udp_inputs[].id` is configured.
+- `udp:<mapped-alias>` when a UDP alias map supplies identity.
+- `udp:<remote-ip>` when no UDP ID or alias is available.
+- `udpsec:<authenticated-station-id>` for an authenticated UDPSEC station.
+- `udp:<forwarder-id>` for a named UDP forwarder.
+
+`sec_inputs[].id` may affect the emitted TAG `s` alias when the global
+`station_id` is empty, but it does not replace the authenticated UDPSEC routing
+source ID.
+
+### 🧮 Logical zone operations
+
+```yaml
+routing:
+  zones:
+    fixed_receivers:
+      include:
+        - udp:roof
+        - udp:dock
+
+    mobile_receivers:
+      include:
+        - udpsec:boat_ais
+
+    trusted_sources:
+      union:
+        - fixed_receivers
+        - mobile_receivers
+
+    trusted_fixed_sources:
+      intersection:
+        - trusted_sources
+        - fixed_receivers
+
+    public_without_boat:
+      difference:
+        - trusted_sources
+        - mobile_receivers
+```
+
+Operands for `union`, `intersection`, and `difference` are names of other
+logical zones. They are not coordinates, geographic regions, MMSI lists, or
+vessel filters.
+
+See [`examples/config-routing.yaml`](examples/config-routing.yaml) for an
+inactive full static-routing example.
 
 ---
 
-## 🔐 Secure UDP / `nmea_sproxy`
+## 🎛️ Runtime routing control
 
-`nmea_sproxy` is the active client side of a secure UDP relation:
+The Unix control server remains disabled until explicitly enabled:
 
-```text
-one local UDP input -> one encrypted AISMixer SEC input
+```yaml
+control:
+  unix:
+    enabled: true
+    socket_path: /run/aismixer/control.sock
+    socket_mode: "0660"
+    max_request_bytes: 1048576
 ```
 
-Stations authenticate with ECDSA, and AISMixer authorizes their public keys
-through `authorized_keys.yaml`. AIS data and ping/pong liveness messages use
-authenticated AES-GCM encryption. Encrypted pings help keep NAT, CGNAT, and
-mobile-client mappings alive; authenticated encrypted pongs prove that the
-configured peer still holds the session.
+### ⚠️ Operational notes
 
-If the server has lost a session, it may send unauthenticated `NOSESSION` as a
-reconnect hint. The client also reconnects when authenticated replies stop for
-`peer_timeout`. `session_refresh_interval` defaults to `0`, which disables
-planned periodic refresh. A changed client source IP or port requires a new
-handshake; session migration is not implemented.
+- Adding `control:` or `control.unix:` alone does not enable the server.
+- The socket parent directory must already exist.
+- AISMixer does not currently create `/run/aismixer` automatically.
+- The current installer/systemd unit does not yet provision this directory.
+- Filesystem ownership, group, and mode control access to the socket.
+- There is no application-level authentication token.
+- The interface is POSIX-only; Windows can run pure tests and development code,
+  but not the Unix socket listener.
+- Runtime routing changes are process-local and disappear after restart.
+
+See
+[`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
+for an inactive complete configuration with static routing and runtime control.
+
+---
+
+## 🧰 `aismixerctl`
+
+Until installer/systemd integration is updated, do not assume that
+`aismixerctl` is installed globally. From a repository checkout or copied
+service directory, use:
 
 ```bash
-cd nmea_sproxy && python3 nmea_sproxy.py
-sudo systemctl start nmea_sproxy
-sudo systemctl start nmea_sproxy@boat
-sudo systemctl start nmea_sproxy@yacht
+python3 aismixerctl.py --socket /run/aismixer/control.sock status
 ```
 
-Template names such as `boat` and `yacht` are operator-chosen labels, not fixed
-`station1` / `station2` names. Session recovery improves long-running operation,
-but UDP packet loss remains possible and delivery of every AIS sentence is not
-guaranteed. See [`nmea_sproxy/README.md`](nmea_sproxy/README.md) for the detailed
-operator guide.
+The shorter form works only when your local installation or `PATH` provides it:
+
+```bash
+aismixerctl --socket /run/aismixer/control.sock status
+```
+
+Replace the active process-local routing snapshot:
+
+```bash
+python3 aismixerctl.py \
+  --socket /run/aismixer/control.sock \
+  replace \
+  --file examples/routing-update.yaml \
+  --expected-generation 3
+```
+
+Disable routing and return the running process to legacy broadcast mode:
+
+```bash
+python3 aismixerctl.py \
+  --socket /run/aismixer/control.sock \
+  disable \
+  --expected-generation 4
+```
+
+### 🔢 Generation semantics
+
+- `status` returns the current generation.
+- `replace` and `disable` may carry an expected generation.
+- A stale update is rejected instead of overwriting a newer snapshot.
+- The CLI does not retry automatically.
+
+`replace --file` accepts either:
+
+1. a full configuration containing a top-level `routing:` mapping; or
+2. a direct routing section containing only `zones:` and `routes:`.
+
+`routing: null` is not a replacement request; use `disable`.
+
+See [`examples/routing-update.yaml`](examples/routing-update.yaml) for a direct
+routing-section update file.
 
 ---
 
-## ✅ Tests
+## 🔐 UDPSEC and `nmea_sproxy`
 
-Focused pytest coverage lives under `tests/` and covers multipart assembly,
-TAG `s`/`c`/`g` helpers, metadata writing, `nmea_sproxy` extraction, secure UDP
-helpers, and forwarding-loop behavior.
+UDPSEC is AISMixer's authenticated encrypted station-to-mixer UDP transport.
+Stations authenticate with ECDSA, while AIS data and liveness messages use
+authenticated AES-GCM encryption. Authorized station public keys are configured
+through `authorized_keys.yaml`.
+
+`nmea_sproxy` is the station-side proxy:
+
+```text
+one local UDP input → one encrypted UDPSEC AISMixer input
+```
+
+Example commands:
+
+```bash
+cd nmea_sproxy
+python3 nmea_sproxy.py
+sudo systemctl start nmea_sproxy
+sudo systemctl start nmea_sproxy@boat
+```
+
+Template names such as `boat`, `yacht`, or `balchik_roof` are operator-chosen
+labels. See [`nmea_sproxy/README.md`](nmea_sproxy/README.md) for the detailed
+station-side guide.
+
+---
+
+## 🏷️ NMEA TAG behavior
+
+AISMixer reads ingress TAG metadata and emits a controlled `s`/`c`/`g` TAG
+block according to the runtime options described below.
+
+### 🪪 TAG `s` — source label
+
+The emitted TAG `s` value is selected separately from routing `source_id`.
+
+Priority:
+
+1. non-empty global `station_id`;
+2. per-input ID, UDP alias, or authorized UDPSEC station/client name;
+3. incoming TAG `s` when present;
+4. remote IP fallback.
+
+The emitted value is sanitized to `[A-Za-z0-9_]` and limited to 15 characters.
+Routing source IDs are opaque internal identifiers and are not sanitized or
+truncated as TAG `s` values.
+
+### 🕒 TAG `c` — timestamp
+
+`c_preserve_ingress_c: true` preserves a valid ingress TAG `c` timestamp. When
+it is disabled or no valid value is present, AISMixer emits server time.
+
+### 🧷 TAG `g` — output group metadata
+
+TAG `g` is ingress/output metadata for multipart messages. It is **not** the
+assembler key. Multipart assembly uses NMEA fragment fields together with the
+ingress assembler identity.
+
+Relevant options:
+
+```yaml
+g_preserve_ingress_gid: true
+g_id_digits: 18
+g_always_tag_single: false
+c_preserve_ingress_c: true
+```
+
+---
+
+## 📦 Installation
+
+Run directly from the repository:
+
+```bash
+python3 aismixer.py
+```
+
+Or install the existing systemd service:
+
+```bash
+./install.sh
+```
+
+The current installer deploys the runtime files and existing service unit.
+Control-plane installer/systemd integration — including automatic runtime
+directory provisioning and a global `aismixerctl` command — is intentionally a
+separate follow-up change.
+
+---
+
+## 📚 Examples
+
+The examples are inactive until copied or adapted by an operator:
+
+- [`examples/config-routing.yaml`](examples/config-routing.yaml) — full static
+  routing configuration.
+- [`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
+  — full routing configuration with `control.unix` enabled.
+- [`examples/routing-update.yaml`](examples/routing-update.yaml) — direct routing
+  section for `aismixerctl replace --file`.
+- [`examples/README.md`](examples/README.md) — short guide to the example files.
+
+All addresses, IDs, ports, paths, and keys in example files must be adapted to
+the deployment.
+
+---
+
+## 🧪 Testing
+
+The test suite covers multipart assembly, TAG handling, metadata processing,
+UDPSEC helpers, routing, snapshot replacement, control protocol and transports,
+`aismixerctl`, and forwarding behavior.
 
 ```bash
 python -m pytest
 ```
 
----
-
-
-# 🇧🇬 AISMixer — AIS NMEA‑0183 мултиплексор / дедупликатор / **tag‑aware форурдър**
-
-**Ключови думи:** AIS софтуер, Automatic Identification System, NMEA 0183, AIVDM, AIVDO, multiplexer, deduplication, tag block, `s`/`c`/`g`, UDP, secure UDP, ECDSA, AES‑GCM, Raspberry Pi.
-
-> **TL;DR**
-> AISMixer обединява няколко AIS приемни потока, премахва дубликати, сглобява мултипарт чрез NMEA fragment полета и излъчва чист, обединен поток.
-> Системата е **tag‑aware**: чете `s`/`c`/`g` на вход и (според политика) **preserve / normalize / overwrite** на изход — напр. запазва `c` или го заменя със сървърно време; запазва/нормализира `s`; запазва или излъчва компактен `g` като metadata. TAG `g` не се използва като ключ за multipart сглобяване.
+Real Unix-domain listener tests require Linux, WSL, Raspberry Pi OS, or another
+POSIX environment with asyncio Unix-socket support.
 
 ---
 
-## 🌿 Клонове и сайт
+## ⚠️ Current limitations
 
-Този `main` клон е основният runtime/development клон. Тук са Python услугата,
-secure proxy помощните файлове, примерните runtime конфигурации и тестовете в
-`tests/`.
+- UDP is the currently implemented egress adapter.
+- Routing state and generations are process-local.
+- Runtime control changes are not persistent.
+- There is no multiprocessing coordinator or cross-process synchronization.
+- There is no automatic config reload/watch.
+- There is no geographic, MMSI, or vessel filtering.
+- Unix control requires POSIX Unix-domain socket support.
+- Control socket directory provisioning is currently operator-managed.
+- Access control relies on Unix filesystem permissions.
 
-Публичният сайт е в дългоживеещия `website` клон. GitHub Pages deploy-ва от
-този клон, като използва `/docs` за site root, затова `docs/` умишлено не
-присъства в `main`.
+---
+
+## 📖 Further documentation
+
+- [Examples](examples/README.md)
+- [`nmea_sproxy` operator guide](nmea_sproxy/README.md)
+- [Project roadmap](ROADMAP.md)
+- [Public website](https://aismixer.net)
+
+[⬆ Back to language selector](#english)
+
+---
+
+<a id="bulgarian"></a>
+
+**[English](#english) · Български**
+
+# 🇧🇬 AISMixer — обработка и маршрутизация на AIS NMEA 0183 потоци
+
+**Нормализация · Дедупликация · TAG metadata · Маршрутизация · Препращане**
+
+AISMixer обработва AIS NMEA 0183 потоци с UDP/UDPSEC входове, сглобяване на
+multipart съобщения, дедупликация, логическа маршрутизация и целево UDP
+препращане.
+
+[🌐 Уебсайт](https://aismixer.net) · [📚 Примери](examples/README.md) ·
+[🔐 Ръководство за UDPSEC](nmea_sproxy/README.md) ·
+[🗺️ План за развитие](ROADMAP.md)
+
+**Ключови думи:** AIS софтуер, Automatic Identification System, NMEA 0183,
+AIVDM, AIVDO, multiplexer, дедупликация, NMEA TAG block, `s`/`c`/`g`, routing,
+UDP, UDPSEC, ECDSA, AES-GCM, Raspberry Pi.
+
+> ### ⚡ Накратко
+> AISMixer приема AIS потоци от няколко приемника, извлича `!AIVDM` и `!AIVDO`,
+> сглобява multipart съобщения, премахва близки във времето дубликати, управлява
+> NMEA TAG metadata и излъчва един чист логически поток. По желание логическата
+> маршрутизация насочва всеки ingress източник към избрани именувани UDP цели, а
+> `aismixerctl` може атомарно да замени или изключи активния routing snapshot
+> през локален Unix-domain control socket.
+
+---
+
+## 🌿 Клонове и уебсайт
+
+Клонът `main` е основният runtime и development клон. В него са Python услугата,
+secure proxy компонентите, конфигурационните примери, control-plane модулите и
+тестовете в `tests/`.
+
+Публичният сайт е в дългоживеещия клон `website`. GitHub Pages се публикува от
+него с `/docs` като site root, затова `docs/` умишлено не присъства в `main`.
 
 ---
 
 ## 🧭 Какво е AISMixer?
 
-**AISMixer** е Python услуга, която агрегира AIS NMEA‑0183 (AIVDM/AIVDO) от няколко приемника, премахва дубликати, сглобява мултипарт съобщения и препраща един логически поток към външни платформи или ваши услуги.
+**AISMixer** е Python услуга за приемане, нормализиране, дедупликация, TAG
+обработка, маршрутизация и препращане на AIS NMEA 0183 потоци.
 
-- **`aismixer`** е миксерът, дедупликаторът, нормализаторът и tag‑aware
-  форурдърът.
-- **`nmea_sproxy`** е клиентско secure UDP прокси за еднопосочно препращане. То
-  не смесва потоци; един процес препраща един локален UDP вход към един
-  криптиран AISMixer SEC вход.
-- 🔐 Поддържа **обикновен UDP** и **защитен вход** чрез ECDSA handshake + AES‑GCM транспорт (клиентско прокси `nmea_sproxy`).
-- 🧩 Tag‑aware от край до край (чете/управлява `s`/`c`/`g`).
-- 📦 Чист изход сякаш е от една логическа станция.
+- **`aismixer.py`** е дългоживеещият mixer и data-plane процес.
+- **`nmea_sproxy`** е UDPSEC проксито при станцията. Един процес препраща един
+  локален UDP вход към един автентикиран и криптиран secure вход на AISMixer.
+- **`aismixerctl.py`** е операторският CLI клиент за допълнителния локален
+  routing-control socket.
 
----
-
-## 🔀 Основен поток
-
-1. Няколко приемника (хардуерни/софтуерни) изпращат NMEA към AISMixer (UDP или защитено чрез `nmea_sproxy`).
-2. AISMixer **дедупликира** еднакви полезни товари от различни източници.
-3. AISMixer **сглобява мултипарт** AIVDM чрез NMEA fragment полета: ingress source/assembler key, sequential message ID (`seq_id`), radio channel, current fragment number и total fragment count.
-4. AISMixer **форурдва** обединения поток (per‑forwarder tag политика).
-
-```
-+------------+    UDP      +-----------+      +----------------+
-| Receiver A | ----------> |           | ---> | MarineTraffic  |
-+------------+             |           |      | AISHub         |
-                           | AISMixer  | ---> | VesselTracker  |
-+------------+ Encrypted   |           |      | и др.          |
-| nmea_sproxy| ----------> |           |      +----------------+
-+------------+             +-----------+
+```text
+AIS приемник UDP      \
+AIS приемник UDP       \        +----------------+       +----------------+
+nmea_sproxy UDPSEC ---->------> |    AISMixer    | ----> | UDP цели       |
+                                |   data plane   |       +----------------+
+                                +----------------+
+                                         ^
+                                         |
+                                opt-in Unix control plane
+                                         |
+                                   aismixerctl
 ```
 
 ---
 
-## ⚙️ Tag‑aware форурдване (Tag Block `s` / `c` / `g`)
+## ✅ Текущи възможности
 
-AISMixer чете Tag Block на входа и **решава** какво да излъчи на изхода **по политика**:
+### ✅ Реализирано
 
-- **`g` (group)** — ingress/output metadata, която може да бъде запазена или регенерирана за downstream получатели.
-  Не е assembler grouping key; multipart assembly използва NMEA fragment полета плюс ingress source/assembler key.
-- **`s` (source)** — запази входния `s`, мапни по IP/ключ, или задай сървърен station ID.
-- **`c` (timestamp)** — пропусни входното време **или** замени със **сървърно време** (нормализация на часовниците).
+- UDP ingress по IPv4 и IPv6.
+- Автентикиран и криптиран UDPSEC ingress чрез `nmea_sproxy`.
+- Извличане на `!AIVDM` и `!AIVDO`.
+- Сглобяване на multipart чрез NMEA fragment полетата и ingress assembler
+  identity.
+- Обработка на NMEA TAG `s`/`c`/`g`.
+- Глобална дедупликация в legacy broadcast режим.
+- Legacy препращане към всички конфигурирани UDP forwarder-и.
+- Именувани UDP egress цели.
+- Статична логическа маршрутизация, зареждана при стартиране.
+- Съпоставяне чрез логически `source_id` и `target_id`.
+- Логически source zones с `include`, `union`, `intersection` и `difference`.
+- Дедупликация по отделен target в routing режим.
+- Immutable routing tables и process-local generations.
+- Атомарна runtime подмяна на активния routing snapshot.
+- Версиониран JSON routing-control протокол.
+- `routing.status`, `routing.replace` и `routing.disable`.
+- Unix-domain NDJSON control server и клиент.
+- CLI инструментът `aismixerctl`.
 
-### 🧭 Политика на изход (per output; beta)
+### 🧪 Opt-in оперативен интерфейс
 
-- `preserve` — запази входното поле (ако е налично).
-- `normalize` — пренапиши в канонична форма (напр. компактен `g`, sanitized `s`).
-- `overwrite` — игнорирай входа и издай сървърна стойност (напр. сървърно време за `c`).
+Runtime control plane е реализиран, но умишлено се включва само изрично:
+
+- изисква се `control.unix.enabled: true`;
+- listener-ът изисква POSIX Unix-domain socket support;
+- filesystem собственикът, групата и mode на socket path са текущата граница
+  за достъп;
+- няма application-level control token;
+- runtime routing промените са process-local и не се запазват след рестарт.
+
+### 🧭 Планирано или нереализирано
+
+- Запазване на runtime routing state.
+- Автоматично следене или reload на конфигурационния файл.
+- Динамично създаване и премахване на ingress/egress adapters.
+- Multiprocessing coordinator и IPC синхронизация.
+- P2P обмен на routing информация.
+- HTTP или TCP control API.
+- MQTT, AMQP, MongoDB или HTTP egress adapters.
+- Географско, vessel или MMSI филтриране.
+- Spoof detection.
+- Дългосрочно AIS съхранение и анализи.
 
 ---
 
-## 📦 Конфигурация (`config.yaml`)
+## 🔀 Архитектура
+
+AISMixer разделя **data plane** и **control plane**.
+
+### 📡 Data plane
+
+Data plane приема AIS данните, създава вътрешни `IngressEvent` обекти, извлича
+NMEA изреченията, сглобява multipart съобщенията, прилага TAG metadata,
+дедупликира изхода, съпоставя event-а срещу един immutable routing snapshot и
+препраща получените изречения.
+
+- **Legacy режим:** глобална дедупликация и broadcast към всички forwarder-и.
+- **Routing режим:** логическо source matching, дедупликация по target и целево
+  препращане към именувани UDP egress дестинации.
+- За всеки `IngressEvent` се взема един routing snapshot; паралелна control
+  промяна засяга следващия event, а не вече обработвания.
+
+### 🎛️ Control plane
+
+При включване локалният Unix-domain socket приема newline-delimited JSON заявки.
+Control service валидира кандидат routing секцията спрямо наличните target IDs,
+компилира нова immutable таблица и атомарно заменя process-local routing state.
+
+```text
+aismixerctl
+    ↓ Unix-domain NDJSON
+RoutingControlProtocol
+    ↓
+RoutingControlService
+    ↓
+RoutingState (generation + immutable snapshot)
+    ↓
+следващият IngressEvent
+```
+
+### 🧩 Основни компоненти
+
+| Компонент | Роля |
+|---|---|
+| `aismixer.py` | Основен runtime, ingress tasks, mixer loop, forwarding loop и control lifecycle |
+| `core/routing.py` | Логически zones, set operations, routes и immutable routing table |
+| `core/routing_state.py` | Thread-safe process-local generation и snapshot replacement |
+| `core/routing_control.py` | Transport-neutral service за status/replace/disable |
+| `core/routing_control_protocol.py` | Версиониран JSON request/response contract |
+| `core/routing_control_unix.py` | Async Unix-domain NDJSON server |
+| `core/routing_control_unix_client.py` | Unix-domain клиент с една заявка на връзка |
+| `aismixerctl.py` | Операторски CLI за runtime routing control |
+| `aismixer_secure.py` | UDPSEC handshake, автентикация и декриптиране |
+| `nmea_sproxy/` | Station-side proxy: един вход към един secure изход |
+| `assembler.py` | Сглобяване на multipart AIVDM/AIVDO |
+| `dedup.py` | Глобална или target-scoped дедупликация |
+| `meta_writer.py` / `meta_cleaner.py` | NMEA TAG изход и ingress cleanup |
+| `forwarder.py` | UDP broadcast и targeted egress |
+
+---
+
+## 🚀 Бърз старт: legacy broadcast режим
+
+Когато няма top-level `routing:` секция, AISMixer запазва първоначалното
+broadcast поведение:
+
+- дедупликацията е глобална;
+- всяко прието изходно изречение се изпраща към всички forwarder-и;
+- forwarder-и без `id` остават валидни;
+- routing-control generations може да съществуват, но активната routing table е
+  изключена.
+
+Минимален пример:
 
 ```yaml
-station_id: mixstation_1   # ако е непразно → винаги става s=
-debug: true
-
-sec_inputs:
-  - id: secA               # по избор; ако station_id е празно, s=secA
-    listen_ip: "::"
-    listen_port: 29999
+station_id: mixstation_1
 
 udp_inputs:
-  - listen_ip: "0.0.0.0"
-    listen_port: 17777
-    id: udpA               # по избор; ако station_id е празно, s=udpA
-  - listen_ip: "::"
+  - id: roof_receiver
+    listen_ip: "0.0.0.0"
     listen_port: 17777
 
 forwarders:
   - host: 203.0.113.10
     port: 5000
-
-udp_alias_map_file: udp_alias_map.yaml   # по избор
-
-# (beta) По избор — политика за тагове (per‑forwarder или глобална)
-# tag_policy:
-#   s: preserve
-#   c: overwrite   # сървърно време
-#   g: normalize   # preserve/regenerate output TAG g metadata; not assembler key
+  - host: 127.0.0.1
+    port: 19000
 ```
 
-### 🔍 Как се формира `s`
-
-Приоритет:
-
-1. Ако `station_id` е непразно → **s = station_id**
-2. Иначе, ако входът има `id` (вкл. `sec_inputs[].id`) → **s = input.id**
-3. Иначе:
-   - UDP: ако remote IP е в `udp_alias_map.yaml` → **s = alias**
-   - SEC: ако има име в `authorized_keys.yaml` → **s = client_name** (иначе `ANONYMOUS`)
-4. Иначе, ако входящият ред вече носи `\s:…\` → **s = тази стойност**
-5. Иначе → **s = IP** (точки/двуеточия → `_`)
-
-Всички варианти се sanitize‑ват до `[A–Za–z0–9_]` и лимит **15** символа.
-
-### 📦 UDP IP→alias (`udp_alias_map.yaml`)
-
-```yaml
-"127.0.0.1": "lo_alias"
-"2001:db8::1234": "dock_gate"
-```
-
----
-
-## 🧭 Компоненти
-
-| Компонент              | Роля |
-|------------------------|------|
-| `aismixer.py`          | Основен процес (UDP + secure входове) |
-| `aismixer_secure.py`   | ECDSA handshake, дешифриране, автентикация |
-| `nmea_sproxy/`         | Клиентско UDP прокси: един вход към един защитен изход |
-| `assembler.py`         | Сглобяване на мултипарт чрез NMEA fragment полета |
-| `dedup.py`             | Премахване на дубликати |
-| `meta_writer.py`       | Добавя NMEA tag block/префикс и CRC |
-| `meta_cleaner.py`      | Премахва нестандартни мета‑хедъри |
-| `forwarder.py`         | Изпраща изчистения изход към дестинациите |
-| `config.yaml`          | Входове/изходи, station ID, debug, (tag политика — beta) |
-| `authorized_keys.yaml` | Публични ключове на разрешените клиенти |
-
----
-
-## 🚀 Стартиране
+Стартиране от repository checkout:
 
 ```bash
 python3 aismixer.py
 ```
 
-Или като **systemd** услуга чрез `install.sh`.
+---
+
+## 🗺️ Статична логическа маршрутизация
+
+Routing режимът се включва с валидна top-level `routing:` секция.
+
+В routing режим:
+
+- matching използва вътрешния `IngressEvent.source_id`;
+- matching **не** използва излъчения NMEA TAG `s`;
+- route targets трябва да сочат към именувани forwarder-и;
+- неизвестни или неподдържани target IDs прекратяват startup validation;
+- zones са логически множества от source IDs, а не географски AIS области;
+- дедупликацията се изпълнява по отделен логически `target_id`.
+
+### 🪪 Канонични source и target IDs
+
+- `udp:<input-id>` при конфигуриран `udp_inputs[].id`.
+- `udp:<mapped-alias>` при identity от UDP alias map.
+- `udp:<remote-ip>` когато няма UDP ID или alias.
+- `udpsec:<authenticated-station-id>` за автентикирана UDPSEC станция.
+- `udp:<forwarder-id>` за именуван UDP forwarder.
+
+`sec_inputs[].id` може да влияе на излъчения TAG `s` alias, когато глобалният
+`station_id` е празен, но не заменя автентикирания UDPSEC routing source ID.
+
+### 🧮 Операции върху логически zones
+
+```yaml
+routing:
+  zones:
+    fixed_receivers:
+      include:
+        - udp:roof
+        - udp:dock
+
+    mobile_receivers:
+      include:
+        - udpsec:boat_ais
+
+    trusted_sources:
+      union:
+        - fixed_receivers
+        - mobile_receivers
+
+    trusted_fixed_sources:
+      intersection:
+        - trusted_sources
+        - fixed_receivers
+
+    public_without_boat:
+      difference:
+        - trusted_sources
+        - mobile_receivers
+```
+
+Операндите на `union`, `intersection` и `difference` са имена на други логически
+zones. Те не са координати, географски области, MMSI списъци или vessel filters.
+
+Виж [`examples/config-routing.yaml`](examples/config-routing.yaml) за неактивен
+пълен пример със статична маршрутизация.
 
 ---
 
-## 🔐 Secure UDP / `nmea_sproxy`
+## 🎛️ Runtime routing control
 
-`nmea_sproxy` е активната клиентска страна на една secure UDP връзка:
+Unix control server остава изключен, докато не бъде включен изрично:
 
-```text
-един локален UDP вход -> един криптиран AISMixer SEC вход
+```yaml
+control:
+  unix:
+    enabled: true
+    socket_path: /run/aismixer/control.sock
+    socket_mode: "0660"
+    max_request_bytes: 1048576
 ```
 
-Станциите се автентикират с ECDSA, а AISMixer разрешава публичните им ключове
-чрез `authorized_keys.yaml`. AIS данните и ping/pong съобщенията за liveness
-използват автентикирано AES-GCM криптиране. Криптираните ping съобщения помагат
-да се запази NAT, CGNAT или mobile-client mapping, а автентикираните криптирани
-pong отговори доказват, че конфигурираният peer още държи сесията.
+### ⚠️ Оперативни бележки
 
-Ако сървърът е загубил сесията, може да изпрати неавтентикиран `NOSESSION` като
-подсказка за повторно свързване. Клиентът се свързва отново и когато няма
-автентикирани отговори за `peer_timeout`. `session_refresh_interval` по
-подразбиране е `0`, което изключва планираното периодично обновяване. Промяна
-на клиентския source IP или port изисква нов handshake; session migration не е
-реализирана.
+- Самото добавяне на `control:` или `control.unix:` не включва server-а.
+- Parent directory на socket path трябва вече да съществува.
+- AISMixer все още не създава автоматично `/run/aismixer`.
+- Текущият installer/systemd unit още не provision-ва тази директория.
+- Filesystem собственикът, групата и mode управляват достъпа до socket-а.
+- Няма application-level authentication token.
+- Интерфейсът е само за POSIX. Windows може да изпълнява pure tests и
+  development кода, но не и Unix socket listener-а.
+- Runtime routing промените са process-local и изчезват след рестарт.
+
+Виж
+[`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
+за неактивна пълна конфигурация със static routing и runtime control.
+
+---
+
+## 🧰 `aismixerctl`
+
+Докато installer/systemd интеграцията не бъде обновена, не трябва да се приема,
+че `aismixerctl` е инсталирана глобална команда. От repository checkout или
+копирана service директория използвай:
 
 ```bash
-cd nmea_sproxy && python3 nmea_sproxy.py
-sudo systemctl start nmea_sproxy
-sudo systemctl start nmea_sproxy@boat
-sudo systemctl start nmea_sproxy@yacht
+python3 aismixerctl.py --socket /run/aismixer/control.sock status
 ```
 
-Template имена като `boat` и `yacht` са избрани от оператора етикети, а не
-фиксирани имена `station1` / `station2`. Възстановяването на сесии подобрява
-дългата работа, но UDP packet loss остава възможен и доставката на всяко AIS
-изречение не е гарантирана. Подробното ръководство за оператори е в
+Кратката форма работи само когато локалната инсталация или `PATH` я осигурява:
+
+```bash
+aismixerctl --socket /run/aismixer/control.sock status
+```
+
+Подмяна на активния process-local routing snapshot:
+
+```bash
+python3 aismixerctl.py \
+  --socket /run/aismixer/control.sock \
+  replace \
+  --file examples/routing-update.yaml \
+  --expected-generation 3
+```
+
+Изключване на routing и връщане на работещия процес към legacy broadcast режим:
+
+```bash
+python3 aismixerctl.py \
+  --socket /run/aismixer/control.sock \
+  disable \
+  --expected-generation 4
+```
+
+### 🔢 Generation semantics
+
+- `status` връща текущата generation.
+- `replace` и `disable` могат да носят expected generation.
+- Stale update се отхвърля, вместо да презапише по-нов snapshot.
+- CLI не прави автоматични повторни опити.
+
+`replace --file` приема:
+
+1. пълна конфигурация с top-level `routing:` mapping; или
+2. директна routing секция само с `zones:` и `routes:`.
+
+`routing: null` не е replace заявка; използвай `disable`.
+
+Виж [`examples/routing-update.yaml`](examples/routing-update.yaml) за директен
+routing-section update файл.
+
+---
+
+## 🔐 UDPSEC и `nmea_sproxy`
+
+UDPSEC е автентикираният и криптиран UDP транспорт между станцията и AISMixer.
+Станциите се автентикират с ECDSA, а AIS данните и liveness съобщенията използват
+автентикирано AES-GCM криптиране. Разрешените публични ключове на станциите се
+конфигурират чрез `authorized_keys.yaml`.
+
+`nmea_sproxy` е проксито при станцията:
+
+```text
+един локален UDP вход → един криптиран UDPSEC вход на AISMixer
+```
+
+Примерни команди:
+
+```bash
+cd nmea_sproxy
+python3 nmea_sproxy.py
+sudo systemctl start nmea_sproxy
+sudo systemctl start nmea_sproxy@boat
+```
+
+Template имена като `boat`, `yacht` или `balchik_roof` са етикети, избрани от
+оператора. Подробното ръководство е в
 [`nmea_sproxy/README.md`](nmea_sproxy/README.md).
 
 ---
 
-## ✅ Тестове
+## 🏷️ Поведение на NMEA TAG metadata
 
-Focused pytest coverage живее в `tests/` и покрива multipart assembly, TAG
-`s`/`c`/`g` helper-и, metadata writing, `nmea_sproxy` extraction, secure UDP
-helper-и и forwarding-loop behavior.
+AISMixer чете ingress TAG metadata и излъчва контролиран `s`/`c`/`g` TAG block
+според описаните по-долу runtime настройки.
+
+### 🪪 TAG `s` — source label
+
+Излъченият TAG `s` се избира отделно от routing `source_id`.
+
+Приоритет:
+
+1. непразен глобален `station_id`;
+2. ID на входа, UDP alias или име на разрешената UDPSEC станция/клиент;
+3. входящ TAG `s`, когато е наличен;
+4. remote IP като fallback.
+
+Излъчената стойност се sanitize-ва до `[A-Za-z0-9_]` и се ограничава до 15
+символа. Routing source IDs са opaque вътрешни идентификатори и не се sanitize-ват
+или съкращават като TAG `s`.
+
+### 🕒 TAG `c` — timestamp
+
+`c_preserve_ingress_c: true` запазва валиден входящ TAG `c` timestamp. Когато е
+изключено или няма валидна стойност, AISMixer излъчва сървърното време.
+
+### 🧷 TAG `g` — output group metadata
+
+TAG `g` е ingress/output metadata за multipart съобщения. Той **не** е assembler
+key. Multipart assembly използва NMEA fragment полетата заедно с ingress
+assembler identity.
+
+Свързани настройки:
+
+```yaml
+g_preserve_ingress_gid: true
+g_id_digits: 18
+g_always_tag_single: false
+c_preserve_ingress_c: true
+```
+
+---
+
+## 📦 Инсталация
+
+Директно стартиране от repository checkout:
+
+```bash
+python3 aismixer.py
+```
+
+Или инсталиране на съществуващата systemd услуга:
+
+```bash
+./install.sh
+```
+
+Текущият installer разполага runtime файловете и съществуващия service unit.
+Control-plane installer/systemd интеграцията — включително автоматичното
+създаване на runtime директория и глобална команда `aismixerctl` — умишлено е
+отделна следваща промяна.
+
+---
+
+## 📚 Примери
+
+Примерите са неактивни, докато операторът не ги копира или адаптира:
+
+- [`examples/config-routing.yaml`](examples/config-routing.yaml) — пълна static
+  routing конфигурация.
+- [`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
+  — пълна routing конфигурация с включен `control.unix`.
+- [`examples/routing-update.yaml`](examples/routing-update.yaml) — директна
+  routing секция за `aismixerctl replace --file`.
+- [`examples/README.md`](examples/README.md) — кратко описание на примерните
+  файлове.
+
+Всички адреси, IDs, портове, пътища и ключове в примерните файлове трябва да се
+адаптират към конкретната инсталация.
+
+---
+
+## 🧪 Тестове
+
+Тестовете покриват multipart assembly, TAG обработката, metadata processing,
+UDPSEC helper-ите, routing, snapshot replacement, control protocol и
+transport-ите, `aismixerctl` и forwarding поведението.
 
 ```bash
 python -m pytest
 ```
 
+Реалните Unix-domain listener тестове изискват Linux, WSL, Raspberry Pi OS или
+друга POSIX среда с asyncio Unix-socket support.
+
 ---
+
+## ⚠️ Текущи ограничения
+
+- UDP е текущо реализираният egress adapter.
+- Routing state и generations са process-local.
+- Runtime control промените не се запазват.
+- Няма multiprocessing coordinator или cross-process синхронизация.
+- Няма автоматичен config reload/watch.
+- Няма географско, MMSI или vessel филтриране.
+- Unix control изисква POSIX Unix-domain socket support.
+- Provisioning-ът на control socket директорията все още е задача на оператора.
+- Контролът на достъпа разчита на Unix filesystem permissions.
+
+---
+
+## 📖 Допълнителна документация
+
+- [Примерни конфигурации](examples/README.md)
+- [Операторско ръководство за `nmea_sproxy`](nmea_sproxy/README.md)
+- [План за развитие](ROADMAP.md)
+- [Публичен уебсайт](https://aismixer.net)
+
+[⬆ Към избора на език](#english)

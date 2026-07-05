@@ -1,5 +1,8 @@
 # Example only. This file is not loaded unless you copy/adapt it as config.yaml.
 #
+# This is a full AISMixer configuration that demonstrates static logical
+# routing. It intentionally does not enable the runtime control socket.
+#
 # Routing source IDs and target IDs are internal opaque identifiers. They are
 # separate from emitted NMEA TAG s values.
 
@@ -9,7 +12,9 @@ debug: true
 sec_inputs:
   # sec_inputs[].id may still be used as the emitted TAG s alias when
   # station_id is empty. It does not replace the authenticated routing identity.
-  # Secure routing source IDs come from authenticated station_id values, e.g.:
+  #
+  # UDPSEC routing source IDs come from authenticated station_id values, for
+  # example:
   #   udpsec:rPiAIS002
   #   udpsec:vitara_mobile
   - id: secure_listener_alias
@@ -50,6 +55,7 @@ c_preserve_ingress_c: true
 
 routing:
   # Zones contain logical source IDs, not geographic AIS regions.
+  # Set-operation operands are names of other zones.
   zones:
     fixed_udp:
       include:
@@ -61,10 +67,20 @@ routing:
         - udpsec:rPiAIS002
         - udpsec:vitara_mobile
 
+    public_receivers:
+      include:
+        - udp:balchik_roof
+        - udpsec:rPiAIS002
+
     trusted_sources:
       union:
         - fixed_udp
         - secure_stations
+
+    public_fixed_sources:
+      intersection:
+        - fixed_udp
+        - public_receivers
 
     debug_excluded:
       include:
@@ -76,6 +92,10 @@ routing:
         - debug_excluded
 
   routes:
+    # In routing mode, deduplication is scoped by target ID. The same AIS
+    # sentence can be sent once to udp:local_debug and once to udp:aishub, while
+    # overlapping routes to the same target still produce one send within the
+    # deduplication TTL.
     - name: trusted_to_local_debug
       from_zone: trusted_sources
       to:
@@ -83,5 +103,10 @@ routing:
 
     - name: public_platforms
       from_zone: public_platform_sources
+      to:
+        - udp:aishub
+
+    - name: public_fixed_overlap
+      from_zone: public_fixed_sources
       to:
         - udp:aishub

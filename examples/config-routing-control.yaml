@@ -1,0 +1,91 @@
+# Example only. This file is not loaded unless you copy/adapt it as config.yaml.
+#
+# This is a full AISMixer configuration that demonstrates static logical
+# routing plus the opt-in Unix-domain routing-control socket.
+#
+# The parent directory for socket_path must already exist. The current
+# installer/systemd integration does not create /run/aismixer automatically.
+# Socket filesystem ownership, group, and mode are the authorization boundary.
+# Runtime routing changes made through the control socket are process-local and
+# are not persisted after restart.
+
+station_id: mixstation_1
+debug: true
+
+sec_inputs:
+  # The UDPSEC routing source ID is based on the authenticated station identity:
+  #   udpsec:rPiAIS002
+  # sec_inputs[].id may affect emitted TAG s aliasing when station_id is empty,
+  # but it does not replace the authenticated routing source ID.
+  - id: secure_listener_alias
+    listen_ip: "::"
+    listen_port: 29999
+
+udp_inputs:
+  - id: balchik_roof
+    listen_ip: "0.0.0.0"
+    listen_port: 17778
+
+  - id: dock_gate
+    listen_ip: "::"
+    listen_port: 17779
+
+forwarders:
+  - id: aishub
+    host: 192.0.2.20
+    port: 10110
+
+  - id: local_debug
+    host: 127.0.0.1
+    port: 19000
+
+udp_alias_map_file: udp_alias_map.yaml
+
+g_preserve_ingress_gid: true
+g_id_digits: 18
+g_always_tag_single: false
+c_preserve_ingress_c: true
+
+routing:
+  zones:
+    fixed_udp:
+      include:
+        - udp:balchik_roof
+        - udp:dock_gate
+
+    secure_stations:
+      include:
+        - udpsec:rPiAIS002
+        - udpsec:vitara_mobile
+
+    trusted_sources:
+      union:
+        - fixed_udp
+        - secure_stations
+
+    local_only:
+      include:
+        - udp:dock_gate
+
+    public_platform_sources:
+      difference:
+        - trusted_sources
+        - local_only
+
+  routes:
+    - name: trusted_to_local_debug
+      from_zone: trusted_sources
+      to:
+        - udp:local_debug
+
+    - name: public_platforms
+      from_zone: public_platform_sources
+      to:
+        - udp:aishub
+
+control:
+  unix:
+    enabled: true
+    socket_path: /run/aismixer/control.sock
+    socket_mode: "0660"
+    max_request_bytes: 1048576
