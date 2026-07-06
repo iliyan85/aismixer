@@ -1,4 +1,4 @@
-# Singleton systemd service config: one local input -> one secure remote output.
+# Singleton systemd service config: one local input -> one AISMixer UDPSEC input.
 listen_ip: '::'
 listen_port: 50000
 remote_host: 192.0.2.10

@@ -1,5 +1,5 @@
 [Unit]
-Description=NMEA secure UDP proxy shovel (%i)
+Description=NMEA UDPSEC proxy (%i)
 After=network-online.target
 Wants=network-online.target
 

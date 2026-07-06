@@ -2,7 +2,7 @@
 
 **English · [Български](#bulgarian)**
 
-# 🛰️ AISMixer — AIS NMEA 0183 stream mixer and routing engine
+# 🛰️ AISMixer — AIS NMEA 0183 stream processor and routing engine
 
 **Normalize · Deduplicate · Tag · Route · Forward**
 
@@ -45,7 +45,7 @@ tagging, routing, and forwarding AIS NMEA 0183 streams.
 
 - **`aismixer.py`** is the long-running mixer and data-plane service.
 - **`nmea_sproxy`** is the station-side UDPSEC proxy. One process forwards one
-  local UDP input to one authenticated encrypted AISMixer secure input.
+  local UDP input to one AISMixer UDPSEC input.
 - **`aismixerctl.py`** is the operator CLI for the optional local routing-control
   socket.
 
@@ -165,7 +165,7 @@ next IngressEvent
 | `core/routing_control_unix_client.py` | One-request Unix-domain client |
 | `aismixerctl.py` | Operator CLI for runtime routing control |
 | `aismixer_secure.py` | UDPSEC handshake, authentication, and decryption |
-| `nmea_sproxy/` | Station-side one-input-to-one-secure-output proxy |
+| `nmea_sproxy/` | Station-side UDPSEC proxy: one input to one AISMixer UDPSEC input |
 | `assembler.py` | Multipart AIVDM/AIVDO reassembly |
 | `dedup.py` | Global or target-scoped duplicate suppression |
 | `meta_writer.py` / `meta_cleaner.py` | NMEA TAG output and ingress cleanup |
@@ -361,14 +361,16 @@ routing-section update file.
 ## 🔐 UDPSEC and `nmea_sproxy`
 
 UDPSEC is AISMixer's authenticated encrypted station-to-mixer UDP transport.
-Stations authenticate with ECDSA, while AIS data and liveness messages use
-authenticated AES-GCM encryption. Authorized station public keys are configured
-through `authorized_keys.yaml`.
+It is not an external standardized protocol. Stations authenticate with ECDSA,
+while AIS data and liveness messages use authenticated AES-GCM encryption.
+Authorized station public keys are configured through `authorized_keys.yaml`.
+UDPSEC protects packets in transit; it does not prove that the AIS payload
+itself is semantically true or physically accurate.
 
 `nmea_sproxy` is the station-side proxy:
 
 ```text
-one local UDP input → one encrypted UDPSEC AISMixer input
+one local UDP input → one AISMixer UDPSEC input
 ```
 
 Example commands:
@@ -557,7 +559,7 @@ secure proxy компонентите, конфигурационните при
 
 - **`aismixer.py`** е дългоживеещият mixer и data-plane процес.
 - **`nmea_sproxy`** е UDPSEC проксито при станцията. Един процес препраща един
-  локален UDP вход към един автентикиран и криптиран secure вход на AISMixer.
+  локален UDP вход към един UDPSEC вход на AISMixer.
 - **`aismixerctl.py`** е операторският CLI клиент за допълнителния локален
   routing-control socket.
 
@@ -675,7 +677,7 @@ RoutingState (generation + immutable snapshot)
 | `core/routing_control_unix_client.py` | Unix-domain клиент с една заявка на връзка |
 | `aismixerctl.py` | Операторски CLI за runtime routing control |
 | `aismixer_secure.py` | UDPSEC handshake, автентикация и декриптиране |
-| `nmea_sproxy/` | Station-side proxy: един вход към един secure изход |
+| `nmea_sproxy/` | Station-side UDPSEC proxy: един вход към един UDPSEC вход на AISMixer |
 | `assembler.py` | Сглобяване на multipart AIVDM/AIVDO |
 | `dedup.py` | Глобална или target-scoped дедупликация |
 | `meta_writer.py` / `meta_cleaner.py` | NMEA TAG изход и ingress cleanup |
@@ -869,9 +871,11 @@ routing-section update файл.
 ## 🔐 UDPSEC и `nmea_sproxy`
 
 UDPSEC е автентикираният и криптиран UDP транспорт между станцията и AISMixer.
-Станциите се автентикират с ECDSA, а AIS данните и liveness съобщенията използват
-автентикирано AES-GCM криптиране. Разрешените публични ключове на станциите се
-конфигурират чрез `authorized_keys.yaml`.
+Това не е външен стандартизиран протокол. Станциите се автентикират с ECDSA, а
+AIS данните и liveness съобщенията използват автентикирано AES-GCM криптиране.
+Разрешените публични ключове на станциите се конфигурират чрез
+`authorized_keys.yaml`. UDPSEC защитава пакетите при пренос, но не доказва, че
+самият AIS payload е семантично верен или физически точен.
 
 `nmea_sproxy` е проксито при станцията:
 

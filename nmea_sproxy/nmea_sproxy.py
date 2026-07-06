@@ -513,7 +513,7 @@ def forward_loop(udp_sock, out_sock, config, session_key, remote_addr):
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Forward one local AIS UDP input to one encrypted remote secure output."
+            "Forward one local AIS UDP input to one AISMixer UDPSEC input."
         )
     )
     parser.add_argument(

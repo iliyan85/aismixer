@@ -1,4 +1,4 @@
-# One nmea_sproxy process is one 1:1 secure shovel:
+# One nmea_sproxy process is one 1:1 UDPSEC proxy:
 # listen_ip/listen_port -> remote_host/remote_port.
 listen_ip: '::'
 listen_port: 50000

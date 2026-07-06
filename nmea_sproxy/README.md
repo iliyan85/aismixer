@@ -1,22 +1,28 @@
 # nmea_sproxy operator guide
 
-`nmea_sproxy` is a client-side secure UDP shovel/proxy. It is not a mixer,
-deduplicator, or multi-input forwarder. AISMixer performs those jobs.
+`nmea_sproxy` is a client-side UDPSEC proxy. UDPSEC is AISMixer's
+authenticated encrypted UDP transport; it is not an external standardized
+protocol. `nmea_sproxy` does not mix inputs, assemble multipart AIS,
+deduplicate, rewrite TAG metadata, route streams, or fan out to egress targets.
+AISMixer performs those jobs.
 
-Each `nmea_sproxy` process represents exactly one relation:
+Each `nmea_sproxy` process represents exactly one UDPSEC relation:
 
 ```text
-one local UDP input -> one encrypted AISMixer SEC input
+one local UDP input -> one AISMixer UDPSEC input
 listen_ip/listen_port -> remote_host/remote_port
 ```
 
 Run separate processes or systemd template instances for separate relations.
 
-## Secure UDP behavior and limits
+## UDPSEC behavior and limits
 
 The station authenticates to AISMixer with its ECDSA identity key. The station
 also verifies the AISMixer server key. After the handshake, AIS data is sent in
 AES-GCM authenticated encrypted packets.
+
+UDPSEC authenticates the station and protects packets in transit. It does not
+prove that the AIS payload itself is semantically true or physically accurate.
 
 The proxy sends authenticated encrypted pings and accepts matching
 authenticated encrypted pongs from the configured remote peer. These messages
@@ -27,7 +33,7 @@ longer has. `NOSESSION` is unauthenticated and is only a reconnect hint; the
 proxy accepts it only from the configured remote address, ends the local
 session, and attempts a new handshake after `reconnect_delay`.
 
-Secure session recovery does not make UDP reliable:
+UDPSEC session recovery does not make UDP reliable:
 
 - UDP packet loss is still possible.
 - Recovery does not guarantee delivery of every AIS sentence.
@@ -36,7 +42,7 @@ Secure session recovery does not make UDP reliable:
 
 The design assumes that the station client behind NAT, CGNAT, or a mobile
 network is the active side: it initiates the handshake and sends keepalive
-traffic to the reachable AISMixer SEC input.
+traffic to the reachable AISMixer UDPSEC input.
 
 ## Configuration
 
@@ -58,7 +64,8 @@ remote_public_key: aismixer_public.pem
 ```
 
 `listen_ip` / `listen_port` select the one local UDP input.
-`remote_host` / `remote_port` select the one remote AISMixer SEC input.
+`remote_host` / `remote_port` select the configured remote AISMixer UDPSEC
+input.
 
 ### Config resolution order
 
@@ -98,8 +105,8 @@ python3 nmea_sproxy.py
 Select a specific config with the CLI or environment:
 
 ```bash
-python3 nmea_sproxy.py --config /path/to/shovel.yaml
-NMEA_SPROXY_CONFIG=/path/to/shovel.yaml python3 nmea_sproxy.py
+python3 nmea_sproxy.py --config /path/to/udpsec-proxy.yaml
+NMEA_SPROXY_CONFIG=/path/to/udpsec-proxy.yaml python3 nmea_sproxy.py
 ```
 
 Use `--process-title TEXT` to choose the name shown by process tools when
@@ -255,7 +262,7 @@ server. Do not bypass this check.
 
 Check:
 
-- AISMixer is running and its SEC input is listening on the configured port.
+- AISMixer is running and its UDPSEC input is listening on the configured port.
 - Firewalls and port forwarding allow UDP traffic in both directions.
 - The station `station_id` and public key are present in AISMixer's
   `authorized_keys.yaml`.
