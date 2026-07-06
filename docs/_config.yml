@@ -1,5 +1,5 @@
 title: AISMixer
-description: Open-source Python service for merging, deduplicating, reassembling, and securely forwarding AIVDM/AIVDO AIS NMEA 0183 streams.
+description: Open-source AIS NMEA 0183 stream processor and routing engine with UDPSEC, logical routing, and targeted UDP forwarding.
 url: https://aismixer.net
 baseurl: ""
 markdown: kramdown

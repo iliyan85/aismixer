@@ -17,9 +17,4 @@
     <changefreq>weekly</changefreq>
     <priority>0.8</priority>
   </url>
-  <url>
-    <loc>https://aismixer.net/technical/secure-udp-protocol/</loc>
-    <changefreq>monthly</changefreq>
-    <priority>0.5</priority>
-  </url>
 </urlset>
