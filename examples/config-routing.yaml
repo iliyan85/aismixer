@@ -20,6 +20,11 @@ sec_inputs:
   - id: secure_listener_alias
     listen_ip: "::"
     listen_port: 29999
+    # Optional application allow-list. Omit allow_from for no application ACL;
+    # use [] to deny all.
+    allow_from:
+      - 2001:db8:42::/64
+      - 203.0.113.44
 
 udp_inputs:
   # udp_inputs[].id is the preferred UDP routing source identity:
@@ -27,12 +32,17 @@ udp_inputs:
   - id: balchik_roof
     listen_ip: "0.0.0.0"
     listen_port: 17778
+    allow_from:
+      - 192.0.2.15
+      - 198.51.100.0/24
 
   # Another UDP receiver on a different port:
   #   id: dock_gate -> udp:dock_gate
   - id: dock_gate
     listen_ip: "::"
     listen_port: 17779
+    allow_from:
+      - 2001:db8:42::/64
 
 forwarders:
   # forwarders[].id becomes the canonical UDP routing target ID:
@@ -40,6 +50,8 @@ forwarders:
   - id: aishub
     host: 192.0.2.20
     port: 10110
+    # Optional outbound source bind. Omit source_ip to let the OS choose.
+    source_ip: 192.0.2.15
 
   #   id: local_debug -> udp:local_debug
   - id: local_debug

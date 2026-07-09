@@ -12,6 +12,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from core.network_policy import NetworkPolicy
+
 
 ROOT = Path(__file__).resolve().parents[1]
 NMEA_SPROXY_DIR = ROOT / "nmea_sproxy"
@@ -367,7 +369,12 @@ def _encrypted_control_packet(secure, key, nonce, message):
 
 
 def _run_secure_server_with_packets(
-    monkeypatch, secure, packets, now=1010.0, sec_input_id=None
+    monkeypatch,
+    secure,
+    packets,
+    now=1010.0,
+    sec_input_id=None,
+    ingress_policy=None,
 ):
     fake_socket = _FakeSecureSocket()
     fake_loop = _FakeSecureLoop(packets)
@@ -381,7 +388,11 @@ def _run_secure_server_with_packets(
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(
             secure.secure_server(
-                fake_queue, "127.0.0.1", 9999, sec_input_id=sec_input_id
+                fake_queue,
+                "127.0.0.1",
+                9999,
+                sec_input_id=sec_input_id,
+                ingress_policy=ingress_policy,
             )
         )
 
@@ -515,6 +526,83 @@ def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
     assert fake_queue.items[0].raw_line == "!AIVDM,1,1,,A,payload,0*00"
     assert secure.sessions[addr]["last_seen"] == 1010.0
     assert secure.sessions[addr]["seen_data_nonces"] == {nonce: 1310.0}
+
+
+def test_secure_server_allowed_peer_preserves_data_behavior(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    policy = NetworkPolicy.from_entries(
+        ["127.0.0.1"],
+        context="sec_inputs[0].allow_from",
+    )
+    secure.sessions[addr] = secure.create_session(
+        "boat_001", secure.AESGCM(key), now=1000.0)
+    packet = _encrypted_data_packet(secure, key, nonce)
+
+    fake_queue, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        ingress_policy=policy,
+    )
+
+    assert len(fake_queue.items) == 1
+    assert fake_queue.items[0].source_id == "udpsec:boat_001"
+    assert fake_queue.items[0].raw_line == "!AIVDM,1,1,,A,payload,0*00"
+
+
+def test_secure_server_denied_data_peer_gets_no_no_session_response(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    addr = ("192.0.2.10", 50123)
+    packet = secure.DATA_PREFIX + (b"\x00" * 28)
+    policy = NetworkPolicy.from_entries(
+        ["198.51.100.0/24"],
+        context="sec_inputs[0].allow_from",
+    )
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        ingress_policy=policy,
+    )
+
+    assert fake_queue.items == []
+    assert fake_socket.sent == []
+    assert secure.sessions == {}
+
+
+def test_secure_server_denied_handshake_peer_is_dropped_before_crypto(monkeypatch):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True)
+    timestamp = 1000
+    station_id = "boat_001"
+    addr = ("192.0.2.10", 50123)
+    packet = _signed_handshake_packet(
+        secure, client_private_key, station_id, timestamp)
+    policy = NetworkPolicy.from_entries(
+        ["198.51.100.0/24"],
+        context="sec_inputs[0].allow_from",
+    )
+
+    def fail_verify(*_args, **_kwargs):
+        raise AssertionError("signature verification should not run")
+
+    monkeypatch.setattr(secure, "verify_signature", fail_verify)
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        now=float(timestamp),
+        ingress_policy=policy,
+    )
+
+    assert fake_queue.items == []
+    assert fake_socket.sent == []
+    assert secure.sessions == {}
+    assert secure.handshake_replay_cache == {}
 
 
 def test_secure_server_source_id_uses_station_not_sec_input_id(monkeypatch):

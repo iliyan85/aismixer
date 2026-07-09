@@ -302,7 +302,16 @@ async def run_aismixer_main(
 ):
     observer = observer if observer is not None else {}
     routing_state = RoutingState()
-    forwarder = type("FakeForwarder", (), {"target_ids": ("udp:a",)})()
+    class FakeForwarder:
+        target_ids = ("udp:a",)
+
+        def __init__(self):
+            self.close_count = 0
+
+        def close(self):
+            self.close_count += 1
+
+    forwarder = FakeForwarder()
     builder_calls = []
     mixer_cancelled = {"value": False}
     forward_called = {"value": False, "routing_state": None}
@@ -344,6 +353,7 @@ async def run_aismixer_main(
         "mixer_cancelled": mixer_cancelled["value"],
         "forward_called": forward_called,
         "routing_state": routing_state,
+        "forwarder_close_count": forwarder.close_count,
     }
 
 
@@ -356,6 +366,7 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
     assert result["forward_called"]["value"] is True
     assert result["forward_called"]["routing_state"] is result["routing_state"]
     assert result["mixer_cancelled"] is True
+    assert result["forwarder_close_count"] == 1
 
 
 def test_enabled_control_starts_and_closes_server(monkeypatch):
@@ -366,6 +377,7 @@ def test_enabled_control_starts_and_closes_server(monkeypatch):
     assert server.start_count == 1
     assert server.close_count == 1
     assert result["mixer_cancelled"] is True
+    assert result["forwarder_close_count"] == 1
 
 
 def test_server_closes_when_forward_loop_raises(monkeypatch):

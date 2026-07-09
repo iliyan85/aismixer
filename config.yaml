@@ -2,18 +2,30 @@ sec_inputs:
   - listen_ip: 0.0.0.0
     listen_port: 19999
     id: secA
+    # Optional application-level ingress ACL. Omit allow_from for unrestricted.
+    # An empty list denies all.
+    # allow_from:
+    #   - 203.0.113.44
+    #   - 198.51.100.0/24
 
 udp_inputs:
   - listen_ip: 0.0.0.0
     listen_port: 17778
     id: null
+    # allow_from:
+    #   - 192.0.2.15
+    #   - 198.51.100.0/24
   - listen_ip: "::"
     listen_port: 17770
     id: null
+    # allow_from:
+    #   - 2001:db8:42::/64
 
 forwarders:
   - host: 127.0.0.1
     port: 19000
+    # Optional outbound source bind. Omit source_ip to let the OS choose.
+    # source_ip: 192.0.2.15
   - host: 127.0.0.1
     port: 19001
 
