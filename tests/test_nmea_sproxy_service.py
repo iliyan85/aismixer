@@ -75,6 +75,15 @@ def test_install_creates_layout_repairs_keys_and_only_enables_singleton():
     install = read_proxy_file("install.sh")
     commands = shell_commands(install)
 
+    assert 'CORE_DIR="$INSTALL_DIR/core"' in install
+    assert (
+        'run_as_root install -d -m 0755 "$INSTALL_DIR" "$TOOLS_DIR" '
+        '"$CORE_DIR"'
+    ) in install
+    assert (
+        'run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" '
+        '"$CORE_DIR/network_policy.py"'
+    ) in install
     assert 'run_as_root install -d -m 0755 "$CONFIG_DIR" "$INSTANCES_DIR"' in install
     assert 'run_as_root install -d -m 0700 "$KEYS_DIR"' in install
     assert (
@@ -154,10 +163,18 @@ def test_install_user_facing_examples_use_root_cmd_prefix():
 def test_update_routes_runtime_and_unit_updates_through_helper():
     update = read_proxy_file("update.sh")
 
-    assert 'run_as_root install -d -m 0755 "$INSTALL_DIR" "$TOOLS_DIR"' in update
+    assert 'CORE_DIR="$INSTALL_DIR/core"' in update
+    assert (
+        'run_as_root install -d -m 0755 "$INSTALL_DIR" "$TOOLS_DIR" '
+        '"$CORE_DIR"'
+    ) in update
     assert (
         'run_as_root install -m 0755 "$SCRIPT_DIR/nmea_sproxy.py" '
         '"$INSTALL_DIR/nmea_sproxy.py"'
+    ) in update
+    assert (
+        'run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" '
+        '"$CORE_DIR/network_policy.py"'
     ) in update
     assert (
         'run_as_root install -m 0644 "$SCRIPT_DIR/nmea_sproxy.service" '

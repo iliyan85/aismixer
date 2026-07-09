@@ -78,6 +78,8 @@ nmea_sproxy UDPSEC ---->------> |    AISMixer    | ----> | UDP targets    |
 - Named UDP egress targets.
 - Outbound UDP source-address binding for AISMixer forwarders.
 - Application-level ingress allow-lists for AISMixer UDP and UDPSEC listeners.
+- `nmea_sproxy` local UDP ingress allow-lists.
+- `nmea_sproxy` outbound UDPSEC source-address binding.
 - Static logical routing loaded at startup.
 - Logical `source_id` and `target_id` matching.
 - Logical source zones with `include`, `union`, `intersection`, and
@@ -430,6 +432,13 @@ Template names such as `boat`, `yacht`, or `balchik_roof` are operator-chosen
 labels. See [`nmea_sproxy/README.md`](nmea_sproxy/README.md) for the detailed
 station-side guide.
 
+`nmea_sproxy` has its own station-side endpoint controls: top-level
+`allow_from` limits which local/LAN UDP senders may be forwarded under the
+station identity, and top-level `source_ip` binds the outbound UDPSEC socket to
+a literal source address. These are configured in `nmea_sproxy` relation files;
+they are separate from AISMixer's `udp_inputs[]`, `sec_inputs[]`, and
+`forwarders[]` controls.
+
 ---
 
 ## 🏷️ NMEA TAG behavior
@@ -637,6 +646,8 @@ nmea_sproxy UDPSEC ---->------> |    AISMixer    | ----> | UDP цели       |
 - Именувани UDP egress цели.
 - Изходно UDP source-address binding за AISMixer forwarder-и.
 - Application-level ingress allow-lists за AISMixer UDP и UDPSEC listeners.
+- Локални UDP ingress allow-lists в `nmea_sproxy`.
+- Изходно UDPSEC source-address binding в `nmea_sproxy`.
 - Статична логическа маршрутизация, зареждана при стартиране.
 - Съпоставяне чрез логически `source_id` и `target_id`.
 - Логически source zones с `include`, `union`, `intersection` и `difference`.
@@ -983,6 +994,13 @@ sudo systemctl start nmea_sproxy@boat
 Template имена като `boat`, `yacht` или `balchik_roof` са етикети, избрани от
 оператора. Подробното ръководство е в
 [`nmea_sproxy/README.md`](nmea_sproxy/README.md).
+
+`nmea_sproxy` има отделни station-side endpoint controls: top-level
+`allow_from` ограничава кои локални/LAN UDP податели могат да бъдат препратени
+под station identity, а top-level `source_ip` обвързва изходния UDPSEC socket
+към literal source address. Те се конфигурират в relation файловете на
+`nmea_sproxy` и са отделни от AISMixer контролите `udp_inputs[]`,
+`sec_inputs[]` и `forwarders[]`.
 
 ---
 

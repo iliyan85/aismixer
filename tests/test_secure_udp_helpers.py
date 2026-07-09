@@ -4,6 +4,7 @@ import builtins
 import importlib.util
 import io
 import os
+import socket
 import sys
 from pathlib import Path
 
@@ -781,6 +782,19 @@ def test_proxy_ignores_no_session_from_unexpected_address():
     ) == proxy.SERVER_PACKET_IGNORED
 
 
+def test_proxy_ignores_no_session_from_unexpected_port():
+    proxy = load_proxy_module()
+
+    assert proxy.handle_server_packet(
+        b"NOSESSION|boat_001",
+        ("192.0.2.10", 17778),
+        ("192.0.2.10", 17777),
+        b"\x01" * 32,
+        "boat_001",
+        1,
+    ) == proxy.SERVER_PACKET_IGNORED
+
+
 def test_proxy_resolves_configured_remote_for_address_filtering(monkeypatch):
     proxy = load_proxy_module()
     resolved = ("192.0.2.10", 17777)
@@ -803,6 +817,357 @@ def test_proxy_resolves_configured_remote_for_address_filtering(monkeypatch):
     ) == resolved
 
 
+def test_proxy_omitted_allow_from_is_unrestricted():
+    proxy = load_proxy_module()
+
+    policy = proxy.compile_local_ingress_policy({})
+
+    assert policy.is_unrestricted
+    assert policy.allows("192.0.2.15")
+
+
+def test_proxy_empty_allow_from_denies_all():
+    proxy = load_proxy_module()
+
+    policy = proxy.compile_local_ingress_policy({"allow_from": []})
+
+    assert policy.is_deny_all
+    assert not policy.allows("192.0.2.15")
+
+
+@pytest.mark.parametrize(
+    ("entries", "addr"),
+    [
+        (["192.0.2.15"], ("192.0.2.15", 50000)),
+        (["2001:db8::15"], ("2001:db8::15", 50000, 0, 0)),
+        (["198.51.100.0/24"], ("198.51.100.44", 50000)),
+        (["2001:db8:42::/64"], ("2001:db8:42::1234", 50000, 0, 0)),
+        (["192.0.2.0/24"], ("::ffff:192.0.2.15", 50000, 0, 0)),
+    ],
+)
+def test_proxy_local_allow_from_allows_matching_senders(monkeypatch, entries, addr):
+    proxy = load_proxy_module()
+    key = b"\x01" * 32
+    remote_addr = ("192.0.2.10", 17777)
+    policy = proxy.NetworkPolicy.from_entries(
+        entries,
+        context="nmea_sproxy.allow_from",
+    )
+
+    class LocalSocket:
+        def recvfrom(self, _size):
+            return b"!AIVDM,1,1,,A,payload,0*00", addr
+
+    class OutSocket:
+        def __init__(self):
+            self.sent = []
+
+        def sendto(self, data, destination):
+            self.sent.append((data, destination))
+
+    udp_sock = LocalSocket()
+    out_sock = OutSocket()
+    select_calls = []
+
+    def fake_select(_readable, _writable, _exceptional, _timeout):
+        if not select_calls:
+            select_calls.append("local")
+            return [udp_sock], [], []
+        raise OSError("end test")
+
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(proxy.time, "time", lambda: 1000)
+
+    reason = proxy.forward_loop(
+        udp_sock,
+        out_sock,
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 30,
+            "peer_timeout": 90,
+            "session_refresh_interval": 0,
+        },
+        key,
+        remote_addr,
+        policy,
+    )
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    assert len(out_sock.sent) == 1
+    packet, destination = out_sock.sent[0]
+    assert destination == remote_addr
+    assert proxy.decrypt_secure_json_message(packet, key) == {
+        "type": "nmea",
+        "payload": "!AIVDM,1,1,,A,payload,0*00",
+        "timestamp": 1000,
+        "source_id": "boat_001",
+    }
+
+
+def test_proxy_local_allow_from_drops_denied_packet_before_processing(
+    monkeypatch,
+    capsys,
+):
+    proxy = load_proxy_module()
+    remote_addr = ("192.0.2.10", 17777)
+    policy = proxy.NetworkPolicy.from_entries(
+        ["198.51.100.0/24"],
+        context="nmea_sproxy.allow_from",
+    )
+
+    class UndecodablePayload:
+        def decode(self, *_args, **_kwargs):
+            raise AssertionError("denied payload must not be decoded")
+
+    class LocalSocket:
+        def recvfrom(self, _size):
+            return UndecodablePayload(), ("192.0.2.15", 50000)
+
+    class OutSocket:
+        def __init__(self):
+            self.sent = []
+
+        def sendto(self, data, destination):
+            self.sent.append((data, destination))
+
+    def fail_extract(_text):
+        raise AssertionError("denied payload must not be extracted")
+
+    def fail_encrypt(_message, _key):
+        raise AssertionError("denied payload must not be encrypted")
+
+    udp_sock = LocalSocket()
+    out_sock = OutSocket()
+    select_calls = []
+
+    def fake_select(_readable, _writable, _exceptional, _timeout):
+        if not select_calls:
+            select_calls.append("local")
+            return [udp_sock], [], []
+        raise OSError("end test")
+
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(proxy, "extract_nmea_sentences", fail_extract)
+    monkeypatch.setattr(proxy, "encrypt_secure_json_message", fail_encrypt)
+
+    reason = proxy.forward_loop(
+        udp_sock,
+        out_sock,
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 30,
+            "peer_timeout": 90,
+            "session_refresh_interval": 0,
+        },
+        b"\x01" * 32,
+        remote_addr,
+        policy,
+    )
+
+    captured = capsys.readouterr()
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    assert out_sock.sent == []
+    assert "payload" not in captured.out
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ["receiver.example.net"],
+        ["192.0.2.1/33"],
+        ["2001:db8::1/129"],
+        ["192.0.2.15/24"],
+        None,
+    ],
+)
+def test_proxy_malformed_allow_from_fails_configuration(value):
+    proxy = load_proxy_module()
+
+    with pytest.raises(proxy.NetworkPolicyConfigError, match="allow_from"):
+        proxy.compile_local_ingress_policy({"allow_from": value})
+
+
+class _FakeCreatedSocket:
+    def __init__(self, family, sock_type, bind_error=None):
+        self.family = family
+        self.sock_type = sock_type
+        self.bind_error = bind_error
+        self.bound = None
+        self.closed = False
+
+    def bind(self, addr):
+        if self.bind_error:
+            raise self.bind_error
+        self.bound = addr
+
+    def close(self):
+        self.closed = True
+
+
+def test_proxy_omitted_source_ip_leaves_outbound_socket_unbound(monkeypatch):
+    proxy = load_proxy_module()
+    created = []
+
+    def fake_socket(family, sock_type):
+        sock = _FakeCreatedSocket(family, sock_type)
+        created.append(sock)
+        return sock
+
+    monkeypatch.setattr(proxy.socket, "socket", fake_socket)
+
+    sock = proxy.create_outbound_socket(proxy.socket.AF_INET)
+
+    assert sock is created[0]
+    assert sock.family == proxy.socket.AF_INET
+    assert sock.bound is None
+
+
+@pytest.mark.parametrize(
+    ("source_ip", "family"),
+    [
+        ("192.0.2.20", socket.AF_INET),
+        ("2001:db8::20", socket.AF_INET6),
+    ],
+)
+def test_proxy_source_ip_binds_outbound_socket(monkeypatch, source_ip, family):
+    proxy = load_proxy_module()
+    created = []
+
+    def fake_socket(socket_family, sock_type):
+        sock = _FakeCreatedSocket(socket_family, sock_type)
+        created.append(sock)
+        return sock
+
+    monkeypatch.setattr(proxy.socket, "socket", fake_socket)
+    source_address = proxy.parse_source_ip({"source_ip": source_ip})
+
+    sock = proxy.create_outbound_socket(
+        proxy.family_for_ip_address(source_address),
+        source_address,
+    )
+
+    assert sock is created[0]
+    assert sock.family == family
+    assert sock.bound == (source_ip, 0)
+
+
+def test_proxy_literal_source_and_remote_family_mismatch_is_rejected():
+    proxy = load_proxy_module()
+    source_address = proxy.parse_source_ip({"source_ip": "192.0.2.20"})
+
+    with pytest.raises(proxy.ProxyConfigError, match="source_ip"):
+        proxy.resolve_remote_endpoint(
+            {"remote_host": "2001:db8::10", "remote_port": 19999},
+            source_address,
+        )
+
+
+def test_proxy_hostname_resolution_is_constrained_to_source_family(monkeypatch):
+    proxy = load_proxy_module()
+    calls = []
+
+    def fake_getaddrinfo(host, port, family, sock_type):
+        calls.append((host, port, family, sock_type))
+        return [
+            (
+                family,
+                sock_type,
+                17,
+                "",
+                ("2001:db8::10", port, 0, 0),
+            )
+        ]
+
+    monkeypatch.setattr(proxy.socket, "getaddrinfo", fake_getaddrinfo)
+    source_address = proxy.parse_source_ip({"source_ip": "2001:db8::20"})
+
+    remote_addr, family = proxy.resolve_remote_endpoint(
+        {"remote_host": "mixer.example.net", "remote_port": 19999},
+        source_address,
+    )
+
+    assert family == proxy.socket.AF_INET6
+    assert calls == [
+        (
+            "mixer.example.net",
+            19999,
+            proxy.socket.AF_INET6,
+            proxy.socket.SOCK_DGRAM,
+        )
+    ]
+    assert remote_addr == ("2001:db8::10", 19999, 0, 0)
+
+
+def test_proxy_hostname_without_source_ip_preserves_ipv4_default(monkeypatch):
+    proxy = load_proxy_module()
+    calls = []
+
+    def fake_getaddrinfo(host, port, family, sock_type):
+        calls.append((host, port, family, sock_type))
+        return [(family, sock_type, 17, "", ("192.0.2.10", port))]
+
+    monkeypatch.setattr(proxy.socket, "getaddrinfo", fake_getaddrinfo)
+
+    remote_addr, family = proxy.resolve_remote_endpoint(
+        {"remote_host": "mixer.example.net", "remote_port": 19999}
+    )
+
+    assert family == proxy.socket.AF_INET
+    assert calls[0][2] == proxy.socket.AF_INET
+    assert remote_addr == ("192.0.2.10", 19999)
+
+
+def test_proxy_no_matching_hostname_family_is_rejected(monkeypatch):
+    proxy = load_proxy_module()
+
+    def fake_getaddrinfo(*_args):
+        raise proxy.socket.gaierror("no address")
+
+    monkeypatch.setattr(proxy.socket, "getaddrinfo", fake_getaddrinfo)
+    source_address = proxy.parse_source_ip({"source_ip": "2001:db8::20"})
+
+    with pytest.raises(proxy.ProxyConfigError, match="no IPv6 address"):
+        proxy.resolve_remote_endpoint(
+            {"remote_host": "mixer.example.net", "remote_port": 19999},
+            source_address,
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["mixer.example.net", "192.0.2.20/24", "", None],
+)
+def test_proxy_invalid_source_ip_is_rejected(value):
+    proxy = load_proxy_module()
+
+    with pytest.raises(proxy.ProxyConfigError, match="source_ip"):
+        proxy.parse_source_ip({"source_ip": value})
+
+
+def test_proxy_source_ip_bind_error_names_configured_source(monkeypatch):
+    proxy = load_proxy_module()
+    created = []
+
+    def fake_socket(family, sock_type):
+        sock = _FakeCreatedSocket(
+            family,
+            sock_type,
+            bind_error=OSError("cannot assign requested address"),
+        )
+        created.append(sock)
+        return sock
+
+    monkeypatch.setattr(proxy.socket, "socket", fake_socket)
+    source_address = proxy.parse_source_ip({"source_ip": "192.0.2.20"})
+
+    with pytest.raises(proxy.ProxyConfigError, match="192.0.2.20"):
+        proxy.create_outbound_socket(proxy.socket.AF_INET, source_address)
+
+    assert created[0].closed
+
+
 def test_proxy_accepts_only_authenticated_matching_pong_as_liveness():
     proxy = load_proxy_module()
     key = b"\x01" * 32
@@ -820,6 +1185,14 @@ def test_proxy_accepts_only_authenticated_matching_pong_as_liveness():
     assert proxy.handle_server_packet(
         packet, remote_addr, remote_addr, key, "boat_001", 123
     ) == proxy.SERVER_PACKET_AUTHENTICATED
+    assert proxy.handle_server_packet(
+        packet,
+        ("192.0.2.10", 17778),
+        remote_addr,
+        key,
+        "boat_001",
+        123,
+    ) == proxy.SERVER_PACKET_IGNORED
     assert proxy.handle_server_packet(
         b"PONG|123", remote_addr, remote_addr, key, "boat_001", 123
     ) == proxy.SERVER_PACKET_IGNORED
@@ -884,6 +1257,40 @@ def test_proxy_handshake_succeeds_after_stale_no_session_hint(monkeypatch):
         shared_secret, client_signature, server_signature
     )
     assert sock.timeout == 5.0
+
+
+def test_proxy_handshake_ignores_valid_reply_from_unexpected_remote(monkeypatch):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    station_id = "boat_001"
+    remote_addr = ("192.0.2.10", 17777)
+    other_addr = ("192.0.2.10", 17778)
+    client_private_key = ec.generate_private_key(ec.SECP256R1())
+    server_private_key = ec.generate_private_key(ec.SECP256R1())
+    server_public_key = server_private_key.public_key()
+    payload = (
+        proxy.HANDSHAKE_PREFIX
+        + station_id.encode()
+        + timestamp.to_bytes(8, "big")
+    )
+    server_signature = proxy.sign_message(payload, server_private_key)
+    response = b"OK|" + base64.b64encode(server_signature)
+    sock = _FakeHandshakeSocket([
+        (response, other_addr),
+        (response, remote_addr),
+    ])
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+
+    session_key = proxy.perform_handshake(
+        sock,
+        {"station_id": station_id},
+        client_private_key,
+        server_public_key,
+        remote_addr,
+    )
+
+    assert session_key is not None
+    assert len(sock.sent) == 1
 
 
 def test_proxy_handshake_timeout_returns_to_retry_loop(monkeypatch):

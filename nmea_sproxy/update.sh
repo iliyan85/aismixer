@@ -6,6 +6,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 INSTALL_DIR=/opt/nmea_sproxy
 TOOLS_DIR="$INSTALL_DIR/tools"
+CORE_DIR="$INSTALL_DIR/core"
 SYSTEMD_DIR=/etc/systemd/system
 
 if (( EUID == 0 )); then
@@ -26,9 +27,10 @@ run_as_root() {
 }
 
 echo "[+] Updating secure proxy runtime in $INSTALL_DIR"
-run_as_root install -d -m 0755 "$INSTALL_DIR" "$TOOLS_DIR"
+run_as_root install -d -m 0755 "$INSTALL_DIR" "$TOOLS_DIR" "$CORE_DIR"
 run_as_root install -m 0755 "$SCRIPT_DIR/nmea_sproxy.py" "$INSTALL_DIR/nmea_sproxy.py"
 run_as_root install -m 0644 "$SCRIPT_DIR/meta_cleaner.py" "$INSTALL_DIR/meta_cleaner.py"
+run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" "$CORE_DIR/network_policy.py"
 run_as_root install -m 0755 "$REPO_ROOT/tools/aismixer_keys.py" "$TOOLS_DIR/aismixer_keys.py"
 
 echo "[+] Updating systemd unit files"

@@ -6,6 +6,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 INSTALL_DIR=/opt/nmea_sproxy
 TOOLS_DIR="$INSTALL_DIR/tools"
+CORE_DIR="$INSTALL_DIR/core"
 CONFIG_DIR=/etc/nmea_sproxy
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 INSTANCES_DIR="$CONFIG_DIR/instances"
@@ -53,9 +54,10 @@ for pkg in python3-setproctitle python3-yaml python3-cryptography; do
 done
 
 echo "[+] Installing secure proxy runtime to $INSTALL_DIR"
-run_as_root install -d -m 0755 "$INSTALL_DIR" "$TOOLS_DIR"
+run_as_root install -d -m 0755 "$INSTALL_DIR" "$TOOLS_DIR" "$CORE_DIR"
 run_as_root install -m 0755 "$SCRIPT_DIR/nmea_sproxy.py" "$INSTALL_DIR/nmea_sproxy.py"
 run_as_root install -m 0644 "$SCRIPT_DIR/meta_cleaner.py" "$INSTALL_DIR/meta_cleaner.py"
+run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" "$CORE_DIR/network_policy.py"
 run_as_root install -m 0755 "$REPO_ROOT/tools/aismixer_keys.py" "$KEY_TOOL"
 
 echo "[+] Preparing configuration layout"
