@@ -16,6 +16,9 @@ SENTENCE = "!AIVDM,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*5C"
 SECOND_SENTENCE = "!AIVDM,1,1,,B,25Muq?002>G?svP00<:O?vN60<0,0*00"
 MULTIPART_FIRST = "!AIVDM,2,1,7,A,payload1,0*00"
 MULTIPART_SECOND = "!AIVDM,2,2,7,A,payload2,0*00"
+AIVDO_SENTENCE = "!AIVDO,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*42"
+AIVDO_MULTIPART_FIRST = "!AIVDO,2,1,7,A,payload1,0*00"
+AIVDO_MULTIPART_SECOND = "!AIVDO,2,2,7,A,payload2,0*00"
 
 
 class FakeForwarder:
@@ -362,7 +365,11 @@ async def start_forward_loop_capture(
     return queue, task, fake_forwarder
 
 
-async def run_multipart_forward_loop(monkeypatch):
+async def run_multipart_forward_loop(
+    monkeypatch,
+    first_fragment=MULTIPART_FIRST,
+    second_fragment=MULTIPART_SECOND,
+):
     fake_forwarder = FakeForwarder()
     monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
     monkeypatch.setattr(aismixer, "assembler", AIVDMAssembler())
@@ -376,13 +383,13 @@ async def run_multipart_forward_loop(monkeypatch):
     queue = asyncio.Queue()
     task = asyncio.create_task(aismixer.forward_loop(queue))
     try:
-        await queue.put(make_event(MULTIPART_FIRST))
+        await queue.put(make_event(first_fragment))
         await asyncio.sleep(0.05)
         if task.done():
             task.result()
         assert fake_forwarder.messages == []
 
-        await queue.put(make_event(MULTIPART_SECOND))
+        await queue.put(make_event(second_fragment))
         await wait_for_sends(fake_forwarder, task, 2)
         return list(fake_forwarder.messages)
     finally:
@@ -396,6 +403,23 @@ def test_forward_loop_forwards_single_plain_aivdm(monkeypatch):
 
     assert len(messages) == 1
     assert SENTENCE in messages[0]
+    assert messages[0].endswith("\r\n")
+    assert messages[0].startswith("\\c:")
+    assert ",s:test_station" in messages[0]
+
+
+def test_forward_loop_forwards_single_plain_aivdo(monkeypatch):
+    messages = asyncio.run(
+        run_forward_loop_events(
+            monkeypatch,
+            [make_event(AIVDO_SENTENCE)],
+            expected_sends=1,
+        )
+    )
+
+    assert len(messages) == 1
+    assert AIVDO_SENTENCE in messages[0]
+    assert "!AIVDO" in messages[0]
     assert messages[0].endswith("\r\n")
     assert messages[0].startswith("\\c:")
     assert ",s:test_station" in messages[0]
@@ -441,6 +465,30 @@ def test_forward_loop_buffers_multipart_until_second_fragment(monkeypatch):
     assert len(messages) == 2
     assert MULTIPART_FIRST in messages[0]
     assert MULTIPART_SECOND in messages[1]
+
+    first_tag = leading_tag(messages[0])
+    second_tag = leading_tag(messages[1])
+
+    assert re.fullmatch(r"c:\d+,s:test_station,g:1-2-\d+\*[0-9A-F]{2}", first_tag)
+    assert re.fullmatch(r"g:2-2-\d+\*[0-9A-F]{2}", second_tag)
+    assert "c:" not in second_tag
+    assert "s:" not in second_tag
+
+
+def test_forward_loop_forwards_multipart_aivdo_in_part_order(monkeypatch):
+    messages = asyncio.run(
+        run_multipart_forward_loop(
+            monkeypatch,
+            AIVDO_MULTIPART_FIRST,
+            AIVDO_MULTIPART_SECOND,
+        )
+    )
+
+    assert len(messages) == 2
+    assert AIVDO_MULTIPART_FIRST in messages[0]
+    assert AIVDO_MULTIPART_SECOND in messages[1]
+    assert "!AIVDO" in messages[0]
+    assert "!AIVDO" in messages[1]
 
     first_tag = leading_tag(messages[0])
     second_tag = leading_tag(messages[1])
@@ -528,6 +576,29 @@ def test_forward_loop_routing_mode_sends_to_matched_targets(monkeypatch):
     target_ids, message = fake_forwarder.targeted_messages[0]
     assert target_ids == ("udp:aishub",)
     assert SENTENCE in message
+
+
+def test_forward_loop_routing_mode_sends_aivdo_to_matched_targets(monkeypatch):
+    routing_table = make_routing_table()
+    event = make_event(AIVDO_SENTENCE, source_id="udp:source_a")
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [event],
+            expected_targeted_sends=1,
+            routing_state=RoutingState(routing_table),
+        )
+    )
+
+    assert fake_forwarder.messages == []
+    assert len(fake_forwarder.targeted_messages) == 1
+    target_ids, message = fake_forwarder.targeted_messages[0]
+    assert target_ids == ("udp:aishub",)
+    assert AIVDO_SENTENCE in message
+    assert "!AIVDO" in message
+    assert message.startswith("\\c:")
+    assert ",s:test_station" in message
 
 
 def test_forward_loop_routing_mode_no_matching_route_produces_no_output(monkeypatch):

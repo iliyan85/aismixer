@@ -152,7 +152,11 @@ async def forward_loop(queue, routing_state=None):
             route_target_ids = event_routing_table.match(ev.source_id).target_ids
 
         # Zero-copy friendly: взимаме индекси към ev.raw_line, не търсим с find()
-        for sl in extract_nmea_sentences(ev.raw_line, want_idx=True):
+        for sl in extract_nmea_sentences(
+            ev.raw_line,
+            want_idx=True,
+            include_vdo=True,
+        ):
             pos = sl.start
             clean_line = ev.raw_line[sl.start:sl.end]
 
