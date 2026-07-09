@@ -36,6 +36,9 @@ The following capabilities are implemented in the current codebase:
 - Versioned JSON routing-control protocol.
 - Opt-in POSIX Unix-domain control server.
 - `aismixerctl` local operator CLI.
+- Repository-managed systemd unit with `RuntimeDirectory=aismixer`.
+- Globally installed `/usr/local/bin/aismixerctl` wrapper in lifecycle scripts.
+- Install and update flows preserve existing operator configuration and keys.
 
 These items should not be described as planned functionality in repository
 metadata or user-facing documentation.
@@ -44,11 +47,16 @@ metadata or user-facing documentation.
 
 ### 1. Operational Deployment Hardening
 
-- Add systemd `RuntimeDirectory` or equivalent control-socket directory
-  provisioning.
+Completed deployment baseline:
+
+- systemd `RuntimeDirectory=aismixer` provisions `/run/aismixer` while the
+  installed service is running.
+- Installation and update deploy the global `aismixerctl` wrapper.
+- Installation and update preserve existing operator configuration and keys.
+
+Remaining deployment hardening:
+
 - Define explicit service ownership and group access for the control socket.
-- Provide a globally installed `aismixerctl` command during installation.
-- Preserve an existing operator configuration during install and update flows.
 - Verify Linux and Raspberry Pi operational behavior for installer, service,
   UDPSEC, and control-socket deployments.
 

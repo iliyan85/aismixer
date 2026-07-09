@@ -6,6 +6,7 @@ SCRIPT_NAME=$(basename -- "$SCRIPT_DIR/${BASH_SOURCE[0]##*/}")
 
 INSTALL_DIR=/opt/aismixer
 SYSTEMD_UNIT=/etc/systemd/system/aismixer.service
+CLI_WRAPPER=/usr/local/bin/aismixerctl
 CONFIG_DIR=/etc/aismixer
 
 PURGE_CONFIG=false
@@ -59,6 +60,7 @@ fi
 echo "[+] Removing installed files"
 run_as_root rm -rf -- "$INSTALL_DIR"
 run_as_root rm -f -- "$SYSTEMD_UNIT"
+run_as_root rm -f -- "$CLI_WRAPPER"
 
 if [ "$PURGE_CONFIG" = true ]; then
 	echo "[!] Purging $CONFIG_DIR, including operator configs and keys"

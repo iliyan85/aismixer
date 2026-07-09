@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 INSTALL_DIR=/opt/aismixer
+SYSTEMD_UNIT=/etc/systemd/system/aismixer.service
+CLI_WRAPPER=/usr/local/bin/aismixerctl
+CLI_WRAPPER_DIR=/usr/local/bin
 
 if (( EUID == 0 )); then
 	AS_ROOT=()
@@ -38,6 +41,10 @@ require_source_dir() {
 
 preflight_source_layout() {
 	require_source_file "$SCRIPT_DIR/aismixer.py"
+	require_source_file "$SCRIPT_DIR/aismixerctl.py"
+	require_source_file "$SCRIPT_DIR/aismixer.service"
+	require_source_dir "$SCRIPT_DIR/bin"
+	require_source_file "$SCRIPT_DIR/bin/aismixerctl"
 	require_source_dir "$SCRIPT_DIR/core"
 	require_source_dir "$SCRIPT_DIR/tools"
 	find "$SCRIPT_DIR" -maxdepth 1 -type f -name '*.py' -print0 >/dev/null
@@ -79,6 +86,14 @@ run_as_root install -d -m 0755 "$INSTALL_DIR"
 install_top_level_python
 install_tree "$SCRIPT_DIR/core" "$INSTALL_DIR/core" 0644
 install_tree "$SCRIPT_DIR/tools" "$INSTALL_DIR/tools" 0755
+
+echo "[+] Updating systemd unit and aismixerctl command"
+run_as_root install -m 0644 "$SCRIPT_DIR/aismixer.service" "$SYSTEMD_UNIT"
+run_as_root install -d -m 0755 "$CLI_WRAPPER_DIR"
+run_as_root install -m 0755 "$SCRIPT_DIR/bin/aismixerctl" "$CLI_WRAPPER"
+
+echo "[+] Reloading systemd"
+run_as_root systemctl daemon-reload
 
 echo "[+] Restarting aismixer service"
 run_as_root systemctl restart aismixer

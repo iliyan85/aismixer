@@ -93,6 +93,8 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP targets    |
 - `routing.status`, `routing.replace`, and `routing.disable`.
 - Unix-domain NDJSON control server and client.
 - `aismixerctl` CLI.
+- Repository-managed systemd service with `RuntimeDirectory=aismixer`.
+- Global `/usr/local/bin/aismixerctl` wrapper installed by lifecycle scripts.
 
 ### 🧪 Opt-in operational interface
 
@@ -103,6 +105,8 @@ The runtime control plane is implemented but deliberately opt-in:
 - Filesystem ownership, group, and mode on the socket path are the current
   authorization boundary.
 - There is no application-level control token.
+- The installed systemd unit creates `/run/aismixer` only while the service is
+  running; the runtime directory is not persistent state.
 - Runtime routing updates are process-local and are not persisted across
   service restart.
 
@@ -337,10 +341,18 @@ control:
 ### ⚠️ Operational notes
 
 - Adding `control:` or `control.unix:` alone does not enable the server.
-- The socket parent directory must already exist.
-- AISMixer does not currently create `/run/aismixer` automatically.
-- The current installer/systemd unit does not yet provision this directory.
+- The installed systemd unit uses `RuntimeDirectory=aismixer` to create
+  `/run/aismixer` before AISMixer starts. systemd removes that runtime directory
+  after the service stops; it is not persistent state.
+- If AISMixer is run outside the installed systemd unit, provide an equivalent
+  parent directory for the configured socket path.
 - Filesystem ownership, group, and mode control access to the socket.
+- The service continues to run under the same identity as before. This change
+  does not add `User=`, `Group=`, `DynamicUser=`, or a dedicated service
+  account.
+- With the current root-run service and `socket_mode: "0660"`, access may
+  effectively be root-only unless the operator deliberately configures
+  ownership or group policy for the socket.
 - There is no application-level authentication token.
 - The interface is POSIX-only; Windows can run pure tests and development code,
   but not the Unix socket listener.
@@ -354,25 +366,33 @@ for an inactive complete configuration with static routing and runtime control.
 
 ## 🧰 `aismixerctl`
 
-Until installer/systemd integration is updated, do not assume that
-`aismixerctl` is installed globally. From a repository checkout or copied
-service directory, use:
+The installer deploys a small POSIX wrapper at `/usr/local/bin/aismixerctl`.
+The wrapper executes `/usr/bin/python3 /opt/aismixer/aismixerctl.py "$@"` and
+contains no routing or protocol logic.
+
+The default socket path is `/run/aismixer/control.sock`, so an installed system
+can query status with:
 
 ```bash
-python3 aismixerctl.py --socket /run/aismixer/control.sock status
+aismixerctl status
 ```
 
-The shorter form works only when your local installation or `PATH` provides it:
+From a repository checkout or copied service directory, use:
 
 ```bash
-aismixerctl --socket /run/aismixer/control.sock status
+python3 aismixerctl.py status
+```
+
+Use `--socket` to override the default path:
+
+```bash
+aismixerctl --socket /custom/path.sock status
 ```
 
 Replace the active process-local routing snapshot:
 
 ```bash
-python3 aismixerctl.py \
-  --socket /run/aismixer/control.sock \
+aismixerctl \
   replace \
   --file examples/routing-update.yaml \
   --expected-generation 3
@@ -381,8 +401,7 @@ python3 aismixerctl.py \
 Disable routing and return the running process to legacy broadcast mode:
 
 ```bash
-python3 aismixerctl.py \
-  --socket /run/aismixer/control.sock \
+aismixerctl \
   disable \
   --expected-generation 4
 ```
@@ -500,16 +519,17 @@ Run directly from the repository:
 python3 aismixer.py
 ```
 
-Or install the existing systemd service:
+Or install the repository-managed systemd service and global CLI wrapper:
 
 ```bash
 ./install.sh
 ```
 
-The current installer deploys the runtime files and existing service unit.
-Control-plane installer/systemd integration — including automatic runtime
-directory provisioning and a global `aismixerctl` command — is intentionally a
-separate follow-up change.
+The installer deploys runtime files to `/opt/aismixer`, installs
+`aismixer.service`, installs `/usr/local/bin/aismixerctl`, reloads systemd, and
+enables the service. It does not start AISMixer automatically. The unit uses
+`RuntimeDirectory=aismixer`, so systemd creates `/run/aismixer` while the
+service is running and removes it after the service stops.
 
 ---
 
@@ -554,8 +574,8 @@ POSIX environment with asyncio Unix-socket support.
 - There is no automatic config reload/watch.
 - There is no geographic, MMSI, or vessel filtering.
 - Unix control requires POSIX Unix-domain socket support.
-- Control socket directory provisioning is currently operator-managed.
 - Access control relies on Unix filesystem permissions.
+- A dedicated service user/group policy is not yet introduced.
 
 ---
 
@@ -669,6 +689,8 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP цели       |
 - `routing.status`, `routing.replace` и `routing.disable`.
 - Unix-domain NDJSON control server и клиент.
 - CLI инструментът `aismixerctl`.
+- Repository-managed systemd service с `RuntimeDirectory=aismixer`.
+- Глобален `/usr/local/bin/aismixerctl` wrapper, инсталиран от lifecycle scripts.
 
 ### 🧪 Opt-in оперативен интерфейс
 
@@ -679,6 +701,8 @@ Runtime control plane е реализиран, но умишлено се вкл
 - filesystem собственикът, групата и mode на socket path са текущата граница
   за достъп;
 - няма application-level control token;
+- инсталираният systemd unit създава `/run/aismixer` само докато услугата
+  работи; runtime директорията не е persistent state;
 - runtime routing промените са process-local и не се запазват след рестарт.
 
 ### 🧭 Планирано или нереализирано
@@ -909,10 +933,17 @@ control:
 ### ⚠️ Оперативни бележки
 
 - Самото добавяне на `control:` или `control.unix:` не включва server-а.
-- Parent directory на socket path трябва вече да съществува.
-- AISMixer все още не създава автоматично `/run/aismixer`.
-- Текущият installer/systemd unit още не provision-ва тази директория.
+- Инсталираният systemd unit използва `RuntimeDirectory=aismixer`, за да създаде
+  `/run/aismixer` преди старта на AISMixer. systemd премахва тази runtime
+  директория след спиране на услугата; тя не е persistent state.
+- Ако AISMixer се стартира извън инсталирания systemd unit, осигури
+  еквивалентна parent directory за конфигурирания socket path.
 - Filesystem собственикът, групата и mode управляват достъпа до socket-а.
+- Услугата продължава да работи със същата identity както досега. Тази промяна
+  не добавя `User=`, `Group=`, `DynamicUser=` или dedicated service account.
+- При текущата root-run услуга и `socket_mode: "0660"` достъпът може на практика
+  да е само за root, освен ако операторът умишлено не конфигурира ownership или
+  group policy за socket-а.
 - Няма application-level authentication token.
 - Интерфейсът е само за POSIX. Windows може да изпълнява pure tests и
   development кода, но не и Unix socket listener-а.
@@ -926,25 +957,33 @@ control:
 
 ## 🧰 `aismixerctl`
 
-Докато installer/systemd интеграцията не бъде обновена, не трябва да се приема,
-че `aismixerctl` е инсталирана глобална команда. От repository checkout или
-копирана service директория използвай:
+Installer-ът разполага малък POSIX wrapper в `/usr/local/bin/aismixerctl`.
+Wrapper-ът изпълнява `/usr/bin/python3 /opt/aismixer/aismixerctl.py "$@"` и не
+съдържа routing или protocol логика.
+
+Default socket path е `/run/aismixer/control.sock`, така че инсталирана система
+може да провери status с:
 
 ```bash
-python3 aismixerctl.py --socket /run/aismixer/control.sock status
+aismixerctl status
 ```
 
-Кратката форма работи само когато локалната инсталация или `PATH` я осигурява:
+От repository checkout или копирана service директория използвай:
 
 ```bash
-aismixerctl --socket /run/aismixer/control.sock status
+python3 aismixerctl.py status
+```
+
+Използвай `--socket`, за да override-неш default path:
+
+```bash
+aismixerctl --socket /custom/path.sock status
 ```
 
 Подмяна на активния process-local routing snapshot:
 
 ```bash
-python3 aismixerctl.py \
-  --socket /run/aismixer/control.sock \
+aismixerctl \
   replace \
   --file examples/routing-update.yaml \
   --expected-generation 3
@@ -953,8 +992,7 @@ python3 aismixerctl.py \
 Изключване на routing и връщане на работещия процес към legacy broadcast режим:
 
 ```bash
-python3 aismixerctl.py \
-  --socket /run/aismixer/control.sock \
+aismixerctl \
   disable \
   --expected-generation 4
 ```
@@ -1072,16 +1110,17 @@ c_preserve_ingress_c: true
 python3 aismixer.py
 ```
 
-Или инсталиране на съществуващата systemd услуга:
+Или инсталиране на repository-managed systemd услугата и глобалния CLI wrapper:
 
 ```bash
 ./install.sh
 ```
 
-Текущият installer разполага runtime файловете и съществуващия service unit.
-Control-plane installer/systemd интеграцията — включително автоматичното
-създаване на runtime директория и глобална команда `aismixerctl` — умишлено е
-отделна следваща промяна.
+Installer-ът разполага runtime файловете в `/opt/aismixer`, инсталира
+`aismixer.service`, инсталира `/usr/local/bin/aismixerctl`, reload-ва systemd и
+enable-ва услугата. Той не стартира AISMixer автоматично. Unit-ът използва
+`RuntimeDirectory=aismixer`, така че systemd създава `/run/aismixer`, докато
+услугата работи, и я премахва след спиране.
 
 ---
 
@@ -1127,8 +1166,8 @@ python -m pytest
 - Няма автоматичен config reload/watch.
 - Няма географско, MMSI или vessel филтриране.
 - Unix control изисква POSIX Unix-domain socket support.
-- Provisioning-ът на control socket директорията все още е задача на оператора.
 - Контролът на достъпа разчита на Unix filesystem permissions.
+- Dedicated service user/group policy все още не е въведена.
 
 ---
 

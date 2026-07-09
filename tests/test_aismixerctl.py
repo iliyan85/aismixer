@@ -85,6 +85,10 @@ def test_status_request_shape():
     }
 
 
+def test_default_socket_path_is_operational_runtime_socket():
+    assert aismixerctl.DEFAULT_SOCKET_PATH == "/run/aismixer/control.sock"
+
+
 def test_disable_request_shape():
     assert aismixerctl.build_disable_request("req-1") == {
         "version": ROUTING_CONTROL_PROTOCOL_VERSION,
@@ -231,6 +235,40 @@ def test_main_status_uses_generated_request_id(capsys):
         )
     ]
     assert json.loads(captured.out)["ok"] is True
+
+
+def test_main_status_uses_default_socket_path_without_socket_option(capsys):
+    rc = aismixerctl.main(
+        ["status"],
+        client_factory=FakeClient,
+        generated_request_id=lambda: "generated",
+    )
+
+    captured = capsys.readouterr()
+    assert rc == aismixerctl.EXIT_OK
+    assert FakeClient.calls == [
+        (
+            aismixerctl.DEFAULT_SOCKET_PATH,
+            {
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+                "request_id": "generated",
+                "method": "routing.status",
+            },
+        )
+    ]
+    assert json.loads(captured.out)["ok"] is True
+
+
+def test_explicit_socket_overrides_default_socket_path(capsys):
+    rc = aismixerctl.main(
+        ["--socket", "/custom/path.sock", "status"],
+        client_factory=FakeClient,
+        generated_request_id=lambda: "generated",
+    )
+
+    assert rc == aismixerctl.EXIT_OK
+    assert FakeClient.calls[0][0] == "/custom/path.sock"
+    assert json.loads(capsys.readouterr().out)["ok"] is True
 
 
 def test_main_preserves_explicit_request_id(capsys):

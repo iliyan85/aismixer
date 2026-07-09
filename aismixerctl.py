@@ -40,6 +40,7 @@ EXIT_CONNECTION_ERROR = 4
 EXIT_INVALID_RESPONSE = 5
 EXIT_INTERNAL_ERROR = 6
 EXIT_INTERRUPTED = 130
+DEFAULT_SOCKET_PATH = "/run/aismixer/control.sock"
 
 
 class AismixerCtlInputError(ValueError):
@@ -208,7 +209,12 @@ def main(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aismixerctl")
-    parser.add_argument("--socket", dest="socket_path", required=True)
+    parser.add_argument(
+        "--socket",
+        dest="socket_path",
+        default=DEFAULT_SOCKET_PATH,
+        help=f"control socket path (default: {DEFAULT_SOCKET_PATH})",
+    )
     parser.add_argument("--request-id")
     parser.add_argument("--pretty", action="store_true")
 
