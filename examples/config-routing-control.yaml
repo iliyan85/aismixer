@@ -3,8 +3,9 @@
 # This is a full AISMixer configuration that demonstrates static logical
 # routing plus the opt-in Unix-domain routing-control socket.
 #
-# The parent directory for socket_path must already exist. The current
-# installer/systemd integration does not create /run/aismixer automatically.
+# The installed systemd unit provisions /run/aismixer while the service is
+# running through RuntimeDirectory=aismixer. If you run AISMixer outside that
+# unit, provide an equivalent parent directory for socket_path.
 # Socket filesystem ownership, group, and mode are the authorization boundary.
 # Runtime routing changes made through the control socket are process-local and
 # are not persisted after restart.

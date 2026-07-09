@@ -5,6 +5,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 INSTALL_DIR=/opt/aismixer
 SYSTEMD_UNIT=/etc/systemd/system/aismixer.service
+CLI_WRAPPER=/usr/local/bin/aismixerctl
+CLI_WRAPPER_DIR=/usr/local/bin
 CONFIG_DIR=/etc/aismixer
 KEYS_DIR="$CONFIG_DIR/keys"
 PRIVATE_KEY="$KEYS_DIR/aismixer_private.pem"
@@ -50,6 +52,10 @@ require_source_dir() {
 
 preflight_source_layout() {
 	require_source_file "$SCRIPT_DIR/aismixer.py"
+	require_source_file "$SCRIPT_DIR/aismixerctl.py"
+	require_source_file "$SCRIPT_DIR/aismixer.service"
+	require_source_dir "$SCRIPT_DIR/bin"
+	require_source_file "$SCRIPT_DIR/bin/aismixerctl"
 	require_source_dir "$SCRIPT_DIR/core"
 	require_source_dir "$SCRIPT_DIR/tools"
 	require_source_file "$SCRIPT_DIR/config.yaml"
@@ -156,24 +162,12 @@ else
 	echo "  - Created $AUTHORIZED_KEYS_FILE"
 fi
 
-echo "[+] Creating systemd unit"
-run_as_root tee "$SYSTEMD_UNIT" >/dev/null <<EOF
-[Unit]
-Description=AIS Mixer Service
-After=network-online.target
-Wants=network-online.target
+echo "[+] Installing systemd unit"
+run_as_root install -m 0644 "$SCRIPT_DIR/aismixer.service" "$SYSTEMD_UNIT"
 
-[Service]
-Type=simple
-WorkingDirectory=$INSTALL_DIR
-ExecStart=/usr/bin/python3 aismixer.py
-Restart=always
-SyslogIdentifier=aismixer
-
-[Install]
-WantedBy=multi-user.target
-EOF
-run_as_root chmod 0644 "$SYSTEMD_UNIT"
+echo "[+] Installing aismixerctl command"
+run_as_root install -d -m 0755 "$CLI_WRAPPER_DIR"
+run_as_root install -m 0755 "$SCRIPT_DIR/bin/aismixerctl" "$CLI_WRAPPER"
 
 echo "[+] Reloading systemd and enabling service"
 run_as_root systemctl daemon-reload

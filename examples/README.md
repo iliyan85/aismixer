@@ -17,19 +17,24 @@ loaded unless an operator copies or adapts them.
 
 ## Runtime Control Example
 
+On an installed system:
+
+```bash
+aismixerctl status
+aismixerctl replace --file examples/routing-update.yaml
+```
+
 From a repository checkout or copied service directory:
 
 ```bash
-python3 aismixerctl.py --socket /run/aismixer/control.sock status
-python3 aismixerctl.py --socket /run/aismixer/control.sock replace --file examples/routing-update.yaml
+python3 aismixerctl.py status
+python3 aismixerctl.py replace --file examples/routing-update.yaml
 ```
-
-The shorter `aismixerctl` command works only if your local installation or
-`PATH` provides it.
 
 ## Operator Notes
 
 Adapt all IDs, ports, hosts, and paths before using these examples. The control
-socket parent directory must already exist, and socket filesystem permissions
-are the authorization boundary. Runtime routing changes are process-local and
-are not persisted after restart.
+socket parent directory is provisioned by the installed systemd unit while the
+service is running; provide an equivalent directory when running outside that
+unit. Socket filesystem permissions are the authorization boundary. Runtime
+routing changes are process-local and are not persisted after restart.
