@@ -88,6 +88,10 @@ def test_install_creates_layout_repairs_keys_and_only_enables_singleton():
         'run_as_root install -m 0644 "$SCRIPT_DIR/input_adapters.py" '
         '"$INSTALL_DIR/input_adapters.py"'
     ) in install
+    assert (
+        'run_as_root install -m 0644 "$SCRIPT_DIR/output_adapters.py" '
+        '"$INSTALL_DIR/output_adapters.py"'
+    ) in install
     assert 'run_as_root install -d -m 0755 "$CONFIG_DIR" "$INSTANCES_DIR"' in install
     assert 'run_as_root install -d -m 0700 "$KEYS_DIR"' in install
     assert (
@@ -136,6 +140,9 @@ def test_configs_include_inactive_serial_examples_with_placeholder_device_id():
     assert "# input:" in combined
     assert "#   type: serial" in combined
     assert "#   port: COM4" in combined
+    assert "# output:" in combined
+    assert "#   type: udpsec" in combined
+    assert "#   type: udp" in combined
     assert "Virtual_COM_Port_<device-id>-if00" in combined
 
 
@@ -192,6 +199,10 @@ def test_update_routes_runtime_and_unit_updates_through_helper():
     assert (
         'run_as_root install -m 0644 "$SCRIPT_DIR/input_adapters.py" '
         '"$INSTALL_DIR/input_adapters.py"'
+    ) in update
+    assert (
+        'run_as_root install -m 0644 "$SCRIPT_DIR/output_adapters.py" '
+        '"$INSTALL_DIR/output_adapters.py"'
     ) in update
     assert (
         'run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" '

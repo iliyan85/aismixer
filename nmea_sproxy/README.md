@@ -1,16 +1,18 @@
 # nmea_sproxy operator guide
 
-`nmea_sproxy` is a client-side UDPSEC proxy. UDPSEC is AISMixer's
+`nmea_sproxy` is a station-side network proxy. UDPSEC is AISMixer's
 authenticated encrypted UDP transport; it is not an external standardized
-protocol. `nmea_sproxy` does not mix inputs, assemble multipart AIS,
-deduplicate, rewrite TAG metadata, route streams, or fan out to egress targets.
-AISMixer performs those jobs.
+protocol. UDPSEC remains the secure default and legacy behavior. Explicit plain
+UDP output is available only for trusted LAN/VPN compatibility deployments.
+`nmea_sproxy` does not mix inputs, assemble multipart AIS, deduplicate, rewrite
+TAG metadata, route streams, or fan out to egress targets. AISMixer performs
+those jobs.
 
-Each `nmea_sproxy` process represents exactly one UDPSEC relation:
+Each `nmea_sproxy` process represents exactly one relation:
 
 ```text
-one local input (UDP or serial) -> one AISMixer UDPSEC input
-listen_ip/listen_port or input.type: serial -> remote_host/remote_port
+one local input (UDP or serial) -> one network output (UDPSEC or UDP)
+listen_ip/listen_port or input.type: serial -> remote_host/remote_port or output
 ```
 
 Run separate processes or systemd template instances for separate relations.
@@ -44,6 +46,22 @@ The design assumes that the station client behind NAT, CGNAT, or a mobile
 network is the active side: it initiates the handshake and sends keepalive
 traffic to the reachable AISMixer UDPSEC input.
 
+There is no UDPSEC-to-plain-UDP fallback. A relation uses plain UDP only when
+`output.type: udp` is explicitly configured.
+
+## Plain UDP behavior and limits
+
+Plain UDP output sends each extracted `!AIVDM` or `!AIVDO` sentence as one UDP
+datagram. It sends the NMEA sentence text itself: no JSON envelope, no UDPSEC
+prefix, no encryption, no `station_id`, and no TAG metadata rewrite.
+
+Plain UDP provides no confidentiality, station authentication, integrity
+protection, replay protection, or liveness protocol. Use it only where those
+properties are supplied by a controlled LAN, VPN, or other external network
+boundary. In plain UDP mode AISMixer must derive source identity from its own
+UDP ingress configuration, listener ID, allow-list policy, and observed source
+address; `nmea_sproxy` does not authenticate `station_id` in plain UDP mode.
+
 ## Configuration
 
 A minimal relation looks like this:
@@ -65,8 +83,8 @@ remote_public_key: aismixer_public.pem
 
 When `input:` is omitted, `listen_ip` / `listen_port` select the legacy local
 UDP input and behavior is unchanged.
-`remote_host` / `remote_port` select the configured remote AISMixer UDPSEC
-input.
+When `output:` is omitted, `remote_host` / `remote_port` select the legacy
+AISMixer UDPSEC output and behavior is unchanged.
 
 ### Local input modes
 
@@ -124,6 +142,45 @@ current port object, discards unsafe partial line-framing state, and retries the
 same configured port after `input.reconnect_delay`. If the internal queue fills,
 the oldest queued line is dropped so fresher real-time AIS traffic can continue.
 
+### Output modes
+
+The legacy UDPSEC output remains the default and uses the top-level endpoint
+fields:
+
+```yaml
+remote_host: mixer.example.net
+remote_port: 19999
+source_ip: 192.0.2.20
+```
+
+Explicit UDPSEC output uses the same station identity, key files, handshake,
+session, ping/pong, and `NOSESSION` behavior:
+
+```yaml
+output:
+  type: udpsec
+  host: mixer.example.net
+  port: 19999
+  source_ip: 192.0.2.20
+```
+
+Explicit plain UDP output disables UDPSEC for that relation:
+
+```yaml
+output:
+  type: udp
+  host: 192.168.10.20
+  port: 17777
+  source_ip: 192.168.10.15
+```
+
+`output.type` must be either `udpsec` or `udp`. Explicit output mappings require
+both `output.host` and `output.port`; they do not borrow missing endpoint fields
+from legacy `remote_host` / `remote_port`. When both explicit output settings
+and legacy endpoint fields are present, the explicit `output:` endpoint is used.
+Explicit nulls, unknown output keys, blank hosts, invalid ports, invalid
+`output.source_ip`, and address-family mismatches fail startup validation.
+
 ### Network endpoint controls
 
 Two optional top-level controls are available for the station-side proxy:
@@ -135,15 +192,17 @@ Two optional top-level controls are available for the station-side proxy:
   IPv6 CIDR networks. Hostnames and malformed entries fail startup validation.
   `allow_from` applies only to the legacy UDP input and is rejected when
   `input.type: serial` is configured.
-- `source_ip` binds the outbound UDPSEC socket to a literal IPv4 or IPv6 source
-  address and an automatically selected source port. When omitted, the
-  operating system chooses the outbound source address as before. `source_ip`
-  does not select an interface, routing table, socket mark, or source port.
+- `source_ip` binds the legacy outbound UDPSEC socket to a literal IPv4 or IPv6
+  source address and an automatically selected source port. In explicit output
+  mode, use `output.source_ip` for either UDPSEC or plain UDP output. When
+  omitted, the operating system chooses the outbound source address as before.
+  Source binding does not select an interface, routing table, socket mark, or
+  fixed source port.
 
-When `source_ip` is configured, it selects the outbound socket address family.
-A literal `remote_host` must use the same family, and a hostname `remote_host`
-is resolved only within that family. The selected remote address and
-`remote_port` are pinned for the process lifetime; handshake replies, pongs,
+When source binding is configured, it selects the outbound socket address
+family. A literal destination must use the same family, and a hostname
+destination is resolved only within that family. The selected destination tuple
+is pinned for the process lifetime. In UDPSEC mode, handshake replies, pongs,
 and `NOSESSION` hints are accepted only from that tuple.
 
 The local ACL complements the host firewall; it does not replace firewall,
@@ -151,8 +210,8 @@ routing, or interface-level policy. Because the server session is bound to the
 observed client source IP and port, changing the outbound source IP or source
 port requires a new UDPSEC handshake.
 
-`source_ip` remains valid in both UDP and serial input modes because it controls
-the outbound UDPSEC socket, not the local receiver.
+Source binding remains valid with both UDP and serial input modes because it
+controls the outbound socket, not the local receiver.
 
 IPv4 example:
 
@@ -296,7 +355,8 @@ sudo systemctl start nmea_sproxy@balchik_roof
 `boat`, `yacht`, and names such as `balchik_roof` are operator-chosen labels.
 They are not predefined or numbered instance names. Each instance config must
 define one local input, either the legacy UDP listener or an explicit serial
-input, and one remote AISMixer UDPSEC endpoint.
+input, and one remote AISMixer network endpoint using UDPSEC or explicit plain
+UDP.
 
 The installer creates `/etc/nmea_sproxy/instances/` but does not create
 instance configs or enable template instances.
@@ -311,12 +371,15 @@ The standard system key files are:
 /etc/nmea_sproxy/keys/aismixer_public.pem
 ```
 
-- `station_private.pem` is the station identity private key. Keep it private
-  and never copy it to AISMixer.
+- `station_private.pem` is the station identity private key for UDPSEC mode.
+  Keep it private and never copy it to AISMixer.
 - `station_public.pem` is derived from the station private key and is used to
   create the station entry in AISMixer's `authorized_keys.yaml`.
 - `aismixer_public.pem` is the trusted AISMixer server public key copied to the
   station. It lets the station verify the server handshake.
+
+Plain UDP output does not load or require `station_private.pem` or
+`aismixer_public.pem`.
 
 ### Generation, preservation, and repair
 
@@ -360,7 +423,7 @@ Restart AISMixer after changing its authorization file. Trust material is not
 exchanged automatically: copy the AISMixer public key to the station as
 `aismixer_public.pem`, and add the station public-key value to AISMixer.
 
-## Session lifecycle
+## UDPSEC session lifecycle
 
 The defaults are:
 
@@ -416,8 +479,8 @@ logs. Remember that `NOSESSION` itself is not authenticated.
 
 ### Missing key files
 
-Check that all three standard key files exist and that the service user can
-read the station private key and AISMixer public key:
+For UDPSEC mode, check that all three standard key files exist and that the
+service user can read the station private key and AISMixer public key:
 
 ```bash
 sudo ls -l /etc/nmea_sproxy/keys
