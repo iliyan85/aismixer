@@ -7,7 +7,6 @@ import base64
 import sys
 import json
 import select
-import ipaddress
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -22,6 +21,18 @@ from input_adapters import (
     normalize_local_input_config,
 )
 from meta_cleaner import extract_nmea_sentences
+from output_adapters import (
+    OutputConfigError,
+    PlainUdpOutputAdapter,
+    UDPSEC_OUTPUT_TYPE,
+    UDP_OUTPUT_TYPE,
+    create_output_socket,
+    create_outbound_socket as adapter_create_outbound_socket,
+    normalize_output_config,
+    parse_source_ip as adapter_parse_source_ip,
+    resolve_output_endpoint,
+    resolve_remote_addr as adapter_resolve_remote_addr,
+)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -185,6 +196,7 @@ def load_config(path=None):
     apply_default_key_paths(config, user_config)
     resolve_configured_key_paths(config, user_config, selected_path)
     validate_local_input_config(config)
+    validate_output_config(config)
     return config
 
 
@@ -206,6 +218,15 @@ def create_local_input_adapter(config, ingress_policy=None):
         except InputConfigError as exc:
             raise ProxyConfigError(str(exc)) from exc
     return UdpInputAdapter.bind(config, ingress_policy)
+
+
+def validate_output_config(config):
+    try:
+        output_config = normalize_output_config(config)
+    except OutputConfigError as exc:
+        raise ProxyConfigError(str(exc)) from exc
+    config["output"] = output_config
+    return output_config
 
 
 def set_process_title(title):
@@ -299,38 +320,25 @@ def remote_addresses_match(addr, remote_addr):
 
 
 def address_family_name(family):
-    if family == socket.AF_INET:
-        return "IPv4"
-    if family == socket.AF_INET6:
-        return "IPv6"
-    return str(family)
+    from output_adapters import address_family_name as _address_family_name
+    return _address_family_name(family)
 
 
 def family_for_ip_address(address):
-    return socket.AF_INET6 if address.version == 6 else socket.AF_INET
+    from output_adapters import family_for_ip_address as _family_for_ip_address
+    return _family_for_ip_address(address)
 
 
 def default_remote_family(host):
-    return socket.AF_INET6 if ":" in str(host) else socket.AF_INET
+    from output_adapters import default_remote_family as _default_remote_family
+    return _default_remote_family(host)
 
 
 def parse_source_ip(config):
-    if "source_ip" not in config:
-        return None
-
-    value = config["source_ip"]
-    if not isinstance(value, str) or not value.strip():
-        raise ProxyConfigError(
-            f"source_ip: invalid literal IP address {value!r}"
-        )
-
-    value = value.strip()
     try:
-        return ipaddress.ip_address(value)
-    except ValueError as exc:
-        raise ProxyConfigError(
-            f"source_ip: invalid literal IP address {value!r}"
-        ) from exc
+        return adapter_parse_source_ip(config, context="source_ip")
+    except OutputConfigError as exc:
+        raise ProxyConfigError(str(exc)) from exc
 
 
 def compile_local_ingress_policy(config):
@@ -338,61 +346,43 @@ def compile_local_ingress_policy(config):
 
 
 def resolve_remote_endpoint(config, source_address=None):
-    host = config["remote_host"]
-    port = config["remote_port"]
-    if source_address is None:
-        family = default_remote_family(host)
-    else:
-        family = family_for_ip_address(source_address)
-        try:
-            remote_literal = ipaddress.ip_address(str(host))
-        except ValueError:
-            remote_literal = None
-        if (
-            remote_literal is not None
-            and remote_literal.version != source_address.version
-        ):
-            raise ProxyConfigError(
-                "remote_host: literal address family "
-                f"{address_family_name(family_for_ip_address(remote_literal))} "
-                f"does not match source_ip {source_address}"
-            )
-
-    return resolve_remote_addr(host, port, family), family
+    output_config = {
+        "type": UDPSEC_OUTPUT_TYPE,
+        "host": config["remote_host"],
+        "port": config["remote_port"],
+        "legacy": True,
+    }
+    if source_address is not None:
+        output_config["source_ip"] = str(source_address)
+    elif "source_ip" in config:
+        output_config["source_ip"] = config["source_ip"]
+    try:
+        return resolve_output_endpoint(output_config)
+    except OutputConfigError as exc:
+        raise ProxyConfigError(str(exc)) from exc
 
 
 def resolve_remote_addr(host, port, family):
     try:
-        addresses = socket.getaddrinfo(host, port, family, socket.SOCK_DGRAM)
-    except socket.gaierror as exc:
-        raise ProxyConfigError(
-            f"remote_host: no {address_family_name(family)} address for "
-            f"{host!r}:{port}"
-        ) from exc
-    if not addresses:
-        raise ProxyConfigError(
-            f"remote_host: no {address_family_name(family)} address for "
-            f"{host!r}:{port}"
+        return adapter_resolve_remote_addr(
+            host,
+            port,
+            family,
+            context="remote_host",
         )
-    return addresses[0][4]
+    except OutputConfigError as exc:
+        raise ProxyConfigError(str(exc)) from exc
 
 
 def create_outbound_socket(family, source_address=None):
-    sock = socket.socket(family, socket.SOCK_DGRAM)
-    if source_address is None:
-        return sock
-
-    source_ip = str(source_address)
     try:
-        sock.bind((source_ip, 0))
-    except OSError as exc:
-        close = getattr(sock, "close", None)
-        if close:
-            close()
-        raise ProxyConfigError(
-            f"source_ip {source_ip!r}: bind failed: {exc}"
-        ) from exc
-    return sock
+        return adapter_create_outbound_socket(
+            family,
+            source_address,
+            context="source_ip",
+        )
+    except OutputConfigError as exc:
+        raise ProxyConfigError(str(exc)) from exc
 
 
 def is_no_session_hint(data):
@@ -476,30 +466,34 @@ def _coerce_input_adapter(local_input, ingress_policy=None):
     return UdpInputAdapter(local_input, ingress_policy)
 
 
-def forward_input_payload(data, out_sock, config, session_key, remote_addr):
-    clean_lines = extract_nmea_sentences(
-        data.decode(errors="replace").strip()
+def iter_forwardable_nmea_sentences(data):
+    return extract_nmea_sentences(data.decode(errors="replace").strip())
+
+
+def send_udpsec_nmea_sentence(clean_line, out_sock, config, session_key, remote_addr):
+    json_obj = {
+        "type": "nmea",
+        "payload": clean_line,
+        "timestamp": int(time.time()),
+        "source_id": config["station_id"],
+    }
+    out_sock.sendto(
+        encrypt_secure_json_message(json_obj, session_key),
+        remote_addr,
     )
-    for clean_line in clean_lines:
+
+
+def forward_input_payload(data, send_sentence):
+    for clean_line in iter_forwardable_nmea_sentences(data):
         if not clean_line:
             continue
-
-        json_obj = {
-            "type": "nmea",
-            "payload": clean_line,
-            "timestamp": int(time.time()),
-            "source_id": config["station_id"],
-        }
         print(clean_line)
-        out_sock.sendto(
-            encrypt_secure_json_message(json_obj, session_key),
-            remote_addr,
-        )
+        send_sentence(clean_line)
 
 
-def forward_pending_input(input_adapter, out_sock, config, session_key, remote_addr):
+def forward_pending_input(input_adapter, send_sentence):
     for data in input_adapter.read_pending():
-        forward_input_payload(data, out_sock, config, session_key, remote_addr)
+        forward_input_payload(data, send_sentence)
 
 
 def send_ping(sock, remote_addr, session_key, station_id, seq):
@@ -605,6 +599,13 @@ def forward_loop(
     last_ping_at = session_started_at
     expected_ping_seq = None
     next_ping_seq = 1
+    send_sentence = lambda clean_line: send_udpsec_nmea_sentence(
+        clean_line,
+        out_sock,
+        config,
+        session_key,
+        remote_addr,
+    )
 
     while True:
         now = time.monotonic()
@@ -633,10 +634,7 @@ def forward_loop(
         try:
             forward_pending_input(
                 input_adapter,
-                out_sock,
-                config,
-                session_key,
-                remote_addr,
+                send_sentence,
             )
         except Exception as e:
             print(f"❌ Forwarding error: {e}")
@@ -682,10 +680,7 @@ def forward_loop(
                 for data in input_adapter.read_ready(ready_socket):
                     forward_input_payload(
                         data,
-                        out_sock,
-                        config,
-                        session_key,
-                        remote_addr,
+                        send_sentence,
                     )
             except Exception as e:
                 print(f"❌ Forwarding error: {e}")
@@ -709,11 +704,90 @@ def forward_loop(
             last_ping_at = now
 
 
+def plain_udp_forward_loop(local_input, output_adapter, ingress_policy=None):
+    input_adapter = _coerce_input_adapter(local_input, ingress_policy)
+
+    while True:
+        send_sentence = output_adapter.send_sentence
+        try:
+            forward_pending_input(input_adapter, send_sentence)
+        except Exception as e:
+            print(f"❌ Plain UDP forwarding error: {e}")
+            return SESSION_END_SOCKET_ERROR
+
+        input_sockets = input_adapter.selectable_sockets()
+        poll_timeout = input_adapter.poll_interval()
+
+        if not input_sockets:
+            time.sleep(poll_timeout if poll_timeout is not None else 0.2)
+            continue
+
+        try:
+            readable, _, _ = select.select(
+                input_sockets, [], [], poll_timeout
+            )
+        except Exception as e:
+            print(f"❌ Plain UDP forwarding error: {e}")
+            return SESSION_END_SOCKET_ERROR
+
+        for ready_socket in input_sockets:
+            if ready_socket not in readable:
+                continue
+            try:
+                for data in input_adapter.read_ready(ready_socket):
+                    forward_input_payload(data, send_sentence)
+            except Exception as e:
+                print(f"❌ Plain UDP forwarding error: {e}")
+                return SESSION_END_SOCKET_ERROR
+
+
+def create_plain_udp_output_adapter(output_config):
+    try:
+        return PlainUdpOutputAdapter.from_config(output_config)
+    except OutputConfigError as exc:
+        raise ProxyConfigError(str(exc)) from exc
+
+
+def run_plain_udp_relation(
+    local_input,
+    output_config,
+    config,
+    ingress_policy=None,
+    output_adapter=None,
+):
+    if output_adapter is None:
+        try:
+            output_adapter = create_plain_udp_output_adapter(output_config)
+        except ProxyConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 1
+    try:
+        while True:
+            reason = plain_udp_forward_loop(
+                local_input,
+                output_adapter,
+                ingress_policy,
+            )
+            output_adapter.close()
+
+            retry_delay = retry_delay_for_reason(reason, config)
+            print(f"🔁 Recreating plain UDP socket in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+
+            try:
+                output_adapter.recreate_socket()
+            except OutputConfigError as exc:
+                print(f"Configuration error: {exc}", file=sys.stderr)
+                return 1
+    finally:
+        output_adapter.close()
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Forward one local AIS input (UDP or serial) to one AISMixer "
-            "UDPSEC input."
+            "Forward one local AIS input (UDP or serial) to one network "
+            "output (UDPSEC or UDP)."
         )
     )
     parser.add_argument(
@@ -742,31 +816,45 @@ def main(argv=None):
     try:
         config = load_config(config_path)
         input_config = validate_local_input_config(config)
+        output_config = config["output"]
         if input_config["type"] == LEGACY_UDP_INPUT_TYPE:
             ingress_policy = compile_local_ingress_policy(config)
         else:
             ingress_policy = NetworkPolicy.unrestricted()
-        source_address = parse_source_ip(config)
-        remote_addr, out_family = resolve_remote_endpoint(config, source_address)
     except (NetworkPolicyConfigError, ProxyConfigError) as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         return 1
 
-    private_key = load_private_key(config["station_private_key"])
-    server_pubkey = load_public_key(config["remote_public_key"])
+    if output_config["type"] == UDPSEC_OUTPUT_TYPE:
+        try:
+            remote_addr, out_family = resolve_output_endpoint(output_config)
+        except OutputConfigError as e:
+            print(f"Configuration error: {e}", file=sys.stderr)
+            return 1
 
-    try:
-        out_sock = create_outbound_socket(out_family, source_address)
-    except ProxyConfigError as e:
-        print(f"Configuration error: {e}", file=sys.stderr)
-        return 1
-    out_sock.settimeout(5.0)
+        private_key = load_private_key(config["station_private_key"])
+        server_pubkey = load_public_key(config["remote_public_key"])
+        try:
+            out_sock = create_output_socket(output_config, out_family)
+        except OutputConfigError as e:
+            print(f"Configuration error: {e}", file=sys.stderr)
+            return 1
+        out_sock.settimeout(5.0)
+    else:
+        try:
+            plain_output = create_plain_udp_output_adapter(output_config)
+        except ProxyConfigError as e:
+            print(f"Configuration error: {e}", file=sys.stderr)
+            return 1
 
     try:
         local_input = create_local_input_adapter(config, ingress_policy)
     except (OSError, ProxyConfigError) as e:
         print(f"Configuration error: {e}", file=sys.stderr)
-        out_sock.close()
+        if output_config["type"] == UDPSEC_OUTPUT_TYPE:
+            out_sock.close()
+        else:
+            plain_output.close()
         return 1
 
     if input_config["type"] == SERIAL_INPUT_TYPE:
@@ -776,11 +864,29 @@ def main(argv=None):
         )
     else:
         print(f"📡 Listening on UDP {config['listen_ip']}:{config['listen_port']}")
-    print(
-        f"📤 Forwarding encrypted packets to {config['remote_host']}:{config['remote_port']}")
+
+    if output_config["type"] == UDP_OUTPUT_TYPE:
+        print(
+            f"📤 Forwarding plain UDP packets to "
+            f"{output_config['host']}:{output_config['port']}"
+        )
+    else:
+        print(
+            f"📤 Forwarding encrypted packets to "
+            f"{output_config['host']}:{output_config['port']}"
+        )
 
     local_input.start()
     try:
+        if output_config["type"] == UDP_OUTPUT_TYPE:
+            return run_plain_udp_relation(
+                local_input,
+                output_config,
+                config,
+                ingress_policy,
+                output_adapter=plain_output,
+            )
+
         while True:
             session_key = perform_handshake(
                 out_sock, config, private_key, server_pubkey, remote_addr)
@@ -805,7 +911,8 @@ def main(argv=None):
             time.sleep(retry_delay)
     finally:
         local_input.close()
-        out_sock.close()
+        if output_config["type"] == UDPSEC_OUTPUT_TYPE:
+            out_sock.close()
 
 
 if __name__ == "__main__":
