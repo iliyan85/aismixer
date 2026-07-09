@@ -67,6 +67,59 @@ remote_public_key: aismixer_public.pem
 `remote_host` / `remote_port` select the configured remote AISMixer UDPSEC
 input.
 
+### Network endpoint controls
+
+Two optional top-level controls are available for the station-side proxy:
+
+- `allow_from` is an application-level ACL for the local UDP sender. When the
+  key is omitted, no application ACL is applied and the current unrestricted
+  local-input behavior is preserved. `allow_from: []` denies all local UDP
+  input packets. Entries must be literal IPv4 or IPv6 addresses, or IPv4 or
+  IPv6 CIDR networks. Hostnames and malformed entries fail startup validation.
+- `source_ip` binds the outbound UDPSEC socket to a literal IPv4 or IPv6 source
+  address and an automatically selected source port. When omitted, the
+  operating system chooses the outbound source address as before. `source_ip`
+  does not select an interface, routing table, socket mark, or source port.
+
+When `source_ip` is configured, it selects the outbound socket address family.
+A literal `remote_host` must use the same family, and a hostname `remote_host`
+is resolved only within that family. The selected remote address and
+`remote_port` are pinned for the process lifetime; handshake replies, pongs,
+and `NOSESSION` hints are accepted only from that tuple.
+
+The local ACL complements the host firewall; it does not replace firewall,
+routing, or interface-level policy. Because the server session is bound to the
+observed client source IP and port, changing the outbound source IP or source
+port requires a new UDPSEC handshake.
+
+IPv4 example:
+
+```yaml
+listen_ip: "0.0.0.0"
+listen_port: 50000
+allow_from:
+  - 192.0.2.15
+  - 198.51.100.0/24
+
+remote_host: mixer.example.net
+remote_port: 19999
+source_ip: 192.0.2.20
+```
+
+IPv6 example:
+
+```yaml
+listen_ip: "::"
+listen_port: 50000
+allow_from:
+  - 2001:db8:42::15
+  - 2001:db8:42::/64
+
+remote_host: 2001:db8:77::10
+remote_port: 19999
+source_ip: 2001:db8:42::20
+```
+
 ### Config resolution order
 
 The proxy selects configuration in this order:

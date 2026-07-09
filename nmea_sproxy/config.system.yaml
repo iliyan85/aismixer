@@ -1,8 +1,15 @@
 # Singleton systemd service config: one local input -> one AISMixer UDPSEC input.
 listen_ip: '::'
 listen_port: 50000
+# Optional application-level ACL for local UDP senders. Omit for unrestricted.
+# An empty list denies all local UDP packets.
+# allow_from:
+#   - 2001:db8:42::15
+#   - 2001:db8:42::/64
 remote_host: 192.0.2.10
 remote_port: 17777
+# Optional outbound UDPSEC source bind. Omit to let the OS choose.
+# source_ip: 192.0.2.20
 station_id: boat_001
 keepalive_interval: 30
 peer_timeout: 90

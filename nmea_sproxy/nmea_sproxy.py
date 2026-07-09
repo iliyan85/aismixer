@@ -7,12 +7,33 @@ import base64
 import sys
 import json
 import select
-from meta_cleaner import extract_nmea_sentences
+import ipaddress
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidSignature
+from meta_cleaner import extract_nmea_sentences
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+
+
+def add_shared_module_path():
+    for base in (SCRIPT_DIR, REPO_ROOT):
+        if os.path.exists(os.path.join(base, "core", "network_policy.py")):
+            if base not in sys.path:
+                sys.path.insert(0, base)
+            return
+
+
+add_shared_module_path()
+
+from core.network_policy import (  # noqa: E402
+    NetworkPolicy,
+    NetworkPolicyConfigError,
+    compile_ingress_policy,
+)
 
 
 # Константи
@@ -32,7 +53,7 @@ CONFIG_ENV_VAR = "NMEA_SPROXY_CONFIG"
 DEFAULT_PROCESS_TITLE = "nmea_sproxy"
 SYSTEM_CONFIG_PATH = "/etc/nmea_sproxy/config.yaml"
 LOCAL_CONFIG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    SCRIPT_DIR,
     "config.yaml",
 )
 CANONICAL_STATION_PRIVATE_KEY_PATH = "/etc/nmea_sproxy/keys/station_private.pem"
@@ -54,6 +75,10 @@ DEFAULT_CONFIG = {
     "session_refresh_interval": 0,
     "log_level": "INFO",
 }
+
+
+class ProxyConfigError(ValueError):
+    """Raised for operator-facing proxy configuration errors."""
 
 
 def resolve_existing_path(candidates):
@@ -244,11 +269,101 @@ def remote_addresses_match(addr, remote_addr):
     )
 
 
+def address_family_name(family):
+    if family == socket.AF_INET:
+        return "IPv4"
+    if family == socket.AF_INET6:
+        return "IPv6"
+    return str(family)
+
+
+def family_for_ip_address(address):
+    return socket.AF_INET6 if address.version == 6 else socket.AF_INET
+
+
+def default_remote_family(host):
+    return socket.AF_INET6 if ":" in str(host) else socket.AF_INET
+
+
+def parse_source_ip(config):
+    if "source_ip" not in config:
+        return None
+
+    value = config["source_ip"]
+    if not isinstance(value, str) or not value.strip():
+        raise ProxyConfigError(
+            f"source_ip: invalid literal IP address {value!r}"
+        )
+
+    value = value.strip()
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ProxyConfigError(
+            f"source_ip: invalid literal IP address {value!r}"
+        ) from exc
+
+
+def compile_local_ingress_policy(config):
+    return compile_ingress_policy(config, context="nmea_sproxy")
+
+
+def resolve_remote_endpoint(config, source_address=None):
+    host = config["remote_host"]
+    port = config["remote_port"]
+    if source_address is None:
+        family = default_remote_family(host)
+    else:
+        family = family_for_ip_address(source_address)
+        try:
+            remote_literal = ipaddress.ip_address(str(host))
+        except ValueError:
+            remote_literal = None
+        if (
+            remote_literal is not None
+            and remote_literal.version != source_address.version
+        ):
+            raise ProxyConfigError(
+                "remote_host: literal address family "
+                f"{address_family_name(family_for_ip_address(remote_literal))} "
+                f"does not match source_ip {source_address}"
+            )
+
+    return resolve_remote_addr(host, port, family), family
+
+
 def resolve_remote_addr(host, port, family):
-    addresses = socket.getaddrinfo(host, port, family, socket.SOCK_DGRAM)
+    try:
+        addresses = socket.getaddrinfo(host, port, family, socket.SOCK_DGRAM)
+    except socket.gaierror as exc:
+        raise ProxyConfigError(
+            f"remote_host: no {address_family_name(family)} address for "
+            f"{host!r}:{port}"
+        ) from exc
     if not addresses:
-        raise OSError(f"Could not resolve remote address: {host}:{port}")
+        raise ProxyConfigError(
+            f"remote_host: no {address_family_name(family)} address for "
+            f"{host!r}:{port}"
+        )
     return addresses[0][4]
+
+
+def create_outbound_socket(family, source_address=None):
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    if source_address is None:
+        return sock
+
+    source_ip = str(source_address)
+    try:
+        sock.bind((source_ip, 0))
+    except OSError as exc:
+        close = getattr(sock, "close", None)
+        if close:
+            close()
+        raise ProxyConfigError(
+            f"source_ip {source_ip!r}: bind failed: {exc}"
+        ) from exc
+    return sock
 
 
 def is_no_session_hint(data):
@@ -409,7 +524,15 @@ def perform_handshake(sock, config, private_key, server_pubkey, remote_addr):
             settimeout(original_timeout)
 
 
-def forward_loop(udp_sock, out_sock, config, session_key, remote_addr):
+def forward_loop(
+    udp_sock,
+    out_sock,
+    config,
+    session_key,
+    remote_addr,
+    ingress_policy=None,
+):
+    ingress_policy = ingress_policy or NetworkPolicy.unrestricted()
     session_started_at = time.monotonic()
     last_authenticated_peer = session_started_at
     last_ping_at = session_started_at
@@ -469,7 +592,10 @@ def forward_loop(udp_sock, out_sock, config, session_key, remote_addr):
 
         if udp_sock in readable:
             try:
-                data, _ = udp_sock.recvfrom(4096)
+                data, addr = udp_sock.recvfrom(4096)
+                if not ingress_policy.allows(addr[0]):
+                    continue
+
                 clean_lines = extract_nmea_sentences(
                     data.decode(errors="replace").strip()
                 )
@@ -540,19 +666,27 @@ def main(argv=None):
         return 1
 
     config = load_config(config_path)
+    try:
+        ingress_policy = compile_local_ingress_policy(config)
+        source_address = parse_source_ip(config)
+        remote_addr, out_family = resolve_remote_endpoint(config, source_address)
+    except (NetworkPolicyConfigError, ProxyConfigError) as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        return 1
+
     private_key = load_private_key(config["station_private_key"])
     server_pubkey = load_public_key(config["remote_public_key"])
 
     udp_family = socket.AF_INET6 if ':' in config["listen_ip"] else socket.AF_INET
-    out_family = socket.AF_INET6 if ':' in config["remote_host"] else socket.AF_INET
-    remote_addr = resolve_remote_addr(
-        config["remote_host"], config["remote_port"], out_family
-    )
 
     udp_sock = socket.socket(udp_family, socket.SOCK_DGRAM)
     udp_sock.bind((config["listen_ip"], config["listen_port"]))
 
-    out_sock = socket.socket(out_family, socket.SOCK_DGRAM)
+    try:
+        out_sock = create_outbound_socket(out_family, source_address)
+    except ProxyConfigError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        return 1
     out_sock.settimeout(5.0)
 
     print(f"📡 Listening on UDP {config['listen_ip']}:{config['listen_port']}")
@@ -564,7 +698,12 @@ def main(argv=None):
             out_sock, config, private_key, server_pubkey, remote_addr)
         if session_key:
             reason = forward_loop(
-                udp_sock, out_sock, config, session_key, remote_addr
+                udp_sock,
+                out_sock,
+                config,
+                session_key,
+                remote_addr,
+                ingress_policy,
             )
         else:
             reason = HANDSHAKE_FAILURE
