@@ -9,8 +9,8 @@ AISMixer performs those jobs.
 Each `nmea_sproxy` process represents exactly one UDPSEC relation:
 
 ```text
-one local UDP input -> one AISMixer UDPSEC input
-listen_ip/listen_port -> remote_host/remote_port
+one local input (UDP or serial) -> one AISMixer UDPSEC input
+listen_ip/listen_port or input.type: serial -> remote_host/remote_port
 ```
 
 Run separate processes or systemd template instances for separate relations.
@@ -63,9 +63,66 @@ station_private_key: station_private.pem
 remote_public_key: aismixer_public.pem
 ```
 
-`listen_ip` / `listen_port` select the one local UDP input.
+When `input:` is omitted, `listen_ip` / `listen_port` select the legacy local
+UDP input and behavior is unchanged.
 `remote_host` / `remote_port` select the configured remote AISMixer UDPSEC
 input.
+
+### Local input modes
+
+The legacy UDP mode remains the default and uses the top-level listener fields:
+
+```yaml
+listen_ip: "::"
+listen_port: 50000
+```
+
+Serial input is enabled only by an explicit `input:` mapping. In serial mode no
+local UDP listener is created, and the configured `port` string is passed
+unchanged to pySerial.
+
+Linux example:
+
+```yaml
+input:
+  type: serial
+  port: /dev/serial/by-id/usb-SRT_Marine_Technology_Ltd._AIS_Virtual_COM_Port_<device-id>-if00
+  baudrate: 38400
+  bytesize: 8
+  parity: N
+  stopbits: 1
+  read_timeout: 1.0
+  reconnect_delay: 5
+  max_line_bytes: 4096
+```
+
+Windows example:
+
+```yaml
+input:
+  type: serial
+  port: COM4
+  baudrate: 38400
+  bytesize: 8
+  parity: N
+  stopbits: 1
+  read_timeout: 1.0
+  reconnect_delay: 5
+  max_line_bytes: 4096
+```
+
+The serial defaults are `baudrate: 38400`, `bytesize: 8`, `parity: N`,
+`stopbits: 1`, `read_timeout: 1.0`, `reconnect_delay: 5`, and
+`max_line_bytes: 4096`. Explicit null values, invalid numeric ranges,
+unsupported parity or stop-bit values, missing/blank `input.port`, and unknown
+`input.type` values fail startup validation.
+
+The serial reader uses a daemon thread and a bounded queue, so it works on both
+Linux and Windows without putting the serial port in `select.select()`. If the
+device is absent or disconnects, the proxy logs a concise message, closes the
+current port object, discards unsafe partial line-framing state, and retries the
+same configured port after `input.reconnect_delay`. If the internal queue fills,
+the oldest queued line is dropped so fresher real-time AIS traffic can continue.
 
 ### Network endpoint controls
 
@@ -76,6 +133,8 @@ Two optional top-level controls are available for the station-side proxy:
   local-input behavior is preserved. `allow_from: []` denies all local UDP
   input packets. Entries must be literal IPv4 or IPv6 addresses, or IPv4 or
   IPv6 CIDR networks. Hostnames and malformed entries fail startup validation.
+  `allow_from` applies only to the legacy UDP input and is rejected when
+  `input.type: serial` is configured.
 - `source_ip` binds the outbound UDPSEC socket to a literal IPv4 or IPv6 source
   address and an automatically selected source port. When omitted, the
   operating system chooses the outbound source address as before. `source_ip`
@@ -91,6 +150,9 @@ The local ACL complements the host firewall; it does not replace firewall,
 routing, or interface-level policy. Because the server session is bound to the
 observed client source IP and port, changing the outbound source IP or source
 port requires a new UDPSEC handshake.
+
+`source_ip` remains valid in both UDP and serial input modes because it controls
+the outbound UDPSEC socket, not the local receiver.
 
 IPv4 example:
 
@@ -172,6 +234,22 @@ python3 nmea_sproxy.py --process-title nmea_sproxy@boat
 The no-argument workflow remains supported and follows the config resolution
 order above.
 
+On Windows, install the manual-mode dependencies with:
+
+```powershell
+py -m pip install pyserial pyyaml cryptography setproctitle
+```
+
+If `setproctitle` is unavailable on Windows, `nmea_sproxy` continues without
+changing the process title. pySerial can list visible serial ports:
+
+```powershell
+py -m serial.tools.list_ports
+```
+
+Use the shown COM name, such as `COM4`, as `input.port`. No Windows Service
+integration is provided by this installer; the systemd scripts are Linux-only.
+
 ## systemd services
 
 ### Singleton service
@@ -190,6 +268,10 @@ The installer installs and enables `nmea_sproxy.service`, using:
 ```
 
 It does not start the service automatically.
+On Debian-family systems the installer checks for `python3-serial` along with
+the existing YAML, cryptography, and optional process-title dependencies.
+Future non-root service users would also need operating-system permission to
+open the serial device, for example through the appropriate device group.
 
 ### Template services
 
@@ -213,8 +295,8 @@ sudo systemctl start nmea_sproxy@balchik_roof
 
 `boat`, `yacht`, and names such as `balchik_roof` are operator-chosen labels.
 They are not predefined or numbered instance names. Each instance config must
-define its own 1:1 `listen_ip` / `listen_port` to `remote_host` /
-`remote_port` relation.
+define one local input, either the legacy UDP listener or an explicit serial
+input, and one remote AISMixer UDPSEC endpoint.
 
 The installer creates `/etc/nmea_sproxy/instances/` but does not create
 instance configs or enable template instances.

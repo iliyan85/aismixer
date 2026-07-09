@@ -1,5 +1,7 @@
 # One nmea_sproxy process is one 1:1 UDPSEC proxy:
-# listen_ip/listen_port -> remote_host/remote_port.
+# one local input (UDP or serial) -> remote_host/remote_port.
+#
+# Leave input omitted for the legacy local UDP input.
 listen_ip: '::'
 listen_port: 50000
 # Optional application-level ACL for local UDP senders. Omit for unrestricted.
@@ -11,6 +13,31 @@ remote_host: 192.0.2.10
 remote_port: 17777
 # Optional outbound UDPSEC source bind. Omit to let the OS choose.
 # source_ip: 192.0.2.20
+#
+# Inactive Linux serial input example. The port string is passed unchanged to
+# pySerial; replace <device-id> with the receiver-specific value.
+# input:
+#   type: serial
+#   port: /dev/serial/by-id/usb-SRT_Marine_Technology_Ltd._AIS_Virtual_COM_Port_<device-id>-if00
+#   baudrate: 38400
+#   bytesize: 8
+#   parity: N
+#   stopbits: 1
+#   read_timeout: 1.0
+#   reconnect_delay: 5
+#   max_line_bytes: 4096
+#
+# Inactive Windows serial input example.
+# input:
+#   type: serial
+#   port: COM4
+#   baudrate: 38400
+#   bytesize: 8
+#   parity: N
+#   stopbits: 1
+#   read_timeout: 1.0
+#   reconnect_delay: 5
+#   max_line_bytes: 4096
 station_id: boat_001
 keepalive_interval: 30
 peer_timeout: 90

@@ -13,6 +13,14 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidSignature
+from input_adapters import (
+    InputConfigError,
+    LEGACY_UDP_INPUT_TYPE,
+    SERIAL_INPUT_TYPE,
+    SerialInputAdapter,
+    UdpInputAdapter,
+    normalize_local_input_config,
+)
 from meta_cleaner import extract_nmea_sentences
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -176,7 +184,28 @@ def load_config(path=None):
         print("⚠️ No config file found. Using built-in defaults.")
     apply_default_key_paths(config, user_config)
     resolve_configured_key_paths(config, user_config, selected_path)
+    validate_local_input_config(config)
     return config
+
+
+def validate_local_input_config(config):
+    try:
+        input_config = normalize_local_input_config(config)
+    except InputConfigError as exc:
+        raise ProxyConfigError(str(exc)) from exc
+    if input_config["type"] == SERIAL_INPUT_TYPE:
+        config["input"] = input_config
+    return input_config
+
+
+def create_local_input_adapter(config, ingress_policy=None):
+    input_config = validate_local_input_config(config)
+    if input_config["type"] == SERIAL_INPUT_TYPE:
+        try:
+            return SerialInputAdapter(input_config)
+        except InputConfigError as exc:
+            raise ProxyConfigError(str(exc)) from exc
+    return UdpInputAdapter.bind(config, ingress_policy)
 
 
 def set_process_title(title):
@@ -435,6 +464,44 @@ def retry_delay_for_reason(reason, config):
     return config["reconnect_delay"]
 
 
+def _coerce_input_adapter(local_input, ingress_policy=None):
+    adapter_methods = (
+        "selectable_sockets",
+        "poll_interval",
+        "read_ready",
+        "read_pending",
+    )
+    if all(hasattr(local_input, method) for method in adapter_methods):
+        return local_input
+    return UdpInputAdapter(local_input, ingress_policy)
+
+
+def forward_input_payload(data, out_sock, config, session_key, remote_addr):
+    clean_lines = extract_nmea_sentences(
+        data.decode(errors="replace").strip()
+    )
+    for clean_line in clean_lines:
+        if not clean_line:
+            continue
+
+        json_obj = {
+            "type": "nmea",
+            "payload": clean_line,
+            "timestamp": int(time.time()),
+            "source_id": config["station_id"],
+        }
+        print(clean_line)
+        out_sock.sendto(
+            encrypt_secure_json_message(json_obj, session_key),
+            remote_addr,
+        )
+
+
+def forward_pending_input(input_adapter, out_sock, config, session_key, remote_addr):
+    for data in input_adapter.read_pending():
+        forward_input_payload(data, out_sock, config, session_key, remote_addr)
+
+
 def send_ping(sock, remote_addr, session_key, station_id, seq):
     message = {
         "type": "ping",
@@ -525,14 +592,14 @@ def perform_handshake(sock, config, private_key, server_pubkey, remote_addr):
 
 
 def forward_loop(
-    udp_sock,
+    local_input,
     out_sock,
     config,
     session_key,
     remote_addr,
     ingress_policy=None,
 ):
-    ingress_policy = ingress_policy or NetworkPolicy.unrestricted()
+    input_adapter = _coerce_input_adapter(local_input, ingress_policy)
     session_started_at = time.monotonic()
     last_authenticated_peer = session_started_at
     last_ping_at = session_started_at
@@ -559,10 +626,28 @@ def forward_loop(
             last_ping_at,
             config,
         )
+        input_poll_interval = input_adapter.poll_interval()
+        if input_poll_interval is not None:
+            poll_timeout = min(poll_timeout, input_poll_interval)
+
+        try:
+            forward_pending_input(
+                input_adapter,
+                out_sock,
+                config,
+                session_key,
+                remote_addr,
+            )
+        except Exception as e:
+            print(f"❌ Forwarding error: {e}")
+            return SESSION_END_SOCKET_ERROR
+
+        input_sockets = input_adapter.selectable_sockets()
+        readable_sockets = input_sockets + [out_sock]
 
         try:
             readable, _, _ = select.select(
-                [udp_sock, out_sock], [], [], poll_timeout
+                readable_sockets, [], [], poll_timeout
             )
         except Exception as e:
             print(f"❌ Forwarding error: {e}")
@@ -590,28 +675,16 @@ def forward_loop(
                 last_authenticated_peer = time.monotonic()
                 expected_ping_seq = None
 
-        if udp_sock in readable:
+        for ready_socket in input_sockets:
+            if ready_socket not in readable:
+                continue
             try:
-                data, addr = udp_sock.recvfrom(4096)
-                if not ingress_policy.allows(addr[0]):
-                    continue
-
-                clean_lines = extract_nmea_sentences(
-                    data.decode(errors="replace").strip()
-                )
-                for clean_line in clean_lines:
-                    if not clean_line:
-                        continue
-
-                    json_obj = {
-                        "type": "nmea",
-                        "payload": clean_line,
-                        "timestamp": int(time.time()),
-                        "source_id": config["station_id"],
-                    }
-                    print(clean_line)
-                    out_sock.sendto(
-                        encrypt_secure_json_message(json_obj, session_key),
+                for data in input_adapter.read_ready(ready_socket):
+                    forward_input_payload(
+                        data,
+                        out_sock,
+                        config,
+                        session_key,
                         remote_addr,
                     )
             except Exception as e:
@@ -639,7 +712,8 @@ def forward_loop(
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Forward one local AIS UDP input to one AISMixer UDPSEC input."
+            "Forward one local AIS input (UDP or serial) to one AISMixer "
+            "UDPSEC input."
         )
     )
     parser.add_argument(
@@ -665,9 +739,13 @@ def main(argv=None):
         print(f"Config file not found: {config_path}", file=sys.stderr)
         return 1
 
-    config = load_config(config_path)
     try:
-        ingress_policy = compile_local_ingress_policy(config)
+        config = load_config(config_path)
+        input_config = validate_local_input_config(config)
+        if input_config["type"] == LEGACY_UDP_INPUT_TYPE:
+            ingress_policy = compile_local_ingress_policy(config)
+        else:
+            ingress_policy = NetworkPolicy.unrestricted()
         source_address = parse_source_ip(config)
         remote_addr, out_family = resolve_remote_endpoint(config, source_address)
     except (NetworkPolicyConfigError, ProxyConfigError) as e:
@@ -677,11 +755,6 @@ def main(argv=None):
     private_key = load_private_key(config["station_private_key"])
     server_pubkey = load_public_key(config["remote_public_key"])
 
-    udp_family = socket.AF_INET6 if ':' in config["listen_ip"] else socket.AF_INET
-
-    udp_sock = socket.socket(udp_family, socket.SOCK_DGRAM)
-    udp_sock.bind((config["listen_ip"], config["listen_port"]))
-
     try:
         out_sock = create_outbound_socket(out_family, source_address)
     except ProxyConfigError as e:
@@ -689,32 +762,50 @@ def main(argv=None):
         return 1
     out_sock.settimeout(5.0)
 
-    print(f"📡 Listening on UDP {config['listen_ip']}:{config['listen_port']}")
+    try:
+        local_input = create_local_input_adapter(config, ingress_policy)
+    except (OSError, ProxyConfigError) as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        out_sock.close()
+        return 1
+
+    if input_config["type"] == SERIAL_INPUT_TYPE:
+        print(
+            f"📡 Reading serial input from {input_config['port']} "
+            f"at {input_config['baudrate']} baud"
+        )
+    else:
+        print(f"📡 Listening on UDP {config['listen_ip']}:{config['listen_port']}")
     print(
         f"📤 Forwarding encrypted packets to {config['remote_host']}:{config['remote_port']}")
 
-    while True:
-        session_key = perform_handshake(
-            out_sock, config, private_key, server_pubkey, remote_addr)
-        if session_key:
-            reason = forward_loop(
-                udp_sock,
-                out_sock,
-                config,
-                session_key,
-                remote_addr,
-                ingress_policy,
-            )
-        else:
-            reason = HANDSHAKE_FAILURE
+    local_input.start()
+    try:
+        while True:
+            session_key = perform_handshake(
+                out_sock, config, private_key, server_pubkey, remote_addr)
+            if session_key:
+                reason = forward_loop(
+                    local_input,
+                    out_sock,
+                    config,
+                    session_key,
+                    remote_addr,
+                    ingress_policy,
+                )
+            else:
+                reason = HANDSHAKE_FAILURE
 
-        retry_delay = retry_delay_for_reason(reason, config)
-        if retry_delay is None:
-            print("Refreshing secure session immediately.")
-            continue
+            retry_delay = retry_delay_for_reason(reason, config)
+            if retry_delay is None:
+                print("Refreshing secure session immediately.")
+                continue
 
-        print(f"🔁 Retrying in {retry_delay} seconds...")
-        time.sleep(retry_delay)
+            print(f"🔁 Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+    finally:
+        local_input.close()
+        out_sock.close()
 
 
 if __name__ == "__main__":

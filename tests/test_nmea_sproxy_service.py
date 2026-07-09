@@ -84,6 +84,10 @@ def test_install_creates_layout_repairs_keys_and_only_enables_singleton():
         'run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" '
         '"$CORE_DIR/network_policy.py"'
     ) in install
+    assert (
+        'run_as_root install -m 0644 "$SCRIPT_DIR/input_adapters.py" '
+        '"$INSTALL_DIR/input_adapters.py"'
+    ) in install
     assert 'run_as_root install -d -m 0755 "$CONFIG_DIR" "$INSTANCES_DIR"' in install
     assert 'run_as_root install -d -m 0700 "$KEYS_DIR"' in install
     assert (
@@ -92,6 +96,7 @@ def test_install_creates_layout_repairs_keys_and_only_enables_singleton():
     ) in commands
     assert 'run_as_root python3 "$KEY_TOOL" station --keys-dir "$KEYS_DIR"' in commands
     assert "python3-setproctitle" in install
+    assert "python3-serial" in install
     assert "run_as_root systemctl enable nmea_sproxy.service" in commands
     assert not any(
         command.startswith("run_as_root systemctl start ") for command in commands
@@ -120,6 +125,18 @@ def test_manual_config_uses_local_relative_key_paths():
     assert "station_private_key: station_private.pem" in manual_config
     assert "remote_public_key: aismixer_public.pem" in manual_config
     assert "/etc/nmea_sproxy/keys/" not in manual_config
+
+
+def test_configs_include_inactive_serial_examples_with_placeholder_device_id():
+    combined = "\n".join(
+        read_proxy_file(name)
+        for name in ("config.yaml", "config.system.yaml")
+    )
+
+    assert "# input:" in combined
+    assert "#   type: serial" in combined
+    assert "#   port: COM4" in combined
+    assert "Virtual_COM_Port_<device-id>-if00" in combined
 
 
 def test_install_preserves_existing_system_config():
@@ -171,6 +188,10 @@ def test_update_routes_runtime_and_unit_updates_through_helper():
     assert (
         'run_as_root install -m 0755 "$SCRIPT_DIR/nmea_sproxy.py" '
         '"$INSTALL_DIR/nmea_sproxy.py"'
+    ) in update
+    assert (
+        'run_as_root install -m 0644 "$SCRIPT_DIR/input_adapters.py" '
+        '"$INSTALL_DIR/input_adapters.py"'
     ) in update
     assert (
         'run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" '

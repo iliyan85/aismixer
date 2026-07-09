@@ -43,7 +43,7 @@ path_exists() {
 }
 
 echo "[+] Checking dependencies"
-for pkg in python3-setproctitle python3-yaml python3-cryptography; do
+for pkg in python3-setproctitle python3-yaml python3-cryptography python3-serial; do
 	if dpkg -s "$pkg" >/dev/null 2>&1; then
 		echo "  - $pkg is installed"
 	else
@@ -56,6 +56,7 @@ done
 echo "[+] Installing secure proxy runtime to $INSTALL_DIR"
 run_as_root install -d -m 0755 "$INSTALL_DIR" "$TOOLS_DIR" "$CORE_DIR"
 run_as_root install -m 0755 "$SCRIPT_DIR/nmea_sproxy.py" "$INSTALL_DIR/nmea_sproxy.py"
+run_as_root install -m 0644 "$SCRIPT_DIR/input_adapters.py" "$INSTALL_DIR/input_adapters.py"
 run_as_root install -m 0644 "$SCRIPT_DIR/meta_cleaner.py" "$INSTALL_DIR/meta_cleaner.py"
 run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" "$CORE_DIR/network_policy.py"
 run_as_root install -m 0755 "$REPO_ROOT/tools/aismixer_keys.py" "$KEY_TOOL"
