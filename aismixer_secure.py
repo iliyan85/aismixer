@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 from core.event import IngressEvent
+from core.network_policy import NetworkPolicy
 from core.source_identity import build_udpsec_source_id
 
 
@@ -291,17 +292,21 @@ def derive_session_key(shared_secret, combined_sig):
     return h.finalize()
 
 
-async def secure_server(queue, ip, port, sec_input_id=None):
+async def secure_server(queue, ip, port, sec_input_id=None, ingress_policy=None):
     sock = socket.socket(
         socket.AF_INET6 if ':' in ip else socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((ip, port))
     sock.setblocking(False)
     loop = asyncio.get_running_loop()
+    policy = ingress_policy or NetworkPolicy.unrestricted()
 
     print(f"[+] Secure listener started on {ip}:{port}")
 
     while True:
         data, addr = await loop.sock_recvfrom(sock, 8192)
+        source_ip = addr[0]
+        if not policy.allows(source_ip):
+            continue
 
         if data.startswith(HANDSHAKE_PREFIX):
             try:

@@ -76,6 +76,8 @@ nmea_sproxy UDPSEC ---->------> |    AISMixer    | ----> | UDP targets    |
 - Global deduplication in legacy broadcast mode.
 - Legacy forwarding to every configured UDP forwarder.
 - Named UDP egress targets.
+- Outbound UDP source-address binding for AISMixer forwarders.
+- Application-level ingress allow-lists for AISMixer UDP and UDPSEC listeners.
 - Static logical routing loaded at startup.
 - Logical `source_id` and `target_id` matching.
 - Logical source zones with `include`, `union`, `intersection`, and
@@ -205,6 +207,48 @@ Run from the repository:
 
 ```bash
 python3 aismixer.py
+```
+
+### Network endpoint controls
+
+Two optional network-boundary controls are available in AISMixer
+configuration:
+
+- `forwarders[].source_ip` binds an outbound UDP forwarder socket to a literal
+  IPv4 or IPv6 source address. When omitted, the operating system chooses the
+  source address as before. Hostnames in `forwarders[].host` are resolved only
+  within the address family selected by `source_ip`.
+- `udp_inputs[].allow_from` and `sec_inputs[].allow_from` are
+  application-level ingress allow-lists. When the key is omitted, AISMixer does
+  not apply an application ACL. An explicitly empty list denies all packets for
+  that listener. Entries must be literal IP addresses or CIDR networks; hostnames
+  are rejected during startup.
+
+The ingress ACL complements the host firewall; it does not replace firewall,
+routing, or interface-level policy.
+
+```yaml
+udp_inputs:
+  - id: roof_receiver
+    listen_ip: "0.0.0.0"
+    listen_port: 17777
+    allow_from:
+      - 192.0.2.15
+      - 198.51.100.0/24
+
+sec_inputs:
+  - id: secure_stations
+    listen_ip: "::"
+    listen_port: 19999
+    allow_from:
+      - 2001:db8:42::/64
+      - 203.0.113.44
+
+forwarders:
+  - id: aishub
+    host: feed.example.net
+    port: 10110
+    source_ip: 192.0.2.15
 ```
 
 ---
@@ -591,6 +635,8 @@ nmea_sproxy UDPSEC ---->------> |    AISMixer    | ----> | UDP цели       |
 - Глобална дедупликация в legacy broadcast режим.
 - Legacy препращане към всички конфигурирани UDP forwarder-и.
 - Именувани UDP egress цели.
+- Изходно UDP source-address binding за AISMixer forwarder-и.
+- Application-level ingress allow-lists за AISMixer UDP и UDPSEC listeners.
 - Статична логическа маршрутизация, зареждана при стартиране.
 - Съпоставяне чрез логически `source_id` и `target_id`.
 - Логически source zones с `include`, `union`, `intersection` и `difference`.
@@ -717,6 +763,48 @@ forwarders:
 
 ```bash
 python3 aismixer.py
+```
+
+### Контрол на network endpoints
+
+В AISMixer конфигурацията са налични два допълнителни network-boundary
+контрола:
+
+- `forwarders[].source_ip` обвързва изходния UDP forwarder socket към literal
+  IPv4 или IPv6 source address. Когато е пропуснат, операционната система избира
+  source address както досега. Hostnames в `forwarders[].host` се resolve-ват
+  само в address family, избрана от `source_ip`.
+- `udp_inputs[].allow_from` и `sec_inputs[].allow_from` са application-level
+  ingress allow-lists. Когато ключът е пропуснат, AISMixer не прилага
+  application ACL. Явно празен списък отказва всички пакети за този listener.
+  Entries трябва да са literal IP addresses или CIDR networks; hostnames се
+  отхвърлят при startup.
+
+Ingress ACL допълва host firewall-а; не заменя firewall, routing или
+interface-level policy.
+
+```yaml
+udp_inputs:
+  - id: roof_receiver
+    listen_ip: "0.0.0.0"
+    listen_port: 17777
+    allow_from:
+      - 192.0.2.15
+      - 198.51.100.0/24
+
+sec_inputs:
+  - id: secure_stations
+    listen_ip: "::"
+    listen_port: 19999
+    allow_from:
+      - 2001:db8:42::/64
+      - 203.0.113.44
+
+forwarders:
+  - id: aishub
+    host: feed.example.net
+    port: 10110
+    source_ip: 192.0.2.15
 ```
 
 ---

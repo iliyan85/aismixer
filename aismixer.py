@@ -10,6 +10,7 @@ from secrets import randbelow
 from forwarder import Forwarder
 from dedup import Deduplicator
 from core.event import IngressEvent
+from core.network_policy import NetworkPolicy, compile_ingress_policy
 from core.runtime_control import build_optional_routing_control_server
 from core.runtime_routing import load_optional_routing_table
 from core.routing_state import RoutingState
@@ -123,6 +124,13 @@ async def _cancel_and_await_tasks(tasks):
             task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def compile_input_policies(entries, kind):
+    return tuple(
+        compile_ingress_policy(entry, context=f"{kind}[{index}]")
+        for index, entry in enumerate(entries)
+    )
 
 
 async def forward_loop(queue, routing_state=None):
@@ -239,11 +247,21 @@ async def forward_loop(queue, routing_state=None):
                     multipart_s_ctx.pop((ev.assembler_key, gid), None)
 
 
-async def handle_socket(sock, queue, fixed_alias=None, alias_map=None):
+async def handle_socket(
+    sock,
+    queue,
+    fixed_alias=None,
+    alias_map=None,
+    ingress_policy=None,
+):
     loop = asyncio.get_running_loop()
+    policy = ingress_policy or NetworkPolicy.unrestricted()
     while True:
         data, addr = await loop.sock_recvfrom(sock, 8192)
         source_ip, source_port = addr[:2]
+        if not policy.allows(source_ip):
+            continue
+
         raw_line = data.decode(errors="ignore").strip()
 
         if DEBUG:
@@ -268,6 +286,8 @@ async def main():
     mixer_queue = asyncio.Queue()
     runtime_tasks = []
     udp_sockets = []
+    sec_input_policies = compile_input_policies(SEC_INPUTS, "sec_inputs")
+    udp_input_policies = compile_input_policies(UDP_INPUTS, "udp_inputs")
     control_server = build_optional_routing_control_server(
         config,
         routing_state,
@@ -281,7 +301,7 @@ async def main():
             control_server_started = True
 
         # Secure входове
-        for entry in SEC_INPUTS:
+        for entry, ingress_policy in zip(SEC_INPUTS, sec_input_policies):
             q = asyncio.Queue()
             input_queues.append(q)
             ip = entry["listen_ip"]
@@ -289,11 +309,19 @@ async def main():
             sec_id = entry.get("id")
             print(f"{ts()} Secure listening on {format_source(ip, port)}")
             runtime_tasks.append(
-                asyncio.create_task(secure_server(q, ip, port, sec_input_id=sec_id))
+                asyncio.create_task(
+                    secure_server(
+                        q,
+                        ip,
+                        port,
+                        sec_input_id=sec_id,
+                        ingress_policy=ingress_policy,
+                    )
+                )
             )
 
         # UDP входове
-        for entry in UDP_INPUTS:
+        for entry, ingress_policy in zip(UDP_INPUTS, udp_input_policies):
             q = asyncio.Queue()
             input_queues.append(q)
             ip = entry["listen_ip"]
@@ -314,6 +342,7 @@ async def main():
                         q,
                         fixed_alias,
                         alias_map=UDP_ALIAS_MAP if not fixed_alias else None,
+                        ingress_policy=ingress_policy,
                     )
                 )
             )
@@ -327,6 +356,7 @@ async def main():
             sock.close()
         if control_server_started:
             await control_server.close()
+        forwarder.close()
 
 if __name__ == '__main__':
     try:

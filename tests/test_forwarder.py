@@ -1,4 +1,5 @@
 import asyncio as real_asyncio
+import socket
 
 import pytest
 
@@ -15,21 +16,37 @@ class _FakeTransport:
         self.loop = loop
         self.remote_addr = remote_addr
         self.sent = []
+        self.closed = False
 
     def sendto(self, data):
         self.sent.append(data)
         self.loop.sends.append((self.remote_addr, data, self))
+
+    def close(self):
+        self.closed = True
 
 
 class _FakeLoop:
     def __init__(self):
         self.created = []
         self.sends = []
+        self.endpoint_kwargs = []
 
-    async def create_datagram_endpoint(self, protocol_factory, remote_addr):
+    async def create_datagram_endpoint(
+        self,
+        protocol_factory,
+        remote_addr,
+        family=0,
+        local_addr=None,
+    ):
         transport = _FakeTransport(self, remote_addr)
         protocol = protocol_factory()
         self.created.append((remote_addr, transport))
+        self.endpoint_kwargs.append({
+            "remote_addr": remote_addr,
+            "family": family,
+            "local_addr": local_addr,
+        })
         return transport, protocol
 
 
@@ -191,3 +208,126 @@ def test_targeted_sends_reuse_transport_cache(monkeypatch):
         (("192.0.2.20", 10110), b"two"),
     ]
     assert [addr for addr, _ in loop.created] == [("192.0.2.20", 10110)]
+
+
+def test_source_ip_is_copied_into_immutable_target_entry():
+    config = [{"host": "198.51.100.20", "port": 10110, "source_ip": "192.0.2.15"}]
+    forwarder = Forwarder(config)
+
+    config[0]["source_ip"] = "192.0.2.99"
+
+    assert forwarder.targets[0]["source_ip"] == "192.0.2.15"
+    with pytest.raises(TypeError):
+        forwarder.targets[0]["source_ip"] = "192.0.2.99"
+
+
+def test_source_ip_binds_ipv4_transport(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder([
+        {"host": "198.51.100.20", "port": 10110, "source_ip": "192.0.2.15"}
+    ])
+
+    real_asyncio.run(forwarder.send("bound"))
+
+    assert loop.endpoint_kwargs == [{
+        "remote_addr": ("198.51.100.20", 10110),
+        "family": socket.AF_INET,
+        "local_addr": ("192.0.2.15", 0),
+    }]
+    assert [(addr, data) for addr, data, _ in loop.sends] == [
+        (("198.51.100.20", 10110), b"bound")
+    ]
+
+
+def test_source_ip_binds_ipv6_transport(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder([
+        {"host": "2001:db8:50::20", "port": 10110, "source_ip": "2001:db8:10::15"}
+    ])
+
+    real_asyncio.run(forwarder.send("bound-v6"))
+
+    assert loop.endpoint_kwargs == [{
+        "remote_addr": ("2001:db8:50::20", 10110),
+        "family": socket.AF_INET6,
+        "local_addr": ("2001:db8:10::15", 0),
+    }]
+
+
+def test_hostname_destination_is_constrained_to_source_family(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder([
+        {"host": "feed.example.net", "port": 10110, "source_ip": "192.0.2.15"}
+    ])
+
+    real_asyncio.run(forwarder.send("hostname"))
+
+    assert loop.endpoint_kwargs == [{
+        "remote_addr": ("feed.example.net", 10110),
+        "family": socket.AF_INET,
+        "local_addr": ("192.0.2.15", 0),
+    }]
+
+
+def test_same_destination_with_different_source_ips_gets_distinct_transports(
+    monkeypatch,
+):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder([
+        {"host": "198.51.100.20", "port": 10110, "source_ip": "192.0.2.15"},
+        {"host": "198.51.100.20", "port": 10110, "source_ip": "192.0.2.16"},
+    ])
+
+    real_asyncio.run(forwarder.send("one"))
+    real_asyncio.run(forwarder.send("two"))
+
+    assert len(loop.created) == 2
+    assert sorted(forwarder.transports) == [
+        ("198.51.100.20", 10110, "192.0.2.15"),
+        ("198.51.100.20", 10110, "192.0.2.16"),
+    ]
+    assert [entry["local_addr"] for entry in loop.endpoint_kwargs] == [
+        ("192.0.2.15", 0),
+        ("192.0.2.16", 0),
+    ]
+
+
+def test_system_default_forwarder_keeps_legacy_transport_arguments(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder([{"host": "198.51.100.20", "port": 10110}])
+
+    real_asyncio.run(forwarder.send("default"))
+
+    assert loop.endpoint_kwargs == [{
+        "remote_addr": ("198.51.100.20", 10110),
+        "family": 0,
+        "local_addr": None,
+    }]
+    assert list(forwarder.transports) == [("198.51.100.20", 10110)]
+
+
+def test_incompatible_literal_source_and_destination_families_are_rejected():
+    with pytest.raises(ForwarderConfigError, match="source_ip .* IPv4.*host .* IPv6"):
+        Forwarder([
+            {"host": "2001:db8:50::20", "port": 10110, "source_ip": "192.0.2.15"}
+        ])
+
+
+@pytest.mark.parametrize("source_ip", ["feed.example.net", "192.0.2.0/24", ""])
+def test_invalid_source_ip_is_rejected(source_ip):
+    with pytest.raises(ForwarderConfigError, match="source_ip"):
+        Forwarder([
+            {"id": "aishub", "host": "198.51.100.20", "port": 10110, "source_ip": source_ip}
+        ])
+
+
+def test_close_closes_cached_transports(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder([{"host": "127.0.0.1", "port": 19000}])
+
+    real_asyncio.run(forwarder.send("message"))
+    transport = loop.created[0][1]
+    forwarder.close()
+
+    assert transport.closed
+    assert forwarder.transports == {}

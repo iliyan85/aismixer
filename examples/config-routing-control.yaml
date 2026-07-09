@@ -20,20 +20,29 @@ sec_inputs:
   - id: secure_listener_alias
     listen_ip: "::"
     listen_port: 29999
+    allow_from:
+      - 2001:db8:42::/64
+      - 203.0.113.44
 
 udp_inputs:
   - id: balchik_roof
     listen_ip: "0.0.0.0"
     listen_port: 17778
+    allow_from:
+      - 192.0.2.15
+      - 198.51.100.0/24
 
   - id: dock_gate
     listen_ip: "::"
     listen_port: 17779
+    allow_from:
+      - 2001:db8:42::/64
 
 forwarders:
   - id: aishub
     host: 192.0.2.20
     port: 10110
+    source_ip: 192.0.2.15
 
   - id: local_debug
     host: 127.0.0.1

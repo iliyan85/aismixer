@@ -27,10 +27,14 @@ class _FakeTransport:
         self.loop = loop
         self.remote_addr = remote_addr
         self.sent = []
+        self.closed = False
 
     def sendto(self, data):
         self.sent.append(data)
         self.loop.sends.append((self.remote_addr, data, self))
+
+    def close(self):
+        self.closed = True
 
 
 class _FakeLoop:
@@ -38,7 +42,13 @@ class _FakeLoop:
         self.created = []
         self.sends = []
 
-    async def create_datagram_endpoint(self, protocol_factory, remote_addr):
+    async def create_datagram_endpoint(
+        self,
+        protocol_factory,
+        remote_addr,
+        family=0,
+        local_addr=None,
+    ):
         transport = _FakeTransport(self, remote_addr)
         protocol = protocol_factory()
         self.created.append((remote_addr, transport))

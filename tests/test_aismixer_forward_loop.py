@@ -6,6 +6,7 @@ import pytest
 import aismixer
 from assembler import AIVDMAssembler
 from core.event import IngressEvent
+from core.network_policy import NetworkPolicy
 from core.routing import RoutingResult, RoutingTable
 from core.routing_state import RoutingSnapshot, RoutingState
 from dedup import Deduplicator
@@ -158,6 +159,84 @@ def test_handle_socket_creates_ingress_event_with_udp_source_id(monkeypatch):
     assert event.remote_ip == "192.0.2.10"
     assert event.assembler_key == "192.0.2.10:17778"
     assert event.raw_line == SENTENCE
+
+
+def test_handle_socket_allows_packet_matching_ingress_policy(monkeypatch):
+    queue = _FakeQueue()
+    fake_loop = _OnePacketLoop(
+        (SENTENCE.encode(), ("192.0.2.10", 17778))
+    )
+    policy = NetworkPolicy.from_entries(
+        ["192.0.2.0/24"],
+        context="udp_inputs[0].allow_from",
+    )
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                queue,
+                ingress_policy=policy,
+            )
+        )
+
+    assert len(queue.items) == 1
+    assert queue.items[0].remote_ip == "192.0.2.10"
+    assert queue.items[0].raw_line == SENTENCE
+
+
+def test_handle_socket_denied_packet_does_not_decode_or_enqueue(monkeypatch):
+    queue = _FakeQueue()
+    fake_loop = _OnePacketLoop(
+        (SENTENCE.encode(), ("192.0.2.10", 17778))
+    )
+    policy = NetworkPolicy.from_entries(
+        ["198.51.100.0/24"],
+        context="udp_inputs[0].allow_from",
+    )
+
+    def fail_source_id(*_args, **_kwargs):
+        raise AssertionError("source identity should not be built")
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+    monkeypatch.setattr(aismixer, "build_udp_source_id", fail_source_id)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                queue,
+                alias_map={"192.0.2.10": "dock_gate"},
+                ingress_policy=policy,
+            )
+        )
+
+    assert queue.items == []
+
+
+def test_handle_socket_empty_ingress_policy_drops_all_packets(monkeypatch):
+    queue = _FakeQueue()
+    fake_loop = _OnePacketLoop(
+        (SENTENCE.encode(), ("192.0.2.10", 17778))
+    )
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                queue,
+                ingress_policy=NetworkPolicy.deny_all(),
+            )
+        )
+
+    assert queue.items == []
 
 
 async def wait_for_sends(fake_forwarder, task, count, timeout=0.5):
