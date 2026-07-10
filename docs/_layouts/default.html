@@ -13,16 +13,18 @@
   <meta property="og:title" content="{% if page.title %}{{ page.title }} | {% endif %}{{ site.title }}">
   <meta property="og:description" content="{{ page.description | default: site.description | escape }}">
   <meta property="og:url" content="{{ page.url | absolute_url }}">
-  <meta property="og:image" content="{{ '/assets/img/og.png' | absolute_url }}">
-  <meta property="og:image:width" content="1200">
-  <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="AISMixer AIS NMEA 0183 stream processor and routing engine">
+  <meta property="og:image" content="{{ '/assets/img/aismixer-social-preview-1280x640.png' | absolute_url }}">
+  <meta property="og:image:secure_url" content="{{ '/assets/img/aismixer-social-preview-1280x640.png' | absolute_url }}">
+  <meta property="og:image:type" content="image/png">
+  <meta property="og:image:width" content="1280">
+  <meta property="og:image:height" content="640">
+  <meta property="og:image:alt" content="AISMixer AIS stream processing and routing platform overview">
   <meta property="og:locale" content="en_US">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="{% if page.title %}{{ page.title }} | {% endif %}{{ site.title }}">
   <meta name="twitter:description" content="{{ page.description | default: site.description | escape }}">
-  <meta name="twitter:image" content="{{ '/assets/img/og.png' | absolute_url }}">
-  <meta name="twitter:image:alt" content="AISMixer AIS NMEA 0183 stream processor and routing engine">
+  <meta name="twitter:image" content="{{ '/assets/img/aismixer-social-preview-1280x640.png' | absolute_url }}">
+  <meta name="twitter:image:alt" content="AISMixer AIS stream processing and routing platform overview">
   <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
   <link rel="icon" href="/assets/img/favicon-32.png" sizes="32x32" type="image/png">
   <link rel="apple-touch-icon" href="/assets/img/apple-touch-icon.png">
@@ -30,12 +32,13 @@
   <link rel="stylesheet" href="/assets/css/styles.css">
 </head>
 <body>
-  <nav class="nav">
+  <!-- Website content synchronized with AISMixer main at {{ site.source_sync_commit }} -->
+  <nav class="nav" aria-label="Primary navigation">
     <div class="container nav-inner">
       <a class="brand" href="/" aria-label="AISMixer home">
         <span class="logo" aria-hidden="true">🛰️</span>
         <span class="brand-name">AISMixer</span>
-        <span class="chip">AIS routing engine</span>
+        <span class="chip">AIS stream platform</span>
       </a>
       <div class="toggles">
         <a class="btn" href="/">Home</a>

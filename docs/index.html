@@ -3,33 +3,33 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AISMixer | AIS NMEA 0183 Stream Processor and Routing Engine</title>
+  <title>AISMixer | AIS Stream Processing and Routing Platform</title>
   <link rel="canonical" href="https://aismixer.net/">
-  <meta name="description" content="AISMixer processes AIS NMEA 0183 streams with UDP and UDPSEC ingress, multipart assembly, TAG handling, deduplication, logical routing, and targeted UDP forwarding.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183 stream processor, routing engine, logical routing, UDPSEC, targeted UDP forwarding, maritime data, maritime security, maritime-domain-awareness data pipelines, AIVDM, AIVDO, nmea_sproxy, Raspberry Pi, Python">
+  <meta name="description" content="AISMixer receives, normalizes, deduplicates, tags, routes, and forwards AIS NMEA 0183 streams across controlled UDP and UDPSEC endpoints.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, AIS stream processing, logical routing, UDPSEC, nmea_sproxy, AIVDM, AIVDO, aismixerctl, maritime data">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
 
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
-  <meta property="og:title" content="AISMixer | AIS NMEA 0183 Stream Processor and Routing Engine">
-  <meta property="og:description" content="Open-source Python service for UDP/UDPSEC AIS ingress, multipart assembly, TAG handling, logical routing, and targeted UDP forwarding.">
+  <meta property="og:title" content="AISMixer | AIS Stream Processing and Routing Platform">
+  <meta property="og:description" content="Normalize, deduplicate, tag, route, and forward AIS NMEA 0183 streams with AISMixer.">
   <meta property="og:url" content="https://aismixer.net/">
-  <meta property="og:image" content="https://aismixer.net/assets/img/og.png">
-  <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/og.png">
+  <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
+  <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:type" content="image/png">
-  <meta property="og:image:width" content="1200">
-  <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="AISMixer AIS NMEA 0183 stream processor and routing engine">
+  <meta property="og:image:width" content="1280">
+  <meta property="og:image:height" content="640">
+  <meta property="og:image:alt" content="AISMixer AIS stream processing and routing platform overview">
   <meta property="og:locale" content="en_US">
   <meta property="og:locale:alternate" content="bg_BG">
 
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="AISMixer | AIS NMEA 0183 Stream Processor and Routing Engine">
-  <meta name="twitter:description" content="Process AIS NMEA 0183 streams with UDPSEC, TAG handling, logical routing, and targeted UDP forwarding.">
-  <meta name="twitter:image" content="https://aismixer.net/assets/img/og.png">
-  <meta name="twitter:image:alt" content="AISMixer AIS NMEA 0183 stream processor and routing engine">
+  <meta name="twitter:title" content="AISMixer | AIS Stream Processing and Routing Platform">
+  <meta name="twitter:description" content="Normalize · Deduplicate · Tag · Route · Forward AIS NMEA 0183 streams.">
+  <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
+  <meta name="twitter:image:alt" content="AISMixer AIS stream processing and routing platform overview">
 
   <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
   <link rel="icon" href="assets/img/favicon-32.png" sizes="32x32" type="image/png">
@@ -47,8 +47,9 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
-    "description": "Open-source AIS NMEA 0183 stream processor and routing engine with UDP and UDPSEC ingress, multipart assembly, TAG handling, logical routing, target-scoped deduplication, and targeted UDP forwarding.",
+    "description": "Open-source platform for receiving, normalizing, deduplicating, tagging, routing, and forwarding AIS NMEA 0183 streams.",
     "url": "https://aismixer.net/",
+    "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
     "author": {
       "@type": "Person",
@@ -61,7 +62,7 @@
     ],
     "inLanguage": "en",
     "isAccessibleForFree": true,
-    "keywords": ["AIS NMEA 0183 stream processor", "routing engine", "logical routing", "UDPSEC", "targeted UDP forwarding", "maritime data", "maritime security", "maritime-domain-awareness data pipelines", "AIVDM", "AIVDO", "nmea_sproxy", "Python"]
+    "keywords": ["AIS NMEA 0183", "stream processing", "logical routing", "UDPSEC", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -69,16 +70,16 @@
   <link rel="alternate" hreflang="x-default" href="https://aismixer.net/">
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
   <nav class="nav" aria-label="Primary navigation">
     <div class="container nav-inner">
       <a class="brand" href="#top" aria-label="AISMixer home">
         <span class="logo" aria-hidden="true">🛰️</span>
         <span class="brand-name">AISMixer</span>
-        <span class="chip">AIS routing engine</span>
+        <span class="chip">AIS stream platform</span>
       </a>
       <div class="toggles">
-        <a class="btn" href="/bg/" lang="bg">Български</a>
-        <a class="btn" href="#architecture">Architecture</a>
+        <a class="btn" href="/bg/" lang="bg" hreflang="bg">Български</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
       </div>
@@ -87,205 +88,289 @@
 
   <header class="hero container" id="top">
     <div class="two-col">
-      <div>
+      <div class="hero-copy">
         <div class="chip">Open source • Python • AIS NMEA 0183</div>
-        <h1>AISMixer — AIS NMEA 0183 stream processor and routing engine</h1>
+        <h1>AISMixer</h1>
+        <p class="hero-kicker">AIS stream processing and routing platform</p>
         <p class="tagline">Normalize · Deduplicate · Tag · Route · Forward</p>
         <p class="lead">
-          AISMixer processes AIS NMEA 0183 streams with UDP and UDPSEC ingress,
-          multipart assembly, TAG handling, deduplication, logical routing, and
-          targeted UDP forwarding.
+          Receive AIS feeds, turn receiver traffic into one controlled logical
+          stream, and deliver it to the UDP egress targets that need it.
         </p>
         <div class="cta" aria-label="Project links">
-          <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub repository</a>
-          <a class="button" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
-          <a class="button" href="https://github.com/iliyan85/aismixer#readme" target="_blank" rel="noopener">README</a>
-          <a class="button" href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
+          <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">View the GitHub repository</a>
+          <a class="button" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Explore the GitHub Wiki</a>
         </div>
       </div>
-      <div class="card tldr">
-        <div class="icons" aria-hidden="true">🛰️ 🧭 📦 🔁 ⚙️</div>
-        <p class="card-heading">Implemented today</p>
+      <aside class="card hero-summary" aria-labelledby="logical-stream-title">
+        <div class="icons" aria-hidden="true">📡 → 🧭 → 📤</div>
+        <p class="card-heading" id="logical-stream-title">One logical AIS stream</p>
         <ul class="list">
-          <li>UDP IPv4/IPv6 and authenticated UDPSEC ingress.</li>
-          <li><span class="kbd">!AIVDM</span> / <span class="kbd">!AIVDO</span> extraction and multipart assembly.</li>
-          <li>NMEA TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> handling.</li>
-          <li>Legacy broadcast mode and logical routing mode.</li>
-          <li>Opt-in local runtime control with <span class="kbd">aismixerctl</span>.</li>
+          <li>Receive plain UDP and authenticated UDPSEC ingress.</li>
+          <li>Extract and assemble <span class="kbd">!AIVDM</span> and <span class="kbd">!AIVDO</span>.</li>
+          <li>Deduplicate, control TAG metadata, and apply routing.</li>
+          <li>Forward accepted data to selected named UDP egress targets.</li>
         </ul>
-      </div>
+      </aside>
     </div>
   </header>
 
-  <main class="container">
-    <section id="features" class="section">
-      <h2>Current capabilities</h2>
+  <main class="container" id="main-content">
+    <section id="processing" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">AIS stream processing</p>
+        <h2>From receiver traffic to a clean, source-aware feed</h2>
+        <p class="section-intro">AISMixer keeps transport, NMEA assembly, metadata, deduplication, and delivery in one near-real-time processing path.</p>
+      </div>
       <div class="grid">
-        <div class="card">
+        <article class="card">
           <div class="icons" aria-hidden="true">📡</div>
-          <h3>Ingress and parsing</h3>
-          <p>Accepts plain UDP and authenticated encrypted UDPSEC through <span class="kbd">nmea_sproxy</span>. Extracts AIVDM/AIVDO sentences from realistic receiver input.</p>
-        </div>
-        <div class="card">
-          <div class="icons" aria-hidden="true">🧷</div>
-          <h3>Multipart and TAG handling</h3>
-          <p>Assembles multipart messages with NMEA fragment fields and ingress assembler identity. TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> metadata is handled separately from routing identity.</p>
-        </div>
-        <div class="card">
+          <h3>Flexible ingress</h3>
+          <p>Receive plain UDP over IPv4 or IPv6, or authenticated encrypted UDPSEC station traffic.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧾</div>
+          <h3>AIS sentence extraction</h3>
+          <p>Extract both <span class="kbd">!AIVDM</span> and <span class="kbd">!AIVDO</span> from realistic receiver and application output.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧩</div>
+          <h3>Multipart assembly</h3>
+          <p>Reassemble multipart messages with NMEA fragment fields and a stable ingress assembler identity.</p>
+        </article>
+        <article class="card">
           <div class="icons" aria-hidden="true">🔁</div>
-          <h3>Deduplication and forwarding</h3>
-          <p>Legacy mode keeps global deduplication and broadcast forwarding. Routing mode applies target-scoped deduplication and forwards to named UDP egress targets.</p>
-        </div>
-        <div class="card">
-          <div class="icons" aria-hidden="true">🧭</div>
-          <h3>Logical routing</h3>
-          <p>Uses internal <span class="kbd">source_id</span> and <span class="kbd">target_id</span> identities, named UDP targets, and logical zones with <span class="kbd">include</span>, <span class="kbd">union</span>, <span class="kbd">intersection</span>, and <span class="kbd">difference</span>.</p>
-        </div>
-        <div class="card">
-          <div class="icons" aria-hidden="true">🎛️</div>
-          <h3>Runtime control</h3>
-          <p>Supports immutable routing snapshots, process-local generations, <span class="kbd">routing.status</span>, <span class="kbd">routing.replace</span>, <span class="kbd">routing.disable</span>, a versioned JSON protocol, POSIX Unix-domain NDJSON transport, and <span class="kbd">aismixerctl</span>.</p>
-        </div>
-        <div class="card">
-          <div class="icons" aria-hidden="true">🔐</div>
-          <h3>UDPSEC station transport</h3>
-          <p>UDPSEC authenticates stations and the server with ECDSA and protects session traffic with AES-GCM. It is AISMixer's project transport, not an external standard.</p>
-        </div>
+          <h3>Near-real-time deduplication</h3>
+          <p>Suppress repeated logical AIS messages globally in broadcast mode or per target in routing mode.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🏷️</div>
+          <h3>Controlled TAG metadata</h3>
+          <p>Read and write NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span>, and <span class="kbd">g</span> without confusing metadata with routing identity.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📤</div>
+          <h3>Selected forwarding</h3>
+          <p>Forward the resulting logical stream to all configured outputs or only the named UDP egress targets selected by routing.</p>
+        </article>
       </div>
     </section>
 
-    <section id="architecture" class="section">
-      <h2>Data-plane architecture</h2>
-      <div class="card">
-        <div class="flow" aria-label="Data-plane processing order">
-          <span>transport ingress</span>
-          <span>IngressEvent</span>
-          <span>snapshot capture</span>
-          <span>source_id match</span>
-          <span>NMEA + ingress TAG</span>
-          <span>multipart assembly</span>
-          <span>deduplication</span>
-          <span>outbound TAG</span>
-          <span>UDP egress</span>
-        </div>
-        <p>The data plane captures one immutable routing snapshot per <span class="kbd">IngressEvent</span> and matches <span class="kbd">source_id</span> once for that event. A concurrent control update affects subsequent events, not the event already being processed.</p>
-        <p>Legacy mode uses global deduplication and broadcast forwarding. Routing mode uses target-scoped deduplication and named UDP targets.</p>
+    <section id="routing" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Routing and logical zones</p>
+        <h2>Express stream policy with source identities</h2>
+        <p class="section-intro">Static logical routing connects named ingress sources to named UDP egress targets through reusable source sets and ordered routes.</p>
       </div>
+      <div class="pipeline" aria-label="Logical routing flow">
+        <div class="pipeline-node"><strong>Named ingress</strong><span>UDP and UDPSEC sources</span></div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node"><strong>Logical zones</strong><span>Sets of source identities</span></div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node"><strong>Ordered routes</strong><span>Declarative target selection</span></div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node"><strong>Named egress</strong><span>Selected UDP targets</span></div>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <h3>Composable source sets</h3>
+          <p>Define zones with <span class="kbd">include</span>, <span class="kbd">union</span>, <span class="kbd">intersection</span>, and <span class="kbd">difference</span>.</p>
+        </article>
+        <article class="card">
+          <h3>Logical, not geographic</h3>
+          <p>Zones are sets of internal source identities—not map areas, MMSI filters, vessel filters, or payload rules.</p>
+        </article>
+        <article class="card">
+          <h3>Per-target stream quality</h3>
+          <p>Routing mode scopes deduplication to each logical target, so one delivery path does not suppress another.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><span class="kbd">source_id</span> is an internal routing identity. It is separate from the NMEA TAG <span class="kbd">s</span> value emitted downstream.</p>
     </section>
 
-    <section class="section">
-      <h2>Routing model</h2>
-      <div class="grid">
-        <div class="card">
-          <h3>Source identity</h3>
-          <p><span class="kbd">source_id</span> is an internal routing identity. It is distinct from the emitted NMEA TAG <span class="kbd">s</span> value.</p>
-        </div>
-        <div class="card">
-          <h3>Logical zones</h3>
-          <p>Logical zones are sets of source IDs. They are not geographic regions, MMSI filters, vessel filters, or payload-aware rules.</p>
-        </div>
-        <div class="card">
-          <h3>Targets</h3>
-          <p>Named UDP forwarders create <span class="kbd">target_id</span> values. UDP is the only implemented egress adapter today.</p>
-        </div>
+    <section id="runtime-control" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Runtime routing control</p>
+        <h2>Change active routes without interrupting the data plane</h2>
+        <p class="section-intro">An optional local Unix-domain control plane exposes concise routing operations through the globally installed <span class="kbd">aismixerctl</span> command.</p>
       </div>
-      <pre class="mono">routing:
-  zones:
-    trusted:
-      include:
-        - udp:roof
-        - udpsec:boat_ais
-  routes:
-    - name: trusted_to_public
-      from_zone: trusted
-      to: [udp:aishub]</pre>
-    </section>
-
-    <section class="section">
-      <h2>Control plane</h2>
-      <div class="card">
-        <p>The runtime control plane is implemented but opt-in. Enabling <span class="kbd">control.unix</span> starts a POSIX Unix-domain NDJSON socket for local control requests.</p>
-        <ul class="list">
-          <li><span class="kbd">routing.status</span>, <span class="kbd">routing.replace</span>, and <span class="kbd">routing.disable</span> are implemented.</li>
-          <li><span class="kbd">expected_generation</span> protects against stale updates.</li>
-          <li>Routing state and generations are process-local and non-persistent.</li>
-          <li>Filesystem permissions on the socket are the authorization boundary.</li>
-          <li>There are no application-level control tokens.</li>
-        </ul>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔎</div>
+          <h3>Inspect routing status</h3>
+          <p>See the active generation, enabled state, logical zones, ordered routes, and target identities.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">⚡</div>
+          <h3>Replace or disable atomically</h3>
+          <p>Validate a complete candidate before swapping the immutable routing snapshot, or return to legacy broadcast mode.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🛡️</div>
+          <h3>Reject stale updates</h3>
+          <p>Optional generation checks prevent an operator from overwriting a newer routing change unintentionally.</p>
+        </article>
       </div>
-    </section>
-
-    <section class="section">
-      <h2>UDPSEC and nmea_sproxy</h2>
-      <div class="grid">
-        <div class="card">
-          <h3>Station-to-mixer transport</h3>
-          <p><span class="kbd">nmea_sproxy</span> maps one local UDP input to one secure AISMixer input. UDPSEC provides authenticated encrypted transport between that station and AISMixer.</p>
-        </div>
-        <div class="card">
-          <h3>Authentication and liveness</h3>
-          <p>ECDSA is used for station/server authentication, AES-GCM protects session traffic, and encrypted ping/pong helps maintain liveness and NAT/CGNAT mappings.</p>
-        </div>
-        <div class="card">
-          <h3>Boundaries</h3>
-          <p>UDP remains lossy. Transport authenticity does not prove the semantic truth of AIS payloads.</p>
-        </div>
-      </div>
-      <p class="note">Read the <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">nmea_sproxy guide</a> and the <a href="https://github.com/iliyan85/aismixer/wiki/UDPSEC-and-nmea_sproxy" target="_blank" rel="noopener">UDPSEC Wiki page</a>.</p>
-    </section>
-
-    <section class="section">
-      <h2>Maritime security positioning</h2>
       <div class="callout">
-        <p>AISMixer can supply normalized, source-aware AIS streams to maritime security and maritime-domain-awareness data pipelines. Spoof and anomaly detection is a priority planned research capability, but AISMixer does not currently produce an operational maritime picture or perform spoof detection.</p>
+        <p><strong>Deliberately local and process-scoped.</strong> Runtime routes are not persisted after restart, configuration files are not rewritten, and ingress or egress adapters are not created dynamically. Unix socket permissions are the current authorization boundary; there is no application-level control token.</p>
       </div>
     </section>
 
-    <section class="section">
-      <h2>Limitations and roadmap</h2>
+    <section id="network-controls" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Network endpoint controls</p>
+        <h2>Constrain peers and outbound source addresses</h2>
+        <p class="section-intro">Small application-level controls make IPv4 and IPv6 endpoints easier to place inside an operator’s wider firewall and routing policy.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">🚧</div>
+          <h3>Ingress <span class="kbd">allow_from</span></h3>
+          <p>Restrict UDP and UDPSEC listeners to literal IP addresses or CIDR networks, with explicit deny-all behavior available.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📍</div>
+          <h3>Outbound <span class="kbd">source_ip</span></h3>
+          <p>Bind an egress socket to a literal IPv4 or IPv6 source address and constrain destination resolution to the same family.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧱</div>
+          <h3>Part of a layered boundary</h3>
+          <p>These policies complement operating-system firewall and routing rules; they do not replace them.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><span class="kbd">source_ip</span> is source-address binding—not interface selection, routing-table selection, socket marking, or SDN.</p>
+    </section>
+
+    <section id="receivers" class="section section-emphasis">
+      <div class="section-heading">
+        <p class="eyebrow">nmea_sproxy and physical AIS receivers</p>
+        <h2>Connect networked or physical AIS receivers through nmea_sproxy</h2>
+        <p class="section-intro"><span class="kbd">nmea_sproxy</span> is the station-side proxy that connects one local AIS source to one configured AISMixer destination.</p>
+      </div>
+      <div class="architecture-path" aria-label="Physical AIS receiver connection through nmea_sproxy to AISMixer">
+        <div class="path-node">
+          <span class="icons" aria-hidden="true">📻</span>
+          <strong>Physical AIS receiver</strong>
+        </div>
+        <div class="path-connector">
+          <span aria-hidden="true">→</span>
+          <small>serial port or USB virtual COM</small>
+        </div>
+        <div class="path-node path-node-accent">
+          <span class="icons" aria-hidden="true">🔐</span>
+          <strong>nmea_sproxy</strong>
+        </div>
+        <div class="path-connector">
+          <span aria-hidden="true">→</span>
+          <small>UDPSEC or explicitly trusted plain UDP</small>
+        </div>
+        <div class="path-node">
+          <span class="icons" aria-hidden="true">🛰️</span>
+          <strong>AISMixer</strong>
+        </div>
+      </div>
+      <div class="grid proxy-grid">
+        <article class="card">
+          <h3>Implemented local inputs</h3>
+          <ul class="list">
+            <li>UDP from a local networked receiver or AIS application.</li>
+            <li>Direct physical serial-port input.</li>
+            <li>USB virtual COM input from a physical AIS receiver.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Implemented outputs</h3>
+          <ul class="list">
+            <li>Authenticated encrypted UDPSEC with liveness and reconnection.</li>
+            <li>Explicit plain UDP for a trusted LAN, VPN, or equivalent boundary.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Clear relation boundary</h3>
+          <p>One local input maps to one configured output. <span class="kbd">nmea_sproxy</span> does not mix, fan out, route, deduplicate, assemble multipart AIS, or rewrite TAG metadata.</p>
+        </article>
+      </div>
+      <div class="callout">
+        <p>A networked receiver can feed local UDP into <span class="kbd">nmea_sproxy</span> or send UDP directly to AISMixer, depending on the deployment. The main AISMixer process does not read serial ports directly. Trusted plain UDP does not provide UDPSEC encryption, authentication, replay protection, or liveness.</p>
+      </div>
+    </section>
+
+    <section id="operations" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Deployment and operations</p>
+        <h2>A native Linux lifecycle built for real installations</h2>
+        <p class="section-intro">The repository-managed deployment keeps runtime files, operator state, systemd integration, and local routing control aligned.</p>
+      </div>
       <div class="grid">
-        <div class="card">
-          <h3>Current limits</h3>
-          <ul class="list">
-            <li>UDP-only egress.</li>
-            <li>Process-local, non-persistent runtime routing.</li>
-            <li>POSIX-only Unix control transport.</li>
-            <li>No multiprocessing coordinator or IPC.</li>
-            <li>No automatic config reload.</li>
-            <li>No geographic or payload-aware filtering.</li>
-            <li>No spoof detection, long-term storage, or analytics.</li>
-          </ul>
-        </div>
-        <div class="card">
-          <h3>Priority themes</h3>
-          <ul class="list">
-            <li>Installer and systemd control-socket hardening.</li>
-            <li>Globally installed <span class="kbd">aismixerctl</span>.</li>
-            <li>Coordinator plus ingress and egress workers.</li>
-            <li>Routing-state operations and observability.</li>
-            <li>Maritime security and feed-quality research.</li>
-          </ul>
-        </div>
+        <article class="card">
+          <div class="icons" aria-hidden="true">⚙️</div>
+          <h3>Repository-managed systemd</h3>
+          <p>The native service provisions <span class="kbd">/run/aismixer</span> while AISMixer is running and supports the optional local control socket.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔄</div>
+          <h3>Install, update, and uninstall</h3>
+          <p>Privilege-aware lifecycle scripts handle root or sudo operation and maintain the deployed runtime and service units.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🗝️</div>
+          <h3>Operator state preserved</h3>
+          <p>Normal install, update, and uninstall flows preserve operator configuration and cryptographic keys.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧰</div>
+          <h3>Global routing CLI</h3>
+          <p>The installed workflow places <span class="kbd">aismixerctl</span> in <span class="kbd">/usr/local/bin</span> for local routing operations.</p>
+        </article>
       </div>
-      <p class="note">See the <a href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">project roadmap</a> for the maintained development track.</p>
     </section>
 
-    <section id="get-started" class="section">
-      <h2>Project documentation</h2>
-      <div class="card links">
-        <a href="https://github.com/iliyan85/aismixer#readme" target="_blank" rel="noopener">Main README</a>
-        <a href="https://github.com/iliyan85/aismixer/tree/main/examples" target="_blank" rel="noopener">Examples</a>
+    <section id="documentation" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Documentation and project status</p>
+        <h2>Implemented foundations, clearly separated from what comes next</h2>
+        <p class="section-intro">The Wiki is the detailed guide to architecture, configuration, routing, security, and operations. The Roadmap tracks future work without promising dates.</p>
+      </div>
+      <div class="status-grid">
+        <article class="card status-card status-now">
+          <p class="status-label">Implemented now</p>
+          <ul class="list">
+            <li>Logical routing, zones, and target-scoped deduplication.</li>
+            <li>Runtime routing control with <span class="kbd">aismixerctl</span>.</li>
+            <li>Endpoint ACLs and source-address binding.</li>
+            <li>Physical receiver input through <span class="kbd">nmea_sproxy</span>.</li>
+            <li>UDPSEC and explicitly trusted plain-UDP proxy output.</li>
+            <li>Hardened native systemd deployment lifecycle.</li>
+          </ul>
+        </article>
+        <article class="card status-card status-next">
+          <p class="status-label">Planned next</p>
+          <ul class="list">
+            <li>Docker deployment and expanded Quickstart material.</li>
+            <li>A coordinator process with ingress workers and egress workers.</li>
+            <li>IPC routing-state distribution and additional adapters.</li>
+            <li>Persistent runtime routing options and configuration reload.</li>
+            <li>Distributed or P2P routing development.</li>
+            <li>Spoof/anomaly research—not an implemented detector today.</li>
+          </ul>
+        </article>
+      </div>
+      <div class="card links" aria-label="Documentation links">
+        <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Main repository</a>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
+        <a href="https://github.com/iliyan85/aismixer/wiki/Quick-Start" target="_blank" rel="noopener">Quick Start</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">nmea_sproxy guide</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Security policy</a>
-        <a href="https://github.com/iliyan85/aismixer/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
       </div>
     </section>
   </main>
 
   <footer>
-    <div class="container">
-      <div class="chip">© 2026 AISMixer project</div>
+    <div class="container footer-inner">
+      <span>© 2026 AISMixer project</span>
+      <span class="muted">Open-source AIS stream processing and routing</span>
     </div>
   </footer>
 </body>

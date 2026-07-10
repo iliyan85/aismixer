@@ -1,7 +1,7 @@
 {
   "name": "AISMixer",
   "short_name": "AISMixer",
-  "description": "AIS NMEA 0183 stream processor and routing engine",
+  "description": "AIS NMEA 0183 stream processing and routing platform",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0b1220",

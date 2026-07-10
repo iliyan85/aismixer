@@ -3,33 +3,33 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AISMixer | AIS NMEA 0183 stream processor и routing engine</title>
+  <title>AISMixer | Обработка и маршрутизиране на AIS потоци</title>
   <link rel="canonical" href="https://aismixer.net/bg/">
-  <meta name="description" content="AISMixer обработва AIS NMEA 0183 потоци с UDP и UDPSEC ingress, multipart assembly, TAG handling, дедупликация, logical routing и targeted UDP forwarding.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183 stream processor, routing engine, logical routing, UDPSEC, targeted UDP forwarding, maritime data, maritime security, maritime-domain-awareness data pipelines, AIVDM, AIVDO, nmea_sproxy, Raspberry Pi, Python">
+  <meta name="description" content="AISMixer приема, нормализира, дедуплицира, маркира, маршрутизира и препраща AIS NMEA 0183 потоци през контролирани UDP и UDPSEC крайни точки.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, обработка на AIS потоци, логическа маршрутизация, UDPSEC, nmea_sproxy, AIVDM, AIVDO, aismixerctl, морски данни">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
 
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
-  <meta property="og:title" content="AISMixer | AIS NMEA 0183 stream processor и routing engine">
-  <meta property="og:description" content="Python услуга с отворен код за UDP/UDPSEC AIS ingress, multipart assembly, TAG handling, logical routing и targeted UDP forwarding.">
+  <meta property="og:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
+  <meta property="og:description" content="Нормализиране, дедупликация, TAG метаданни, маршрутизиране и препращане на AIS NMEA 0183 потоци.">
   <meta property="og:url" content="https://aismixer.net/bg/">
-  <meta property="og:image" content="https://aismixer.net/assets/img/og-bg.png">
-  <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/og-bg.png">
+  <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
+  <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:type" content="image/png">
-  <meta property="og:image:width" content="1200">
-  <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="AISMixer AIS NMEA 0183 stream processor и routing engine">
+  <meta property="og:image:width" content="1280">
+  <meta property="og:image:height" content="640">
+  <meta property="og:image:alt" content="Преглед на платформата AISMixer за обработка и маршрутизиране на AIS потоци">
   <meta property="og:locale" content="bg_BG">
   <meta property="og:locale:alternate" content="en_US">
 
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="AISMixer | AIS NMEA 0183 stream processor и routing engine">
-  <meta name="twitter:description" content="Обработка на AIS NMEA 0183 потоци с UDPSEC, TAG handling, logical routing и targeted UDP forwarding.">
-  <meta name="twitter:image" content="https://aismixer.net/assets/img/og-bg.png">
-  <meta name="twitter:image:alt" content="AISMixer AIS NMEA 0183 stream processor и routing engine">
+  <meta name="twitter:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
+  <meta name="twitter:description" content="Normalize · Deduplicate · Tag · Route · Forward за AIS NMEA 0183 потоци.">
+  <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
+  <meta name="twitter:image:alt" content="Преглед на платформата AISMixer за обработка и маршрутизиране на AIS потоци">
 
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
   <link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/">
@@ -50,8 +50,9 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
-    "description": "AISMixer е AIS NMEA 0183 stream processor и routing engine с UDP и UDPSEC ingress, multipart assembly, TAG handling, logical routing, target-scoped дедупликация и targeted UDP forwarding.",
+    "description": "Платформа с отворен код за приемане, нормализиране, дедупликация, TAG метаданни, маршрутизиране и препращане на AIS NMEA 0183 потоци.",
     "url": "https://aismixer.net/bg/",
+    "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
     "author": {
       "@type": "Person",
@@ -64,21 +65,21 @@
     ],
     "inLanguage": "bg",
     "isAccessibleForFree": true,
-    "keywords": ["AIS NMEA 0183 stream processor", "routing engine", "logical routing", "UDPSEC", "targeted UDP forwarding", "maritime data", "maritime security", "maritime-domain-awareness data pipelines", "AIVDM", "AIVDO", "nmea_sproxy", "Python"]
+    "keywords": ["AIS NMEA 0183", "обработка на потоци", "логическа маршрутизация", "UDPSEC", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Към основното съдържание</a>
   <nav class="nav" aria-label="Основна навигация">
     <div class="container nav-inner">
-      <a class="brand" href="/bg/" aria-label="AISMixer начало">
+      <a class="brand" href="#top" aria-label="Начална страница на AISMixer">
         <span class="logo" aria-hidden="true">🛰️</span>
         <span class="brand-name">AISMixer</span>
-        <span class="chip">AIS routing engine</span>
+        <span class="chip">AIS stream platform</span>
       </a>
       <div class="toggles">
-        <a class="btn" href="/" lang="en">English</a>
-        <a class="btn" href="#architecture">Архитектура</a>
+        <a class="btn" href="/" lang="en" hreflang="en">English</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
       </div>
@@ -87,205 +88,289 @@
 
   <header class="hero container" id="top">
     <div class="two-col">
-      <div>
+      <div class="hero-copy">
         <div class="chip">Отворен код • Python • AIS NMEA 0183</div>
-        <h1>AISMixer — AIS NMEA 0183 stream processor и routing engine</h1>
+        <h1>AISMixer</h1>
+        <p class="hero-kicker">Платформа за обработка и маршрутизиране на AIS потоци</p>
         <p class="tagline">Normalize · Deduplicate · Tag · Route · Forward</p>
         <p class="lead">
-          AISMixer обработва AIS NMEA 0183 потоци с UDP и UDPSEC ingress,
-          multipart assembly, TAG handling, дедупликация, logical routing и
-          targeted UDP forwarding.
+          Приемайте AIS източници, превръщайте трафика от приемниците в един
+          контролиран логически поток и го доставяйте до нужните UDP egress цели.
         </p>
         <div class="cta" aria-label="Връзки към проекта">
-          <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub repository</a>
-          <a class="button" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
-          <a class="button" href="https://github.com/iliyan85/aismixer#readme" target="_blank" rel="noopener">README</a>
-          <a class="button" href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
+          <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Хранилището в GitHub</a>
+          <a class="button" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Разгледайте GitHub Wiki</a>
         </div>
       </div>
-      <div class="card tldr">
-        <div class="icons" aria-hidden="true">🛰️ 🧭 📦 🔁 ⚙️</div>
-        <p class="card-heading">Реализирано днес</p>
+      <aside class="card hero-summary" aria-labelledby="logical-stream-title">
+        <div class="icons" aria-hidden="true">📡 → 🧭 → 📤</div>
+        <p class="card-heading" id="logical-stream-title">Един логически AIS поток</p>
         <ul class="list">
-          <li>UDP IPv4/IPv6 и автентикиран UDPSEC ingress.</li>
-          <li>Извличане на <span class="kbd">!AIVDM</span> / <span class="kbd">!AIVDO</span> и multipart assembly.</li>
-          <li>NMEA TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> handling.</li>
-          <li>Legacy broadcast режим и logical routing режим.</li>
-          <li>Opt-in local runtime control чрез <span class="kbd">aismixerctl</span>.</li>
+          <li>Приема plain UDP и автентикиран UDPSEC ingress.</li>
+          <li>Извлича и сглобява <span class="kbd">!AIVDM</span> и <span class="kbd">!AIVDO</span>.</li>
+          <li>Дедуплицира, управлява TAG метаданните и прилага маршрутизация.</li>
+          <li>Препраща приетите данни към избрани именувани UDP egress цели.</li>
         </ul>
-      </div>
+      </aside>
     </div>
   </header>
 
-  <main class="container">
-    <section id="features" class="section">
-      <h2>Текущи възможности</h2>
+  <main class="container" id="main-content">
+    <section id="processing" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Обработка на AIS потоци</p>
+        <h2>От трафика на приемниците до чист поток с ясни източници</h2>
+        <p class="section-intro">AISMixer обединява транспорта, NMEA сглобяването, метаданните, дедупликацията и доставката в един път за обработка в почти реално време.</p>
+      </div>
       <div class="grid">
-        <div class="card">
+        <article class="card">
           <div class="icons" aria-hidden="true">📡</div>
-          <h3>Ingress и parsing</h3>
-          <p>Приема plain UDP и автентикиран криптиран UDPSEC чрез <span class="kbd">nmea_sproxy</span>. Извлича AIVDM/AIVDO изречения от реалистичен receiver input.</p>
-        </div>
-        <div class="card">
-          <div class="icons" aria-hidden="true">🧷</div>
-          <h3>Multipart и TAG handling</h3>
-          <p>Сглобява multipart съобщения чрез NMEA fragment полетата и ingress assembler identity. TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> metadata е отделна от routing identity.</p>
-        </div>
-        <div class="card">
+          <h3>Гъвкав ingress</h3>
+          <p>Приема plain UDP през IPv4 или IPv6, както и автентикиран криптиран UDPSEC трафик от станции.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧾</div>
+          <h3>Извличане на AIS изречения</h3>
+          <p>Извлича <span class="kbd">!AIVDM</span> и <span class="kbd">!AIVDO</span> от реален изход на приемници и приложения.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧩</div>
+          <h3>Multipart сглобяване</h3>
+          <p>Сглобява multipart съобщения чрез NMEA полетата за фрагменти и стабилна ingress идентичност за сглобяването.</p>
+        </article>
+        <article class="card">
           <div class="icons" aria-hidden="true">🔁</div>
-          <h3>Дедупликация и forwarding</h3>
-          <p>Legacy режимът пази global deduplication и broadcast forwarding. Routing режимът използва target-scoped дедупликация и named UDP egress targets.</p>
-        </div>
-        <div class="card">
-          <div class="icons" aria-hidden="true">🧭</div>
-          <h3>Logical routing</h3>
-          <p>Използва вътрешни <span class="kbd">source_id</span> и <span class="kbd">target_id</span>, named UDP targets и logical zones с <span class="kbd">include</span>, <span class="kbd">union</span>, <span class="kbd">intersection</span> и <span class="kbd">difference</span>.</p>
-        </div>
-        <div class="card">
-          <div class="icons" aria-hidden="true">🎛️</div>
-          <h3>Runtime control</h3>
-          <p>Поддържа immutable routing snapshots, process-local generations, <span class="kbd">routing.status</span>, <span class="kbd">routing.replace</span>, <span class="kbd">routing.disable</span>, versioned JSON protocol, POSIX Unix-domain NDJSON transport и <span class="kbd">aismixerctl</span>.</p>
-        </div>
-        <div class="card">
-          <div class="icons" aria-hidden="true">🔐</div>
-          <h3>UDPSEC station transport</h3>
-          <p>UDPSEC автентикира станцията и сървъра с ECDSA и защитава session traffic с AES-GCM. Това е project transport на AISMixer, а не външен стандарт.</p>
-        </div>
+          <h3>Дедупликация в почти реално време</h3>
+          <p>Потиска повторените логически AIS съобщения глобално в broadcast режим или поотделно за всяка цел при логическа маршрутизация.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🏷️</div>
+          <h3>Контролирани TAG метаданни</h3>
+          <p>Чете и записва NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span> и <span class="kbd">g</span>, без да смесва метаданните с идентичността за маршрутизация.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📤</div>
+          <h3>Избрано препращане</h3>
+          <p>Препраща логическия поток към всички конфигурирани изходи или само към именуваните UDP egress цели, избрани от маршрутизацията.</p>
+        </article>
       </div>
     </section>
 
-    <section id="architecture" class="section">
-      <h2>Data-plane архитектура</h2>
-      <div class="card">
-        <div class="flow" aria-label="Ред на data-plane обработката">
-          <span>transport ingress</span>
-          <span>IngressEvent</span>
-          <span>snapshot capture</span>
-          <span>source_id match</span>
-          <span>NMEA + ingress TAG</span>
-          <span>multipart assembly</span>
-          <span>deduplication</span>
-          <span>outbound TAG</span>
-          <span>UDP egress</span>
-        </div>
-        <p>Data plane взема един immutable routing snapshot за всеки <span class="kbd">IngressEvent</span> и съпоставя <span class="kbd">source_id</span> веднъж за този event. Control update засяга следващите events, а не вече обработвания.</p>
-        <p>Legacy режимът използва global deduplication и broadcast forwarding. Routing режимът използва target-scoped deduplication и named UDP targets.</p>
+    <section id="routing" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Маршрутизиране и логически зони</p>
+        <h2>Опишете политиката на потока чрез идентичности на източници</h2>
+        <p class="section-intro">Статичната логическа маршрутизация свързва именувани ingress източници с именувани UDP egress цели чрез преизползваеми множества и подредени маршрути.</p>
       </div>
+      <div class="pipeline" aria-label="Път на логическата маршрутизация">
+        <div class="pipeline-node"><strong>Именуван ingress</strong><span>UDP и UDPSEC източници</span></div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node"><strong>Логически зони</strong><span>Множества от идентичности на източници</span></div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node"><strong>Подредени маршрути</strong><span>Декларативен избор на цели</span></div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node"><strong>Именуван egress</strong><span>Избрани UDP цели</span></div>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <h3>Съставни множества от източници</h3>
+          <p>Дефинирайте зони чрез <span class="kbd">include</span>, <span class="kbd">union</span>, <span class="kbd">intersection</span> и <span class="kbd">difference</span>.</p>
+        </article>
+        <article class="card">
+          <h3>Логически, не географски</h3>
+          <p>Зоните са множества от вътрешни идентичности на източници, а не райони върху карта, MMSI филтри, филтри за плавателни съдове или правила по съдържанието.</p>
+        </article>
+        <article class="card">
+          <h3>Качество за всяка цел</h3>
+          <p>Режимът с маршрутизация прилага дедупликацията за всяка логическа цел поотделно, така че един път за доставка да не потиска друг.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><span class="kbd">source_id</span> е вътрешна идентичност за маршрутизация. Тя е отделна от стойността на NMEA TAG <span class="kbd">s</span>, която се изпраща надолу по потока.</p>
     </section>
 
-    <section class="section">
-      <h2>Routing model</h2>
-      <div class="grid">
-        <div class="card">
-          <h3>Source identity</h3>
-          <p><span class="kbd">source_id</span> е вътрешна routing identity. Тя е различна от излъчения NMEA TAG <span class="kbd">s</span>.</p>
-        </div>
-        <div class="card">
-          <h3>Logical zones</h3>
-          <p>Logical zones са множества от source IDs. Те не са географски региони, MMSI filters, vessel filters или payload-aware rules.</p>
-        </div>
-        <div class="card">
-          <h3>Targets</h3>
-          <p>Named UDP forwarders създават <span class="kbd">target_id</span> стойности. UDP е единственият реализиран egress adapter днес.</p>
-        </div>
+    <section id="runtime-control" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Управление на маршрутизацията в движение</p>
+        <h2>Променяйте активните маршрути, без да прекъсвате потока</h2>
+        <p class="section-intro">Незадължителна локална управляваща равнина (control plane) през Unix-domain socket предоставя ясни операции по маршрутизация чрез глобално инсталираната команда <span class="kbd">aismixerctl</span>.</p>
       </div>
-      <pre class="mono">routing:
-  zones:
-    trusted:
-      include:
-        - udp:roof
-        - udpsec:boat_ais
-  routes:
-    - name: trusted_to_public
-      from_zone: trusted
-      to: [udp:aishub]</pre>
-    </section>
-
-    <section class="section">
-      <h2>Control plane</h2>
-      <div class="card">
-        <p>Runtime control plane е реализиран, но е opt-in. При включване на <span class="kbd">control.unix</span> се стартира POSIX Unix-domain NDJSON socket за local control requests.</p>
-        <ul class="list">
-          <li><span class="kbd">routing.status</span>, <span class="kbd">routing.replace</span> и <span class="kbd">routing.disable</span> са реализирани.</li>
-          <li><span class="kbd">expected_generation</span> предпазва от stale updates.</li>
-          <li>Routing state и generations са process-local и non-persistent.</li>
-          <li>Filesystem permissions върху socket-а са authorization boundary.</li>
-          <li>Няма application-level control tokens.</li>
-        </ul>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔎</div>
+          <h3>Състояние на маршрутизацията</h3>
+          <p>Показва активното поколение, състоянието, логическите зони, подредените маршрути и идентичностите на целите.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">⚡</div>
+          <h3>Атомарна подмяна или изключване</h3>
+          <p>Валидира цялата кандидат-конфигурация преди смяна на неизменяемото състояние на маршрутизацията или връщане към legacy broadcast режим.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🛡️</div>
+          <h3>Защита от остарели промени</h3>
+          <p>Незадължителната проверка на поколението не позволява неволно презаписване на по-нова промяна в маршрутизацията.</p>
+        </article>
       </div>
-    </section>
-
-    <section class="section">
-      <h2>UDPSEC и nmea_sproxy</h2>
-      <div class="grid">
-        <div class="card">
-          <h3>Station-to-mixer transport</h3>
-          <p><span class="kbd">nmea_sproxy</span> свързва един local UDP input с един secure AISMixer input. UDPSEC осигурява authenticated encrypted transport между станцията и AISMixer.</p>
-        </div>
-        <div class="card">
-          <h3>Автентикация и liveness</h3>
-          <p>ECDSA се използва за station/server authentication, AES-GCM защитава session traffic, а encrypted ping/pong помага за liveness и NAT/CGNAT mappings.</p>
-        </div>
-        <div class="card">
-          <h3>Граници</h3>
-          <p>UDP остава lossy. Transport authenticity не доказва semantic truth на AIS payloads.</p>
-        </div>
-      </div>
-      <p class="note">Вижте <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">nmea_sproxy guide</a> и <a href="https://github.com/iliyan85/aismixer/wiki/UDPSEC-and-nmea_sproxy" target="_blank" rel="noopener">UDPSEC Wiki page</a>.</p>
-    </section>
-
-    <section class="section">
-      <h2>Maritime security позициониране</h2>
       <div class="callout">
-        <p>AISMixer може да подава normalized, source-aware AIS streams към maritime security и maritime-domain-awareness data pipelines. Spoof/anomaly detection е priority planned research capability, но AISMixer в момента не изгражда operational maritime picture и не извършва spoof detection.</p>
+        <p><strong>Умишлено локално и ограничено до текущия процес.</strong> Промените по време на работа не се запазват след рестарт, конфигурационните файлове не се пренаписват, а ingress и egress адаптери не се създават динамично. Правата върху Unix socket са текущата граница за достъп; няма application-level control token.</p>
       </div>
     </section>
 
-    <section class="section">
-      <h2>Ограничения и roadmap</h2>
+    <section id="network-controls" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Контрол на мрежовите крайни точки</p>
+        <h2>Ограничете разрешените източници и изходните адреси</h2>
+        <p class="section-intro">Малки контроли на ниво приложение улесняват включването на IPv4 и IPv6 крайни точки в по-широките firewall и routing правила на оператора.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">🚧</div>
+          <h3>Ingress <span class="kbd">allow_from</span></h3>
+          <p>Ограничете UDP и UDPSEC listeners до буквални IP адреси или CIDR мрежи, включително с изрична пълна забрана.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📍</div>
+          <h3>Изходен <span class="kbd">source_ip</span></h3>
+          <p>Обвържете egress socket с буквален IPv4 или IPv6 адрес на източника и ограничете DNS разрешаването на целта до същата адресна фамилия.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧱</div>
+          <h3>Част от многослойна граница</h3>
+          <p>Тези политики допълват правилата на операционната система за firewall и маршрутизация; не ги заменят.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><span class="kbd">source_ip</span> задава обвързване с адрес на източника, а не избор на мрежов интерфейс, routing table, socket mark или SDN.</p>
+    </section>
+
+    <section id="receivers" class="section section-emphasis">
+      <div class="section-heading">
+        <p class="eyebrow">nmea_sproxy и физически AIS приемници</p>
+        <h2>Свържете мрежови или физически AIS приемници чрез nmea_sproxy</h2>
+        <p class="section-intro"><span class="kbd">nmea_sproxy</span> е проксито при станцията, което свързва един локален AIS източник с една конфигурирана AISMixer цел.</p>
+      </div>
+      <div class="architecture-path" aria-label="Свързване на физически AIS приемник чрез nmea_sproxy към AISMixer">
+        <div class="path-node">
+          <span class="icons" aria-hidden="true">📻</span>
+          <strong>Физически AIS приемник</strong>
+        </div>
+        <div class="path-connector">
+          <span aria-hidden="true">→</span>
+          <small>сериен порт или USB virtual COM</small>
+        </div>
+        <div class="path-node path-node-accent">
+          <span class="icons" aria-hidden="true">🔐</span>
+          <strong>nmea_sproxy</strong>
+        </div>
+        <div class="path-connector">
+          <span aria-hidden="true">→</span>
+          <small>UDPSEC или изрично доверен plain UDP</small>
+        </div>
+        <div class="path-node">
+          <span class="icons" aria-hidden="true">🛰️</span>
+          <strong>AISMixer</strong>
+        </div>
+      </div>
+      <div class="grid proxy-grid">
+        <article class="card">
+          <h3>Реализирани локални входове</h3>
+          <ul class="list">
+            <li>UDP от локален мрежов приемник или AIS приложение.</li>
+            <li>Директен вход от физически сериен порт.</li>
+            <li>USB virtual COM вход от физически AIS приемник.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Реализирани изходи</h3>
+          <ul class="list">
+            <li>Автентикиран криптиран UDPSEC с проверка за активност и повторно свързване.</li>
+            <li>Изрично конфигуриран plain UDP за доверена LAN, VPN или равностойна мрежова граница.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Ясен модел на връзката</h3>
+          <p>Един локален вход се свързва с един конфигуриран изход. <span class="kbd">nmea_sproxy</span> не смесва, не разклонява към няколко изхода, не маршрутизира, не дедуплицира, не сглобява multipart AIS и не пренаписва TAG метаданни.</p>
+        </article>
+      </div>
+      <div class="callout">
+        <p>Мрежов приемник може да подава локален UDP към <span class="kbd">nmea_sproxy</span> или директно към AISMixer според внедряването. Основният AISMixer процес не чете серийни портове директно. Довереният plain UDP не предоставя UDPSEC криптиране, автентикация, защита срещу повторение или протокол за активност.</p>
+      </div>
+    </section>
+
+    <section id="operations" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Внедряване и експлоатация</p>
+        <h2>Практичен жизнен цикъл за нативни Linux инсталации</h2>
+        <p class="section-intro">Управляваното от хранилището внедряване поддържа runtime файловете, операторските настройки, systemd интеграцията и локалното управление на маршрутизацията съгласувани.</p>
+      </div>
       <div class="grid">
-        <div class="card">
-          <h3>Текущи ограничения</h3>
-          <ul class="list">
-            <li>UDP-only egress.</li>
-            <li>Process-local, non-persistent runtime routing.</li>
-            <li>POSIX-only Unix control transport.</li>
-            <li>Няма multiprocessing coordinator или IPC.</li>
-            <li>Няма automatic config reload.</li>
-            <li>Няма geographic или payload-aware filtering.</li>
-            <li>Няма spoof detection, long-term storage или analytics.</li>
-          </ul>
-        </div>
-        <div class="card">
-          <h3>Priority themes</h3>
-          <ul class="list">
-            <li>Installer и systemd control-socket hardening.</li>
-            <li>Globally installed <span class="kbd">aismixerctl</span>.</li>
-            <li>Coordinator плюс ingress и egress workers.</li>
-            <li>Routing-state operations и observability.</li>
-            <li>Maritime security и feed-quality research.</li>
-          </ul>
-        </div>
+        <article class="card">
+          <div class="icons" aria-hidden="true">⚙️</div>
+          <h3>Systemd услуга от хранилището</h3>
+          <p>Нативната услуга създава <span class="kbd">/run/aismixer</span>, докато AISMixer работи, и поддържа незадължителния локален control socket.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔄</div>
+          <h3>Install, update и uninstall</h3>
+          <p>Lifecycle скриптовете разпознават root и sudo и поддържат инсталираните runtime файлове и service units.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🗝️</div>
+          <h3>Запазени операторски настройки</h3>
+          <p>Обичайните install, update и uninstall операции запазват конфигурацията на оператора и криптографските ключове.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧰</div>
+          <h3>Глобален CLI за маршрутизация</h3>
+          <p>Инсталацията поставя <span class="kbd">aismixerctl</span> в <span class="kbd">/usr/local/bin</span> за локални операции по маршрутизация.</p>
+        </article>
       </div>
-      <p class="note">Вижте <a href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">project roadmap</a> за актуалния development track.</p>
     </section>
 
-    <section id="get-started" class="section">
-      <h2>Документация</h2>
-      <div class="card links">
-        <a href="https://github.com/iliyan85/aismixer#readme" target="_blank" rel="noopener">Main README</a>
-        <a href="https://github.com/iliyan85/aismixer/tree/main/examples" target="_blank" rel="noopener">Examples</a>
+    <section id="documentation" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Документация и състояние на проекта</p>
+        <h2>Реализираната основа е ясно отделена от следващите стъпки</h2>
+        <p class="section-intro">Wiki съдържа подробностите за архитектура, конфигурация, маршрутизация, сигурност и експлоатация. Roadmap проследява бъдещата работа без обещани срокове.</p>
+      </div>
+      <div class="status-grid">
+        <article class="card status-card status-now">
+          <p class="status-label">Реализирано сега</p>
+          <ul class="list">
+            <li>Логическа маршрутизация, зони и дедупликация по цели.</li>
+            <li>Управление на runtime маршрутизацията чрез <span class="kbd">aismixerctl</span>.</li>
+            <li>ACL за крайни точки и обвързване с адрес на източника.</li>
+            <li>Вход от физически приемници чрез <span class="kbd">nmea_sproxy</span>.</li>
+            <li>UDPSEC и изрично доверен plain-UDP изход от проксито.</li>
+            <li>Устойчив нативен жизнен цикъл за systemd внедряване.</li>
+          </ul>
+        </article>
+        <article class="card status-card status-next">
+          <p class="status-label">Планирано след това</p>
+          <ul class="list">
+            <li>Внедряване с Docker и разширен Quickstart материал.</li>
+            <li>Coordinator процес с ingress workers и egress workers.</li>
+            <li>IPC разпространение на състоянието на маршрутизацията и допълнителни адаптери.</li>
+            <li>Опции за персистентна runtime маршрутизация и презареждане на конфигурацията.</li>
+            <li>Разпределена маршрутизация и развитие на P2P обмен.</li>
+            <li>Изследвания на spoof/anomaly detection; такава функция още не е реализирана.</li>
+          </ul>
+        </article>
+      </div>
+      <div class="card links" aria-label="Връзки към документацията">
+        <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Основно хранилище</a>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
-        <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">nmea_sproxy guide</a>
-        <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Security policy</a>
-        <a href="https://github.com/iliyan85/aismixer/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+        <a href="https://github.com/iliyan85/aismixer/wiki/Quick-Start" target="_blank" rel="noopener">Quick Start</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">Ръководство за nmea_sproxy</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Политика за сигурност</a>
       </div>
     </section>
   </main>
 
   <footer>
-    <div class="container">
-      <div class="chip">© 2026 AISMixer project</div>
+    <div class="container footer-inner">
+      <span>© 2026 AISMixer project</span>
+      <span class="muted">Обработка и маршрутизиране на AIS потоци с отворен код</span>
     </div>
   </footer>
 </body>
