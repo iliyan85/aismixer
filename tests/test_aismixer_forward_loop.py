@@ -675,6 +675,65 @@ def test_forward_loop_legacy_mode_keeps_global_deduplication(monkeypatch):
     assert fake_forwarder.targeted_messages == []
 
 
+def test_current_behavior_known_defect_candidate_legacy_partial_multipart(
+    monkeypatch,
+):
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11DEDU,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22OLD,0")
+    second_new = make_nmea_sentence("AIVDM,2,2,7,A,22NEW,0")
+    group_one = (
+        f"\\g:1-2-111*00\\{first}",
+        f"\\g:2-2-111*00\\{second}",
+    )
+    group_two = (
+        f"\\g:1-2-222*00\\{first}",
+        f"\\g:2-2-222*00\\{second_new}",
+    )
+
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(monkeypatch)
+        try:
+            await queue.put(make_event(group_one[0]))
+            await queue.put(make_event(group_one[1]))
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=2,
+            )
+
+            await queue.put(make_event(group_two[0]))
+            await queue.put(make_event(group_two[1]))
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=3,
+            )
+            await asyncio.sleep(0.05)
+            if task.done():
+                task.result()
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    messages = fake_forwarder.messages
+
+    assert len(messages) == 3
+    assert first in messages[0]
+    assert second in messages[1]
+    assert second_new in messages[2]
+    assert sum(first in message for message in messages) == 1
+    assert ",g:1-2-111*" in leading_tag(messages[0])
+    assert re.fullmatch(r"g:2-2-111\*[0-9A-F]{2}", leading_tag(messages[1]))
+
+    # Known defect candidate: fragment-level dedup turns a complete assembled
+    # second group into a partial output group while retaining ordinal 2 of 2.
+    surviving_tag = leading_tag(messages[2])
+    assert re.fullmatch(r"g:2-2-222\*[0-9A-F]{2}", surviving_tag)
+    assert "c:" not in surviving_tag
+    assert "s:" not in surviving_tag
+
+
 def test_forward_loop_routing_state_with_no_table_uses_legacy_mode(monkeypatch):
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
@@ -811,6 +870,91 @@ def test_forward_loop_routing_mode_allows_same_sentence_to_two_targets(monkeypat
     assert fake_forwarder.targeted_messages[0][0] == (
         "udp:aishub",
         "udp:local_debug",
+    )
+
+
+def test_current_behavior_routing_multipart_dedup_diverges_by_target(
+    monkeypatch,
+):
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11DEDU,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22OLD,0")
+    second_new = make_nmea_sentence("AIVDM,2,2,7,A,22NEW,0")
+    group_one = (
+        f"\\g:1-2-111*00\\{first}",
+        f"\\g:2-2-111*00\\{second}",
+    )
+    group_two = (
+        f"\\g:1-2-222*00\\{first}",
+        f"\\g:2-2-222*00\\{second_new}",
+    )
+    second_table = make_routing_table(
+        routes=[
+            {
+                "name": "source_a_to_two_targets",
+                "from_zone": "source_a",
+                "to": ["udp:first", "udp:second"],
+            }
+        ]
+    )
+
+    async def run():
+        routing_state = RoutingState(make_single_target_table("udp:first"))
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            routing_state=routing_state,
+        )
+        try:
+            await queue.put(make_event(group_one[0], source_id="udp:source_a"))
+            await queue.put(make_event(group_one[1], source_id="udp:source_a"))
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                targeted_count=2,
+            )
+
+            routing_state.replace(second_table)
+
+            await queue.put(make_event(group_two[0], source_id="udp:source_a"))
+            await queue.put(make_event(group_two[1], source_id="udp:source_a"))
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                targeted_count=4,
+            )
+            await asyncio.sleep(0.05)
+            if task.done():
+                task.result()
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    records = fake_forwarder.targeted_messages
+
+    assert fake_forwarder.messages == []
+    assert len(records) == 4
+    assert records[0][0] == ("udp:first",)
+    assert first in records[0][1]
+    assert ",g:1-2-111*" in leading_tag(records[0][1])
+    assert records[1][0] == ("udp:first",)
+    assert second in records[1][1]
+    assert re.fullmatch(
+        r"g:2-2-111\*[0-9A-F]{2}",
+        leading_tag(records[1][1]),
+    )
+
+    # Characterization only: per-target fragment decisions let different
+    # targets receive different subsets; the final contract remains undecided.
+    assert records[2][0] == ("udp:second",)
+    assert first in records[2][1]
+    assert leading_tag(records[2][1]).startswith("c:")
+    assert ",g:1-2-222*" in leading_tag(records[2][1])
+
+    assert records[3][0] == ("udp:first", "udp:second")
+    assert second_new in records[3][1]
+    assert re.fullmatch(
+        r"g:2-2-222\*[0-9A-F]{2}",
+        leading_tag(records[3][1]),
     )
 
 
