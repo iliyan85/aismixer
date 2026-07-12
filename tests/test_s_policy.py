@@ -6,6 +6,14 @@ from core.s_policy import (
     parse_tag_pairs_before_index,
     sanitize_s,
 )
+from meta_cleaner import extract_nmea_sentences
+
+
+def _tag_checksum(body):
+    checksum = 0
+    for character in body:
+        checksum ^= ord(character)
+    return f"{checksum:02X}"
 
 
 def test_sanitize_s_replaces_unsafe_chars_and_truncates():
@@ -36,6 +44,65 @@ def test_parse_tag_pairs_before_index_uses_tag_immediately_before_sentence():
     assert parse_tag_pairs_before_index(raw, raw.index(second_sentence)) == {
         "s": "second",
         "g": "1-1-99",
+    }
+
+
+def test_current_behavior_tag_without_checksum_is_associated_and_parsed():
+    tag = "\\s:boat,c:123,g:1-1-9\\"
+    sentence = "!AIVDM,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*31"
+    raw = tag + sentence
+
+    slices = extract_nmea_sentences(raw, want_idx=True)
+
+    assert len(slices) == 1
+    assert slices[0].tag_end == slices[0].start - 1
+    # Characterization only: checksum omission is not yet an approved policy.
+    assert parse_tag_pairs_before_index(raw, slices[0].start) == {
+        "s": "boat",
+        "c": "123",
+        "g": "1-1-9",
+    }
+
+
+def test_current_behavior_incorrect_tag_checksum_is_ignored_when_parsing():
+    tag_body = "s:boat,c:123,g:1-1-9"
+    supplied_checksum = "00"
+    sentence = "!AIVDM,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*31"
+    tag = f"\\{tag_body}*{supplied_checksum}\\"
+    raw = tag + sentence
+
+    assert _tag_checksum(tag_body) == "5C"
+    assert _tag_checksum(tag_body) != supplied_checksum
+
+    slices = extract_nmea_sentences(raw, want_idx=True)
+
+    assert len(slices) == 1
+    assert raw[slices[0].tag_start:slices[0].tag_end + 1] == tag
+    # Characterization only: acceptance does not approve the final checksum policy.
+    assert parse_tag_pairs_before_index(raw, slices[0].start) == {
+        "s": "boat",
+        "c": "123",
+        "g": "1-1-9",
+    }
+
+
+def test_correct_tag_checksum_is_associated_and_parsed():
+    tag_body = "s:boat,c:123,g:1-1-9"
+    supplied_checksum = "5C"
+    sentence = "!AIVDM,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*31"
+    tag = f"\\{tag_body}*{supplied_checksum}\\"
+    raw = tag + sentence
+
+    assert _tag_checksum(tag_body) == supplied_checksum
+
+    slices = extract_nmea_sentences(raw, want_idx=True)
+
+    assert len(slices) == 1
+    assert raw[slices[0].tag_start:slices[0].tag_end + 1] == tag
+    assert parse_tag_pairs_before_index(raw, slices[0].start) == {
+        "s": "boat",
+        "c": "123",
+        "g": "1-1-9",
     }
 
 
