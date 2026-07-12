@@ -1,4 +1,13 @@
+import assembler as assembler_module
 from assembler import AIVDMAssembler
+
+
+class FakeClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
 
 
 def test_feed_returns_none_for_non_numeric_total():
@@ -72,6 +81,79 @@ def test_current_behavior_known_defect_candidate_repeated_ordinal_completes():
     # Known defect candidate: stored count currently completes the group even
     # though fragment 2 was never received. This does not approve that policy.
     assert assembler.feed("src", first) == [first, first]
+
+
+def test_current_behavior_timeout_equality_keeps_group_live(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(assembler_module.time, "time", clock)
+    assembler = AIVDMAssembler(timeout=1.0)
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+    unrelated = "!AIVDM,2,1,8,A,unrelated1,0*00"
+
+    assert assembler.feed("source-a", first) is None
+
+    clock.now = 1.0
+
+    # Characterization only: strict equality is not yet an approved contract.
+    assert assembler.feed("source-b", unrelated) is None
+    assert assembler.feed("source-a", second) == [first, second]
+
+
+def test_current_behavior_unrelated_cleanup_expires_group_after_timeout(
+    monkeypatch,
+):
+    clock = FakeClock()
+    monkeypatch.setattr(assembler_module.time, "time", clock)
+    assembler = AIVDMAssembler(timeout=1.0)
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+    unrelated = "!AIVDM,2,1,8,A,unrelated1,0*00"
+
+    assert assembler.feed("source-a", first) is None
+
+    clock.now = 1.001
+
+    assert assembler.feed("source-b", unrelated) is None
+    assert assembler.feed("source-a", second) is None
+
+
+def test_current_behavior_accepted_fragment_refreshes_timeout_window(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(assembler_module.time, "time", clock)
+    assembler = AIVDMAssembler(timeout=1.0)
+    first = "!AIVDM,3,1,7,A,payload1,0*00"
+    second = "!AIVDM,3,2,7,A,payload2,0*00"
+    third = "!AIVDM,3,3,7,A,payload3,0*00"
+    unrelated = "!AIVDM,2,1,8,A,unrelated1,0*00"
+
+    assert assembler.feed("source-a", first) is None
+
+    clock.now = 0.75
+
+    assert assembler.feed("source-a", second) is None
+
+    clock.now = 1.5
+
+    # Characterization only: sliding refresh is not yet an approved contract.
+    assert assembler.feed("source-b", unrelated) is None
+    assert assembler.feed("source-a", third) == [first, second, third]
+
+
+def test_current_behavior_known_defect_candidate_stale_group_revives(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(assembler_module.time, "time", clock)
+    assembler = AIVDMAssembler(timeout=1.0)
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+
+    assert assembler.feed("source-a", first) is None
+
+    clock.now = 10.0
+
+    # Known defect candidate: feed refreshes and appends to the stale current
+    # key before cleanup, so the old group completes after its nominal timeout.
+    assert assembler.feed("source-a", second) == [first, second]
 
 
 def test_feed_groups_multipart_by_same_source_seq_channel_and_total():
