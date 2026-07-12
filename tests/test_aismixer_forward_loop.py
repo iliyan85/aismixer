@@ -21,6 +21,13 @@ AIVDO_MULTIPART_FIRST = "!AIVDO,2,1,7,A,payload1,0*00"
 AIVDO_MULTIPART_SECOND = "!AIVDO,2,2,7,A,payload2,0*00"
 
 
+def make_nmea_sentence(body):
+    checksum = 0
+    for character in body:
+        checksum ^= ord(character)
+    return f"!{body}*{checksum:02X}"
+
+
 class FakeForwarder:
     def __init__(self, on_send_to=None):
         self.messages = []
@@ -497,6 +504,149 @@ def test_forward_loop_forwards_multipart_aivdo_in_part_order(monkeypatch):
     assert re.fullmatch(r"g:2-2-\d+\*[0-9A-F]{2}", second_tag)
     assert "c:" not in second_tag
     assert "s:" not in second_tag
+
+
+def test_current_behavior_completion_arrival_owns_ingress_c_out_of_order(
+    monkeypatch,
+):
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11COWN,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22COWN,0")
+    second_arrival = f"\\c:222,g:2-2-{group_id}*00\\{second}"
+    completion_arrival = f"\\c:111,g:1-2-{group_id}*00\\{first}"
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(second_arrival), make_event(completion_arrival)],
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+
+    first_tag = leading_tag(messages[0])
+    # Current ownership follows the arrival that completes assembly. Here that
+    # arrival has NMEA ordinal 1, rather than the highest multipart ordinal.
+    assert first_tag.startswith(f"c:111,s:test_station,g:1-2-{group_id}*")
+    assert all("c:222" not in leading_tag(message) for message in messages)
+
+
+def test_current_behavior_completion_arrival_owns_conflicting_ingress_gid(
+    monkeypatch,
+):
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11GIDA,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22GIDB,0")
+    earlier_arrival = f"\\g:1-2-111*00\\{first}"
+    completion_arrival = f"\\c:123,g:2-2-222*00\\{second}"
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(earlier_arrival), make_event(completion_arrival)],
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    # Characterization only: conflicting ingress GID ownership still requires
+    # an explicit contract decision.
+    assert leading_tag(messages[0]).startswith(
+        "c:123,s:test_station,g:1-2-222*"
+    )
+    assert leading_tag(messages[1]).startswith("g:2-2-222*")
+    assert all("-111" not in leading_tag(message) for message in messages)
+
+
+def test_current_behavior_completion_fragment_s_overrides_earlier_s(monkeypatch):
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11SERA,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22SERB,0")
+    earlier_arrival = f"\\s:early,g:1-2-{group_id}*00\\{first}"
+    completion_arrival = (
+        f"\\s:late,c:123,g:2-2-{group_id}*00\\{second}"
+    )
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(earlier_arrival), make_event(completion_arrival)],
+            expected_broadcast_sends=2,
+            station_id="",
+        )
+    )
+
+    first_tag = leading_tag(fake_forwarder.messages[0])
+    assert first_tag.startswith(f"c:123,s:late,g:1-2-{group_id}*")
+    assert "s:early" not in first_tag
+
+
+def test_current_behavior_earlier_s_is_reused_when_completion_has_no_s(
+    monkeypatch,
+):
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11SCAA,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22SCAB,0")
+    earlier_arrival = f"\\s:early,g:1-2-{group_id}*00\\{first}"
+    completion_arrival = f"\\c:123,g:2-2-{group_id}*00\\{second}"
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(earlier_arrival), make_event(completion_arrival)],
+            expected_broadcast_sends=2,
+            station_id="",
+        )
+    )
+
+    first_tag = leading_tag(fake_forwarder.messages[0])
+    assert first_tag.startswith(f"c:123,s:early,g:1-2-{group_id}*")
+
+
+def test_current_behavior_known_defect_candidate_s_context_leaks_between_groups(
+    monkeypatch,
+):
+    assembler_key = "shared-receiver"
+    group_id = "424242"
+    group_a_first = make_nmea_sentence("AIVDM,2,1,7,A,11LEAK,0")
+    group_b_first = make_nmea_sentence("AIVDM,2,1,8,A,11BGRP,0")
+    group_b_second = make_nmea_sentence("AIVDM,2,2,8,A,22BGRP,0")
+    group_a_arrival = f"\\s:stale,g:1-2-{group_id}*00\\{group_a_first}"
+    group_b_first_arrival = f"\\g:1-2-{group_id}*00\\{group_b_first}"
+    group_b_completion = (
+        f"\\c:123,g:2-2-{group_id}*00\\{group_b_second}"
+    )
+
+    events = [
+        make_event(group_a_arrival, assembler_key=assembler_key),
+        make_event(group_b_first_arrival, assembler_key=assembler_key),
+        make_event(group_b_completion, assembler_key=assembler_key),
+    ]
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            events,
+            expected_broadcast_sends=2,
+            station_id="",
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert group_b_first in messages[0]
+    assert group_b_second in messages[1]
+    assert group_a_first not in "".join(messages)
+
+    # Known defect candidate: the s context key omits NMEA sequential ID, so
+    # pending group A leaks its source into distinct group B under the same
+    # assembler key and ingress GID. Group A intentionally remains incomplete.
+    assert leading_tag(messages[0]).startswith(
+        f"c:123,s:stale,g:1-2-{group_id}*"
+    )
 
 
 def test_forward_loop_legacy_mode_calls_send_not_send_to(monkeypatch):
