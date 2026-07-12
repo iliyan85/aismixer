@@ -73,6 +73,39 @@ def test_ttl_expiration_is_independent_per_scoped_entry(monkeypatch):
     assert not deduplicator.is_unique("message", scope="udp:b")
 
 
+def test_current_behavior_accepts_message_exactly_at_ttl_boundary(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(dedup, "time", clock)
+    deduplicator = Deduplicator(ttl=30)
+
+    assert deduplicator.is_unique("message", scope="udp:aishub")
+
+    clock.now = 1029.999
+
+    assert not deduplicator.is_unique("message", scope="udp:aishub")
+
+    clock.now = 1030.0
+
+    assert deduplicator.is_unique("message", scope="udp:aishub")
+
+
+def test_current_behavior_rejected_duplicate_does_not_refresh_ttl(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(dedup, "time", clock)
+    deduplicator = Deduplicator(ttl=30)
+
+    assert deduplicator.is_unique("message", scope="udp:aishub")
+
+    clock.advance(20)
+
+    assert not deduplicator.is_unique("message", scope="udp:aishub")
+
+    # Characterization: expiry remains anchored to the last accepted observation.
+    clock.advance(10)
+
+    assert deduplicator.is_unique("message", scope="udp:aishub")
+
+
 def test_cleanup_removes_expired_scoped_and_unscoped_entries(monkeypatch):
     clock = FakeClock()
     monkeypatch.setattr(dedup, "time", clock)
