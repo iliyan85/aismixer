@@ -53,6 +53,27 @@ def test_feed_assembles_valid_multipart_sentences():
     assert assembler.feed("src", second) == [first, second]
 
 
+def test_current_behavior_orders_out_of_order_fragments_by_ordinal():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+
+    # Characterization only: this ordering is not yet an approved contract.
+    assert assembler.feed("src", second) is None
+    assert assembler.feed("src", first) == [first, second]
+
+
+def test_current_behavior_known_defect_candidate_repeated_ordinal_completes():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+
+    assert assembler.feed("src", first) is None
+
+    # Known defect candidate: stored count currently completes the group even
+    # though fragment 2 was never received. This does not approve that policy.
+    assert assembler.feed("src", first) == [first, first]
+
+
 def test_feed_groups_multipart_by_same_source_seq_channel_and_total():
     assembler = AIVDMAssembler()
     first = "!AIVDM,2,1,7,A,payload1,0*00"
