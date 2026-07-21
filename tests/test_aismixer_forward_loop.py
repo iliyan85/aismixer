@@ -575,7 +575,7 @@ def test_current_behavior_completion_arrival_owns_conflicting_ingress_gid(
     assert all("-111" not in leading_tag(message) for message in messages)
 
 
-def test_current_behavior_completion_fragment_s_overrides_earlier_s(monkeypatch):
+def test_completion_fragment_s_overrides_earlier_s(monkeypatch):
     group_id = "424242"
     first = make_nmea_sentence("AIVDM,2,1,7,A,11SERA,0")
     second = make_nmea_sentence("AIVDM,2,2,7,A,22SERB,0")
@@ -594,11 +594,12 @@ def test_current_behavior_completion_fragment_s_overrides_earlier_s(monkeypatch)
     )
 
     first_tag = leading_tag(fake_forwarder.messages[0])
+    # Approved precedence: completion-arrival source metadata wins.
     assert first_tag.startswith(f"c:123,s:late,g:1-2-{group_id}*")
     assert "s:early" not in first_tag
 
 
-def test_current_behavior_earlier_s_is_reused_when_completion_has_no_s(
+def test_earlier_s_is_reused_when_completion_has_no_s(
     monkeypatch,
 ):
     group_id = "424242"
@@ -617,7 +618,126 @@ def test_current_behavior_earlier_s_is_reused_when_completion_has_no_s(
     )
 
     first_tag = leading_tag(fake_forwarder.messages[0])
+    # Approved fallback: earlier metadata supplies a source when completion
+    # carries no source of its own.
     assert first_tag.startswith(f"c:123,s:early,g:1-2-{group_id}*")
+
+
+def test_dedup_suppressed_completion_clears_multipart_s_context(
+    monkeypatch,
+):
+    assembler_key = "shared-receiver"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11DSUP,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22DSUP,0")
+    second_new = make_nmea_sentence("AIVDM,2,2,7,A,22DNEW,0")
+    group_one = (
+        f"\\g:1-2-111*00\\{first}",
+        f"\\g:2-2-111*00\\{second}",
+    )
+    group_two = (
+        f"\\s:stale,g:1-2-222*00\\{first}",
+        f"\\g:2-2-222*00\\{second}",
+    )
+    group_three = (
+        f"\\g:1-2-333*00\\{first}",
+        f"\\g:2-2-333*00\\{second_new}",
+    )
+
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            station_id="",
+        )
+        try:
+            for arrival in group_one:
+                await queue.put(
+                    make_event(arrival, assembler_key=assembler_key)
+                )
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=2,
+            )
+
+            for arrival in group_two:
+                await queue.put(
+                    make_event(arrival, assembler_key=assembler_key)
+                )
+            await asyncio.sleep(0)
+            if task.done():
+                task.result()
+            assert len(fake_forwarder.messages) == 2
+
+            for arrival in group_three:
+                await queue.put(
+                    make_event(arrival, assembler_key=assembler_key)
+                )
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=4,
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    messages = fake_forwarder.messages
+    assert len(messages) == 4
+    assert first in messages[0]
+    assert second in messages[1]
+    assert first in messages[2]
+    assert second_new in messages[3]
+    assert second not in "".join(messages[2:])
+    assert all("-222" not in leading_tag(message) for message in messages)
+    assert "s:stale" not in leading_tag(messages[2])
+    assert ",s:192_0_2_10," in leading_tag(messages[2])
+
+
+def test_completion_without_g_tag_clears_multipart_s_context(monkeypatch):
+    assembler_key = "shared-receiver"
+    group_a_first = make_nmea_sentence("AIVDM,2,1,7,A,11NOGA,0")
+    group_a_second = make_nmea_sentence("AIVDM,2,2,7,A,22NOGA,0")
+    group_b_first = make_nmea_sentence("AIVDM,2,1,7,A,11NOGB,0")
+    group_b_second = make_nmea_sentence("AIVDM,2,2,7,A,22NOGB,0")
+    events = [
+        make_event(
+            f"\\s:stale,g:1-2-111*00\\{group_a_first}",
+            assembler_key=assembler_key,
+        ),
+        make_event(group_a_second, assembler_key=assembler_key),
+        make_event(
+            f"\\g:1-2-222*00\\{group_b_first}",
+            assembler_key=assembler_key,
+        ),
+        make_event(
+            f"\\g:2-2-222*00\\{group_b_second}",
+            assembler_key=assembler_key,
+        ),
+    ]
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            events,
+            expected_broadcast_sends=4,
+            station_id="",
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 4
+    assert group_a_first in messages[0]
+    assert group_a_second in messages[1]
+    assert group_b_first in messages[2]
+    assert group_b_second in messages[3]
+    assert all(group_b_first not in message for message in messages[:2])
+    assert all(group_b_second not in message for message in messages[:2])
+    assert all(group_a_first not in message for message in messages[2:])
+    assert all(group_a_second not in message for message in messages[2:])
+    assert "s:stale" in leading_tag(messages[0])
+    assert "s:stale" not in leading_tag(messages[2])
+    assert ",s:192_0_2_10," in leading_tag(messages[2])
 
 
 def test_multipart_s_context_is_isolated_by_assembly_key(
