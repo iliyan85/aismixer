@@ -575,6 +575,161 @@ def test_current_behavior_completion_arrival_owns_conflicting_ingress_gid(
     assert all("-111" not in leading_tag(message) for message in messages)
 
 
+def test_current_behavior_earlier_ingress_c_is_lost_when_completion_has_no_c(
+    monkeypatch,
+):
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11CLOS,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22CLOS,0")
+    earlier_arrival = f"\\c:111,g:1-2-{group_id}*00\\{first}"
+    completion_arrival = f"\\g:2-2-{group_id}*00\\{second}"
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(earlier_arrival), make_event(completion_arrival)],
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+
+    first_tag = leading_tag(messages[0])
+    timestamp_match = re.fullmatch(
+        rf"c:(\d+),s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+        first_tag,
+    )
+    assert timestamp_match is not None
+    assert timestamp_match.group(1) != "111"
+    assert re.fullmatch(
+        rf"g:2-2-{group_id}\*[0-9A-F]{{2}}",
+        leading_tag(messages[1]),
+    )
+
+    # Characterization only: the earlier valid c is not retained as group
+    # metadata. With no valid c on completion, output receives a server
+    # timestamp; this does not approve a permanent ownership policy.
+
+
+def test_current_behavior_earlier_ingress_gid_is_lost_when_completion_has_no_g(
+    monkeypatch,
+):
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11GLOS,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22GLOS,0")
+    earlier_arrival = f"\\g:1-2-111*00\\{first}"
+    monkeypatch.setattr(
+        aismixer,
+        "_gen_numeric_gid_fixed",
+        lambda _digits: "999999",
+    )
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(earlier_arrival), make_event(second)],
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+    assert re.fullmatch(
+        r"c:\d+,s:test_station,g:1-2-999999\*[0-9A-F]{2}",
+        leading_tag(messages[0]),
+    )
+    assert re.fullmatch(
+        r"g:2-2-999999\*[0-9A-F]{2}",
+        leading_tag(messages[1]),
+    )
+    assert all("-111" not in leading_tag(message) for message in messages)
+
+    # Characterization only: the earlier valid ingress GID is not retained as
+    # group metadata. With no valid g on completion, output receives a newly
+    # generated GID; this does not approve a permanent ownership policy.
+
+
+def test_current_behavior_out_of_order_completion_without_c_does_not_reuse_earlier_c(
+    monkeypatch,
+):
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11COOO,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22COOO,0")
+    earlier_arrival = f"\\c:222,g:2-2-{group_id}*00\\{second}"
+    completion_arrival = f"\\g:1-2-{group_id}*00\\{first}"
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(earlier_arrival), make_event(completion_arrival)],
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+
+    timestamp_match = re.fullmatch(
+        rf"c:(\d+),s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+        leading_tag(messages[0]),
+    )
+    assert timestamp_match is not None
+    assert timestamp_match.group(1) != "222"
+    assert re.fullmatch(
+        rf"g:2-2-{group_id}\*[0-9A-F]{{2}}",
+        leading_tag(messages[1]),
+    )
+
+    # Characterization only: c:222 is lost even though it arrived first on
+    # the highest NMEA ordinal. The ordinal-1 completion has no c, so output
+    # uses server time; no permanent ownership policy is approved here.
+
+
+def test_current_behavior_out_of_order_completion_without_g_does_not_reuse_earlier_gid(
+    monkeypatch,
+):
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11GOOO,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22GOOO,0")
+    earlier_arrival = f"\\g:2-2-222*00\\{second}"
+    monkeypatch.setattr(
+        aismixer,
+        "_gen_numeric_gid_fixed",
+        lambda _digits: "999999",
+    )
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(earlier_arrival), make_event(first)],
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+    assert re.fullmatch(
+        r"c:\d+,s:test_station,g:1-2-999999\*[0-9A-F]{2}",
+        leading_tag(messages[0]),
+    )
+    assert re.fullmatch(
+        r"g:2-2-999999\*[0-9A-F]{2}",
+        leading_tag(messages[1]),
+    )
+    assert all("-222" not in leading_tag(message) for message in messages)
+
+    # Characterization only: the earlier GID came from the first arrival and
+    # highest ordinal, but the ordinal-1 completion has no g. Output therefore
+    # generates a new GID; no permanent ownership policy is approved here.
+
+
 def test_completion_fragment_s_overrides_earlier_s(monkeypatch):
     group_id = "424242"
     first = make_nmea_sentence("AIVDM,2,1,7,A,11SERA,0")
