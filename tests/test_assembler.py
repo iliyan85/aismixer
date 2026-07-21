@@ -86,6 +86,42 @@ def test_out_of_order_fragments_complete_in_ordinal_order():
     assert assembler.feed("src", first) == [first, second]
 
 
+def test_current_behavior_blank_seq_id_supports_out_of_order_assembly():
+    assembler = AIVDMAssembler(clock=FakeClock())
+    first = "!AIVDM,2,1,,A,SINGLE_MESSAGE_PART_1,0*00"
+    second = "!AIVDM,2,2,,A,SINGLE_MESSAGE_PART_2,0*00"
+
+    # Characterization only: one coherent blank-ID message currently retains
+    # out-of-order compatibility. This does not decide how ambiguous
+    # concurrent blank-ID groups should be handled.
+    assert assembler.feed("src", second) is None
+    assert assembler.feed("src", first) == [first, second]
+
+
+def test_current_behavior_known_risk_blank_seq_fragments_can_synthesize_group():
+    assembler = AIVDMAssembler(clock=FakeClock())
+    message_a = (
+        "!AIVDM,2,1,,A,MESSAGE_A_PART_1,0*00",
+        "!AIVDM,2,2,,A,MESSAGE_A_PART_2,0*00",
+    )
+    message_b = (
+        "!AIVDM,2,1,,A,MESSAGE_B_PART_1,0*00",
+        "!AIVDM,2,2,,A,MESSAGE_B_PART_2,0*00",
+    )
+
+    assert assembler.feed("src", message_a[0]) is None
+
+    # Known ambiguity and defect candidate: A1 plus B2 provides complete
+    # ordinal coverage without a duplicate-ordinal conflict, so insufficient
+    # blank-ID multipart identity synthesizes a group. TTL and unique-ordinal
+    # integrity cannot prove that these fragments share a transmission. This
+    # characterization does not select a permanent blank-ID policy.
+    assert assembler.feed("src", message_b[1]) == [
+        message_a[0],
+        message_b[1],
+    ]
+
+
 def test_exact_duplicate_fragment_is_idempotent():
     assembler = AIVDMAssembler()
     first = "!AIVDM,2,1,7,A,payload1,0*00"
