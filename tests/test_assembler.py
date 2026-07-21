@@ -83,6 +83,24 @@ def test_current_behavior_known_defect_candidate_repeated_ordinal_completes():
     assert assembler.feed("src", first) == [first, first]
 
 
+def test_current_behavior_known_defect_candidate_conflicting_ordinal_completes():
+    assembler = AIVDMAssembler()
+    lexically_later_first_arrival = "!AIVDM,2,1,7,A,BBBBBB,0*00"
+    lexically_earlier_second_arrival = "!AIVDM,2,1,7,A,AAAAAA,0*00"
+
+    assert assembler.feed("src", lexically_later_first_arrival) is None
+
+    # Known defect candidate: two conflicting ordinal-1 fragments currently
+    # complete the count-based group even though ordinal 2 was never received.
+    # Implementation-specific characterization only: sorting the stored
+    # (ordinal, line) tuples makes equal ordinals sort by sentence text, not
+    # arrival order. Neither behavior is approved as a permanent contract.
+    assert assembler.feed("src", lexically_earlier_second_arrival) == [
+        lexically_earlier_second_arrival,
+        lexically_later_first_arrival,
+    ]
+
+
 def test_current_behavior_timeout_equality_keeps_group_live(monkeypatch):
     clock = FakeClock()
     monkeypatch.setattr(assembler_module.time, "time", clock)
