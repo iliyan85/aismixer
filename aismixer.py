@@ -3,7 +3,7 @@ import socket
 import yaml
 import os
 import time
-from assembler import AIVDMAssembler
+from assembler import AIVDMAssembler, AssemblyKey, AssemblyStatus
 from meta_writer import wrap_with_meta
 from meta_cleaner import extract_nmea_sentences
 from secrets import randbelow
@@ -140,8 +140,8 @@ async def forward_loop(queue, routing_state=None):
     the event currently being processed.
     """
 
-    # Контекст: (assembler_key, group_id) -> 's' от ранна част на мултипарт
-    multipart_s_ctx: dict[tuple[str, str], str] = {}
+    # Multipart source metadata follows the assembler's correlation identity.
+    multipart_s_ctx: dict[AssemblyKey, str] = {}
     while True:
         ev: IngressEvent = await queue.get()
         event_routing_table = None
@@ -176,15 +176,32 @@ async def forward_loop(queue, routing_state=None):
             if C_PRESERVE_INGRESS_C and c_ingress and c_ingress.isdigit():
                 ts_for_header = int(c_ingress)
 
-            # ако този фрагмент носи s:, запази го за групата
-            if 's' in tag_pairs and g_info:
-                _, _, gid = g_info
-                multipart_s_ctx[(ev.assembler_key, gid)] = tag_pairs['s']
-
             # 2) Сглобяване на мултипарт
-            multipart = assembler.feed(ev.assembler_key, clean_line)
-            if multipart is None:
-                continue  # чакаме още части
+            outcome = assembler.feed_outcome(ev.assembler_key, clean_line)
+
+            # Discarded generations must be cleared before the current
+            # observation can establish metadata for a fresh generation.
+            for discarded_key in outcome.discarded_keys:
+                multipart_s_ctx.pop(discarded_key, None)
+
+            if (
+                outcome.status
+                in {AssemblyStatus.PENDING, AssemblyStatus.DUPLICATE}
+                and outcome.group_key is not None
+                and 's' in tag_pairs
+                and g_info
+            ):
+                multipart_s_ctx[outcome.group_key] = tag_pairs['s']
+
+            if outcome.status in {
+                AssemblyStatus.INVALID,
+                AssemblyStatus.PENDING,
+                AssemblyStatus.DUPLICATE,
+                AssemblyStatus.CONFLICT,
+            }:
+                continue
+
+            multipart = outcome.sentences
 
             # --- изходно gid за тази група ---
             incoming_gid: str | None = None
@@ -212,15 +229,18 @@ async def forward_loop(queue, routing_state=None):
                 )
                 emit_group = bool(eligible_target_ids)
 
+            incoming_s = tag_pairs.get('s')
+            if (
+                outcome.status is AssemblyStatus.COMPLETE
+                and outcome.group_key is not None
+            ):
+                incoming_s = incoming_s or multipart_s_ctx.get(
+                    outcome.group_key
+                )
+
             for i, full_line in enumerate(multipart if emit_group else ()):
                 is_first = i == 0
-                # 3) Определи incoming_s
-                incoming_s = tag_pairs.get('s')
-                if g_info:
-                    part, total, gid = g_info
-                    incoming_s = incoming_s or multipart_s_ctx.get(
-                        (ev.assembler_key, gid))
-                # 4) Построй финалното s
+                # 3) Построй финалното s
                 s_value = choose_s_value(
                     STATION_ID, ev.alias_for_s or incoming_s, ev.raw_line, ev.remote_ip)
                 touch_s(s_value)  # TTL поддръжка за s
@@ -244,11 +264,12 @@ async def forward_loop(queue, routing_state=None):
                         wrapped_line + '\r\n',
                     )
 
-            # 5) Ако това е последната част от групата — чистим кеша
-            if g_info:
-                part, total, gid = g_info
-                if part == total:
-                    multipart_s_ctx.pop((ev.assembler_key, gid), None)
+            # 4) Successful multipart completion consumes its source context.
+            if (
+                outcome.status is AssemblyStatus.COMPLETE
+                and outcome.group_key is not None
+            ):
+                multipart_s_ctx.pop(outcome.group_key, None)
 
 
 async def handle_socket(

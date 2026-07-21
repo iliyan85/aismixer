@@ -71,6 +71,14 @@ class _FakeQueue:
         self.items.append(item)
 
 
+class FakeClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
 def make_event(
     raw_line,
     source_id="udp:192.0.2.10",
@@ -322,12 +330,14 @@ async def run_forward_loop_capture(
     routing_state=None,
     station_id="test_station",
     on_send_to=None,
+    assembler_instance=None,
 ):
     queue, task, fake_forwarder = await start_forward_loop_capture(
         monkeypatch,
         routing_state=routing_state,
         station_id=station_id,
         on_send_to=on_send_to,
+        assembler_instance=assembler_instance,
     )
     try:
         for event in events:
@@ -354,10 +364,13 @@ async def start_forward_loop_capture(
     routing_state=None,
     station_id="test_station",
     on_send_to=None,
+    assembler_instance=None,
 ):
     fake_forwarder = FakeForwarder(on_send_to=on_send_to)
     monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
-    monkeypatch.setattr(aismixer, "assembler", AIVDMAssembler())
+    if assembler_instance is None:
+        assembler_instance = AIVDMAssembler()
+    monkeypatch.setattr(aismixer, "assembler", assembler_instance)
     monkeypatch.setattr(aismixer, "deduplicator", Deduplicator())
     monkeypatch.setattr(aismixer, "STATION_ID", station_id)
     monkeypatch.setattr(aismixer, "DEBUG", False)
@@ -607,7 +620,7 @@ def test_current_behavior_earlier_s_is_reused_when_completion_has_no_s(
     assert first_tag.startswith(f"c:123,s:early,g:1-2-{group_id}*")
 
 
-def test_current_behavior_known_defect_candidate_s_context_leaks_between_groups(
+def test_multipart_s_context_is_isolated_by_assembly_key(
     monkeypatch,
 ):
     assembler_key = "shared-receiver"
@@ -641,15 +654,15 @@ def test_current_behavior_known_defect_candidate_s_context_leaks_between_groups(
     assert group_b_second in messages[1]
     assert group_a_first not in "".join(messages)
 
-    # Known defect candidate: the s context key omits NMEA sequential ID, so
-    # pending group A leaks its source into distinct group B under the same
-    # assembler key and ingress GID. Group A intentionally remains incomplete.
+    # Group A remains pending, but its AssemblyKey includes sequential ID 7 and
+    # cannot supply source metadata to completed group B with sequential ID 8.
     assert leading_tag(messages[0]).startswith(
-        f"c:123,s:stale,g:1-2-{group_id}*"
+        f"c:123,s:192_0_2_10,g:1-2-{group_id}*"
     )
+    assert "s:stale" not in leading_tag(messages[0])
 
 
-def test_current_behavior_known_defect_candidate_out_of_order_completion_leaks_s_context(
+def test_out_of_order_completion_clears_multipart_s_context(
     monkeypatch,
 ):
     assembler_key = "shared-receiver"
@@ -698,15 +711,13 @@ def test_current_behavior_known_defect_candidate_out_of_order_completion_leaks_s
     assert all(group_a_second not in message for message in messages[2:])
     assert "s:stale" in leading_tag(messages[0])
 
-    # Known defect candidate: group A completed successfully when NMEA ordinal
-    # 1 arrived second. Cleanup considered only that completion arrival's TAG g
-    # ordinal, so g.part != g.total left the context alive. Because the context
-    # key also omits the NMEA sequential ID, the surviving source contaminated
-    # logically distinct group B.
-    assert "s:stale" in leading_tag(messages[2])
+    # Group A completed successfully when NMEA ordinal 1 arrived second. Its
+    # source context is consumed by the COMPLETE outcome and cannot affect B.
+    assert "s:stale" not in leading_tag(messages[2])
+    assert ",s:192_0_2_10," in leading_tag(messages[2])
 
 
-def test_current_behavior_known_defect_candidate_conflict_invalidation_leaks_s_context(
+def test_conflict_invalidation_clears_multipart_s_context(
     monkeypatch,
 ):
     assembler_key = "shared-receiver"
@@ -762,11 +773,70 @@ def test_current_behavior_known_defect_candidate_conflict_invalidation_leaks_s_c
     assert fresh_second in messages[1]
     assert conflicting_first not in "".join(messages)
 
-    # Known defect candidate: the conflicting fragment cleared assembler state,
-    # but feed() exposed only None to the forward loop. The external multipart
-    # s context was therefore not cleared, and a fresh group begun afterward
-    # reused stale metadata when it completed out of order.
-    assert "s:stale" in leading_tag(messages[0])
+    # The conflict outcome discards the invalidated generation's source
+    # context before the later out-of-order group begins fresh.
+    assert "s:stale" not in leading_tag(messages[0])
+    assert ",s:192_0_2_10," in leading_tag(messages[0])
+
+
+def test_expired_generation_clears_multipart_s_context_before_fresh_state(
+    monkeypatch,
+):
+    clock = FakeClock()
+    assembler_instance = AIVDMAssembler(timeout=1.0, clock=clock)
+    assembler_key = "shared-receiver"
+    gid = "424242"
+    old_first = make_nmea_sentence("AIVDM,2,1,7,A,11EXPO,0")
+    fresh_first = make_nmea_sentence("AIVDM,2,1,7,A,11EXPN,0")
+    fresh_second = make_nmea_sentence("AIVDM,2,2,7,A,22EXPN,0")
+    old_arrival = f"\\s:stale,g:1-2-{gid}*00\\{old_first}"
+    fresh_second_arrival = f"\\g:2-2-{gid}*00\\{fresh_second}"
+    fresh_completion_arrival = f"\\g:1-2-{gid}*00\\{fresh_first}"
+
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            station_id="",
+            assembler_instance=assembler_instance,
+        )
+        try:
+            await queue.put(
+                make_event(old_arrival, assembler_key=assembler_key)
+            )
+            await asyncio.sleep(0)
+            assert fake_forwarder.messages == []
+
+            clock.now = 1.0
+            await queue.put(
+                make_event(fresh_second_arrival, assembler_key=assembler_key)
+            )
+            await asyncio.sleep(0)
+            assert fake_forwarder.messages == []
+
+            clock.now = 1.1
+            await queue.put(
+                make_event(
+                    fresh_completion_arrival,
+                    assembler_key=assembler_key,
+                )
+            )
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=2,
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert fresh_first in messages[0]
+    assert fresh_second in messages[1]
+    assert old_first not in "".join(messages)
+    assert all("s:stale" not in leading_tag(message) for message in messages)
+    assert ",s:192_0_2_10," in leading_tag(messages[0])
 
 
 def test_forward_loop_legacy_mode_calls_send_not_send_to(monkeypatch):
