@@ -1,10 +1,9 @@
 import time
-from collections import defaultdict
 
 
 class AIVDMAssembler:
     def __init__(self, timeout=1.0):
-        self.fragments = defaultdict(list)
+        self.fragments = {}
         self.timestamps = {}
         self.timeout = timeout  # seconds
 
@@ -23,18 +22,34 @@ class AIVDMAssembler:
         if total < 1 or current < 1 or current > total:
             return None
 
+        if total == 1:
+            return [line]
+
         seq_id = parts[3]
         channel = parts[4]
 
         key = (source_ip, seq_id, channel, total)
 
         now = time.time()
+        timestamp = self.timestamps.get(key)
+        if timestamp is not None and now - timestamp > self.timeout:
+            del self.fragments[key]
+            del self.timestamps[key]
+
+        group = self.fragments.setdefault(key, {})
+        if current in group:
+            if group[current] != line:
+                del self.fragments[key]
+                del self.timestamps[key]
+                self.cleanup_expired(now)
+                return None
+        else:
+            group[current] = line
+
         self.timestamps[key] = now
 
-        self.fragments[key].append((current, line))
-
-        if len(self.fragments[key]) == total:
-            full_lines = [frag[1] for frag in sorted(self.fragments[key])]
+        if all(ordinal in group for ordinal in range(1, total + 1)):
+            full_lines = [group[ordinal] for ordinal in range(1, total + 1)]
             del self.fragments[key]
             del self.timestamps[key]
             return full_lines

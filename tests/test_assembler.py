@@ -62,43 +62,55 @@ def test_feed_assembles_valid_multipart_sentences():
     assert assembler.feed("src", second) == [first, second]
 
 
-def test_current_behavior_orders_out_of_order_fragments_by_ordinal():
+def test_out_of_order_fragments_complete_in_ordinal_order():
     assembler = AIVDMAssembler()
     first = "!AIVDM,2,1,7,A,payload1,0*00"
     second = "!AIVDM,2,2,7,A,payload2,0*00"
 
-    # Characterization only: this ordering is not yet an approved contract.
     assert assembler.feed("src", second) is None
     assert assembler.feed("src", first) == [first, second]
 
 
-def test_current_behavior_known_defect_candidate_repeated_ordinal_completes():
+def test_exact_duplicate_fragment_is_idempotent():
     assembler = AIVDMAssembler()
     first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
 
     assert assembler.feed("src", first) is None
+    assert assembler.feed("src", first) is None
 
-    # Known defect candidate: stored count currently completes the group even
-    # though fragment 2 was never received. This does not approve that policy.
-    assert assembler.feed("src", first) == [first, first]
+    result = assembler.feed("src", second)
+
+    assert result == [first, second]
+    assert result.count(first) == 1
 
 
-def test_current_behavior_known_defect_candidate_conflicting_ordinal_completes():
+def test_conflicting_duplicate_ordinal_invalidates_live_group():
     assembler = AIVDMAssembler()
-    lexically_later_first_arrival = "!AIVDM,2,1,7,A,BBBBBB,0*00"
-    lexically_earlier_second_arrival = "!AIVDM,2,1,7,A,AAAAAA,0*00"
+    first_a = "!AIVDM,2,1,7,A,AAAAAA,0*00"
+    first_b = "!AIVDM,2,1,7,A,BBBBBB,0*00"
+    second = "!AIVDM,2,2,7,A,CCCCCC,0*00"
 
-    assert assembler.feed("src", lexically_later_first_arrival) is None
+    assert assembler.feed("src", first_a) is None
+    assert assembler.feed("src", first_b) is None
+    assert assembler.feed("src", second) is None
 
-    # Known defect candidate: two conflicting ordinal-1 fragments currently
-    # complete the count-based group even though ordinal 2 was never received.
-    # Implementation-specific characterization only: sorting the stored
-    # (ordinal, line) tuples makes equal ordinals sort by sentence text, not
-    # arrival order. Neither behavior is approved as a permanent contract.
-    assert assembler.feed("src", lexically_earlier_second_arrival) == [
-        lexically_earlier_second_arrival,
-        lexically_later_first_arrival,
-    ]
+    result = assembler.feed("src", first_a)
+
+    assert result == [first_a, second]
+    assert first_b not in result
+
+
+def test_completion_requires_every_unique_ordinal():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,3,1,7,A,payload1,0*00"
+    second = "!AIVDM,3,2,7,A,payload2,0*00"
+    third = "!AIVDM,3,3,7,A,payload3,0*00"
+
+    assert assembler.feed("src", first) is None
+    assert assembler.feed("src", first) is None
+    assert assembler.feed("src", third) is None
+    assert assembler.feed("src", second) == [first, second, third]
 
 
 def test_current_behavior_timeout_equality_keeps_group_live(monkeypatch):
@@ -158,20 +170,26 @@ def test_current_behavior_accepted_fragment_refreshes_timeout_window(monkeypatch
     assert assembler.feed("source-a", third) == [first, second, third]
 
 
-def test_current_behavior_known_defect_candidate_stale_group_revives(monkeypatch):
+def test_fragment_after_timeout_starts_fresh_out_of_order_group(monkeypatch):
     clock = FakeClock()
     monkeypatch.setattr(assembler_module.time, "time", clock)
     assembler = AIVDMAssembler(timeout=1.0)
-    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    old_first = "!AIVDM,2,1,7,A,OLD,0*00"
+    new_first = "!AIVDM,2,1,7,A,NEW,0*00"
     second = "!AIVDM,2,2,7,A,payload2,0*00"
 
-    assert assembler.feed("source-a", first) is None
+    assert assembler.feed("source-a", old_first) is None
 
     clock.now = 10.0
 
-    # Known defect candidate: feed refreshes and appends to the stale current
-    # key before cleanup, so the old group completes after its nominal timeout.
-    assert assembler.feed("source-a", second) == [first, second]
+    assert assembler.feed("source-a", second) is None
+
+    clock.now = 10.1
+
+    result = assembler.feed("source-a", new_first)
+
+    assert result == [new_first, second]
+    assert old_first not in result
 
 
 def test_feed_groups_multipart_by_same_source_seq_channel_and_total():
