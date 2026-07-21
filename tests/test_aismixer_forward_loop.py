@@ -649,6 +649,126 @@ def test_current_behavior_known_defect_candidate_s_context_leaks_between_groups(
     )
 
 
+def test_current_behavior_known_defect_candidate_out_of_order_completion_leaks_s_context(
+    monkeypatch,
+):
+    assembler_key = "shared-receiver"
+    gid = "424242"
+    group_a_first = make_nmea_sentence("AIVDM,2,1,7,A,11OODA,0")
+    group_a_second = make_nmea_sentence("AIVDM,2,2,7,A,22OODA,0")
+    group_b_first = make_nmea_sentence("AIVDM,2,1,8,A,11OODB,0")
+    group_b_second = make_nmea_sentence("AIVDM,2,2,8,A,22OODB,0")
+    events = [
+        make_event(
+            f"\\s:stale,g:2-2-{gid}*00\\{group_a_second}",
+            assembler_key=assembler_key,
+        ),
+        make_event(
+            f"\\g:1-2-{gid}*00\\{group_a_first}",
+            assembler_key=assembler_key,
+        ),
+        make_event(
+            f"\\g:1-2-{gid}*00\\{group_b_first}",
+            assembler_key=assembler_key,
+        ),
+        make_event(
+            f"\\g:2-2-{gid}*00\\{group_b_second}",
+            assembler_key=assembler_key,
+        ),
+    ]
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            events,
+            expected_broadcast_sends=4,
+            station_id="",
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 4
+    assert group_a_first in messages[0]
+    assert group_a_second in messages[1]
+    assert group_b_first in messages[2]
+    assert group_b_second in messages[3]
+    assert all(group_b_first not in message for message in messages[:2])
+    assert all(group_b_second not in message for message in messages[:2])
+    assert all(group_a_first not in message for message in messages[2:])
+    assert all(group_a_second not in message for message in messages[2:])
+    assert "s:stale" in leading_tag(messages[0])
+
+    # Known defect candidate: group A completed successfully when NMEA ordinal
+    # 1 arrived second. Cleanup considered only that completion arrival's TAG g
+    # ordinal, so g.part != g.total left the context alive. Because the context
+    # key also omits the NMEA sequential ID, the surviving source contaminated
+    # logically distinct group B.
+    assert "s:stale" in leading_tag(messages[2])
+
+
+def test_current_behavior_known_defect_candidate_conflict_invalidation_leaks_s_context(
+    monkeypatch,
+):
+    assembler_key = "shared-receiver"
+    gid = "424242"
+    fresh_first = make_nmea_sentence("AIVDM,2,1,7,A,11CONA,0")
+    conflicting_first = make_nmea_sentence("AIVDM,2,1,7,A,11CONB,0")
+    fresh_second = make_nmea_sentence("AIVDM,2,2,7,A,22CONF,0")
+    stale_arrival = f"\\s:stale,g:1-2-{gid}*00\\{fresh_first}"
+    conflict_arrival = f"\\g:1-2-{gid}*00\\{conflicting_first}"
+    fresh_second_arrival = f"\\g:2-2-{gid}*00\\{fresh_second}"
+    fresh_completion_arrival = f"\\g:1-2-{gid}*00\\{fresh_first}"
+
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            station_id="",
+        )
+        try:
+            await queue.put(
+                make_event(stale_arrival, assembler_key=assembler_key)
+            )
+            await queue.put(
+                make_event(conflict_arrival, assembler_key=assembler_key)
+            )
+            await asyncio.sleep(0)
+            assert fake_forwarder.messages == []
+
+            await queue.put(
+                make_event(fresh_second_arrival, assembler_key=assembler_key)
+            )
+            await asyncio.sleep(0)
+            assert fake_forwarder.messages == []
+
+            await queue.put(
+                make_event(
+                    fresh_completion_arrival,
+                    assembler_key=assembler_key,
+                )
+            )
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=2,
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert fresh_first in messages[0]
+    assert fresh_second in messages[1]
+    assert conflicting_first not in "".join(messages)
+
+    # Known defect candidate: the conflicting fragment cleared assembler state,
+    # but feed() exposed only None to the forward loop. The external multipart
+    # s context was therefore not cleared, and a fresh group begun afterward
+    # reused stale metadata when it completed out of order.
+    assert "s:stale" in leading_tag(messages[0])
+
+
 def test_forward_loop_legacy_mode_calls_send_not_send_to(monkeypatch):
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
