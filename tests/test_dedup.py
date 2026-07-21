@@ -147,3 +147,38 @@ def test_two_different_messages_in_same_scope_are_independent(monkeypatch):
     assert deduplicator.is_unique("message two", scope="udp:aishub")
     assert not deduplicator.is_unique("message one", scope="udp:aishub")
     assert not deduplicator.is_unique("message two", scope="udp:aishub")
+
+
+def test_exact_tuple_key_is_suppressed_within_ttl(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(dedup, "time", clock)
+    deduplicator = Deduplicator(ttl=30)
+    group_key = ("part one", "part two")
+
+    assert deduplicator.is_unique(group_key)
+    assert not deduplicator.is_unique(group_key)
+
+
+def test_tuple_keys_differing_in_one_fragment_are_distinct(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(dedup, "time", clock)
+    deduplicator = Deduplicator(ttl=30)
+    first_group = ("shared part one", "old part two")
+    changed_group = ("shared part one", "new part two")
+
+    assert deduplicator.is_unique(first_group)
+    assert deduplicator.is_unique(changed_group)
+    assert not deduplicator.is_unique(first_group)
+    assert not deduplicator.is_unique(changed_group)
+
+
+def test_same_tuple_key_is_independent_across_target_scopes(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(dedup, "time", clock)
+    deduplicator = Deduplicator(ttl=30)
+    group_key = ("part one", "part two")
+
+    assert deduplicator.is_unique(group_key, scope="udp:first")
+    assert not deduplicator.is_unique(group_key, scope="udp:first")
+    assert deduplicator.is_unique(group_key, scope="udp:second")
+    assert not deduplicator.is_unique(group_key, scope="udp:second")

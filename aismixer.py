@@ -200,19 +200,19 @@ async def forward_loop(queue, routing_state=None):
             total_parts = len(multipart)
             tag_single = (total_parts == 1 and G_ALWAYS_TAG_SINGLE)
 
-            for i, full_line in enumerate(multipart):
-                eligible_target_ids = None
-                if event_routing_table is None:
-                    if not deduplicator.is_unique(full_line):
-                        continue
-                else:
-                    eligible_target_ids = tuple(
-                        target_id
-                        for target_id in route_target_ids
-                        if deduplicator.is_unique(full_line, scope=target_id)
-                    )
-                    if not eligible_target_ids:
-                        continue
+            logical_key = multipart[0] if total_parts == 1 else tuple(multipart)
+            eligible_target_ids = None
+            if event_routing_table is None:
+                emit_group = deduplicator.is_unique(logical_key)
+            else:
+                eligible_target_ids = tuple(
+                    target_id
+                    for target_id in route_target_ids
+                    if deduplicator.is_unique(logical_key, scope=target_id)
+                )
+                emit_group = bool(eligible_target_ids)
+
+            for i, full_line in enumerate(multipart if emit_group else ()):
                 is_first = i == 0
                 # 3) Определи incoming_s
                 incoming_s = tag_pairs.get('s')
