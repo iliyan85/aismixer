@@ -2,10 +2,11 @@ import time
 
 
 class AIVDMAssembler:
-    def __init__(self, timeout=1.0):
+    def __init__(self, timeout=1.0, clock=None):
         self.fragments = {}
         self.timestamps = {}
         self.timeout = timeout  # seconds
+        self._clock = time.monotonic if clock is None else clock
 
     def feed(self, source_ip, line):
         parts = line.split(',')
@@ -30,22 +31,24 @@ class AIVDMAssembler:
 
         key = (source_ip, seq_id, channel, total)
 
-        now = time.time()
+        now = self._clock()
         timestamp = self.timestamps.get(key)
-        if timestamp is not None and now - timestamp > self.timeout:
+        if timestamp is not None and now - timestamp >= self.timeout:
             del self.fragments[key]
             del self.timestamps[key]
 
         group = self.fragments.setdefault(key, {})
         if current in group:
-            if group[current] != line:
-                del self.fragments[key]
-                del self.timestamps[key]
+            if group[current] == line:
                 self.cleanup_expired(now)
                 return None
-        else:
-            group[current] = line
 
+            del self.fragments[key]
+            del self.timestamps[key]
+            self.cleanup_expired(now)
+            return None
+
+        group[current] = line
         self.timestamps[key] = now
 
         if all(ordinal in group for ordinal in range(1, total + 1)):
@@ -57,9 +60,16 @@ class AIVDMAssembler:
         self.cleanup_expired(now)
         return None
 
-    def cleanup_expired(self, now):
+    def cleanup_expired(self, now=None):
+        if now is None:
+            now = self._clock()
+
         expired_keys = [k for k, t in self.timestamps.items()
-                        if now - t > self.timeout]
+                        if now - t >= self.timeout]
         for key in expired_keys:
             del self.fragments[key]
             del self.timestamps[key]
+
+    def reset(self):
+        self.fragments.clear()
+        self.timestamps.clear()

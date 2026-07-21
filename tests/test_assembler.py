@@ -10,6 +10,21 @@ class FakeClock:
         return self.now
 
 
+def test_default_clock_uses_time_monotonic(monkeypatch):
+    calls = []
+
+    def fake_monotonic():
+        calls.append(True)
+        return 123.0
+
+    monkeypatch.setattr(assembler_module.time, "monotonic", fake_monotonic)
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+
+    assert assembler.feed("src", first) is None
+    assert calls
+
+
 def test_feed_returns_none_for_non_numeric_total():
     assembler = AIVDMAssembler()
 
@@ -113,10 +128,43 @@ def test_completion_requires_every_unique_ordinal():
     assert assembler.feed("src", second) == [first, second, third]
 
 
-def test_current_behavior_timeout_equality_keeps_group_live(monkeypatch):
+def test_group_expires_exactly_at_timeout():
     clock = FakeClock()
-    monkeypatch.setattr(assembler_module.time, "time", clock)
-    assembler = AIVDMAssembler(timeout=1.0)
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    old_first = "!AIVDM,2,1,7,A,OLD,0*00"
+    new_first = "!AIVDM,2,1,7,A,NEW,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+
+    assert assembler.feed("source-a", old_first) is None
+
+    clock.now = 1.0
+
+    assert assembler.feed("source-a", second) is None
+
+    clock.now = 1.1
+
+    result = assembler.feed("source-a", new_first)
+
+    assert result == [new_first, second]
+    assert old_first not in result
+
+
+def test_group_remains_live_immediately_before_timeout():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+
+    assert assembler.feed("source-a", first) is None
+
+    clock.now = 0.999
+
+    assert assembler.feed("source-a", second) == [first, second]
+
+
+def test_unrelated_cleanup_expires_group_at_timeout_boundary():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
     first = "!AIVDM,2,1,7,A,payload1,0*00"
     second = "!AIVDM,2,2,7,A,payload2,0*00"
     unrelated = "!AIVDM,2,1,8,A,unrelated1,0*00"
@@ -125,37 +173,32 @@ def test_current_behavior_timeout_equality_keeps_group_live(monkeypatch):
 
     clock.now = 1.0
 
-    # Characterization only: strict equality is not yet an approved contract.
     assert assembler.feed("source-b", unrelated) is None
-    assert assembler.feed("source-a", second) == [first, second]
+    assert assembler.feed("source-a", second) is None
+    assert assembler.feed("source-a", first) == [first, second]
 
 
-def test_current_behavior_unrelated_cleanup_expires_group_after_timeout(
-    monkeypatch,
-):
+def test_cleanup_expired_uses_injected_clock_at_timeout_boundary():
     clock = FakeClock()
-    monkeypatch.setattr(assembler_module.time, "time", clock)
-    assembler = AIVDMAssembler(timeout=1.0)
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
     first = "!AIVDM,2,1,7,A,payload1,0*00"
     second = "!AIVDM,2,2,7,A,payload2,0*00"
-    unrelated = "!AIVDM,2,1,8,A,unrelated1,0*00"
 
     assert assembler.feed("source-a", first) is None
 
-    clock.now = 1.001
+    clock.now = 1.0
 
-    assert assembler.feed("source-b", unrelated) is None
+    assert assembler.cleanup_expired() is None
     assert assembler.feed("source-a", second) is None
+    assert assembler.feed("source-a", first) == [first, second]
 
 
-def test_current_behavior_accepted_fragment_refreshes_timeout_window(monkeypatch):
+def test_unique_fragment_refreshes_timeout_window():
     clock = FakeClock()
-    monkeypatch.setattr(assembler_module.time, "time", clock)
-    assembler = AIVDMAssembler(timeout=1.0)
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
     first = "!AIVDM,3,1,7,A,payload1,0*00"
     second = "!AIVDM,3,2,7,A,payload2,0*00"
     third = "!AIVDM,3,3,7,A,payload3,0*00"
-    unrelated = "!AIVDM,2,1,8,A,unrelated1,0*00"
 
     assert assembler.feed("source-a", first) is None
 
@@ -165,15 +208,37 @@ def test_current_behavior_accepted_fragment_refreshes_timeout_window(monkeypatch
 
     clock.now = 1.5
 
-    # Characterization only: sliding refresh is not yet an approved contract.
-    assert assembler.feed("source-b", unrelated) is None
     assert assembler.feed("source-a", third) == [first, second, third]
 
 
-def test_fragment_after_timeout_starts_fresh_out_of_order_group(monkeypatch):
+def test_exact_duplicate_does_not_refresh_timeout_window():
     clock = FakeClock()
-    monkeypatch.setattr(assembler_module.time, "time", clock)
-    assembler = AIVDMAssembler(timeout=1.0)
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    old_first = "!AIVDM,2,1,7,A,OLD,0*00"
+    new_first = "!AIVDM,2,1,7,A,NEW,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+
+    assert assembler.feed("source-a", old_first) is None
+
+    clock.now = 0.75
+
+    assert assembler.feed("source-a", old_first) is None
+
+    clock.now = 1.0
+
+    assert assembler.feed("source-a", second) is None
+
+    clock.now = 1.1
+
+    result = assembler.feed("source-a", new_first)
+
+    assert result == [new_first, second]
+    assert old_first not in result
+
+
+def test_fragment_after_timeout_starts_fresh_out_of_order_group():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
     old_first = "!AIVDM,2,1,7,A,OLD,0*00"
     new_first = "!AIVDM,2,1,7,A,NEW,0*00"
     second = "!AIVDM,2,2,7,A,payload2,0*00"
@@ -190,6 +255,37 @@ def test_fragment_after_timeout_starts_fresh_out_of_order_group(monkeypatch):
 
     assert result == [new_first, second]
     assert old_first not in result
+
+
+def test_reset_clears_all_pending_groups():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    first_a = "!AIVDM,2,1,7,A,group-a-1,0*00"
+    second_a = "!AIVDM,2,2,7,A,group-a-2,0*00"
+    first_b = "!AIVDM,2,1,8,A,group-b-1,0*00"
+    second_b = "!AIVDM,2,2,8,A,group-b-2,0*00"
+
+    assert assembler.feed("source-a", first_a) is None
+    assert assembler.feed("source-b", first_b) is None
+
+    assert assembler.reset() is None
+
+    assert assembler.feed("source-a", second_a) is None
+    assert assembler.feed("source-b", second_b) is None
+    assert assembler.feed("source-a", first_a) == [first_a, second_a]
+    assert assembler.feed("source-b", first_b) == [first_b, second_b]
+
+
+def test_reset_is_safe_when_empty():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+
+    assert assembler.reset() is None
+    assert assembler.reset() is None
+    assert assembler.feed("src", first) is None
+    assert assembler.feed("src", second) == [first, second]
 
 
 def test_feed_groups_multipart_by_same_source_seq_channel_and_total():
