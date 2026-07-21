@@ -1,5 +1,9 @@
+from dataclasses import FrozenInstanceError
+
+import pytest
+
 import assembler as assembler_module
-from assembler import AIVDMAssembler
+from assembler import AIVDMAssembler, AssemblyOutcome, AssemblyStatus
 
 
 class FakeClock:
@@ -8,6 +12,183 @@ class FakeClock:
 
     def __call__(self):
         return self.now
+
+
+def test_feed_outcome_reports_invalid_input():
+    outcome = AIVDMAssembler().feed_outcome("src", "not an NMEA sentence")
+
+    assert outcome.status is AssemblyStatus.INVALID
+    assert outcome.group_key is None
+    assert outcome.sentences == ()
+    assert outcome.discarded_keys == ()
+
+
+def test_feed_outcome_reports_single_sentence():
+    assembler = AIVDMAssembler()
+    sentence = "!AIVDM,1,1,,A,payload,0*00"
+
+    outcome = assembler.feed_outcome("src", sentence)
+
+    assert outcome.status is AssemblyStatus.SINGLE
+    assert outcome.group_key is None
+    assert outcome.sentences == (sentence,)
+    assert outcome.discarded_keys == ()
+
+
+def test_feed_outcome_reports_pending_then_complete():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+    key = ("src", "7", "A", 2)
+
+    pending = assembler.feed_outcome("src", first)
+    complete = assembler.feed_outcome("src", second)
+
+    assert pending.status is AssemblyStatus.PENDING
+    assert pending.group_key == key
+    assert pending.sentences == ()
+    assert pending.discarded_keys == ()
+    assert complete.status is AssemblyStatus.COMPLETE
+    assert complete.group_key == key
+    assert complete.sentences == (first, second)
+    assert complete.discarded_keys == ()
+
+
+def test_feed_outcome_preserves_out_of_order_completion():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+    key = ("src", "7", "A", 2)
+
+    pending = assembler.feed_outcome("src", second)
+    complete = assembler.feed_outcome("src", first)
+
+    assert pending.status is AssemblyStatus.PENDING
+    assert pending.group_key == key
+    assert complete.status is AssemblyStatus.COMPLETE
+    assert complete.group_key == key
+    assert complete.sentences == (first, second)
+    assert complete.discarded_keys == ()
+
+
+def test_feed_outcome_reports_exact_duplicate():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+    key = ("src", "7", "A", 2)
+
+    pending = assembler.feed_outcome("src", first)
+    duplicate = assembler.feed_outcome("src", first)
+    complete = assembler.feed_outcome("src", second)
+
+    assert pending.status is AssemblyStatus.PENDING
+    assert duplicate.status is AssemblyStatus.DUPLICATE
+    assert duplicate.group_key == key
+    assert duplicate.sentences == ()
+    assert duplicate.discarded_keys == ()
+    assert complete.status is AssemblyStatus.COMPLETE
+    assert complete.sentences == (first, second)
+
+
+def test_feed_outcome_reports_conflict_and_discarded_key():
+    assembler = AIVDMAssembler()
+    first_a = "!AIVDM,2,1,7,A,AAAAAA,0*00"
+    first_b = "!AIVDM,2,1,7,A,BBBBBB,0*00"
+    second = "!AIVDM,2,2,7,A,CCCCCC,0*00"
+    key = ("src", "7", "A", 2)
+
+    pending = assembler.feed_outcome("src", first_a)
+    conflict = assembler.feed_outcome("src", first_b)
+
+    assert pending.status is AssemblyStatus.PENDING
+    assert conflict.status is AssemblyStatus.CONFLICT
+    assert conflict.group_key == key
+    assert conflict.sentences == ()
+    assert conflict.discarded_keys == (key,)
+
+    fresh_pending = assembler.feed_outcome("src", second)
+    complete = assembler.feed_outcome("src", first_a)
+
+    assert fresh_pending.status is AssemblyStatus.PENDING
+    assert complete.status is AssemblyStatus.COMPLETE
+    assert complete.sentences == (first_a, second)
+
+
+def test_feed_outcome_reports_expired_generation_before_fresh_state():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    old_first = "!AIVDM,2,1,7,A,OLD,0*00"
+    fresh_first = "!AIVDM,2,1,7,A,FRESH,0*00"
+    fresh_second = "!AIVDM,2,2,7,A,payload2,0*00"
+    key = ("src", "7", "A", 2)
+
+    old_pending = assembler.feed_outcome("src", old_first)
+    clock.now = 1.0
+    fresh_pending = assembler.feed_outcome("src", fresh_second)
+
+    assert old_pending.status is AssemblyStatus.PENDING
+    assert fresh_pending.status is AssemblyStatus.PENDING
+    assert fresh_pending.group_key == key
+    assert fresh_pending.sentences == ()
+    assert fresh_pending.discarded_keys == (key,)
+
+    complete = assembler.feed_outcome("src", fresh_first)
+
+    assert complete.status is AssemblyStatus.COMPLETE
+    assert complete.sentences == (fresh_first, fresh_second)
+    assert old_first not in complete.sentences
+
+
+def test_feed_outcome_reports_unrelated_expired_keys():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    source_b_first = "!AIVDM,2,1,2,B,source-b,0*00"
+    source_a_first = "!AIVDM,2,1,1,A,source-a,0*00"
+    source_c_first = "!AIVDM,2,1,3,A,source-c,0*00"
+    key_a = ("source-a", "1", "A", 2)
+    key_b = ("source-b", "2", "B", 2)
+    key_c = ("source-c", "3", "A", 2)
+
+    assert (
+        assembler.feed_outcome("source-b", source_b_first).status
+        is AssemblyStatus.PENDING
+    )
+    assert (
+        assembler.feed_outcome("source-a", source_a_first).status
+        is AssemblyStatus.PENDING
+    )
+
+    clock.now = 1.0
+    outcome = assembler.feed_outcome("source-c", source_c_first)
+
+    assert outcome.status is AssemblyStatus.PENDING
+    assert outcome.group_key == key_c
+    assert outcome.sentences == ()
+    assert outcome.discarded_keys == (key_a, key_b)
+
+
+def test_feed_remains_compatible_with_structured_outcomes():
+    assembler = AIVDMAssembler()
+    first = "!AIVDM,2,1,7,A,payload1,0*00"
+    second = "!AIVDM,2,2,7,A,payload2,0*00"
+
+    assert assembler.feed("src", first) is None
+
+    complete = assembler.feed("src", second)
+
+    assert complete == [first, second]
+    assert isinstance(complete, list)
+    assert not isinstance(complete, AssemblyOutcome)
+
+
+def test_assembly_outcome_is_immutable():
+    outcome = AIVDMAssembler().feed_outcome(
+        "src",
+        "!AIVDM,2,1,7,A,payload1,0*00",
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        outcome.status = AssemblyStatus.COMPLETE
 
 
 def test_default_clock_uses_time_monotonic(monkeypatch):
