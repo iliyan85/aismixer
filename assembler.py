@@ -2,6 +2,15 @@ import time
 
 
 class AIVDMAssembler:
+    """Correlate multipart NMEA sentences within a bounded TTL window.
+
+    Groups are keyed by source identity, sequential message ID, channel, and
+    declared total. Fragments may arrive out of order and complete only after
+    every unique ordinal is present. Blank sequential IDs are supported but
+    weaken correlation identity: complete ordinal coverage within the TTL does
+    not prove that all fragments share a common transmission origin.
+    """
+
     def __init__(self, timeout=1.0, clock=None):
         self.fragments = {}
         self.timestamps = {}

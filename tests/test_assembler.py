@@ -86,19 +86,18 @@ def test_out_of_order_fragments_complete_in_ordinal_order():
     assert assembler.feed("src", first) == [first, second]
 
 
-def test_current_behavior_blank_seq_id_supports_out_of_order_assembly():
+def test_blank_seq_id_supports_out_of_order_assembly():
     assembler = AIVDMAssembler(clock=FakeClock())
     first = "!AIVDM,2,1,,A,SINGLE_MESSAGE_PART_1,0*00"
     second = "!AIVDM,2,2,,A,SINGLE_MESSAGE_PART_2,0*00"
 
-    # Characterization only: one coherent blank-ID message currently retains
-    # out-of-order compatibility. This does not decide how ambiguous
-    # concurrent blank-ID groups should be handled.
+    # Approved compatibility behavior: a coherent blank-ID message may start
+    # with any valid ordinal and still complete in ordinal order.
     assert assembler.feed("src", second) is None
     assert assembler.feed("src", first) == [first, second]
 
 
-def test_current_behavior_known_risk_blank_seq_fragments_can_synthesize_group():
+def test_blank_seq_id_can_ambiguously_combine_distinct_messages():
     assembler = AIVDMAssembler(clock=FakeClock())
     message_a = (
         "!AIVDM,2,1,,A,MESSAGE_A_PART_1,0*00",
@@ -111,15 +110,38 @@ def test_current_behavior_known_risk_blank_seq_fragments_can_synthesize_group():
 
     assert assembler.feed("src", message_a[0]) is None
 
-    # Known ambiguity and defect candidate: A1 plus B2 provides complete
-    # ordinal coverage without a duplicate-ordinal conflict, so insufficient
-    # blank-ID multipart identity synthesizes a group. TTL and unique-ordinal
-    # integrity cannot prove that these fragments share a transmission. This
-    # characterization does not select a permanent blank-ID policy.
+    # Documented compatibility limitation: A1 plus B2 forms a synthetic
+    # logical combination, not proof of common transmission origin. There is
+    # no duplicate-ordinal conflict, and the available NMEA identity cannot
+    # distinguish the cases without rejecting valid blank-ID traffic or valid
+    # out-of-order fragments. Future native implementations must preserve this
+    # reference behavior unless the public contract is deliberately revised.
     assert assembler.feed("src", message_b[1]) == [
         message_a[0],
         message_b[1],
     ]
+
+
+def test_blank_seq_id_does_not_correlate_with_expired_state():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    old_a1 = "!AIVDM,2,1,,A,OLD_A1,0*00"
+    new_b1 = "!AIVDM,2,1,,A,NEW_B1,0*00"
+    new_b2 = "!AIVDM,2,2,,A,NEW_B2,0*00"
+
+    assert assembler.feed("src", old_a1) is None
+
+    clock.now = 1.0
+
+    assert assembler.feed("src", new_b2) is None
+
+    clock.now = 1.1
+
+    result = assembler.feed("src", new_b1)
+
+    # TTL bounds the ambiguity window; it does not prove fresh common origin.
+    assert result == [new_b1, new_b2]
+    assert old_a1 not in result
 
 
 def test_exact_duplicate_fragment_is_idempotent():
