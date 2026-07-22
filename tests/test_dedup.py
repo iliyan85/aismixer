@@ -104,10 +104,15 @@ def test_rejected_duplicate_does_not_refresh_ttl():
     deduplicator = Deduplicator(ttl=30, clock=clock)
 
     assert deduplicator.is_unique("message", scope="udp:aishub")
+    cache_key = next(iter(deduplicator.cache))
+    original_entry = deduplicator.cache[cache_key]
+    expiry_count = len(deduplicator._expiry_index)
 
     clock.advance(20)
 
     assert not deduplicator.is_unique("message", scope="udp:aishub")
+    assert deduplicator.cache[cache_key] is original_entry
+    assert len(deduplicator._expiry_index) == expiry_count
 
     clock.advance(10)
 
@@ -153,6 +158,62 @@ def test_cleanup_expired_accepts_explicit_now():
     assert deduplicator.cleanup_expired(now=1030.0) is None
     assert clock.calls == calls_before_cleanup
     assert deduplicator.is_unique("message")
+
+
+def test_cleanup_removes_only_expired_prefix():
+    clock = FakeClock()
+    deduplicator = Deduplicator(ttl=30, clock=clock)
+
+    assert deduplicator.is_unique("first")
+    first_key = next(iter(deduplicator.cache))
+
+    clock.advance(10)
+    assert deduplicator.is_unique("second")
+    second_key = next(
+        key for key in deduplicator.cache if key != first_key
+    )
+
+    clock.advance(10)
+    assert deduplicator.is_unique("third")
+    third_key = next(
+        key
+        for key in deduplicator.cache
+        if key not in (first_key, second_key)
+    )
+
+    clock.advance(10)
+    assert deduplicator.cleanup_expired() is None
+    assert first_key not in deduplicator.cache
+    assert second_key in deduplicator.cache
+    assert third_key in deduplicator.cache
+    assert len(deduplicator._expiry_index) == 2
+
+    clock.advance(10)
+    assert deduplicator.cleanup_expired() is None
+    assert second_key not in deduplicator.cache
+    assert third_key in deduplicator.cache
+    assert len(deduplicator._expiry_index) == 1
+
+
+def test_stale_expiry_record_cannot_remove_newer_incarnation():
+    clock = FakeClock()
+    deduplicator = Deduplicator(ttl=30, clock=clock)
+
+    assert deduplicator.is_unique("message")
+    cache_key = next(iter(deduplicator.cache))
+    old_entry = deduplicator.cache.pop(cache_key)
+
+    clock.advance(10)
+    assert deduplicator.is_unique("message")
+    new_entry = deduplicator.cache[cache_key]
+    assert new_entry is not old_entry
+    assert len(deduplicator._expiry_index) == 2
+
+    clock.advance(20)
+    assert deduplicator.cleanup_expired() is None
+    assert deduplicator.cache[cache_key] is new_entry
+    assert len(deduplicator._expiry_index) == 1
+    assert not deduplicator.is_unique("message")
 
 
 def test_opaque_transport_agnostic_scope_strings_are_accepted():
@@ -224,8 +285,12 @@ def test_reset_clears_global_scoped_string_and_tuple_entries():
     assert not deduplicator.is_unique(global_key)
     assert not deduplicator.is_unique(scoped_key, scope="udp:first")
     assert not deduplicator.is_unique(group_key, scope="udp:second")
+    assert len(deduplicator.cache) == 3
+    assert len(deduplicator._expiry_index) == 3
 
     assert deduplicator.reset() is None
+    assert deduplicator.cache == {}
+    assert not deduplicator._expiry_index
 
     assert deduplicator.is_unique(global_key)
     assert deduplicator.is_unique(scoped_key, scope="udp:first")
