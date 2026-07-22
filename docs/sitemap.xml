@@ -5,6 +5,7 @@
     <loc>https://aismixer.net/</loc>
     <xhtml:link rel="alternate" hreflang="en" href="https://aismixer.net/"/>
     <xhtml:link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/"/>
+    <xhtml:link rel="alternate" hreflang="ro" href="https://aismixer.net/ro/"/>
     <xhtml:link rel="alternate" hreflang="x-default" href="https://aismixer.net/"/>
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
@@ -13,6 +14,16 @@
     <loc>https://aismixer.net/bg/</loc>
     <xhtml:link rel="alternate" hreflang="en" href="https://aismixer.net/"/>
     <xhtml:link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/"/>
+    <xhtml:link rel="alternate" hreflang="ro" href="https://aismixer.net/ro/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://aismixer.net/"/>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://aismixer.net/ro/</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://aismixer.net/"/>
+    <xhtml:link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/"/>
+    <xhtml:link rel="alternate" hreflang="ro" href="https://aismixer.net/ro/"/>
     <xhtml:link rel="alternate" hreflang="x-default" href="https://aismixer.net/"/>
     <changefreq>weekly</changefreq>
     <priority>0.8</priority>

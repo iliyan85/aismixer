@@ -24,6 +24,7 @@
   <meta property="og:image:alt" content="Преглед на платформата AISMixer за обработка и маршрутизиране на AIS потоци">
   <meta property="og:locale" content="bg_BG">
   <meta property="og:locale:alternate" content="en_US">
+  <meta property="og:locale:alternate" content="ro_RO">
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
@@ -33,6 +34,7 @@
 
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
   <link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/">
+  <link rel="alternate" hreflang="ro" href="https://aismixer.net/ro/">
   <link rel="alternate" hreflang="x-default" href="https://aismixer.net/">
   <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
   <link rel="icon" href="/assets/img/favicon-32.png" sizes="32x32" type="image/png">
@@ -79,7 +81,20 @@
         <span class="chip">AIS stream platform</span>
       </a>
       <div class="toggles">
-        <a class="btn" href="/" lang="en" hreflang="en">English</a>
+        <nav class="language-switcher" aria-label="Език">
+          <a class="language-link" href="/" lang="en" hreflang="en">
+            <img class="language-flag" src="/assets/img/flags/eu.svg" alt="" aria-hidden="true">
+            <span>English</span>
+          </a>
+          <a class="language-link is-current" href="/bg/" lang="bg" hreflang="bg" aria-current="page">
+            <img class="language-flag" src="/assets/img/flags/bg.svg" alt="" aria-hidden="true">
+            <span>Български</span>
+          </a>
+          <a class="language-link" href="/ro/" lang="ro" hreflang="ro">
+            <img class="language-flag" src="/assets/img/flags/ro.svg" alt="" aria-hidden="true">
+            <span>Română</span>
+          </a>
+        </nav>
         <a class="btn" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
       </div>
@@ -136,23 +151,48 @@
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
           <h3>Multipart сглобяване</h3>
-          <p>Сглобява multipart съобщения чрез NMEA полетата за фрагменти и стабилна ingress идентичност за сглобяването.</p>
+          <p>Фрагментите могат да пристигат в напълно произволен ред; завършените групи се извеждат по ред на позициите. Точно повторение не променя състоянието, а различно съдържание на заета позиция обезсилва текущата група.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔁</div>
           <h3>Дедупликация в почти реално време</h3>
-          <p>Потиска повторените логически AIS съобщения глобално в broadcast режим или поотделно за всяка цел при логическа маршрутизация.</p>
+          <p>Взема едно решение за дедупликация за всяка завършена multipart група, така че всички нейни фрагменти се потискат или изпращат заедно; използва глобален обхват в broadcast режим и обхват по цели при маршрутизация.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🏷️</div>
           <h3>Контролирани TAG метаданни</h3>
-          <p>Чете и записва NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span> и <span class="kbd">g</span>, без да смесва метаданните с идентичността за маршрутизация.</p>
+          <p>Избира NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span> и <span class="kbd">g</span> детерминирано през жизнения цикъл на multipart групата и държи метаданните отделени от идентичността за маршрутизация.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">📤</div>
           <h3>Избрано препращане</h3>
-          <p>Препраща логическия поток към всички конфигурирани изходи или само към именуваните UDP egress цели, избрани от маршрутизацията.</p>
+          <p>Игнорира ненизовите входни данни преди маршрутизация и извличане. Всяко прието низово събитие използва едно неизменяемо моментно състояние на маршрутизацията, след което се препраща към всички изходи в broadcast режим или към избраните именувани UDP egress цели.</p>
         </article>
+      </div>
+    </section>
+
+    <section id="processing-contract" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Проверено референтно поведение</p>
+        <h2>Детерминиран договор за обработка</h2>
+        <p class="section-intro">Python реализацията е тестваният еталон за приемането на входни събития, сглобяването, метаданните, дедупликацията, маршрутизацията и препращането. Всяка бъдеща нативна реализация ще се проверява спрямо същите наблюдаеми резултати.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <h3>Ingress граница</h3>
+          <p>До обработка се допускат само низови входни данни. Данните от друг тип се игнорират преди маршрутизация и извличане, а всяко прието низово събитие използва едно неизменяемо моментно състояние на маршрутизацията.</p>
+        </article>
+        <article class="card">
+          <h3>Multipart lifecycle</h3>
+          <p>Фрагментите могат да пристигат в напълно произволен ред. Точно повторение на вече заета позиция не променя състоянието; различно съдържание на същата позиция обезсилва текущата група.</p>
+        </article>
+        <article class="card">
+          <h3>Метаданни и маршрутизация</h3>
+          <p>Изборът на TAG <span class="kbd">s</span>, <span class="kbd">c</span> и <span class="kbd">g</span> следва детерминирани правила, обвързани с жизнения цикъл. Дедупликацията на multipart съобщение е атомарна за цялата подредена група.</p>
+        </article>
+      </div>
+      <div class="callout">
+        <p><strong>Нужни са точните правила за граничните случаи?</strong> <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">Прочетете договора за поведение</a>.</p>
       </div>
     </section>
 
@@ -360,6 +400,7 @@
         <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Основно хранилище</a>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a href="https://github.com/iliyan85/aismixer/wiki/Quick-Start" target="_blank" rel="noopener">Quick Start</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">Договор за поведението</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">Ръководство за nmea_sproxy</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Политика за сигурност</a>

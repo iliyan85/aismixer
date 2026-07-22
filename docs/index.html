@@ -24,6 +24,7 @@
   <meta property="og:image:alt" content="AISMixer AIS stream processing and routing platform overview">
   <meta property="og:locale" content="en_US">
   <meta property="og:locale:alternate" content="bg_BG">
+  <meta property="og:locale:alternate" content="ro_RO">
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | AIS Stream Processing and Routing Platform">
@@ -67,6 +68,7 @@
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
   <link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/">
+  <link rel="alternate" hreflang="ro" href="https://aismixer.net/ro/">
   <link rel="alternate" hreflang="x-default" href="https://aismixer.net/">
 </head>
 <body>
@@ -79,7 +81,20 @@
         <span class="chip">AIS stream platform</span>
       </a>
       <div class="toggles">
-        <a class="btn" href="/bg/" lang="bg" hreflang="bg">Български</a>
+        <nav class="language-switcher" aria-label="Language">
+          <a class="language-link is-current" href="/" lang="en" hreflang="en" aria-current="page">
+            <img class="language-flag" src="/assets/img/flags/eu.svg" alt="" aria-hidden="true">
+            <span>English</span>
+          </a>
+          <a class="language-link" href="/bg/" lang="bg" hreflang="bg">
+            <img class="language-flag" src="/assets/img/flags/bg.svg" alt="" aria-hidden="true">
+            <span>Български</span>
+          </a>
+          <a class="language-link" href="/ro/" lang="ro" hreflang="ro">
+            <img class="language-flag" src="/assets/img/flags/ro.svg" alt="" aria-hidden="true">
+            <span>Română</span>
+          </a>
+        </nav>
         <a class="btn" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
       </div>
@@ -136,23 +151,48 @@
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
           <h3>Multipart assembly</h3>
-          <p>Reassemble multipart messages with NMEA fragment fields and a stable ingress assembler identity.</p>
+          <p>Fragments may arrive fully out of order; complete groups are emitted in ordinal order. An exact repeat is idempotent, while conflicting content at an occupied ordinal invalidates the live group.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔁</div>
           <h3>Near-real-time deduplication</h3>
-          <p>Suppress repeated logical AIS messages globally in broadcast mode or per target in routing mode.</p>
+          <p>Make one deduplication decision for each complete multipart group, suppressing or emitting every fragment together; use global scope in broadcast mode and target scope in routing mode.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🏷️</div>
           <h3>Controlled TAG metadata</h3>
-          <p>Read and write NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span>, and <span class="kbd">g</span> without confusing metadata with routing identity.</p>
+          <p>Select NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span>, and <span class="kbd">g</span> deterministically across the multipart lifecycle, and keep metadata separate from routing identity.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">📤</div>
           <h3>Selected forwarding</h3>
-          <p>Forward the resulting logical stream to all configured outputs or only the named UDP egress targets selected by routing.</p>
+          <p>Ignore non-string payloads before routing and extraction. Each accepted string event uses one immutable routing snapshot, then forwards to every configured output in broadcast mode or to its selected named UDP targets.</p>
         </article>
+      </div>
+    </section>
+
+    <section id="processing-contract" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Tested reference behaviour</p>
+        <h2>A deterministic processing contract</h2>
+        <p class="section-intro">The Python processor is the tested reference for ingress acceptance, assembly, metadata, deduplication, routing, and forwarding. Any future native processor will be checked against the same observable outcomes.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <h3>Ingress boundary</h3>
+          <p>Only string payloads enter processing. Non-string payloads are ignored before routing and extraction, while every accepted string event uses one immutable routing snapshot.</p>
+        </article>
+        <article class="card">
+          <h3>Multipart lifecycle</h3>
+          <p>Fragments may arrive fully out of order. Exact repeats at an occupied ordinal are idempotent; conflicting content there invalidates the live generation.</p>
+        </article>
+        <article class="card">
+          <h3>Metadata and routing</h3>
+          <p>TAG <span class="kbd">s</span>, <span class="kbd">c</span>, and <span class="kbd">g</span> selection follows deterministic, lifecycle-aware rules. Multipart deduplication is group-atomic, with one decision for the complete ordered group.</p>
+        </article>
+      </div>
+      <div class="callout">
+        <p><strong>Need the exact edge-case semantics?</strong> <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">Read the behavioural contract</a>.</p>
       </div>
     </section>
 
@@ -360,6 +400,7 @@
         <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Main repository</a>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a href="https://github.com/iliyan85/aismixer/wiki/Quick-Start" target="_blank" rel="noopener">Quick Start</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">Behavioural contract</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">nmea_sproxy guide</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Security policy</a>

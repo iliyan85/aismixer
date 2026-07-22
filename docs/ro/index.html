@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="ro">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AISMixer | Procesarea și rutarea fluxurilor AIS</title>
+  <link rel="canonical" href="https://aismixer.net/ro/">
+  <meta name="description" content="AISMixer recepționează, normalizează, deduplică, etichetează, rutează și redirecționează fluxuri AIS NMEA 0183 prin puncte terminale UDP și UDPSEC controlate.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, procesarea fluxurilor AIS, rutare logică, UDPSEC, nmea_sproxy, AIVDM, AIVDO, aismixerctl, date maritime">
+  <meta name="robots" content="index,follow">
+  <meta name="theme-color" content="#0b1220">
+  <meta name="color-scheme" content="light dark">
+
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="AISMixer">
+  <meta property="og:title" content="AISMixer | Procesarea și rutarea fluxurilor AIS">
+  <meta property="og:description" content="Normalizare, deduplicare, metadate TAG, rutare și redirecționare pentru fluxuri AIS NMEA 0183.">
+  <meta property="og:url" content="https://aismixer.net/ro/">
+  <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
+  <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
+  <meta property="og:image:type" content="image/png">
+  <meta property="og:image:width" content="1280">
+  <meta property="og:image:height" content="640">
+  <meta property="og:image:alt" content="Prezentare generală a platformei AISMixer pentru procesarea și rutarea fluxurilor AIS">
+  <meta property="og:locale" content="ro_RO">
+  <meta property="og:locale:alternate" content="en_US">
+  <meta property="og:locale:alternate" content="bg_BG">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="AISMixer | Procesarea și rutarea fluxurilor AIS">
+  <meta name="twitter:description" content="Normalizează · Deduplică · Etichetează · Rutează · Redirecționează fluxuri AIS NMEA 0183.">
+  <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
+  <meta name="twitter:image:alt" content="Prezentare generală a platformei AISMixer pentru procesarea și rutarea fluxurilor AIS">
+
+  <link rel="alternate" hreflang="en" href="https://aismixer.net/">
+  <link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/">
+  <link rel="alternate" hreflang="ro" href="https://aismixer.net/ro/">
+  <link rel="alternate" hreflang="x-default" href="https://aismixer.net/">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/assets/img/favicon-32.png" sizes="32x32" type="image/png">
+  <link rel="apple-touch-icon" href="/assets/img/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
+  <link rel="preload" href="/assets/css/styles.css" as="style">
+  <link rel="stylesheet" href="/assets/css/styles.css">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "AISMixer",
+    "alternateName": "aismixer",
+    "applicationCategory": "DeveloperApplication",
+    "programmingLanguage": "Python",
+    "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
+    "description": "Platformă open-source pentru recepționarea, normalizarea, deduplicarea, etichetarea, rutarea și redirecționarea fluxurilor AIS NMEA 0183.",
+    "url": "https://aismixer.net/ro/",
+    "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
+    "codeRepository": "https://github.com/iliyan85/aismixer",
+    "author": {
+      "@type": "Person",
+      "name": "Iliyan Iliev",
+      "url": "https://github.com/iliyan85"
+    },
+    "sameAs": [
+      "https://github.com/iliyan85/aismixer",
+      "https://github.com/iliyan85/aismixer/wiki"
+    ],
+    "inLanguage": "ro",
+    "isAccessibleForFree": true,
+    "keywords": ["AIS NMEA 0183", "procesarea fluxurilor", "rutare logică", "UDPSEC", "nmea_sproxy", "AIVDM", "AIVDO"]
+  }
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Sari la conținutul principal</a>
+  <nav class="nav" aria-label="Navigare principală">
+    <div class="container nav-inner">
+      <a class="brand" href="#top" aria-label="Pagina principală AISMixer">
+        <span class="logo" aria-hidden="true">🛰️</span>
+        <span class="brand-name">AISMixer</span>
+        <span class="chip">Platformă pentru fluxuri AIS</span>
+      </a>
+      <div class="toggles">
+        <nav class="language-switcher" aria-label="Limbă">
+          <a class="language-link" href="/" lang="en" hreflang="en">
+            <img class="language-flag" src="/assets/img/flags/eu.svg" alt="" aria-hidden="true">
+            <span>English</span>
+          </a>
+          <a class="language-link" href="/bg/" lang="bg" hreflang="bg">
+            <img class="language-flag" src="/assets/img/flags/bg.svg" alt="" aria-hidden="true">
+            <span>Български</span>
+          </a>
+          <a class="language-link is-current" href="/ro/" lang="ro" hreflang="ro" aria-current="page">
+            <img class="language-flag" src="/assets/img/flags/ro.svg" alt="" aria-hidden="true">
+            <span>Română</span>
+          </a>
+        </nav>
+        <a class="btn" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
+        <a class="btn" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <header class="hero container" id="top">
+    <div class="two-col">
+      <div class="hero-copy">
+        <div class="chip">Sursă deschisă • Python • AIS NMEA 0183</div>
+        <h1>AISMixer</h1>
+        <p class="hero-kicker">Platformă de procesare și rutare a fluxurilor AIS</p>
+        <p class="tagline">Normalizează · Deduplică · Etichetează · Rutează · Redirecționează</p>
+        <p class="lead">
+          Recepționați fluxuri AIS, transformați traficul receptoarelor într-un
+          singur flux logic controlat și livrați-l către destinațiile UDP egress
+          care au nevoie de el.
+        </p>
+        <div class="cta" aria-label="Legături către proiect">
+          <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Vedeți depozitul GitHub</a>
+          <a class="button" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Explorați Wiki-ul GitHub</a>
+        </div>
+      </div>
+      <aside class="card hero-summary" aria-labelledby="logical-stream-title">
+        <div class="icons" aria-hidden="true">📡 → 🧭 → 📤</div>
+        <p class="card-heading" id="logical-stream-title">Un singur flux AIS logic</p>
+        <ul class="list">
+          <li>Recepționează ingress prin UDP simplu și UDPSEC autentificat.</li>
+          <li>Extrage și asamblează <span class="kbd">!AIVDM</span> și <span class="kbd">!AIVDO</span>.</li>
+          <li>Deduplică, controlează metadatele TAG și aplică rutarea.</li>
+          <li>Redirecționează datele acceptate către destinații UDP egress denumite și selectate.</li>
+        </ul>
+      </aside>
+    </div>
+  </header>
+
+  <main class="container" id="main-content">
+    <section id="processing" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Procesarea fluxurilor AIS</p>
+        <h2>De la traficul receptoarelor la un flux curat, cu surse identificabile</h2>
+        <p class="section-intro">AISMixer reunește transportul, asamblarea NMEA, metadatele, deduplicarea și livrarea într-un singur traseu de procesare aproape în timp real.</p>
+      </div>
+      <div class="grid">
+        <article class="card">
+          <div class="icons" aria-hidden="true">📡</div>
+          <h3>Ingress flexibil</h3>
+          <p>Recepționează UDP simplu prin IPv4 sau IPv6 și trafic UDPSEC autentificat și criptat. Payload-urile ingress care nu sunt șiruri sunt ignorate înainte de rutare și extragere.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧾</div>
+          <h3>Extragerea propozițiilor AIS</h3>
+          <p>Extrage atât <span class="kbd">!AIVDM</span>, cât și <span class="kbd">!AIVDO</span> din ieșirile reale ale receptoarelor și aplicațiilor.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧩</div>
+          <h3>Asamblare multipart</h3>
+          <p>Asamblează mesajele multipart într-o ordine complet arbitrară. Un fragment duplicat exact este idempotent, iar conținutul diferit la un ordinal deja ocupat invalidează generația activă.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔁</div>
+          <h3>Deduplicare aproape în timp real</h3>
+          <p>Suprimă mesajele AIS logice repetate global în modul broadcast sau separat pentru fiecare destinație în modul de rutare. Pentru multipart, decizia este atomică la nivelul grupului.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🏷️</div>
+          <h3>Metadate TAG controlate</h3>
+          <p>Gestionează determinist metadatele NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span> și <span class="kbd">g</span> în limitele ciclului de viață, fără a confunda metadatele cu identitatea de rutare.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📤</div>
+          <h3>Redirecționare selectivă</h3>
+          <p>Pentru fiecare <span class="kbd">IngressEvent</span> acceptat al cărui payload este un șir, folosește un singur snapshot imuabil de rutare și redirecționează fluxul logic către toate ieșirile configurate sau numai către destinațiile UDP egress selectate.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="processing-contract" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Comportament de referință verificat</p>
+        <h2>Un contract de procesare determinist</h2>
+        <p class="section-intro">Implementarea Python este referința testată pentru comportamentul AISMixer la limita de ingress, pe durata asamblării multipart și în timpul rutării.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <h3>Limita de ingress</h3>
+          <p>Evenimentele cu payload de tip șir, inclusiv subclasele <span class="kbd">str</span>, sunt procesate normal; payload-urile care nu sunt șiruri sunt ignorate înainte de rutare și extragere.</p>
+        </article>
+        <article class="card">
+          <h3>Ciclul de viață multipart</h3>
+          <p>Fragmentele pot sosi în orice ordine. Duplicatele exacte sunt idempotente, conflictele invalidează generația activă, iar expirarea și finalizarea închid starea grupului.</p>
+        </article>
+        <article class="card">
+          <h3>Metadate și rutare</h3>
+          <p>Deduplicarea multipart este atomică la nivelul grupului, starea TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> respectă ciclul de viață, iar fiecare eveniment acceptat folosește un singur snapshot imuabil de rutare.</p>
+        </article>
+      </div>
+      <div class="callout">
+        <p>Contractul complet fixează baza verificată pentru implementarea Python și pentru viitoarele verificări diferențiale ale unei implementări native. <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">Citiți contractul comportamental</a>.</p>
+      </div>
+    </section>
+
+    <section id="routing" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Rutare și zone logice</p>
+        <h2>Exprimați politica fluxului prin identitățile surselor</h2>
+        <p class="section-intro">Rutarea logică statică leagă surse ingress denumite de destinații UDP egress denumite, prin seturi de surse reutilizabile și rute ordonate.</p>
+      </div>
+      <div class="pipeline" aria-label="Fluxul rutării logice">
+        <div class="pipeline-node"><strong>Ingress denumit</strong><span>Surse UDP și UDPSEC</span></div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node"><strong>Zone logice</strong><span>Seturi de identități ale surselor</span></div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node"><strong>Rute ordonate</strong><span>Selectarea declarativă a destinațiilor</span></div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node"><strong>Egress denumit</strong><span>Destinații UDP selectate</span></div>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <h3>Seturi compozabile de surse</h3>
+          <p>Definiți zone cu <span class="kbd">include</span>, <span class="kbd">union</span>, <span class="kbd">intersection</span> și <span class="kbd">difference</span>.</p>
+        </article>
+        <article class="card">
+          <h3>Logice, nu geografice</h3>
+          <p>Zonele sunt seturi de identități interne ale surselor, nu regiuni pe hartă, filtre MMSI, filtre pentru nave sau reguli aplicate payload-ului.</p>
+        </article>
+        <article class="card">
+          <h3>Calitatea fluxului pentru fiecare destinație</h3>
+          <p>Modul de rutare aplică deduplicarea separat pentru fiecare <span class="kbd">target_id</span> logic, astfel încât un traseu de livrare să nu suprime altul.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><span class="kbd">source_id</span> este o identitate internă de rutare. Este separată de valoarea NMEA TAG <span class="kbd">s</span> emisă în aval.</p>
+    </section>
+
+    <section id="runtime-control" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Controlul rutării la runtime</p>
+        <h2>Modificați rutele active fără a întrerupe planul de date</h2>
+        <p class="section-intro">Un plan de control local opțional, printr-un socket din domeniul Unix, expune operații concise de rutare prin comanda <span class="kbd">aismixerctl</span> instalată global.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔎</div>
+          <h3>Inspectați starea rutării</h3>
+          <p>Consultați generația activă, starea de activare, zonele logice, rutele ordonate și identitățile destinațiilor.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">⚡</div>
+          <h3>Înlocuiți sau dezactivați atomic</h3>
+          <p>Validează candidatul complet înainte de a înlocui snapshot-ul imuabil de rutare sau de a reveni la modul legacy broadcast.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🛡️</div>
+          <h3>Respingeți actualizările depășite</h3>
+          <p>Verificările opționale ale generației împiedică operatorul să suprascrie neintenționat o modificare de rutare mai nouă.</p>
+        </article>
+      </div>
+      <div class="callout">
+        <p><strong>În mod intenționat local și limitat la proces.</strong> Rutele modificate la runtime nu persistă după repornire, fișierele de configurare nu sunt rescrise, iar adaptoarele ingress sau egress nu sunt create dinamic. Permisiunile socketului Unix reprezintă limita actuală de autorizare; nu există un token de control la nivelul aplicației.</p>
+      </div>
+    </section>
+
+    <section id="network-controls" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Controlul punctelor terminale de rețea</p>
+        <h2>Limitați sursele permise și adresele-sursă de ieșire</h2>
+        <p class="section-intro">Controalele simple la nivelul aplicației facilitează integrarea punctelor terminale IPv4 și IPv6 în politica mai largă de firewall și rutare a operatorului.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">🚧</div>
+          <h3>Ingress <span class="kbd">allow_from</span></h3>
+          <p>Limitați listener-ele UDP și UDPSEC la adrese IP literale sau rețele CIDR, inclusiv printr-o regulă explicită de blocare totală.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📍</div>
+          <h3>Adresă de ieșire <span class="kbd">source_ip</span></h3>
+          <p>Asociați un socket egress cu o adresă-sursă IPv4 sau IPv6 literală și limitați rezolvarea destinației la aceeași familie de adrese.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧱</div>
+          <h3>Parte a unei limite stratificate</h3>
+          <p>Aceste politici completează regulile de firewall și rutare ale sistemului de operare; nu le înlocuiesc.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><span class="kbd">source_ip</span> reprezintă asocierea unei adrese-sursă, nu selectarea interfeței, a tabelei de rutare, marcarea socketului sau SDN.</p>
+    </section>
+
+    <section id="receivers" class="section section-emphasis">
+      <div class="section-heading">
+        <p class="eyebrow">nmea_sproxy și receptoare AIS fizice</p>
+        <h2>Conectați receptoare AIS de rețea sau fizice prin nmea_sproxy</h2>
+        <p class="section-intro"><span class="kbd">nmea_sproxy</span> este proxy-ul de la stație care conectează o singură sursă AIS locală la o singură destinație AISMixer configurată.</p>
+      </div>
+      <div class="architecture-path" aria-label="Conectarea unui receptor AIS fizic prin nmea_sproxy la AISMixer">
+        <div class="path-node">
+          <span class="icons" aria-hidden="true">📻</span>
+          <strong>Receptor AIS fizic</strong>
+        </div>
+        <div class="path-connector">
+          <span aria-hidden="true">→</span>
+          <small>port serial sau COM virtual prin USB</small>
+        </div>
+        <div class="path-node path-node-accent">
+          <span class="icons" aria-hidden="true">🔐</span>
+          <strong>nmea_sproxy</strong>
+        </div>
+        <div class="path-connector">
+          <span aria-hidden="true">→</span>
+          <small>UDPSEC sau UDP simplu declarat explicit ca sigur</small>
+        </div>
+        <div class="path-node">
+          <span class="icons" aria-hidden="true">🛰️</span>
+          <strong>AISMixer</strong>
+        </div>
+      </div>
+      <div class="grid proxy-grid">
+        <article class="card">
+          <h3>Intrări locale implementate</h3>
+          <ul class="list">
+            <li>UDP de la un receptor local conectat la rețea sau de la o aplicație AIS.</li>
+            <li>Intrare directă prin portul serial fizic.</li>
+            <li>Intrare COM virtuală prin USB de la un receptor AIS fizic.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Ieșiri implementate</h3>
+          <ul class="list">
+            <li>UDPSEC autentificat și criptat, cu verificarea activității și reconectare.</li>
+            <li>UDP simplu configurat explicit pentru o rețea LAN, un VPN sau o limită echivalentă de încredere.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Model clar al relației</h3>
+          <p>O intrare locală este asociată unei singure ieșiri configurate. <span class="kbd">nmea_sproxy</span> nu mixează, nu distribuie către mai multe ieșiri, nu rutează, nu deduplică, nu asamblează AIS multipart și nu rescrie metadatele TAG.</p>
+        </article>
+      </div>
+      <div class="callout">
+        <p>Un receptor de rețea poate trimite UDP local către <span class="kbd">nmea_sproxy</span> sau direct către AISMixer, în funcție de instalare. Procesul principal AISMixer nu citește direct porturi seriale. UDP-ul simplu de încredere nu oferă criptare UDPSEC, autentificare, protecție împotriva reluării sau protocol de verificare a activității.</p>
+      </div>
+    </section>
+
+    <section id="operations" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Instalare și operare</p>
+        <h2>Un ciclu de viață Linux nativ, conceput pentru instalări reale</h2>
+        <p class="section-intro">Instalarea gestionată din depozit menține aliniate fișierele runtime, starea operatorului, integrarea systemd și controlul local al rutării.</p>
+      </div>
+      <div class="grid">
+        <article class="card">
+          <div class="icons" aria-hidden="true">⚙️</div>
+          <h3>Serviciu systemd gestionat din depozit</h3>
+          <p>Serviciul nativ creează <span class="kbd">/run/aismixer</span> cât timp AISMixer rulează și acceptă socketul local opțional de control.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔄</div>
+          <h3>Instalare, actualizare și dezinstalare</h3>
+          <p>Scripturile pentru ciclul de viață gestionează rularea ca root sau prin sudo și întrețin fișierele runtime și unitățile de serviciu instalate.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🗝️</div>
+          <h3>Starea operatorului este păstrată</h3>
+          <p>Fluxurile normale de instalare, actualizare și dezinstalare păstrează configurația operatorului și cheile criptografice.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧰</div>
+          <h3>CLI global pentru rutare</h3>
+          <p>Fluxul de instalare plasează <span class="kbd">aismixerctl</span> în <span class="kbd">/usr/local/bin</span> pentru operații locale de rutare.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="documentation" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Documentație și starea proiectului</p>
+        <h2>Funcționalitățile implementate sunt separate clar de pașii următori</h2>
+        <p class="section-intro">Wiki-ul este ghidul detaliat pentru arhitectură, configurare, rutare, securitate și operare. Roadmap-ul urmărește activitatea viitoare fără a promite termene.</p>
+      </div>
+      <div class="status-grid">
+        <article class="card status-card status-now">
+          <p class="status-label">Implementat acum</p>
+          <ul class="list">
+            <li>Rutare logică, zone și deduplicare separată pentru fiecare destinație.</li>
+            <li>Controlul rutării la runtime prin <span class="kbd">aismixerctl</span>.</li>
+            <li>ACL-uri pentru punctele terminale și asocierea adresei-sursă.</li>
+            <li>Intrare de la receptoare fizice prin <span class="kbd">nmea_sproxy</span>.</li>
+            <li>Ieșire UDPSEC și UDP simplu declarat explicit ca sigur prin proxy.</li>
+            <li>Ciclu de viață nativ consolidat pentru instalări systemd.</li>
+          </ul>
+        </article>
+        <article class="card status-card status-next">
+          <p class="status-label">Planificat în continuare</p>
+          <ul class="list">
+            <li>Instalare Docker și materiale Quick Start extinse.</li>
+            <li>Un proces coordonator cu workeri ingress și egress.</li>
+            <li>Distribuirea prin IPC a stării de rutare și adaptoare suplimentare.</li>
+            <li>Opțiuni pentru persistența rutării la runtime și reîncărcarea configurației.</li>
+            <li>Dezvoltarea rutării distribuite sau P2P.</li>
+            <li>Cercetare privind detectarea spoofingului și a anomaliilor; un astfel de detector nu este implementat în prezent.</li>
+          </ul>
+        </article>
+      </div>
+      <div class="card links" aria-label="Legături către documentație">
+        <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Depozitul principal</a>
+        <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
+        <a href="https://github.com/iliyan85/aismixer/wiki/Quick-Start" target="_blank" rel="noopener">Quick Start</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">Contract comportamental</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">Ghidul nmea_sproxy</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Politica de securitate</a>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container footer-inner">
+      <span>© 2026 proiectul AISMixer</span>
+      <span class="muted">Procesarea și rutarea open-source a fluxurilor AIS</span>
+    </div>
+  </footer>
+</body>
+</html>
