@@ -1,5 +1,8 @@
+from dataclasses import FrozenInstanceError
+
 import dedup
-from dedup import Deduplicator
+import pytest
+from dedup import Deduplicator, DedupStats
 
 
 class FakeClock:
@@ -13,6 +16,31 @@ class FakeClock:
 
     def advance(self, seconds):
         self.now += seconds
+
+
+def assert_stats(
+    deduplicator,
+    *,
+    accepted=0,
+    duplicates=0,
+    expired=0,
+    capacity_evicted=0,
+    resets=0,
+    current_entries=0,
+    peak_entries=0,
+):
+    snapshot = deduplicator.stats()
+    assert snapshot == DedupStats(
+        accepted=accepted,
+        duplicates=duplicates,
+        expired=expired,
+        capacity_evicted=capacity_evicted,
+        resets=resets,
+        current_entries=current_entries,
+        peak_entries=peak_entries,
+    )
+    assert snapshot.current_entries == len(deduplicator.cache)
+    return snapshot
 
 
 def test_default_clock_uses_time_monotonic(monkeypatch):
@@ -213,6 +241,12 @@ def test_stale_expiry_record_cannot_remove_newer_incarnation():
     assert deduplicator.cleanup_expired() is None
     assert deduplicator.cache[cache_key] is new_entry
     assert len(deduplicator._expiry_index) == 1
+    assert_stats(
+        deduplicator,
+        accepted=2,
+        current_entries=1,
+        peak_entries=1,
+    )
     assert not deduplicator.is_unique("message")
 
 
@@ -316,3 +350,374 @@ def test_reset_is_safe_when_empty_and_preserves_configuration():
     clock.now = 1030.0
 
     assert deduplicator.is_unique("message")
+
+
+def test_max_entries_none_preserves_unbounded_behavior():
+    deduplicator = Deduplicator(max_entries=None)
+
+    assert deduplicator.max_entries is None
+    assert deduplicator.is_unique("one")
+    assert deduplicator.is_unique("two")
+    assert deduplicator.is_unique("three")
+    assert_stats(
+        deduplicator,
+        accepted=3,
+        current_entries=3,
+        peak_entries=3,
+    )
+
+
+@pytest.mark.parametrize("max_entries", [1, 2, 100])
+def test_positive_max_entries_is_accepted(max_entries):
+    deduplicator = Deduplicator(max_entries=max_entries)
+
+    assert deduplicator.max_entries == max_entries
+
+
+@pytest.mark.parametrize("max_entries", [0, -1])
+def test_max_entries_below_one_is_rejected(max_entries):
+    with pytest.raises(ValueError):
+        Deduplicator(max_entries=max_entries)
+
+
+@pytest.mark.parametrize(
+    "max_entries",
+    [True, False, "2", 2.0, object()],
+)
+def test_non_integer_max_entries_is_rejected(max_entries):
+    with pytest.raises(TypeError):
+        Deduplicator(max_entries=max_entries)
+
+
+def test_capacity_evicts_oldest_live_entries_in_order():
+    clock = FakeClock()
+    deduplicator = Deduplicator(
+        ttl=100,
+        clock=clock,
+        max_entries=2,
+    )
+
+    assert deduplicator.is_unique("A")
+    clock.advance(1)
+    assert deduplicator.is_unique("B")
+
+    clock.advance(1)
+    calls_before_overflow = clock.calls
+    assert deduplicator.is_unique("C")
+    assert clock.calls == calls_before_overflow + 1
+    assert not deduplicator.is_unique("C")
+    assert not deduplicator.is_unique("B")
+
+    clock.advance(1)
+    assert deduplicator.is_unique("A")
+    assert not deduplicator.is_unique("A")
+
+    clock.advance(1)
+    assert deduplicator.is_unique("B")
+    assert_stats(
+        deduplicator,
+        accepted=5,
+        duplicates=3,
+        capacity_evicted=3,
+        current_entries=2,
+        peak_entries=2,
+    )
+
+
+def test_capacity_is_shared_across_scopes_and_key_types():
+    clock = FakeClock()
+    deduplicator = Deduplicator(
+        ttl=100,
+        clock=clock,
+        max_entries=3,
+    )
+    group_key = ("part one", "part two")
+    changed_group_key = ("part one", "changed part two")
+
+    assert deduplicator.is_unique("same")
+    clock.advance(1)
+    assert deduplicator.is_unique("same", scope="udp:a")
+    clock.advance(1)
+    assert deduplicator.is_unique(group_key, scope="udp:b")
+
+    assert not deduplicator.is_unique("same")
+    assert not deduplicator.is_unique("same", scope="udp:a")
+    assert not deduplicator.is_unique(group_key, scope="udp:b")
+
+    clock.advance(1)
+    assert deduplicator.is_unique(changed_group_key, scope="udp:b")
+    assert not deduplicator.is_unique("same", scope="udp:a")
+    assert not deduplicator.is_unique(group_key, scope="udp:b")
+
+    clock.advance(1)
+    assert deduplicator.is_unique("same")
+    clock.advance(1)
+    assert deduplicator.is_unique("same", scope="udp:a")
+    assert_stats(
+        deduplicator,
+        accepted=6,
+        duplicates=5,
+        capacity_evicted=3,
+        current_entries=3,
+        peak_entries=3,
+    )
+
+
+def test_duplicate_at_capacity_changes_only_duplicate_count():
+    clock = FakeClock()
+    deduplicator = Deduplicator(
+        ttl=30,
+        clock=clock,
+        max_entries=2,
+    )
+
+    assert deduplicator.is_unique("A")
+    clock.advance(1)
+    assert deduplicator.is_unique("B")
+
+    clock.now = 1029.999
+    expiry_index_before = tuple(deduplicator._expiry_index)
+    stats_before = assert_stats(
+        deduplicator,
+        accepted=2,
+        current_entries=2,
+        peak_entries=2,
+    )
+    calls_before_duplicate = clock.calls
+
+    assert not deduplicator.is_unique("A")
+    assert clock.calls == calls_before_duplicate + 1
+    assert tuple(deduplicator._expiry_index) == expiry_index_before
+    stats_after = assert_stats(
+        deduplicator,
+        accepted=2,
+        duplicates=1,
+        current_entries=2,
+        peak_entries=2,
+    )
+    assert stats_after.accepted == stats_before.accepted
+    assert stats_after.expired == stats_before.expired
+    assert stats_after.capacity_evicted == stats_before.capacity_evicted
+
+    clock.now = 1030.0
+    assert deduplicator.is_unique("C")
+    assert_stats(
+        deduplicator,
+        accepted=3,
+        duplicates=1,
+        expired=1,
+        current_entries=2,
+        peak_entries=2,
+    )
+
+
+def test_live_entry_immediately_before_ttl_is_capacity_evicted():
+    clock = FakeClock()
+    deduplicator = Deduplicator(
+        ttl=30,
+        clock=clock,
+        max_entries=2,
+    )
+
+    assert deduplicator.is_unique("A")
+    clock.advance(1)
+    assert deduplicator.is_unique("B")
+
+    clock.now = 1029.999
+    assert deduplicator.is_unique("C")
+    assert deduplicator._cache_key("A", None) not in deduplicator.cache
+    assert deduplicator._cache_key("C", None) in deduplicator.cache
+    assert_stats(
+        deduplicator,
+        accepted=3,
+        capacity_evicted=1,
+        current_entries=2,
+        peak_entries=2,
+    )
+
+
+def test_expired_counter_covers_both_cleanup_paths():
+    clock = FakeClock()
+    deduplicator = Deduplicator(ttl=10, clock=clock)
+
+    assert deduplicator.is_unique("A")
+    clock.advance(1)
+    assert deduplicator.is_unique("B")
+
+    assert deduplicator.cleanup_expired(now=1010.0) is None
+    assert_stats(
+        deduplicator,
+        accepted=2,
+        expired=1,
+        current_entries=1,
+        peak_entries=2,
+    )
+
+    clock.now = 1011.0
+    assert deduplicator.is_unique("C")
+    assert_stats(
+        deduplicator,
+        accepted=3,
+        expired=2,
+        current_entries=1,
+        peak_entries=2,
+    )
+
+
+def test_capacity_eviction_skips_stale_front_record():
+    clock = FakeClock()
+    deduplicator = Deduplicator(
+        ttl=100,
+        clock=clock,
+        max_entries=2,
+    )
+
+    assert deduplicator.is_unique("A")
+    cache_key = next(iter(deduplicator.cache))
+    old_entry = deduplicator.cache.pop(cache_key)
+
+    clock.advance(1)
+    assert deduplicator.is_unique("B")
+    clock.advance(1)
+    assert deduplicator.is_unique("A")
+    new_entry = deduplicator.cache[cache_key]
+    assert new_entry is not old_entry
+
+    clock.advance(1)
+    assert deduplicator.is_unique("C")
+    assert deduplicator.cache[cache_key] is new_entry
+    assert old_entry not in deduplicator._expiry_index
+    assert len(deduplicator._expiry_index) == 2
+    assert_stats(
+        deduplicator,
+        accepted=4,
+        capacity_evicted=1,
+        current_entries=2,
+        peak_entries=2,
+    )
+
+    assert not deduplicator.is_unique("A")
+    assert not deduplicator.is_unique("C")
+    clock.advance(1)
+    assert deduplicator.is_unique("B")
+    assert_stats(
+        deduplicator,
+        accepted=5,
+        duplicates=2,
+        capacity_evicted=2,
+        current_entries=2,
+        peak_entries=2,
+    )
+
+
+def test_stats_snapshot_is_immutable_stable_and_side_effect_free():
+    clock = FakeClock()
+    deduplicator = Deduplicator(ttl=10, clock=clock)
+
+    initial = assert_stats(deduplicator)
+    with pytest.raises(FrozenInstanceError):
+        initial.accepted = 1
+
+    assert deduplicator.is_unique("A")
+    retained = assert_stats(
+        deduplicator,
+        accepted=1,
+        current_entries=1,
+        peak_entries=1,
+    )
+
+    clock.advance(10)
+    calls_before_stats = clock.calls
+    cache_before_stats = dict(deduplicator.cache)
+    expiry_index_before_stats = tuple(deduplicator._expiry_index)
+    pending_expiry = assert_stats(
+        deduplicator,
+        accepted=1,
+        current_entries=1,
+        peak_entries=1,
+    )
+    assert clock.calls == calls_before_stats
+    assert deduplicator.cache == cache_before_stats
+    assert tuple(deduplicator._expiry_index) == expiry_index_before_stats
+    assert pending_expiry.expired == 0
+
+    assert deduplicator.cleanup_expired() is None
+    assert_stats(
+        deduplicator,
+        accepted=1,
+        expired=1,
+        peak_entries=1,
+    )
+    assert initial == DedupStats(0, 0, 0, 0, 0, 0, 0)
+    assert retained == DedupStats(1, 0, 0, 0, 0, 1, 1)
+    assert pending_expiry == retained
+
+
+def test_reset_preserves_cumulative_statistics_and_capacity():
+    clock = FakeClock()
+    deduplicator = Deduplicator(
+        ttl=10,
+        clock=clock,
+        max_entries=2,
+    )
+
+    assert deduplicator.is_unique("A")
+    clock.advance(1)
+    assert deduplicator.is_unique("B")
+    clock.advance(1)
+    assert not deduplicator.is_unique("A")
+    clock.advance(1)
+    assert deduplicator.is_unique("C")
+
+    clock.now = 1011.0
+    assert deduplicator.cleanup_expired() is None
+    assert_stats(
+        deduplicator,
+        accepted=3,
+        duplicates=1,
+        expired=1,
+        capacity_evicted=1,
+        current_entries=1,
+        peak_entries=2,
+    )
+
+    assert deduplicator.reset() is None
+    assert deduplicator.cache == {}
+    assert not deduplicator._expiry_index
+    assert_stats(
+        deduplicator,
+        accepted=3,
+        duplicates=1,
+        expired=1,
+        capacity_evicted=1,
+        resets=1,
+        peak_entries=2,
+    )
+
+    assert deduplicator.reset() is None
+    assert_stats(
+        deduplicator,
+        accepted=3,
+        duplicates=1,
+        expired=1,
+        capacity_evicted=1,
+        resets=2,
+        peak_entries=2,
+    )
+    assert deduplicator.ttl == 10
+    assert deduplicator._clock is clock
+    assert deduplicator.max_entries == 2
+
+    assert deduplicator.is_unique("C")
+    assert deduplicator.is_unique("D")
+    assert deduplicator.is_unique("E")
+    assert_stats(
+        deduplicator,
+        accepted=6,
+        duplicates=1,
+        expired=1,
+        capacity_evicted=2,
+        resets=2,
+        current_entries=2,
+        peak_entries=2,
+    )

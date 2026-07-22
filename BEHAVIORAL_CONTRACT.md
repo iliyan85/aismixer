@@ -173,9 +173,27 @@ emitted in full when otherwise eligible.
 A dedup entry is live while `age < ttl` and expires at `age >= ttl`. A rejected
 duplicate does not refresh the insertion time. Legacy/no-table forwarding uses
 one global deduplication scope. Routed forwarding uses each target ID as an
-independent scope, so a group already seen by one target may still be new to
-another target. Ingress source identity does not create an additional dedup
-scope for that target.
+independent logical-key scope, so a group already seen by one target may still
+be new to another target. Ingress source identity does not create an additional
+dedup scope for that target.
+
+By default, `max_entries=None` leaves the retained entry count unbounded. A
+positive `max_entries` applies one instance-wide, process-local cap shared by
+the legacy global scope and every explicit target scope, and by single-sentence
+string and multipart tuple keys. Scope independence is key-identity
+independence, not a separate capacity quota. Before admitting a unique key,
+entries at the TTL boundary are removed. If the cache remains full, the oldest
+currently live insertion is evicted deterministically. Rejecting a live
+duplicate causes no capacity eviction.
+
+`stats()` returns an immutable point-in-time `DedupStats` snapshot containing
+`accepted`, `duplicates`, `expired`, `capacity_evicted`, `resets`,
+`current_entries`, and `peak_entries`. Decision counters are per `is_unique()`
+call and cumulative for the `Deduplicator` instance. Reading statistics neither
+invokes the clock nor performs cleanup, and earlier snapshots do not change.
+`reset()` clears retained entries and expiry ordering and increments `resets`,
+while preserving the other cumulative counters and `peak_entries`;
+`current_entries` becomes zero.
 
 Deduplication is in-memory and process-local; this contract does not specify
 durable or distributed deduplication.
