@@ -267,18 +267,18 @@ def test_out_of_order_fragments_complete_in_ordinal_order():
     assert assembler.feed("src", first) == [first, second]
 
 
-def test_blank_seq_id_supports_out_of_order_assembly():
+def test_blank_sequence_compatibility_supports_out_of_order_assembly():
     assembler = AIVDMAssembler(clock=FakeClock())
     first = "!AIVDM,2,1,,A,SINGLE_MESSAGE_PART_1,0*00"
     second = "!AIVDM,2,2,,A,SINGLE_MESSAGE_PART_2,0*00"
 
-    # Approved compatibility behavior: a coherent blank-ID message may start
+    # Compatibility contract: a coherent blank-ID message may start
     # with any valid ordinal and still complete in ordinal order.
     assert assembler.feed("src", second) is None
     assert assembler.feed("src", first) == [first, second]
 
 
-def test_blank_seq_id_can_ambiguously_combine_distinct_messages():
+def test_blank_sequence_compatibility_can_ambiguously_combine_distinct_messages():
     assembler = AIVDMAssembler(clock=FakeClock())
     message_a = (
         "!AIVDM,2,1,,A,MESSAGE_A_PART_1,0*00",
@@ -291,7 +291,7 @@ def test_blank_seq_id_can_ambiguously_combine_distinct_messages():
 
     assert assembler.feed("src", message_a[0]) is None
 
-    # Documented compatibility limitation: A1 plus B2 forms a synthetic
+    # Compatibility limitation: A1 plus B2 forms a synthetic
     # logical combination, not proof of common transmission origin. There is
     # no duplicate-ordinal conflict, and the available NMEA identity cannot
     # distinguish the cases without rejecting valid blank-ID traffic or valid
@@ -303,7 +303,7 @@ def test_blank_seq_id_can_ambiguously_combine_distinct_messages():
     ]
 
 
-def test_blank_seq_id_does_not_correlate_with_expired_state():
+def test_blank_sequence_compatibility_does_not_correlate_with_expired_state():
     clock = FakeClock()
     assembler = AIVDMAssembler(timeout=1.0, clock=clock)
     old_a1 = "!AIVDM,2,1,,A,OLD_A1,0*00"

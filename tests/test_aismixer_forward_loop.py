@@ -491,6 +491,22 @@ def test_forward_loop_ignores_non_ais_input_without_crashing(monkeypatch):
     assert messages == []
 
 
+def test_str_subclass_raw_line_is_processed_normally(monkeypatch):
+    class RawLine(str):
+        pass
+
+    messages = asyncio.run(
+        run_forward_loop_events(
+            monkeypatch,
+            [make_event(RawLine(SENTENCE))],
+            expected_sends=1,
+        )
+    )
+
+    assert len(messages) == 1
+    assert SENTENCE in messages[0]
+
+
 def test_non_string_raw_line_is_ignored_without_terminating_forward_loop(
     monkeypatch,
 ):
@@ -906,6 +922,48 @@ def test_conflicting_multipart_ingress_gids_generate_new_gid(
     )
 
 
+def test_multipart_gid_agreement_uses_exact_string_identity(monkeypatch):
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11GIDX,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22GIDX,0")
+    events = [
+        make_event(f"\\g:1-2-001*00\\{first}"),
+        make_event(f"\\g:2-2-1*00\\{second}"),
+    ]
+    monkeypatch.setattr(
+        aismixer,
+        "_gen_numeric_gid_fixed",
+        lambda _digits: "999999",
+    )
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            events,
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+    # GID agreement uses exact string identity and does not normalize through
+    # integer conversion, so digit-only values "001" and "1" conflict.
+    assert re.fullmatch(
+        r"c:\d+,s:test_station,g:1-2-999999\*[0-9A-F]{2}",
+        leading_tag(messages[0]),
+    )
+    assert re.fullmatch(
+        r"g:2-2-999999\*[0-9A-F]{2}",
+        leading_tag(messages[1]),
+    )
+    assert all(
+        ingress_gid not in leading_tag(message)
+        for message in messages
+        for ingress_gid in {"-001*", "-1*"}
+    )
+
+
 def test_multipart_preserves_earlier_c_when_completion_has_no_c(
     monkeypatch,
 ):
@@ -1243,7 +1301,7 @@ def test_completion_fragment_s_overrides_earlier_s(monkeypatch):
     )
 
     first_tag = leading_tag(fake_forwarder.messages[0])
-    # Approved precedence: completion-arrival source metadata wins.
+    # Contract precedence: completion-arrival source metadata wins.
     assert first_tag.startswith(f"c:123,s:late,g:1-2-{group_id}*")
     assert "s:early" not in first_tag
 
@@ -1267,7 +1325,7 @@ def test_earlier_s_is_reused_when_completion_has_no_s(
     )
 
     first_tag = leading_tag(fake_forwarder.messages[0])
-    # Approved fallback: earlier metadata supplies a source when completion
+    # Contract fallback: earlier metadata supplies a source when completion
     # carries no source of its own.
     assert first_tag.startswith(f"c:123,s:early,g:1-2-{group_id}*")
 

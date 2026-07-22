@@ -29,7 +29,7 @@ def test_default_clock_uses_time_monotonic(monkeypatch):
     assert calls
 
 
-def test_unscoped_deduplication_behavior_remains_global():
+def test_unscoped_deduplication_is_global():
     clock = FakeClock()
     deduplicator = Deduplicator(ttl=30, clock=clock)
 
