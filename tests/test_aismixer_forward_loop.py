@@ -491,47 +491,53 @@ def test_forward_loop_ignores_non_ais_input_without_crashing(monkeypatch):
     assert messages == []
 
 
-def test_current_behavior_known_defect_candidate_non_string_raw_line_terminates_forward_loop(
+def test_non_string_raw_line_is_ignored_without_terminating_forward_loop(
     monkeypatch,
 ):
     async def run():
         queue, task, fake_forwarder = await start_forward_loop_capture(
             monkeypatch,
         )
-        await queue.put(make_secure_event(None))
+        try:
+            await queue.put(make_secure_event(None))
+            await asyncio.sleep(0)
+            if task.done():
+                task.result()
 
-        # Known defect candidate: secure JSON null can reach raw_line as None.
-        # The extractor raises before it can safely reject the input, and the
-        # TypeError escapes and terminates the long-running forwarding task.
-        # This characterizes current failure behavior; it does not approve it.
-        with pytest.raises(TypeError):
-            await asyncio.wait_for(task, timeout=0.5)
-
-        assert task.done()
-        assert fake_forwarder.messages == []
-        assert fake_forwarder.targeted_messages == []
+            assert not task.done()
+            assert fake_forwarder.messages == []
+            assert fake_forwarder.targeted_messages == []
+        finally:
+            await cancel_task(task)
 
     asyncio.run(run())
 
 
-def test_current_behavior_known_defect_candidate_non_string_event_prevents_later_valid_event(
+def test_non_string_event_does_not_prevent_later_valid_event(
     monkeypatch,
 ):
     async def run():
         queue, task, fake_forwarder = await start_forward_loop_capture(
             monkeypatch,
         )
-        await queue.put(make_secure_event(None))
-        await queue.put(make_event(SENTENCE))
+        try:
+            await queue.put(make_secure_event(None))
+            await queue.put(make_event(SENTENCE))
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=1,
+            )
 
-        with pytest.raises(TypeError):
-            await asyncio.wait_for(task, timeout=0.5)
+            assert not task.done()
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
 
-        assert task.done()
-        assert fake_forwarder.messages == []
-        assert fake_forwarder.targeted_messages == []
-
-    asyncio.run(run())
+    fake_forwarder = asyncio.run(run())
+    assert len(fake_forwarder.messages) == 1
+    assert SENTENCE in fake_forwarder.messages[0]
+    assert fake_forwarder.targeted_messages == []
 
 
 def test_non_ais_string_does_not_prevent_later_valid_forwarding(monkeypatch):
@@ -546,6 +552,95 @@ def test_non_ais_string_does_not_prevent_later_valid_forwarding(monkeypatch):
     assert len(fake_forwarder.messages) == 1
     assert SENTENCE in fake_forwarder.messages[0]
     assert fake_forwarder.targeted_messages == []
+
+
+@pytest.mark.parametrize(
+    "raw_line",
+    [None, 123, False, [], {}],
+    ids=["null", "number", "boolean", "list", "object"],
+)
+def test_json_non_string_payload_types_are_ignored(monkeypatch, raw_line):
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+        )
+        try:
+            await queue.put(make_secure_event(raw_line))
+            await queue.put(make_event(SENTENCE))
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=1,
+            )
+
+            assert not task.done()
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    assert len(fake_forwarder.messages) == 1
+    assert SENTENCE in fake_forwarder.messages[0]
+    assert fake_forwarder.targeted_messages == []
+
+
+def test_bytes_raw_line_is_not_implicitly_decoded(monkeypatch):
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+        )
+        try:
+            await queue.put(make_secure_event(SENTENCE.encode()))
+            await queue.put(make_event(SECOND_SENTENCE))
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=1,
+            )
+
+            assert not task.done()
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    assert len(fake_forwarder.messages) == 1
+    assert SECOND_SENTENCE in fake_forwarder.messages[0]
+    assert SENTENCE not in fake_forwarder.messages[0]
+    assert fake_forwarder.targeted_messages == []
+
+
+def test_non_string_event_skips_routing_snapshot_and_match(monkeypatch):
+    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_state = RecordingRoutingState(routing_table)
+
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            routing_state=routing_state,
+        )
+        try:
+            await queue.put(make_secure_event(None))
+            await queue.put(make_event(SENTENCE, source_id="udp:source_a"))
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                targeted_count=1,
+            )
+
+            assert not task.done()
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    assert routing_state.snapshot_calls == 1
+    assert routing_table.source_ids == ["udp:source_a"]
+    assert fake_forwarder.messages == []
+    assert len(fake_forwarder.targeted_messages) == 1
+    target_ids, message = fake_forwarder.targeted_messages[0]
+    assert target_ids == ("udp:aishub",)
+    assert SENTENCE in message
 
 
 def test_forward_loop_deduplicates_duplicate_plain_aivdm(monkeypatch):

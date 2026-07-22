@@ -146,6 +146,9 @@ async def forward_loop(queue, routing_state=None):
     multipart_gid_ctx: dict[AssemblyKey, frozenset[str]] = {}
     while True:
         ev: IngressEvent = await queue.get()
+        if not isinstance(ev.raw_line, str):
+            continue
+
         event_routing_table = None
         if routing_state is not None:
             event_routing_table = routing_state.snapshot().table
