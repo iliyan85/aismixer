@@ -331,6 +331,7 @@ async def run_forward_loop_capture(
     station_id="test_station",
     on_send_to=None,
     assembler_instance=None,
+    preserve_ingress_c=True,
 ):
     queue, task, fake_forwarder = await start_forward_loop_capture(
         monkeypatch,
@@ -338,6 +339,7 @@ async def run_forward_loop_capture(
         station_id=station_id,
         on_send_to=on_send_to,
         assembler_instance=assembler_instance,
+        preserve_ingress_c=preserve_ingress_c,
     )
     try:
         for event in events:
@@ -365,6 +367,7 @@ async def start_forward_loop_capture(
     station_id="test_station",
     on_send_to=None,
     assembler_instance=None,
+    preserve_ingress_c=True,
 ):
     fake_forwarder = FakeForwarder(on_send_to=on_send_to)
     monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
@@ -374,7 +377,11 @@ async def start_forward_loop_capture(
     monkeypatch.setattr(aismixer, "deduplicator", Deduplicator())
     monkeypatch.setattr(aismixer, "STATION_ID", station_id)
     monkeypatch.setattr(aismixer, "DEBUG", False)
-    monkeypatch.setattr(aismixer, "C_PRESERVE_INGRESS_C", True)
+    monkeypatch.setattr(
+        aismixer,
+        "C_PRESERVE_INGRESS_C",
+        preserve_ingress_c,
+    )
     monkeypatch.setattr(aismixer, "G_PRESERVE_INGRESS_GID", True)
     monkeypatch.setattr(aismixer, "G_ALWAYS_TAG_SINGLE", False)
 
@@ -519,7 +526,7 @@ def test_forward_loop_forwards_multipart_aivdo_in_part_order(monkeypatch):
     assert "s:" not in second_tag
 
 
-def test_current_behavior_completion_arrival_owns_ingress_c_out_of_order(
+def test_multipart_uses_earliest_valid_c_independent_of_arrival_order(
     monkeypatch,
 ):
     group_id = "424242"
@@ -542,10 +549,149 @@ def test_current_behavior_completion_arrival_owns_ingress_c_out_of_order(
     assert second in messages[1]
 
     first_tag = leading_tag(messages[0])
-    # Current ownership follows the arrival that completes assembly. Here that
-    # arrival has NMEA ordinal 1, rather than the highest multipart ordinal.
+    # Numeric timestamp selection, not completion ownership, determines the
+    # result even when ordinal 1 arrives last and completes the assembly.
     assert first_tag.startswith(f"c:111,s:test_station,g:1-2-{group_id}*")
     assert all("c:222" not in leading_tag(message) for message in messages)
+
+
+def test_multipart_uses_lower_completion_c_when_it_is_earliest(monkeypatch):
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11CLOW,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22CLOW,0")
+    first_arrival = f"\\c:222,g:1-2-{group_id}*00\\{first}"
+    completion_arrival = f"\\c:111,g:2-2-{group_id}*00\\{second}"
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(first_arrival), make_event(completion_arrival)],
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+    assert leading_tag(messages[0]).startswith(
+        f"c:111,s:test_station,g:1-2-{group_id}*"
+    )
+
+
+def test_multipart_keeps_earlier_c_when_completion_c_is_later(monkeypatch):
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11CKEP,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22CKEP,0")
+    first_arrival = f"\\c:111,g:1-2-{group_id}*00\\{first}"
+    completion_arrival = f"\\c:222,g:2-2-{group_id}*00\\{second}"
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(first_arrival), make_event(completion_arrival)],
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+    assert leading_tag(messages[0]).startswith(
+        f"c:111,s:test_station,g:1-2-{group_id}*"
+    )
+    assert all("c:222" not in leading_tag(message) for message in messages)
+
+
+def test_multipart_preserves_zero_as_earliest_valid_c(monkeypatch):
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11CZER,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22CZER,0")
+    first_arrival = f"\\c:0,g:1-2-{group_id}*00\\{first}"
+    completion_arrival = f"\\c:111,g:2-2-{group_id}*00\\{second}"
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(first_arrival), make_event(completion_arrival)],
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+    assert re.fullmatch(
+        rf"c:0,s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+        leading_tag(messages[0]),
+    )
+
+
+def test_duplicate_fragment_c_can_lower_but_not_raise_group_timestamp(
+    monkeypatch,
+):
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11CDUP,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22CDUP,0")
+    arrivals = [
+        f"\\c:222,g:1-2-{group_id}*00\\{first}",
+        f"\\c:111,g:1-2-{group_id}*00\\{first}",
+        f"\\c:333,g:1-2-{group_id}*00\\{first}",
+        f"\\g:2-2-{group_id}*00\\{second}",
+    ]
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(arrival) for arrival in arrivals],
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+    assert leading_tag(messages[0]).startswith(
+        f"c:111,s:test_station,g:1-2-{group_id}*"
+    )
+
+
+def test_disabled_c_preservation_ignores_all_multipart_ingress_c(
+    monkeypatch,
+):
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11CDIS,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22CDIS,0")
+    first_arrival = f"\\c:111,g:1-2-{group_id}*00\\{first}"
+    completion_arrival = f"\\c:222,g:2-2-{group_id}*00\\{second}"
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event(first_arrival), make_event(completion_arrival)],
+            expected_broadcast_sends=2,
+            preserve_ingress_c=False,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert first in messages[0]
+    assert second in messages[1]
+    timestamp_match = re.fullmatch(
+        rf"c:(\d+),s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+        leading_tag(messages[0]),
+    )
+    assert timestamp_match is not None
+    assert timestamp_match.group(1) not in {"111", "222"}
+    assert all(
+        ingress_c not in leading_tag(message)
+        for message in messages
+        for ingress_c in {"c:111", "c:222"}
+    )
 
 
 def test_current_behavior_completion_arrival_owns_conflicting_ingress_gid(
@@ -575,7 +721,7 @@ def test_current_behavior_completion_arrival_owns_conflicting_ingress_gid(
     assert all("-111" not in leading_tag(message) for message in messages)
 
 
-def test_current_behavior_earlier_ingress_c_is_lost_when_completion_has_no_c(
+def test_multipart_preserves_earlier_c_when_completion_has_no_c(
     monkeypatch,
 ):
     group_id = "424242"
@@ -597,21 +743,14 @@ def test_current_behavior_earlier_ingress_c_is_lost_when_completion_has_no_c(
     assert first in messages[0]
     assert second in messages[1]
 
-    first_tag = leading_tag(messages[0])
-    timestamp_match = re.fullmatch(
-        rf"c:(\d+),s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
-        first_tag,
+    assert re.fullmatch(
+        rf"c:111,s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+        leading_tag(messages[0]),
     )
-    assert timestamp_match is not None
-    assert timestamp_match.group(1) != "111"
     assert re.fullmatch(
         rf"g:2-2-{group_id}\*[0-9A-F]{{2}}",
         leading_tag(messages[1]),
     )
-
-    # Characterization only: the earlier valid c is not retained as group
-    # metadata. With no valid c on completion, output receives a server
-    # timestamp; this does not approve a permanent ownership policy.
 
 
 def test_current_behavior_earlier_ingress_gid_is_lost_when_completion_has_no_g(
@@ -653,7 +792,7 @@ def test_current_behavior_earlier_ingress_gid_is_lost_when_completion_has_no_g(
     # generated GID; this does not approve a permanent ownership policy.
 
 
-def test_current_behavior_out_of_order_completion_without_c_does_not_reuse_earlier_c(
+def test_out_of_order_multipart_preserves_earlier_c_when_completion_has_no_c(
     monkeypatch,
 ):
     group_id = "424242"
@@ -675,20 +814,14 @@ def test_current_behavior_out_of_order_completion_without_c_does_not_reuse_earli
     assert first in messages[0]
     assert second in messages[1]
 
-    timestamp_match = re.fullmatch(
-        rf"c:(\d+),s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+    assert re.fullmatch(
+        rf"c:222,s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
         leading_tag(messages[0]),
     )
-    assert timestamp_match is not None
-    assert timestamp_match.group(1) != "222"
     assert re.fullmatch(
         rf"g:2-2-{group_id}\*[0-9A-F]{{2}}",
         leading_tag(messages[1]),
     )
-
-    # Characterization only: c:222 is lost even though it arrived first on
-    # the highest NMEA ordinal. The ordinal-1 completion has no c, so output
-    # uses server time; no permanent ownership policy is approved here.
 
 
 def test_current_behavior_out_of_order_completion_without_g_does_not_reuse_earlier_gid(
@@ -847,6 +980,80 @@ def test_dedup_suppressed_completion_clears_multipart_s_context(
     assert all("-222" not in leading_tag(message) for message in messages)
     assert "s:stale" not in leading_tag(messages[2])
     assert ",s:192_0_2_10," in leading_tag(messages[2])
+
+
+def test_dedup_suppressed_completion_clears_multipart_c_context(
+    monkeypatch,
+):
+    assembler_key = "shared-receiver"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11CDSP,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22CDSP,0")
+    second_new = make_nmea_sentence("AIVDM,2,2,7,A,22CDNW,0")
+    group_one = (
+        f"\\g:1-2-111*00\\{first}",
+        f"\\g:2-2-111*00\\{second}",
+    )
+    group_two = (
+        f"\\c:111,g:1-2-222*00\\{first}",
+        f"\\g:2-2-222*00\\{second}",
+    )
+    group_three = (
+        f"\\g:1-2-333*00\\{first}",
+        f"\\g:2-2-333*00\\{second_new}",
+    )
+
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+        )
+        try:
+            for arrival in group_one:
+                await queue.put(
+                    make_event(arrival, assembler_key=assembler_key)
+                )
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=2,
+            )
+
+            for arrival in group_two:
+                await queue.put(
+                    make_event(arrival, assembler_key=assembler_key)
+                )
+            await asyncio.sleep(0.05)
+            if task.done():
+                task.result()
+            assert len(fake_forwarder.messages) == 2
+
+            for arrival in group_three:
+                await queue.put(
+                    make_event(arrival, assembler_key=assembler_key)
+                )
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=4,
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    messages = fake_forwarder.messages
+    assert len(messages) == 4
+    assert first in messages[0]
+    assert second in messages[1]
+    assert first in messages[2]
+    assert second_new in messages[3]
+    assert second not in "".join(messages[2:])
+
+    timestamp_match = re.fullmatch(
+        r"c:(\d+),s:test_station,g:1-2-333\*[0-9A-F]{2}",
+        leading_tag(messages[2]),
+    )
+    assert timestamp_match is not None
+    assert timestamp_match.group(1) != "111"
 
 
 def test_completion_without_g_tag_clears_multipart_s_context(monkeypatch):
@@ -1054,6 +1261,53 @@ def test_conflict_invalidation_clears_multipart_s_context(
     assert ",s:192_0_2_10," in leading_tag(messages[0])
 
 
+def test_conflict_invalidation_clears_multipart_c_context(monkeypatch):
+    assembler_key = "shared-receiver"
+    group_id = "424242"
+    fresh_first = make_nmea_sentence("AIVDM,2,1,7,A,11CCNA,0")
+    conflicting_first = make_nmea_sentence("AIVDM,2,1,7,A,11CCNB,0")
+    fresh_second = make_nmea_sentence("AIVDM,2,2,7,A,22CCNF,0")
+    events = [
+        make_event(
+            f"\\c:111,g:1-2-{group_id}*00\\{fresh_first}",
+            assembler_key=assembler_key,
+        ),
+        make_event(
+            f"\\c:222,g:1-2-{group_id}*00\\{conflicting_first}",
+            assembler_key=assembler_key,
+        ),
+        make_event(
+            f"\\g:2-2-{group_id}*00\\{fresh_second}",
+            assembler_key=assembler_key,
+        ),
+        make_event(
+            f"\\g:1-2-{group_id}*00\\{fresh_first}",
+            assembler_key=assembler_key,
+        ),
+    ]
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            events,
+            expected_broadcast_sends=2,
+        )
+    )
+
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert fresh_first in messages[0]
+    assert fresh_second in messages[1]
+    assert conflicting_first not in "".join(messages)
+
+    timestamp_match = re.fullmatch(
+        rf"c:(\d+),s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+        leading_tag(messages[0]),
+    )
+    assert timestamp_match is not None
+    assert timestamp_match.group(1) not in {"111", "222"}
+
+
 def test_expired_generation_clears_multipart_s_context_before_fresh_state(
     monkeypatch,
 ):
@@ -1112,6 +1366,71 @@ def test_expired_generation_clears_multipart_s_context_before_fresh_state(
     assert old_first not in "".join(messages)
     assert all("s:stale" not in leading_tag(message) for message in messages)
     assert ",s:192_0_2_10," in leading_tag(messages[0])
+
+
+def test_expired_generation_clears_multipart_c_context(monkeypatch):
+    clock = FakeClock()
+    assembler_instance = AIVDMAssembler(timeout=1.0, clock=clock)
+    assembler_key = "shared-receiver"
+    group_id = "424242"
+    old_first = make_nmea_sentence("AIVDM,2,1,7,A,11CEPO,0")
+    fresh_first = make_nmea_sentence("AIVDM,2,1,7,A,11CEPN,0")
+    fresh_second = make_nmea_sentence("AIVDM,2,2,7,A,22CEPN,0")
+    old_arrival = f"\\c:111,g:1-2-{group_id}*00\\{old_first}"
+    fresh_second_arrival = f"\\g:2-2-{group_id}*00\\{fresh_second}"
+    fresh_completion_arrival = f"\\g:1-2-{group_id}*00\\{fresh_first}"
+
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            assembler_instance=assembler_instance,
+        )
+        try:
+            await queue.put(
+                make_event(old_arrival, assembler_key=assembler_key)
+            )
+            await asyncio.sleep(0)
+            assert fake_forwarder.messages == []
+
+            clock.now = 1.0
+            await queue.put(
+                make_event(
+                    fresh_second_arrival,
+                    assembler_key=assembler_key,
+                )
+            )
+            await asyncio.sleep(0)
+            assert fake_forwarder.messages == []
+
+            clock.now = 1.1
+            await queue.put(
+                make_event(
+                    fresh_completion_arrival,
+                    assembler_key=assembler_key,
+                )
+            )
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=2,
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    messages = fake_forwarder.messages
+    assert len(messages) == 2
+    assert fresh_first in messages[0]
+    assert fresh_second in messages[1]
+    assert old_first not in "".join(messages)
+
+    timestamp_match = re.fullmatch(
+        rf"c:(\d+),s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+        leading_tag(messages[0]),
+    )
+    assert timestamp_match is not None
+    assert timestamp_match.group(1) != "111"
 
 
 def test_forward_loop_legacy_mode_calls_send_not_send_to(monkeypatch):

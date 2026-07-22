@@ -140,8 +140,9 @@ async def forward_loop(queue, routing_state=None):
     the event currently being processed.
     """
 
-    # Multipart source metadata follows the assembler's correlation identity.
+    # Multipart metadata follows the assembler's correlation identity.
     multipart_s_ctx: dict[AssemblyKey, str] = {}
+    multipart_c_ctx: dict[AssemblyKey, int] = {}
     while True:
         ev: IngressEvent = await queue.get()
         event_routing_table = None
@@ -168,13 +169,17 @@ async def forward_loop(queue, routing_state=None):
 
             g_info = extract_g_tuple(tag_pairs)  # (part, total, gid) или None
 
-            # --- избиране на timestamp за TAG 'c' ---
-            # ако е позволено и имаме валиден \c:... в ingress TAG → пазим него,
-            # иначе → текущото време на сървъра
+            # Parse the current valid TAG c for direct single-sentence use
+            # and deterministic multipart timestamp selection below.
             c_ingress = tag_pairs.get('c')
-            ts_for_header = None
-            if C_PRESERVE_INGRESS_C and c_ingress and c_ingress.isdigit():
-                ts_for_header = int(c_ingress)
+            valid_c = (
+                int(c_ingress)
+                if C_PRESERVE_INGRESS_C
+                and c_ingress
+                and c_ingress.isdigit()
+                else None
+            )
+            ts_for_header = valid_c
 
             # 2) Сглобяване на мултипарт
             outcome = assembler.feed_outcome(ev.assembler_key, clean_line)
@@ -183,6 +188,23 @@ async def forward_loop(queue, routing_state=None):
             # observation can establish metadata for a fresh generation.
             for discarded_key in outcome.discarded_keys:
                 multipart_s_ctx.pop(discarded_key, None)
+                multipart_c_ctx.pop(discarded_key, None)
+
+            if (
+                outcome.status in {
+                    AssemblyStatus.PENDING,
+                    AssemblyStatus.DUPLICATE,
+                    AssemblyStatus.COMPLETE,
+                }
+                and outcome.group_key is not None
+                and valid_c is not None
+            ):
+                previous_c = multipart_c_ctx.get(outcome.group_key)
+                multipart_c_ctx[outcome.group_key] = (
+                    valid_c
+                    if previous_c is None
+                    else min(previous_c, valid_c)
+                )
 
             if (
                 outcome.status
@@ -202,6 +224,20 @@ async def forward_loop(queue, routing_state=None):
                 continue
 
             multipart = outcome.sentences
+
+            if (
+                outcome.status is AssemblyStatus.COMPLETE
+                and outcome.group_key is not None
+            ):
+                selected_c = (
+                    multipart_c_ctx.get(outcome.group_key)
+                    if C_PRESERVE_INGRESS_C
+                    else None
+                )
+                # wrap_with_meta treats integer zero as a server-time fallback.
+                # Keep single-sentence behavior unchanged while rendering a
+                # valid multipart c:0 selected by the group-level policy.
+                ts_for_header = "0" if selected_c == 0 else selected_c
 
             # --- изходно gid за тази група ---
             incoming_gid: str | None = None
@@ -264,12 +300,13 @@ async def forward_loop(queue, routing_state=None):
                         wrapped_line + '\r\n',
                     )
 
-            # 4) Successful multipart completion consumes its source context.
+            # 4) Successful multipart completion consumes its metadata.
             if (
                 outcome.status is AssemblyStatus.COMPLETE
                 and outcome.group_key is not None
             ):
                 multipart_s_ctx.pop(outcome.group_key, None)
+                multipart_c_ctx.pop(outcome.group_key, None)
 
 
 async def handle_socket(
