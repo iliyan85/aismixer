@@ -143,6 +143,7 @@ async def forward_loop(queue, routing_state=None):
     # Multipart metadata follows the assembler's correlation identity.
     multipart_s_ctx: dict[AssemblyKey, str] = {}
     multipart_c_ctx: dict[AssemblyKey, int] = {}
+    multipart_gid_ctx: dict[AssemblyKey, frozenset[str]] = {}
     while True:
         ev: IngressEvent = await queue.get()
         event_routing_table = None
@@ -168,6 +169,11 @@ async def forward_loop(queue, routing_state=None):
                 tag_pairs = {}
 
             g_info = extract_g_tuple(tag_pairs)  # (part, total, gid) или None
+            current_ingress_gid: str | None = None
+            if g_info:
+                _, _, candidate_gid = g_info
+                if candidate_gid and candidate_gid.isdigit():
+                    current_ingress_gid = candidate_gid
 
             # Parse the current valid TAG c for direct single-sentence use
             # and deterministic multipart timestamp selection below.
@@ -189,6 +195,7 @@ async def forward_loop(queue, routing_state=None):
             for discarded_key in outcome.discarded_keys:
                 multipart_s_ctx.pop(discarded_key, None)
                 multipart_c_ctx.pop(discarded_key, None)
+                multipart_gid_ctx.pop(discarded_key, None)
 
             if (
                 outcome.status in {
@@ -204,6 +211,24 @@ async def forward_loop(queue, routing_state=None):
                     valid_c
                     if previous_c is None
                     else min(previous_c, valid_c)
+                )
+
+            if (
+                outcome.status in {
+                    AssemblyStatus.PENDING,
+                    AssemblyStatus.DUPLICATE,
+                    AssemblyStatus.COMPLETE,
+                }
+                and outcome.group_key is not None
+                and G_PRESERVE_INGRESS_GID
+                and current_ingress_gid is not None
+            ):
+                previous_gids = multipart_gid_ctx.get(
+                    outcome.group_key,
+                    frozenset(),
+                )
+                multipart_gid_ctx[outcome.group_key] = (
+                    previous_gids | frozenset((current_ingress_gid,))
                 )
 
             if (
@@ -240,13 +265,20 @@ async def forward_loop(queue, routing_state=None):
                 ts_for_header = "0" if selected_c == 0 else selected_c
 
             # --- изходно gid за тази група ---
-            incoming_gid: str | None = None
-            if g_info:
-                _, _, in_gid = g_info
-                if in_gid and in_gid.isdigit():
-                    incoming_gid = in_gid
-            if G_PRESERVE_INGRESS_GID and incoming_gid:
-                out_gid = incoming_gid
+            if (
+                outcome.status is AssemblyStatus.COMPLETE
+                and outcome.group_key is not None
+            ):
+                observed_gids = multipart_gid_ctx.get(
+                    outcome.group_key,
+                    frozenset(),
+                )
+                if G_PRESERVE_INGRESS_GID and len(observed_gids) == 1:
+                    out_gid = next(iter(observed_gids))
+                else:
+                    out_gid = _gen_numeric_gid_fixed(G_ID_DIGITS)
+            elif G_PRESERVE_INGRESS_GID and current_ingress_gid is not None:
+                out_gid = current_ingress_gid
             else:
                 out_gid = _gen_numeric_gid_fixed(G_ID_DIGITS)
 
@@ -307,6 +339,7 @@ async def forward_loop(queue, routing_state=None):
             ):
                 multipart_s_ctx.pop(outcome.group_key, None)
                 multipart_c_ctx.pop(outcome.group_key, None)
+                multipart_gid_ctx.pop(outcome.group_key, None)
 
 
 async def handle_socket(
