@@ -6,6 +6,7 @@ import io
 import os
 import socket
 import sys
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -273,7 +274,7 @@ def test_handshake_replay_constants(monkeypatch):
 
     assert secure.HANDSHAKE_REPLAY_TTL_SECONDS == 60
     assert secure.HANDSHAKE_REPLAY_MAX == 100000
-    assert secure.handshake_replay_cache == {}
+    assert secure.SESSION_MAX == 100000
 
 
 class _FakeSecureSocket:
@@ -329,6 +330,16 @@ class _FakeQueue:
         self.items.append(item)
 
 
+class _FakeClock:
+    def __init__(self, now):
+        self.now = now
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.now
+
+
 def _signed_handshake_packet(secure, client_private_key, station_id, timestamp):
     digest = secure.hashes.Hash(
         secure.hashes.SHA256(), backend=secure.default_backend())
@@ -373,7 +384,9 @@ def _run_secure_server_with_packets(
     monkeypatch,
     secure,
     packets,
-    now=1010.0,
+    state=None,
+    wall_clock=None,
+    monotonic_clock=None,
     sec_input_id=None,
     ingress_policy=None,
 ):
@@ -381,7 +394,13 @@ def _run_secure_server_with_packets(
     fake_loop = _FakeSecureLoop(packets)
     fake_queue = _FakeQueue()
 
-    monkeypatch.setattr(secure.time, "time", lambda: now)
+    state = secure.SecureState() if state is None else state
+    wall_clock = _FakeClock(1010.0) if wall_clock is None else wall_clock
+    monotonic_clock = (
+        _FakeClock(1010.0)
+        if monotonic_clock is None
+        else monotonic_clock
+    )
     monkeypatch.setattr(
         secure, "socket", _FakeSocketModule(fake_socket, secure.socket))
     monkeypatch.setattr(secure, "asyncio", _FakeAsyncioModule(fake_loop))
@@ -394,10 +413,26 @@ def _run_secure_server_with_packets(
                 9999,
                 sec_input_id=sec_input_id,
                 ingress_policy=ingress_policy,
+                state=state,
+                wall_clock=wall_clock,
+                monotonic_clock=monotonic_clock,
             )
         )
 
     return fake_queue, fake_socket
+
+
+def _install_test_session(
+    secure,
+    state,
+    addr,
+    key,
+    now=1000.0,
+    station_id="boat_001",
+):
+    aesgcm = secure.AESGCM(key)
+    session = state.install_session(addr, station_id, aesgcm, now)
+    return session, aesgcm
 
 
 def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
@@ -408,22 +443,44 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
     addr = ("127.0.0.1", 50123)
     packet = _signed_handshake_packet(
         secure, client_private_key, station_id, timestamp)
-    fake_socket = _FakeSecureSocket()
-    fake_loop = _FakeSecureLoop([(packet, addr), (packet, addr)])
+    state = secure.SecureState()
+    wall_clock = _FakeClock(float(timestamp))
+    monotonic_clock = _FakeClock(10.0)
 
-    monkeypatch.setattr(secure.time, "time", lambda: float(timestamp))
-    monkeypatch.setattr(
-        secure, "socket", _FakeSocketModule(fake_socket, secure.socket))
-    monkeypatch.setattr(secure, "asyncio", _FakeAsyncioModule(fake_loop))
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr), (packet, addr)],
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
+    )
 
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(secure.secure_server(None, "127.0.0.1", 9999))
-
+    stats = state.stats()
     assert len(fake_socket.sent) == 1
-    assert fake_socket.sent[0][0].startswith(b"OK|")
+    response_parts = fake_socket.sent[0][0].split(b"|")
+    assert response_parts[0] == b"OK"
+    assert len(response_parts) == 2
+    server_signature = base64.b64decode(response_parts[1], validate=True)
+    digest = secure.hashes.Hash(
+        secure.hashes.SHA256(), backend=secure.default_backend()
+    )
+    digest.update(
+        secure.build_current_handshake_payload(station_id, timestamp)
+    )
+    secure.verify_signature(
+        secure.server_pub_bytes,
+        server_signature,
+        digest.finalize(),
+    )
     assert fake_socket.sent[0][1] == addr
-    assert secure.sessions[addr]["station_id"] == station_id
-    assert len(secure.handshake_replay_cache) == 1
+    assert stats.handshake_replay_accepted == 1
+    assert stats.handshake_replay_rejected == 1
+    assert stats.sessions_created == 1
+    assert stats.current_handshake_replays == 1
+    assert stats.current_sessions == 1
+    assert wall_clock.calls == 2
+    assert monotonic_clock.calls == 2
 
 
 def test_secure_server_sends_no_session_for_data_without_session(monkeypatch):
@@ -443,16 +500,17 @@ def test_secure_server_sends_station_no_session_for_keepalive_without_session(
     monkeypatch,
 ):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
     addr = ("127.0.0.1", 50123)
     packet = b"KEEPALIVE|boat_001|1000"
 
     fake_queue, fake_socket = _run_secure_server_with_packets(
-        monkeypatch, secure, [(packet, addr)]
+        monkeypatch, secure, [(packet, addr)], state=state
     )
 
     assert fake_queue.items == []
     assert fake_socket.sent == [(b"NOSESSION|boat_001", addr)]
-    assert secure.sessions == {}
+    assert state.stats().current_sessions == 0
 
 
 def test_secure_server_sends_bare_no_session_for_unparseable_keepalive(monkeypatch):
@@ -467,14 +525,42 @@ def test_secure_server_sends_bare_no_session_for_unparseable_keepalive(monkeypat
     assert fake_socket.sent == [(secure.NOSESSION_PREFIX, addr)]
 
 
+def test_secure_server_valid_keepalive_touches_once_with_separate_clocks(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 50123)
+    session = state.install_session(
+        addr, "boat_001", object(), now=1000.0
+    )
+    wall_clock = _FakeClock(5000.0)
+    monotonic_clock = _FakeClock(1010.0)
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(b"KEEPALIVE|boat_001|1000", addr)],
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
+    )
+
+    assert fake_queue.items == []
+    assert fake_socket.sent == []
+    assert session.last_seen == 1010.0
+    assert state.stats().sessions_touched == 1
+    assert wall_clock.calls == int(secure.DEBUG)
+    assert monotonic_clock.calls == 1
+
+
 def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     key = b"\x01" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
-    secure.sessions[addr] = secure.create_session(
-        "boat_001", secure.AESGCM(key), now=1000.0
-    )
+    state = secure.SecureState()
+    session, _ = _install_test_session(secure, state, addr, key)
     packet = _encrypted_control_packet(
         secure,
         key,
@@ -486,11 +572,19 @@ def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
             "source_id": "boat_001",
         },
     )
+    wall_clock = _FakeClock(2020.0)
+    monotonic_clock = _FakeClock(1010.0)
 
     fake_queue, fake_socket = _run_secure_server_with_packets(
-        monkeypatch, secure, [(packet, addr)]
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
     )
 
+    stats = state.stats()
     assert fake_queue.items == []
     assert len(fake_socket.sent) == 1
     response, response_addr = fake_socket.sent[0]
@@ -504,10 +598,14 @@ def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
     assert pong == {
         "type": "pong",
         "seq": 123,
-        "timestamp": 1010,
+        "timestamp": 2020,
         "source_id": "boat_001",
     }
-    assert secure.sessions[addr]["last_seen"] == 1010.0
+    assert session.last_seen == 1010.0
+    assert stats.sessions_touched == 1
+    assert stats.data_nonces_accepted == 1
+    assert wall_clock.calls == 1
+    assert monotonic_clock.calls == 1
 
 
 def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
@@ -515,18 +613,21 @@ def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
     key = b"\x01" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
-    secure.sessions[addr] = secure.create_session(
-        "boat_001", secure.AESGCM(key), now=1000.0)
+    state = secure.SecureState()
+    session, _ = _install_test_session(secure, state, addr, key)
     packet = _encrypted_data_packet(secure, key, nonce)
 
     fake_queue, _ = _run_secure_server_with_packets(
-        monkeypatch, secure, [(packet, addr)])
+        monkeypatch, secure, [(packet, addr)], state=state)
 
+    stats = state.stats()
     assert len(fake_queue.items) == 1
     assert fake_queue.items[0].source_id == "udpsec:boat_001"
     assert fake_queue.items[0].raw_line == "!AIVDM,1,1,,A,payload,0*00"
-    assert secure.sessions[addr]["last_seen"] == 1010.0
-    assert secure.sessions[addr]["seen_data_nonces"] == {nonce: 1310.0}
+    assert session.last_seen == 1010.0
+    assert len(session.seen_data_nonces) == 1
+    assert stats.sessions_touched == 1
+    assert stats.data_nonces_accepted == 1
 
 
 def test_secure_server_allowed_peer_preserves_data_behavior(monkeypatch):
@@ -538,14 +639,15 @@ def test_secure_server_allowed_peer_preserves_data_behavior(monkeypatch):
         ["127.0.0.1"],
         context="sec_inputs[0].allow_from",
     )
-    secure.sessions[addr] = secure.create_session(
-        "boat_001", secure.AESGCM(key), now=1000.0)
+    state = secure.SecureState()
+    _install_test_session(secure, state, addr, key)
     packet = _encrypted_data_packet(secure, key, nonce)
 
     fake_queue, _ = _run_secure_server_with_packets(
         monkeypatch,
         secure,
         [(packet, addr)],
+        state=state,
         ingress_policy=policy,
     )
 
@@ -556,23 +658,35 @@ def test_secure_server_allowed_peer_preserves_data_behavior(monkeypatch):
 
 def test_secure_server_denied_data_peer_gets_no_no_session_response(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=1.0)
+    retained_addr = ("198.51.100.20", 50000)
+    state.install_session(retained_addr, "retained", object(), now=0.0)
     addr = ("192.0.2.10", 50123)
     packet = secure.DATA_PREFIX + (b"\x00" * 28)
     policy = NetworkPolicy.from_entries(
         ["198.51.100.0/24"],
         context="sec_inputs[0].allow_from",
     )
+    wall_clock = _FakeClock(1000.0)
+    monotonic_clock = _FakeClock(1.0)
 
     fake_queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
         secure,
         [(packet, addr)],
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
         ingress_policy=policy,
     )
 
     assert fake_queue.items == []
     assert fake_socket.sent == []
-    assert secure.sessions == {}
+    assert tuple(state._sessions) == (retained_addr,)
+    assert state.stats().current_sessions == 1
+    assert state.stats().sessions_expired == 0
+    assert wall_clock.calls == 0
+    assert monotonic_clock.calls == 0
 
 
 def test_secure_server_denied_handshake_peer_is_dropped_before_crypto(monkeypatch):
@@ -592,18 +706,25 @@ def test_secure_server_denied_handshake_peer_is_dropped_before_crypto(monkeypatc
         raise AssertionError("signature verification should not run")
 
     monkeypatch.setattr(secure, "verify_signature", fail_verify)
+    state = secure.SecureState()
+    wall_clock = _FakeClock(float(timestamp))
+    monotonic_clock = _FakeClock(10.0)
     fake_queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
         secure,
         [(packet, addr)],
-        now=float(timestamp),
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
         ingress_policy=policy,
     )
 
     assert fake_queue.items == []
     assert fake_socket.sent == []
-    assert secure.sessions == {}
-    assert secure.handshake_replay_cache == {}
+    assert state.stats().current_sessions == 0
+    assert state.stats().current_handshake_replays == 0
+    assert wall_clock.calls == 0
+    assert monotonic_clock.calls == 0
 
 
 def test_secure_server_source_id_uses_station_not_sec_input_id(monkeypatch):
@@ -611,14 +732,15 @@ def test_secure_server_source_id_uses_station_not_sec_input_id(monkeypatch):
     key = b"\x01" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
-    secure.sessions[addr] = secure.create_session(
-        "boat_001", secure.AESGCM(key), now=1000.0)
+    state = secure.SecureState()
+    _install_test_session(secure, state, addr, key)
     packet = _encrypted_data_packet(secure, key, nonce)
 
     fake_queue, _ = _run_secure_server_with_packets(
         monkeypatch,
         secure,
         [(packet, addr)],
+        state=state,
         sec_input_id="configured_listener_alias",
     )
 
@@ -633,15 +755,23 @@ def test_secure_server_rejects_duplicate_data_nonce_after_first_valid_packet(mon
     key = b"\x01" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
-    secure.sessions[addr] = secure.create_session(
-        "boat_001", secure.AESGCM(key), now=1000.0)
+    state = secure.SecureState()
+    session, _ = _install_test_session(secure, state, addr, key)
     packet = _encrypted_data_packet(secure, key, nonce)
 
     fake_queue, _ = _run_secure_server_with_packets(
-        monkeypatch, secure, [(packet, addr), (packet, addr)])
+        monkeypatch,
+        secure,
+        [(packet, addr), (packet, addr)],
+        state=state,
+    )
 
+    stats = state.stats()
     assert len(fake_queue.items) == 1
-    assert secure.sessions[addr]["seen_data_nonces"] == {nonce: 1310.0}
+    assert len(session.seen_data_nonces) == 1
+    assert stats.data_nonces_accepted == 1
+    assert stats.data_nonce_replays == 1
+    assert stats.sessions_touched == 1
 
 
 def test_secure_server_failed_decrypt_does_not_record_data_nonce(monkeypatch):
@@ -649,16 +779,41 @@ def test_secure_server_failed_decrypt_does_not_record_data_nonce(monkeypatch):
     key = b"\x01" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
-    secure.sessions[addr] = secure.create_session(
-        "boat_001", secure.AESGCM(key), now=1000.0)
+    state = secure.SecureState()
+    session, _ = _install_test_session(secure, state, addr, key)
     packet = secure.DATA_PREFIX + nonce + (b"\x00" * 16)
 
     fake_queue, _ = _run_secure_server_with_packets(
-        monkeypatch, secure, [(packet, addr)])
+        monkeypatch, secure, [(packet, addr)], state=state)
+
+    stats = state.stats()
+    assert fake_queue.items == []
+    assert session.last_seen == 1000.0
+    assert len(session.seen_data_nonces) == 0
+    assert stats.sessions_touched == 0
+    assert stats.data_nonces_accepted == 0
+
+
+def test_secure_server_malformed_framing_does_not_record_nonce_or_touch(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    addr = ("127.0.0.1", 50123)
+    state = secure.SecureState()
+    session, _ = _install_test_session(secure, state, addr, key)
+    packet = secure.DATA_PREFIX + (b"\x02" * 12)
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch, secure, [(packet, addr)], state=state
+    )
 
     assert fake_queue.items == []
-    assert secure.sessions[addr]["last_seen"] == 1000.0
-    assert secure.sessions[addr]["seen_data_nonces"] == {}
+    assert fake_socket.sent == []
+    assert session.last_seen == 1000.0
+    assert len(session.seen_data_nonces) == 0
+    assert state.stats().sessions_touched == 0
+    assert state.stats().data_nonces_accepted == 0
 
 
 def test_secure_server_source_mismatch_does_not_record_data_nonce_or_touch(monkeypatch):
@@ -666,80 +821,645 @@ def test_secure_server_source_mismatch_does_not_record_data_nonce_or_touch(monke
     key = b"\x01" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
-    secure.sessions[addr] = secure.create_session(
-        "boat_001", secure.AESGCM(key), now=1000.0)
+    state = secure.SecureState()
+    session, _ = _install_test_session(secure, state, addr, key)
     packet = _encrypted_data_packet(secure, key, nonce, source_id="other_station")
 
     fake_queue, _ = _run_secure_server_with_packets(
-        monkeypatch, secure, [(packet, addr)])
+        monkeypatch, secure, [(packet, addr)], state=state)
+
+    stats = state.stats()
+    assert fake_queue.items == []
+    assert session.last_seen == 1000.0
+    assert len(session.seen_data_nonces) == 0
+    assert stats.sessions_touched == 0
+    assert stats.data_nonces_accepted == 0
+
+
+@pytest.mark.parametrize(
+    ("wall_now", "accepted"),
+    [
+        (970.0, True),
+        (1030.0, True),
+        (969.999, False),
+        (1030.001, False),
+    ],
+)
+def test_secure_server_handshake_freshness_uses_wall_clock_boundary(
+    monkeypatch,
+    wall_now,
+    accepted,
+):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    timestamp = 1000
+    addr = ("127.0.0.1", 50123)
+    packet = _signed_handshake_packet(
+        secure, client_private_key, "boat_001", timestamp
+    )
+    state = secure.SecureState()
+    wall_clock = _FakeClock(wall_now)
+    monotonic_clock = _FakeClock(1_000_000.0)
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
+    )
+
+    assert bool(fake_socket.sent) is accepted
+    assert state.stats().sessions_created == int(accepted)
+    assert state.stats().handshake_replay_accepted == int(accepted)
+    assert wall_clock.calls == 1
+    assert monotonic_clock.calls == 1
+
+
+def test_secure_server_handshake_replay_ttl_uses_monotonic_clock(monkeypatch):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    timestamp = 1000
+    addr = ("127.0.0.1", 50123)
+    packet = _signed_handshake_packet(
+        secure, client_private_key, "boat_001", timestamp
+    )
+    state = secure.SecureState(handshake_replay_ttl=60.0)
+
+    _, first_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+    )
+    _, duplicate_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(69.999),
+    )
+    _, expired_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(70.0),
+    )
+
+    assert len(first_socket.sent) == 1
+    assert duplicate_socket.sent == []
+    assert len(expired_socket.sent) == 1
+    stats = state.stats()
+    assert stats.handshake_replay_accepted == 2
+    assert stats.handshake_replay_rejected == 1
+    assert stats.handshake_replay_expired == 1
+    assert stats.sessions_created == 2
+    assert stats.sessions_replaced == 1
+
+
+def test_secure_server_keeps_replay_record_after_post_acceptance_failure(monkeypatch):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    timestamp = 1000
+    addr = ("127.0.0.1", 50123)
+    packet = _signed_handshake_packet(
+        secure, client_private_key, "boat_001", timestamp
+    )
+    state = secure.SecureState()
+
+    class FailingServerPrivateKey:
+        def __init__(self):
+            self.sign_calls = 0
+
+        def sign(self, *_args, **_kwargs):
+            self.sign_calls += 1
+            raise RuntimeError("server signing failed")
+
+    failing_key = FailingServerPrivateKey()
+    monkeypatch.setattr(secure, "server_priv", failing_key)
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr), (packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+    )
+
+    assert fake_socket.sent == []
+    assert failing_key.sign_calls == 1
+    stats = state.stats()
+    assert stats.handshake_replay_accepted == 1
+    assert stats.handshake_replay_rejected == 1
+    assert stats.current_handshake_replays == 1
+    assert stats.sessions_created == 0
+
+
+def test_secure_server_successful_handshake_replaces_live_session_only(
+    monkeypatch,
+):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    state = secure.SecureState(max_sessions=2)
+    addr = ("127.0.0.1", 50123)
+    other_addr = ("127.0.0.1", 50124)
+    old = state.install_session(
+        addr, "boat_001", object(), now=0.0
+    )
+    other = state.install_session(
+        other_addr, "other", object(), now=1.0
+    )
+    nonce = b"\x01" * 12
+    assert state.accept_data_nonce(old, nonce, now=1.0)
+    packet = _signed_handshake_packet(
+        secure, client_private_key, "boat_001", 1000
+    )
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(2.0),
+    )
+
+    replacement = state._sessions[addr]
+    response, response_addr = fake_socket.sent[0]
+    assert response_addr == addr
+    assert response.startswith(b"OK|")
+    assert replacement is not old
+    assert replacement.aesgcm is not old.aesgcm
+    assert state._sessions[other_addr] is other
+    assert tuple(state._sessions) == (other_addr, addr)
+    assert not state.data_nonce_seen(replacement, nonce, now=2.0)
+
+    stats = state.stats()
+    assert stats.sessions_created == 3
+    assert stats.sessions_replaced == 1
+    assert stats.sessions_capacity_evicted == 0
+    assert stats.data_nonces_session_discarded == 1
+
+
+@pytest.mark.parametrize(
+    ("monotonic_now", "accepted"),
+    [(1299.999, True), (1300.0, False)],
+)
+def test_secure_server_session_ttl_uses_exact_monotonic_boundary(
+    monkeypatch,
+    monotonic_now,
+    accepted,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    state = secure.SecureState()
+    _install_test_session(secure, state, addr, key, now=1000.0)
+    packet = _encrypted_data_packet(secure, key, nonce)
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(9_999_999.0),
+        monotonic_clock=_FakeClock(monotonic_now),
+    )
+
+    assert bool(fake_queue.items) is accepted
+    assert fake_socket.sent == (
+        [] if accepted else [(secure.NOSESSION_PREFIX, addr)]
+    )
+    assert state.stats().sessions_expired == int(not accepted)
+
+
+def test_secure_server_nonce_ttl_uses_monotonic_clock_and_exact_boundary(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    state = secure.SecureState(session_ttl=1000.0, data_nonce_ttl=10.0)
+    _install_test_session(secure, state, addr, key, now=0.0)
+    packet = _encrypted_data_packet(secure, key, nonce)
+
+    first_queue, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(0.0),
+    )
+    duplicate_queue, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(50_000.0),
+        monotonic_clock=_FakeClock(9.999),
+    )
+    expired_queue, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(-50_000.0),
+        monotonic_clock=_FakeClock(10.0),
+    )
+
+    assert len(first_queue.items) == 1
+    assert duplicate_queue.items == []
+    assert len(expired_queue.items) == 1
+    stats = state.stats()
+    assert stats.data_nonces_accepted == 2
+    assert stats.data_nonce_replays == 1
+    assert stats.data_nonces_expired == 1
+    assert stats.sessions_touched == 2
+
+
+def test_secure_server_rejects_repeated_nonce_before_second_decrypt(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    real_aesgcm = secure.AESGCM(key)
+
+    class CountingAESGCM:
+        def __init__(self):
+            self.decrypt_calls = 0
+
+        def decrypt(self, *args):
+            self.decrypt_calls += 1
+            return real_aesgcm.decrypt(*args)
+
+    aesgcm = CountingAESGCM()
+    state = secure.SecureState()
+    state.install_session(addr, "boat_001", aesgcm, now=1000.0)
+    packet = _encrypted_data_packet(secure, key, nonce)
+
+    fake_queue, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr), (packet, addr)],
+        state=state,
+    )
+
+    assert len(fake_queue.items) == 1
+    assert aesgcm.decrypt_calls == 1
+    assert state.stats().data_nonce_replays == 1
+    assert state.stats().sessions_touched == 1
+
+
+def test_secure_server_invalid_json_does_not_record_nonce_or_touch(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    state = secure.SecureState()
+    session, _ = _install_test_session(secure, state, addr, key)
+    ciphertext = secure.AESGCM(key).encrypt(
+        nonce, b"not-json", secure.DATA_AAD
+    )
+    packet = secure.DATA_PREFIX + nonce + ciphertext
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch, secure, [(packet, addr)], state=state
+    )
 
     assert fake_queue.items == []
-    assert secure.sessions[addr]["last_seen"] == 1000.0
-    assert secure.sessions[addr]["seen_data_nonces"] == {}
+    assert fake_socket.sent == []
+    assert session.last_seen == 1000.0
+    assert state.stats().data_nonces_accepted == 0
+    assert state.stats().sessions_touched == 0
 
 
-def test_mark_handshake_replay_seen_accepts_first_mark(monkeypatch):
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"type": "ping", "source_id": "boat_001"},
+        {"type": "nmea", "source_id": "boat_001"},
+        {"type": "unknown", "source_id": "boat_001"},
+    ],
+)
+def test_secure_server_invalid_message_shape_does_not_record_nonce_or_touch(
+    monkeypatch,
+    message,
+):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    cache = {}
-    key = b"key"
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    state = secure.SecureState()
+    session, _ = _install_test_session(secure, state, addr, key)
+    packet = _encrypted_control_packet(secure, key, nonce, message)
 
-    assert secure.mark_handshake_replay_seen(cache, key, now=100.0, ttl=60.0, max_entries=100)
-    assert cache == {key: 160.0}
-
-
-def test_mark_handshake_replay_seen_rejects_second_mark(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    cache = {}
-    key = b"key"
-
-    assert secure.mark_handshake_replay_seen(cache, key, now=100.0, ttl=60.0, max_entries=100)
-    assert not secure.mark_handshake_replay_seen(
-        cache, key, now=120.0, ttl=60.0, max_entries=100
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch, secure, [(packet, addr)], state=state
     )
 
+    assert fake_queue.items == []
+    assert fake_socket.sent == []
+    assert session.last_seen == 1000.0
+    assert state.stats().data_nonces_accepted == 0
+    assert state.stats().sessions_touched == 0
 
-def test_mark_handshake_replay_seen_accepts_expired_key_again(monkeypatch):
+
+def test_allowed_peer_activity_proactively_cleans_silent_expired_session(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    cache = {}
+    state = secure.SecureState(session_ttl=10.0)
+    silent_addr = ("127.0.0.1", 50122)
+    active_addr = ("127.0.0.1", 50123)
+    state.install_session(silent_addr, "silent", object(), now=0.0)
+    packet = secure.DATA_PREFIX + (b"\x00" * 28)
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, active_addr)],
+        state=state,
+        monotonic_clock=_FakeClock(10.0),
+    )
+
+    assert tuple(state._sessions) == ()
+    assert state.stats().sessions_expired == 1
+    assert fake_socket.sent == [(secure.NOSESSION_PREFIX, active_addr)]
+
+
+def test_allowed_handshake_proactively_cleans_silent_expired_session(monkeypatch):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    state = secure.SecureState(session_ttl=10.0)
+    silent_addr = ("127.0.0.1", 50122)
+    handshake_addr = ("127.0.0.1", 50123)
+    state.install_session(silent_addr, "silent", object(), now=0.0)
+    packet = _signed_handshake_packet(
+        secure, client_private_key, "boat_001", 1000
+    )
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, handshake_addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+    )
+
+    assert tuple(state._sessions) == (handshake_addr,)
+    assert state.stats().sessions_expired == 1
+    assert len(fake_socket.sent) == 1
+    assert fake_socket.sent[0][0].startswith(b"OK|")
+
+
+def test_unknown_allowed_packet_proactively_cleans_without_wall_clock(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0)
+    silent_addr = ("127.0.0.1", 50122)
+    state.install_session(silent_addr, "silent", object(), now=0.0)
+    wall_clock = _FakeClock(1000.0)
+    monotonic_clock = _FakeClock(10.0)
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(b"UNKNOWN", ("127.0.0.1", 50123))],
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
+    )
+
+    assert fake_queue.items == []
+    assert fake_socket.sent == []
+    assert state.stats().sessions_expired == 1
+    assert state.stats().current_sessions == 0
+    assert wall_clock.calls == 0
+    assert monotonic_clock.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("packet_factory", "expected_response"),
+    [
+        (
+            lambda secure: secure.DATA_PREFIX + (b"\x00" * 28),
+            lambda secure, addr: (secure.NOSESSION_PREFIX, addr),
+        ),
+        (
+            lambda _secure: b"KEEPALIVE|boat_001|1000",
+            lambda _secure, addr: (b"NOSESSION|boat_001", addr),
+        ),
+    ],
+)
+def test_exactly_expired_address_receives_existing_no_session_format(
+    monkeypatch,
+    packet_factory,
+    expected_response,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0)
+    addr = ("127.0.0.1", 50123)
+    state.install_session(addr, "boat_001", object(), now=0.0)
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet_factory(secure), addr)],
+        state=state,
+        monotonic_clock=_FakeClock(10.0),
+    )
+
+    assert fake_socket.sent == [expected_response(secure, addr)]
+    assert state.stats().sessions_expired == 1
+
+
+def test_handshake_replay_accepts_first_key(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(handshake_replay_ttl=60.0)
     key = b"key"
 
-    assert secure.mark_handshake_replay_seen(cache, key, now=100.0, ttl=60.0, max_entries=100)
-    assert secure.mark_handshake_replay_seen(cache, key, now=160.0, ttl=60.0, max_entries=100)
-    assert cache == {key: 220.0}
+    assert state.accept_handshake_replay(key, now=100.0)
+    stats = state.stats()
+    assert stats.handshake_replay_accepted == 1
+    assert stats.current_handshake_replays == 1
+    assert stats.peak_handshake_replays == 1
 
 
-def test_mark_handshake_replay_seen_removes_expired_entries_opportunistically(monkeypatch):
+def test_handshake_replay_rejects_live_duplicate_without_refresh(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    cache = {b"expired": 99.0, b"fresh": 130.0}
+    state = secure.SecureState(handshake_replay_ttl=60.0)
+    key = b"key"
 
-    assert secure.mark_handshake_replay_seen(
-        cache, b"new", now=100.0, ttl=60.0, max_entries=100
+    assert state.accept_handshake_replay(key, now=100.0)
+    assert not state.accept_handshake_replay(key, now=120.0)
+    assert not state.accept_handshake_replay(key, now=159.999)
+    assert state.accept_handshake_replay(key, now=160.0)
+    stats = state.stats()
+    assert stats.handshake_replay_accepted == 2
+    assert stats.handshake_replay_rejected == 2
+    assert stats.handshake_replay_expired == 1
+    assert stats.current_handshake_replays == 1
+
+
+def test_handshake_replay_accepts_key_again_at_exact_expiry(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(handshake_replay_ttl=60.0)
+    key = b"key"
+
+    assert state.accept_handshake_replay(key, now=100.0)
+    assert state.accept_handshake_replay(key, now=160.0)
+    assert key in state._handshake_replays._live_by_key
+
+
+def test_handshake_replay_removes_expired_front_prefix(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(
+        handshake_replay_ttl=30.0,
+        handshake_replay_max=100,
+    )
+    assert state.accept_handshake_replay(b"expired", now=0.0)
+    assert state.accept_handshake_replay(b"fresh", now=20.0)
+
+    assert state.accept_handshake_replay(b"new", now=30.0)
+
+    assert set(state._handshake_replays._live_by_key) == {b"fresh", b"new"}
+    stats = state.stats()
+    assert stats.handshake_replay_expired == 1
+    assert stats.current_handshake_replays == 2
+
+
+def test_handshake_replay_capacity_evicts_oldest_live_key(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(
+        handshake_replay_ttl=60.0,
+        handshake_replay_max=2,
     )
 
-    assert cache == {b"fresh": 130.0, b"new": 160.0}
+    assert state.accept_handshake_replay(b"one", now=100.0)
+    assert state.accept_handshake_replay(b"two", now=101.0)
+    assert state.accept_handshake_replay(b"three", now=102.0)
+
+    assert set(state._handshake_replays._live_by_key) == {b"two", b"three"}
+    stats = state.stats()
+    assert stats.handshake_replay_capacity_evicted == 1
+    assert stats.handshake_replay_expired == 0
+    assert stats.current_handshake_replays == 2
+    assert stats.peak_handshake_replays == 2
 
 
-def test_mark_handshake_replay_seen_enforces_max_entries(monkeypatch):
+def test_handshake_replay_accepts_different_keys_independently(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    cache = {}
+    state = secure.SecureState()
 
-    assert secure.mark_handshake_replay_seen(cache, b"one", now=100.0, ttl=60.0, max_entries=2)
-    assert secure.mark_handshake_replay_seen(cache, b"two", now=101.0, ttl=60.0, max_entries=2)
-    assert secure.mark_handshake_replay_seen(
-        cache, b"three", now=102.0, ttl=60.0, max_entries=2
+    assert state.accept_handshake_replay(b"one", now=100.0)
+    assert state.accept_handshake_replay(b"two", now=100.0)
+    assert state.stats().current_handshake_replays == 2
+
+
+def test_handshake_replay_expiry_precedes_capacity_eviction(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(
+        handshake_replay_ttl=10.0,
+        handshake_replay_max=2,
     )
+    assert state.accept_handshake_replay(b"expired", now=0.0)
+    assert state.accept_handshake_replay(b"live", now=5.0)
 
-    assert len(cache) == 2
-    assert b"one" not in cache
-    assert set(cache) == {b"two", b"three"}
+    assert state.accept_handshake_replay(b"new", now=10.0)
+
+    assert set(state._handshake_replays._live_by_key) == {b"live", b"new"}
+    stats = state.stats()
+    assert stats.handshake_replay_expired == 1
+    assert stats.handshake_replay_capacity_evicted == 0
 
 
-def test_mark_handshake_replay_seen_accepts_different_keys_independently(monkeypatch):
+def test_expiring_set_stale_record_identity_cannot_remove_new_incarnation(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    cache = {}
+    expiring_set = secure._BoundedExpiringSet(ttl=10.0, max_entries=2)
+    key = b"same"
+    assert expiring_set.accept(key, now=0.0).accepted
+    stale_record = expiring_set._live_by_key.pop(key)
+    assert expiring_set.accept(key, now=1.0).accepted
+    current_record = expiring_set._live_by_key[key]
+    assert stale_record is not current_record
 
-    assert secure.mark_handshake_replay_seen(cache, b"one", now=100.0, ttl=60.0, max_entries=100)
-    assert secure.mark_handshake_replay_seen(cache, b"two", now=100.0, ttl=60.0, max_entries=100)
+    seen, expired = expiring_set.contains(key, now=10.0)
+
+    assert seen
+    assert expired == 0
+    assert expiring_set._live_by_key[key] is current_record
+    assert tuple(expiring_set._expiry_order) == (current_record,)
+
+
+@pytest.mark.parametrize("kind", ["handshake", "nonce"])
+def test_expiring_state_cleanup_and_capacity_do_not_scan_or_call_min(
+    monkeypatch,
+    kind,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    class NoScanDict(dict):
+        def __iter__(self):
+            raise AssertionError("live dictionary must not be iterated")
+
+        def items(self):
+            raise AssertionError("live dictionary must not be scanned")
+
+        def values(self):
+            raise AssertionError("live dictionary must not be scanned")
+
+    if kind == "handshake":
+        state = secure.SecureState(
+            handshake_replay_ttl=10.0,
+            handshake_replay_max=2,
+        )
+        assert state.accept_handshake_replay(b"expired", now=0.0)
+        assert state.accept_handshake_replay(b"live", now=5.0)
+        expiring_set = state._handshake_replays
+        operation = lambda: state.accept_handshake_replay(b"new", now=10.0)
+        capacity_operation = lambda: state.accept_handshake_replay(
+            b"newest", now=11.0
+        )
+    else:
+        state = secure.SecureState(
+            data_nonce_ttl=10.0,
+            data_nonce_max_per_session=2,
+        )
+        session = state.install_session(
+            ("192.0.2.10", 50000), "boat_001", object(), now=0.0
+        )
+        assert state.accept_data_nonce(session, b"\x01" * 12, now=0.0)
+        assert state.accept_data_nonce(session, b"\x02" * 12, now=5.0)
+        expiring_set = session.seen_data_nonces
+        operation = lambda: state.accept_data_nonce(
+            session, b"\x03" * 12, now=10.0
+        )
+        capacity_operation = lambda: state.accept_data_nonce(
+            session, b"\x04" * 12, now=11.0
+        )
+
+    expiring_set._live_by_key = NoScanDict(expiring_set._live_by_key)
+
+    def fail_min(*_args, **_kwargs):
+        raise AssertionError("min() must not be used for eviction")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "min", fail_min)
+        assert operation()
+        assert capacity_operation()
+
+    assert len(expiring_set._live_by_key) == 2
 
 
 def test_proxy_encrypt_message_aes_gcm_uses_12_byte_nonce_and_nmea_aad():
@@ -1667,25 +2387,11 @@ def test_parse_keepalive_packet_rejects_non_numeric_timestamp(monkeypatch):
         secure.parse_keepalive_packet(b"KEEPALIVE|boat_001|not-a-timestamp")
 
 
-def test_create_session_stores_identity_crypto_and_timestamps(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    aesgcm = object()
-
-    session = secure.create_session("boat_001", aesgcm, now=100.0)
-
-    assert session == {
-        "station_id": "boat_001",
-        "aesgcm": aesgcm,
-        "created_at": 100.0,
-        "last_seen": 100.0,
-        "seen_data_nonces": {},
-    }
-
-
 def test_session_ttl_seconds_is_300(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
 
     assert secure.SESSION_TTL_SECONDS == 300
+    assert secure.SESSION_MAX == 100000
 
 
 def test_data_nonce_constants(monkeypatch):
@@ -1695,207 +2401,675 @@ def test_data_nonce_constants(monkeypatch):
     assert secure.DATA_NONCE_MAX_PER_SESSION == 100000
 
 
-def test_mark_data_nonce_seen_accepts_first_mark(monkeypatch):
+@pytest.mark.parametrize(
+    "field",
+    ["max_sessions", "handshake_replay_max", "data_nonce_max_per_session"],
+)
+@pytest.mark.parametrize("value", [True, 1.0, 1.5, "2", None])
+def test_secure_state_rejects_non_integer_maximums(monkeypatch, field, value):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    session = secure.create_session("boat_001", object(), now=100.0)
+
+    with pytest.raises(TypeError):
+        secure.SecureState(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["max_sessions", "handshake_replay_max", "data_nonce_max_per_session"],
+)
+@pytest.mark.parametrize("value", [0, -1])
+def test_secure_state_rejects_non_positive_maximums(monkeypatch, field, value):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    with pytest.raises(ValueError):
+        secure.SecureState(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["session_ttl", "handshake_replay_ttl", "data_nonce_ttl"],
+)
+@pytest.mark.parametrize("value", [True, "1", None])
+def test_secure_state_rejects_non_numeric_ttls(monkeypatch, field, value):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    with pytest.raises(TypeError):
+        secure.SecureState(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["session_ttl", "handshake_replay_ttl", "data_nonce_ttl"],
+)
+@pytest.mark.parametrize("value", [0, 0.0, -1, -0.5])
+def test_secure_state_rejects_non_positive_ttls(monkeypatch, field, value):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    with pytest.raises(ValueError):
+        secure.SecureState(**{field: value})
+
+
+def test_secure_state_accepts_positive_integer_and_float_limits(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    state = secure.SecureState(
+        session_ttl=1,
+        max_sessions=1,
+        handshake_replay_ttl=1.5,
+        handshake_replay_max=2,
+        data_nonce_ttl=2.5,
+        data_nonce_max_per_session=3,
+    )
+
+    assert state.stats().current_sessions == 0
+
+
+def test_secure_session_stores_identity_crypto_and_monotonic_timestamps(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("192.0.2.10", 50000)
+    aesgcm = object()
+
+    session = state.install_session(addr, "boat_001", aesgcm, now=100.0)
+
+    assert session.station_id == "boat_001"
+    assert session.aesgcm is aesgcm
+    assert session.created_at == 100.0
+    assert session.last_seen == 100.0
+    assert len(session.seen_data_nonces) == 0
+    assert tuple(state._sessions) == (addr,)
+    assert state.stats().sessions_created == 1
+
+
+def test_data_nonce_accepts_first_validated_nonce(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(data_nonce_ttl=60.0)
+    session = state.install_session(
+        ("192.0.2.10", 50000), "boat_001", object(), now=100.0
+    )
     nonce = b"\x01" * 12
 
-    assert secure.mark_data_nonce_seen(
-        session, nonce, now=100.0, ttl=60.0, max_entries=100
-    ) is True
-    assert session["seen_data_nonces"] == {nonce: 160.0}
-    assert secure.data_nonce_seen(session, nonce, now=100.0, ttl=60.0) is True
+    assert not state.data_nonce_seen(session, nonce, now=100.0)
+    assert state.accept_data_nonce(session, nonce, now=100.0)
+    stats = state.stats()
+    assert stats.data_nonces_accepted == 1
+    assert stats.data_nonce_replays == 0
+    assert stats.current_data_nonces == 1
+    assert stats.peak_data_nonces == 1
 
 
-def test_mark_data_nonce_seen_rejects_second_mark(monkeypatch):
+def test_data_nonce_replay_does_not_refresh_expiry(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    session = secure.create_session("boat_001", object(), now=100.0)
+    state = secure.SecureState(data_nonce_ttl=60.0)
+    session = state.install_session(
+        ("192.0.2.10", 50000), "boat_001", object(), now=100.0
+    )
     nonce = b"\x01" * 12
 
-    assert secure.mark_data_nonce_seen(
-        session, nonce, now=100.0, ttl=60.0, max_entries=100
-    ) is True
-    assert secure.mark_data_nonce_seen(
-        session, nonce, now=120.0, ttl=60.0, max_entries=100
-    ) is False
-    assert session["seen_data_nonces"] == {nonce: 160.0}
+    assert state.accept_data_nonce(session, nonce, now=100.0)
+    assert state.data_nonce_seen(session, nonce, now=120.0)
+    assert state.data_nonce_seen(session, nonce, now=159.999)
+    assert not state.data_nonce_seen(session, nonce, now=160.0)
+    assert state.accept_data_nonce(session, nonce, now=160.0)
+
+    stats = state.stats()
+    assert stats.data_nonces_accepted == 2
+    assert stats.data_nonce_replays == 2
+    assert stats.data_nonces_expired == 1
+    assert stats.current_data_nonces == 1
 
 
-def test_mark_data_nonce_seen_accepts_expired_nonce_again(monkeypatch):
+def test_data_nonce_cleanup_removes_only_expired_front_prefix(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    session = secure.create_session("boat_001", object(), now=100.0)
-    nonce = b"\x01" * 12
-
-    assert secure.mark_data_nonce_seen(
-        session, nonce, now=100.0, ttl=60.0, max_entries=100
-    ) is True
-    assert secure.data_nonce_seen(session, nonce, now=160.0, ttl=60.0) is False
-    assert secure.mark_data_nonce_seen(
-        session, nonce, now=160.0, ttl=60.0, max_entries=100
-    ) is True
-    assert session["seen_data_nonces"] == {nonce: 220.0}
-
-
-def test_data_nonce_helpers_remove_expired_entries_opportunistically(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    session = secure.create_session("boat_001", object(), now=100.0)
+    state = secure.SecureState(data_nonce_ttl=30.0)
+    session = state.install_session(
+        ("192.0.2.10", 50000), "boat_001", object(), now=0.0
+    )
     expired_nonce = b"\x01" * 12
     active_nonce = b"\x02" * 12
-    session["seen_data_nonces"] = {
-        expired_nonce: 120.0,
-        active_nonce: 180.0,
-    }
 
-    removed = secure.cleanup_expired_data_nonces(session, now=120.0, ttl=60.0)
+    assert state.accept_data_nonce(session, expired_nonce, now=0.0)
+    assert state.accept_data_nonce(session, active_nonce, now=20.0)
+    assert not state.data_nonce_seen(session, b"\x03" * 12, now=30.0)
 
-    assert removed == [expired_nonce]
-    assert session["seen_data_nonces"] == {active_nonce: 180.0}
+    assert set(session.seen_data_nonces._live_by_key) == {active_nonce}
+    stats = state.stats()
+    assert stats.data_nonces_expired == 1
+    assert stats.current_data_nonces == 1
 
 
-def test_mark_data_nonce_seen_enforces_max_entries(monkeypatch):
+def test_data_nonce_capacity_evicts_oldest_live_nonce(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    session = secure.create_session("boat_001", object(), now=100.0)
+    state = secure.SecureState(
+        data_nonce_ttl=60.0,
+        data_nonce_max_per_session=2,
+    )
+    session = state.install_session(
+        ("192.0.2.10", 50000), "boat_001", object(), now=100.0
+    )
     one = b"\x01" * 12
     two = b"\x02" * 12
     three = b"\x03" * 12
 
-    assert secure.mark_data_nonce_seen(session, one, now=100.0, ttl=60.0, max_entries=2)
-    assert secure.mark_data_nonce_seen(session, two, now=101.0, ttl=60.0, max_entries=2)
-    assert secure.mark_data_nonce_seen(
-        session, three, now=102.0, ttl=60.0, max_entries=2
-    )
+    assert state.accept_data_nonce(session, one, now=100.0)
+    assert state.accept_data_nonce(session, two, now=101.0)
+    assert state.accept_data_nonce(session, three, now=102.0)
 
-    assert session["seen_data_nonces"] == {two: 161.0, three: 162.0}
+    assert set(session.seen_data_nonces._live_by_key) == {two, three}
+    stats = state.stats()
+    assert stats.data_nonces_capacity_evicted == 1
+    assert stats.data_nonces_expired == 0
+    assert stats.current_data_nonces == 2
+    assert stats.peak_data_nonces == 2
 
 
-def test_mark_data_nonce_seen_accepts_different_nonces_independently(monkeypatch):
+def test_data_nonce_expiry_precedes_capacity_eviction(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    session = secure.create_session("boat_001", object(), now=100.0)
-    one = b"\x01" * 12
-    two = b"\x02" * 12
+    state = secure.SecureState(
+        data_nonce_ttl=10.0,
+        data_nonce_max_per_session=2,
+    )
+    session = state.install_session(
+        ("192.0.2.10", 50000), "boat_001", object(), now=0.0
+    )
+    expired = b"\x01" * 12
+    live = b"\x02" * 12
+    new = b"\x03" * 12
+    assert state.accept_data_nonce(session, expired, now=0.0)
+    assert state.accept_data_nonce(session, live, now=5.0)
 
-    assert secure.mark_data_nonce_seen(session, one, now=100.0, ttl=60.0, max_entries=100)
-    assert secure.mark_data_nonce_seen(session, two, now=100.0, ttl=60.0, max_entries=100)
-    assert secure.data_nonce_seen(session, one, now=100.0, ttl=60.0)
-    assert secure.data_nonce_seen(session, two, now=100.0, ttl=60.0)
+    assert state.accept_data_nonce(session, new, now=10.0)
+
+    assert set(session.seen_data_nonces._live_by_key) == {live, new}
+    stats = state.stats()
+    assert stats.data_nonces_expired == 1
+    assert stats.data_nonces_capacity_evicted == 0
 
 
 def test_data_nonce_caches_are_independent_per_session(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    first = secure.create_session("boat_001", object(), now=100.0)
-    second = secure.create_session("boat_002", object(), now=100.0)
+    state = secure.SecureState(data_nonce_ttl=60.0)
+    first = state.install_session(
+        ("192.0.2.10", 50000), "boat_001", object(), now=100.0
+    )
+    second = state.install_session(
+        ("192.0.2.11", 50001), "boat_002", object(), now=100.0
+    )
     nonce = b"\x01" * 12
 
-    assert secure.mark_data_nonce_seen(first, nonce, now=100.0, ttl=60.0, max_entries=100)
+    assert state.accept_data_nonce(first, nonce, now=100.0)
+    assert state.data_nonce_seen(first, nonce, now=100.0)
+    assert not state.data_nonce_seen(second, nonce, now=100.0)
+    assert state.accept_data_nonce(second, nonce, now=100.0)
+    assert state.stats().current_data_nonces == 2
 
-    assert secure.data_nonce_seen(first, nonce, now=100.0, ttl=60.0)
-    assert not secure.data_nonce_seen(second, nonce, now=100.0, ttl=60.0)
-    assert second["seen_data_nonces"] == {}
 
-
-def test_get_active_session_returns_non_expired_session(monkeypatch):
+def test_get_active_session_uses_exact_ttl_boundary(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=30.0)
     addr = ("192.0.2.10", 50000)
-    session = secure.create_session("boat_001", object(), now=100.0)
-    session_store = {addr: session}
+    session = state.install_session(addr, "boat_001", object(), now=100.0)
 
-    assert secure.get_active_session(session_store, addr, now=120.0, ttl=30.0) is session
-    assert addr in session_store
+    assert state.get_active_session(addr, now=129.999) is session
+    assert state.get_active_session(addr, now=130.0) is None
+    stats = state.stats()
+    assert stats.sessions_expired == 1
+    assert stats.current_sessions == 0
 
 
 def test_get_active_session_returns_none_for_missing_session(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
 
-    assert secure.get_active_session({}, ("192.0.2.10", 50000), now=120.0, ttl=30.0) is None
+    assert state.get_active_session(("192.0.2.10", 50000), now=120.0) is None
+    assert state.stats().sessions_expired == 0
 
 
-def test_get_active_session_removes_expired_session(monkeypatch):
+def test_touch_session_updates_lru_order_without_changing_creation(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    addr = ("192.0.2.10", 50000)
-    session_store = {addr: secure.create_session("boat_001", object(), now=100.0)}
+    state = secure.SecureState()
+    first_addr = ("192.0.2.10", 50000)
+    second_addr = ("192.0.2.11", 50001)
+    first = state.install_session(first_addr, "first", object(), now=100.0)
+    state.install_session(second_addr, "second", object(), now=110.0)
 
-    assert secure.get_active_session(session_store, addr, now=131.0, ttl=30.0) is None
-    assert addr not in session_store
+    assert tuple(state._sessions) == (first_addr, second_addr)
+    assert state.touch_session(first_addr, first, now=125.0)
+
+    assert first.created_at == 100.0
+    assert first.last_seen == 125.0
+    assert tuple(state._sessions) == (second_addr, first_addr)
+    assert state.stats().sessions_touched == 1
 
 
-def test_touch_session_updates_last_seen(monkeypatch):
+def test_invalid_keepalive_does_not_touch_or_reorder_session(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    session = secure.create_session("boat_001", object(), now=100.0)
+    state = secure.SecureState()
+    first_addr = ("192.0.2.10", 50000)
+    second_addr = ("192.0.2.11", 50001)
+    first = state.install_session(first_addr, "first", object(), now=100.0)
+    state.install_session(second_addr, "second", object(), now=110.0)
 
-    secure.touch_session(session, now=125.0)
+    assert not state.handle_keepalive(first_addr, "wrong", now=120.0)
 
-    assert session["created_at"] == 100.0
-    assert session["last_seen"] == 125.0
+    assert first.last_seen == 100.0
+    assert tuple(state._sessions) == (first_addr, second_addr)
+    assert state.stats().sessions_touched == 0
 
 
-def test_cleanup_expired_sessions_removes_only_expired_sessions(monkeypatch):
+def test_valid_keepalive_touches_and_reorders_session(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    fresh_addr = ("192.0.2.10", 50000)
-    expired_addr = ("192.0.2.11", 50001)
-    session_store = {
-        fresh_addr: secure.create_session("fresh", object(), now=120.0),
-        expired_addr: secure.create_session("expired", object(), now=90.0),
-    }
+    state = secure.SecureState()
+    first_addr = ("192.0.2.10", 50000)
+    second_addr = ("192.0.2.11", 50001)
+    first = state.install_session(first_addr, "first", object(), now=100.0)
+    state.install_session(second_addr, "second", object(), now=110.0)
 
-    removed = secure.cleanup_expired_sessions(session_store, now=121.0, ttl=30.0)
+    assert state.handle_keepalive(first_addr, "first", now=120.0)
+
+    assert first.last_seen == 120.0
+    assert tuple(state._sessions) == (second_addr, first_addr)
+    assert state.stats().sessions_touched == 1
+
+
+def test_session_cleanup_removes_expired_lru_prefix_and_stops_at_live(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=30.0)
+    expired_addr = ("192.0.2.10", 50000)
+    active_addr = ("192.0.2.11", 50001)
+    state.install_session(expired_addr, "expired", object(), now=90.0)
+    state.install_session(active_addr, "active", object(), now=100.0)
+
+    removed = state.cleanup_expired_sessions(now=120.0)
 
     assert removed == [expired_addr]
-    assert fresh_addr in session_store
-    assert expired_addr not in session_store
+    assert tuple(state._sessions) == (active_addr,)
+    assert state.stats().sessions_expired == 1
 
 
-def test_session_rehandshake_overwrite_uses_normal_dict_assignment(monkeypatch):
+def test_session_capacity_evicts_least_recently_seen(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=2)
+    first_addr = ("192.0.2.10", 50000)
+    second_addr = ("192.0.2.11", 50001)
+    third_addr = ("192.0.2.12", 50002)
+    first = state.install_session(first_addr, "first", object(), now=100.0)
+    state.install_session(second_addr, "second", object(), now=110.0)
+    assert state.touch_session(first_addr, first, now=120.0)
+
+    state.install_session(third_addr, "third", object(), now=130.0)
+
+    assert tuple(state._sessions) == (first_addr, third_addr)
+    stats = state.stats()
+    assert stats.sessions_capacity_evicted == 1
+    assert stats.sessions_expired == 0
+    assert stats.current_sessions == 2
+    assert stats.peak_sessions == 2
+
+
+def test_equal_session_timestamps_use_deterministic_activity_order(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=2)
+    first_addr = ("192.0.2.10", 50000)
+    second_addr = ("192.0.2.11", 50001)
+    third_addr = ("192.0.2.12", 50002)
+    state.install_session(first_addr, "first", object(), now=100.0)
+    state.install_session(second_addr, "second", object(), now=100.0)
+
+    state.install_session(third_addr, "third", object(), now=100.0)
+
+    assert tuple(state._sessions) == (second_addr, third_addr)
+    assert state.stats().sessions_capacity_evicted == 1
+
+
+def test_expired_sessions_are_removed_before_capacity_eviction(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=30.0, max_sessions=2)
+    expired_addr = ("192.0.2.10", 50000)
+    active_addr = ("192.0.2.11", 50001)
+    new_addr = ("192.0.2.12", 50002)
+    state.install_session(expired_addr, "expired", object(), now=90.0)
+    state.install_session(active_addr, "active", object(), now=100.0)
+
+    state.install_session(new_addr, "new", object(), now=120.0)
+
+    assert tuple(state._sessions) == (active_addr, new_addr)
+    stats = state.stats()
+    assert stats.sessions_expired == 1
+    assert stats.sessions_capacity_evicted == 0
+
+
+def test_live_session_replacement_discards_nonce_state_without_other_eviction(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=2)
+    replaced_addr = ("192.0.2.10", 50000)
+    other_addr = ("192.0.2.11", 50001)
+    old_aesgcm = object()
+    new_aesgcm = object()
+    old = state.install_session(replaced_addr, "old", old_aesgcm, now=100.0)
+    state.install_session(other_addr, "other", object(), now=110.0)
+    nonce = b"\x01" * 12
+    assert state.accept_data_nonce(old, nonce, now=115.0)
+
+    new = state.install_session(
+        replaced_addr, "new", new_aesgcm, now=120.0
+    )
+
+    assert new is state._sessions[replaced_addr]
+    assert new is not old
+    assert new.aesgcm is new_aesgcm
+    assert tuple(state._sessions) == (other_addr, replaced_addr)
+    assert not state.data_nonce_seen(new, nonce, now=120.0)
+    assert state.accept_data_nonce(new, nonce, now=120.0)
+    stats = state.stats()
+    assert stats.sessions_created == 3
+    assert stats.sessions_replaced == 1
+    assert stats.sessions_capacity_evicted == 0
+    assert stats.data_nonces_session_discarded == 1
+
+
+def test_expired_same_address_installation_is_not_live_replacement(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=30.0)
     addr = ("192.0.2.10", 50000)
-    session_store = {addr: secure.create_session("old", object(), now=100.0)}
-    new_session = secure.create_session("new", object(), now=150.0)
+    old = state.install_session(addr, "old", object(), now=100.0)
+    assert state.accept_data_nonce(old, b"\x01" * 12, now=100.0)
 
-    session_store[addr] = new_session
+    new = state.install_session(addr, "new", object(), now=130.0)
 
-    assert session_store == {addr: new_session}
+    assert new is state._sessions[addr]
+    stats = state.stats()
+    assert stats.sessions_created == 2
+    assert stats.sessions_replaced == 0
+    assert stats.sessions_expired == 1
+    assert stats.data_nonces_session_discarded == 1
 
 
-def test_handle_keepalive_session_updates_matching_active_session(monkeypatch):
+def test_session_capacity_discard_counts_retained_nonces_once(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=1)
+    first = state.install_session(
+        ("192.0.2.10", 50000), "first", object(), now=100.0
+    )
+    assert state.accept_data_nonce(first, b"\x01" * 12, now=100.0)
+    assert state.accept_data_nonce(first, b"\x02" * 12, now=101.0)
+
+    state.install_session(
+        ("192.0.2.11", 50001), "second", object(), now=102.0
+    )
+
+    stats = state.stats()
+    assert stats.sessions_capacity_evicted == 1
+    assert stats.sessions_expired == 0
+    assert stats.data_nonces_session_discarded == 2
+    assert stats.data_nonces_expired == 0
+    assert stats.data_nonces_capacity_evicted == 0
+    assert stats.current_data_nonces == 0
+
+
+def test_removed_session_handle_cannot_mutate_nonce_state_or_statistics(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=1)
+    old_addr = ("192.0.2.10", 50000)
+    old = state.install_session(
+        old_addr, "old", object(), now=100.0
+    )
+    assert state.accept_data_nonce(old, b"\x01" * 12, now=100.0)
+
+    state.install_session(
+        ("192.0.2.11", 50001), "new", object(), now=101.0
+    )
+    before = state.stats()
+
+    assert not state.data_nonce_seen(old, b"\x01" * 12, now=102.0)
+    assert not state.accept_data_nonce(old, b"\x02" * 12, now=102.0)
+    assert state.stats() == before
+    assert state.stats().current_data_nonces == 0
+
+
+def test_stale_nonce_check_does_not_cleanup_unrelated_expired_session(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0, max_sessions=2)
+    stale_addr = ("192.0.2.10", 50000)
+    expiring_addr = ("192.0.2.11", 50001)
+    stale = state.install_session(
+        stale_addr, "stale", object(), now=0.0
+    )
+    expiring = state.install_session(
+        expiring_addr, "expiring", object(), now=2.0
+    )
+    expiring_nonce = b"\x01" * 12
+    assert state.accept_data_nonce(
+        expiring, expiring_nonce, now=2.0
+    )
+    replacement = state.install_session(
+        stale_addr, "replacement", object(), now=3.0
+    )
+    assert replacement is not stale
+
+    before_stats = state.stats()
+    before_sessions = tuple(state._sessions.items())
+    before_expiring_nonces = set(
+        expiring.seen_data_nonces._live_by_key
+    )
+    before_stale_nonces = set(stale.seen_data_nonces._live_by_key)
+
+    assert not state.data_nonce_seen(
+        stale, b"\x02" * 12, now=12.0
+    )
+
+    assert state.stats() == before_stats
+    assert tuple(state._sessions.items()) == before_sessions
+    assert state._sessions[expiring_addr] is expiring
+    assert (
+        set(expiring.seen_data_nonces._live_by_key)
+        == before_expiring_nonces
+    )
+    assert (
+        set(stale.seen_data_nonces._live_by_key)
+        == before_stale_nonces
+    )
+
+
+def test_stale_nonce_accept_does_not_cleanup_unrelated_expired_session(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0, max_sessions=2)
+    stale_addr = ("192.0.2.10", 50000)
+    expiring_addr = ("192.0.2.11", 50001)
+    replacement_addr = ("192.0.2.12", 50002)
+    stale = state.install_session(
+        stale_addr, "stale", object(), now=0.0
+    )
+    assert state.accept_data_nonce(
+        stale, b"\x01" * 12, now=0.0
+    )
+    expiring = state.install_session(
+        expiring_addr, "expiring", object(), now=2.0
+    )
+    expiring_nonce = b"\x02" * 12
+    assert state.accept_data_nonce(
+        expiring, expiring_nonce, now=2.0
+    )
+    state.install_session(
+        replacement_addr, "replacement", object(), now=3.0
+    )
+    assert stale_addr not in state._sessions
+
+    before_stats = state.stats()
+    before_sessions = tuple(state._sessions.items())
+    before_expiring_nonces = set(
+        expiring.seen_data_nonces._live_by_key
+    )
+    before_stale_nonces = set(stale.seen_data_nonces._live_by_key)
+
+    assert not state.accept_data_nonce(
+        stale, b"\x03" * 12, now=12.0
+    )
+
+    assert state.stats() == before_stats
+    assert tuple(state._sessions.items()) == before_sessions
+    assert state._sessions[expiring_addr] is expiring
+    assert (
+        set(expiring.seen_data_nonces._live_by_key)
+        == before_expiring_nonces
+    )
+    assert (
+        set(stale.seen_data_nonces._live_by_key)
+        == before_stale_nonces
+    )
+
+
+def test_stale_touch_does_not_cleanup_unrelated_expired_session(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0, max_sessions=2)
+    stale_addr = ("192.0.2.10", 50000)
+    expiring_addr = ("192.0.2.11", 50001)
+    stale = state.install_session(
+        stale_addr, "stale", object(), now=0.0
+    )
+    expiring = state.install_session(
+        expiring_addr, "expiring", object(), now=2.0
+    )
+    state.install_session(
+        stale_addr, "replacement", object(), now=3.0
+    )
+
+    before_stats = state.stats()
+    before_sessions = tuple(state._sessions.items())
+
+    assert not state.touch_session(
+        stale_addr, stale, now=12.0
+    )
+
+    assert state.stats() == before_stats
+    assert tuple(state._sessions.items()) == before_sessions
+    assert state._sessions[expiring_addr] is expiring
+    assert state.stats().sessions_touched == before_stats.sessions_touched
+
+
+def test_touch_address_mismatch_is_side_effect_free_before_cleanup(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0)
+    expiring_addr = ("192.0.2.10", 50000)
+    current_addr = ("192.0.2.11", 50001)
+    expiring = state.install_session(
+        expiring_addr, "expiring", object(), now=2.0
+    )
+    current = state.install_session(
+        current_addr, "current", object(), now=3.0
+    )
+
+    before_stats = state.stats()
+    before_sessions = tuple(state._sessions.items())
+
+    assert not state.touch_session(
+        expiring_addr, current, now=12.0
+    )
+
+    assert state.stats() == before_stats
+    assert tuple(state._sessions.items()) == before_sessions
+    assert state._sessions[expiring_addr] is expiring
+    assert current.last_seen == 3.0
+
+
+def test_expired_session_handle_cannot_accept_or_check_nonces(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0)
     addr = ("192.0.2.10", 50000)
-    session = secure.create_session("boat_001", object(), now=100.0)
-    session_store = {addr: session}
+    session = state.install_session(
+        addr, "old", object(), now=0.0
+    )
+    assert state.accept_data_nonce(session, b"\x01" * 12, now=0.0)
 
-    assert secure.handle_keepalive_session(
-        session_store, addr, "boat_001", now=120.0, ttl=30.0
-    ) is True
-    assert session["last_seen"] == 120.0
+    assert not state.data_nonce_seen(session, b"\x01" * 12, now=10.0)
+
+    after_expiry = state.stats()
+    assert addr not in state._sessions
+    assert after_expiry.sessions_expired == 1
+    assert after_expiry.data_nonces_session_discarded == 1
+    assert after_expiry.data_nonces_accepted == 1
+    assert after_expiry.current_sessions == 0
+    assert after_expiry.current_data_nonces == 0
+
+    assert not state.accept_data_nonce(
+        session, b"\x02" * 12, now=10.0
+    )
+    assert not state.touch_session(addr, session, now=10.0)
+    assert state.stats() == after_expiry
+    assert addr not in state._sessions
 
 
-def test_handle_keepalive_session_returns_false_for_missing_session(monkeypatch):
+def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
 
-    assert secure.handle_keepalive_session(
-        {}, ("192.0.2.10", 50000), "boat_001", now=120.0, ttl=30.0
-    ) is False
+    initial = state.stats()
+
+    assert set(vars(initial)) == {
+        "handshake_replay_accepted",
+        "handshake_replay_rejected",
+        "handshake_replay_expired",
+        "handshake_replay_capacity_evicted",
+        "sessions_created",
+        "sessions_replaced",
+        "sessions_touched",
+        "sessions_expired",
+        "sessions_capacity_evicted",
+        "data_nonces_accepted",
+        "data_nonce_replays",
+        "data_nonces_expired",
+        "data_nonces_capacity_evicted",
+        "data_nonces_session_discarded",
+        "current_handshake_replays",
+        "peak_handshake_replays",
+        "current_sessions",
+        "peak_sessions",
+        "current_data_nonces",
+        "peak_data_nonces",
+    }
+    assert all(value == 0 for value in vars(initial).values())
+    with pytest.raises(FrozenInstanceError):
+        initial.current_sessions = 1
+
+    state.install_session(
+        ("192.0.2.10", 50000), "boat_001", object(), now=100.0
+    )
+    current = state.stats()
+    assert initial.current_sessions == 0
+    assert initial.sessions_created == 0
+    assert current.current_sessions == 1
+    assert current.sessions_created == 1
 
 
-def test_handle_keepalive_session_removes_expired_session(monkeypatch):
+def test_secure_state_stats_do_not_read_clocks_or_cleanup(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=1.0)
     addr = ("192.0.2.10", 50000)
-    session_store = {addr: secure.create_session("boat_001", object(), now=100.0)}
+    state.install_session(addr, "boat_001", object(), now=0.0)
 
-    assert secure.handle_keepalive_session(
-        session_store, addr, "boat_001", now=131.0, ttl=30.0
-    ) is False
-    assert addr not in session_store
+    def fail_clock():
+        raise AssertionError("stats must not read a clock")
 
+    monkeypatch.setattr(secure.time, "time", fail_clock)
+    monkeypatch.setattr(secure.time, "monotonic", fail_clock)
 
-def test_handle_keepalive_session_returns_false_for_station_id_mismatch(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    addr = ("192.0.2.10", 50000)
-    session = secure.create_session("boat_001", object(), now=100.0)
-    session_store = {addr: session}
+    stats = state.stats()
 
-    assert secure.handle_keepalive_session(
-        session_store, addr, "other_station", now=120.0, ttl=30.0
-    ) is False
-    assert session["last_seen"] == 100.0
+    assert stats.current_sessions == 1
+    assert tuple(state._sessions) == (addr,)
+    assert stats.sessions_expired == 0
 
 
 def test_secure_server_private_key_prefers_canonical_path(monkeypatch):

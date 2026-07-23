@@ -9,6 +9,7 @@ This document defines the currently tested Python processing contract for:
 - multipart assembly;
 - TAG metadata ownership;
 - deduplication;
+- secure-ingress local replay, session, and nonce state;
 - routing snapshot use; and
 - forwarding boundaries.
 
@@ -248,7 +249,82 @@ while preserving the other cumulative counters and `peak_entries`;
 Deduplication is in-memory and process-local; this contract does not specify
 durable or distributed deduplication.
 
-## 11. Routing snapshot boundary
+## 11. Secure local state
+
+Secure ingress has one explicit `SecureState` owner for handshake replay
+records, active sessions, per-session accepted data nonces, and their
+statistics. The production default is module-wide, while an isolated state
+owner and clocks may be injected into a secure listener. This state is
+in-memory and process-local; it is neither durable nor shared across processes.
+
+Wall time and monotonic time have separate ownership. Wall time is used only
+for externally meaningful protocol or diagnostic timestamps: the transmitted
+handshake timestamp check, the pong timestamp, and existing timestamped debug
+output. Handshake freshness remains inclusive at the boundary:
+`abs(wall_now - transmitted_timestamp) <= 30`. Monotonic time owns handshake
+replay TTL, session creation and last-seen times, session TTL, data-nonce TTL,
+and local capacity ordering. Each allowed received packet uses one monotonic
+observation for all of that packet's local-state decisions. Network policy is
+applied first; a denied packet performs no cryptographic work, state mutation,
+session cleanup, or secure-state clock read.
+
+Every process-local TTL uses the same exact boundary: state is live while
+`age < ttl` and expires when `age >= ttl`. A duplicate handshake replay key or
+data nonce does not refresh its expiry. Wall-clock changes do not expire,
+revive, or extend replay, session, or nonce state.
+
+Handshake replay identity is exactly the value produced by
+`build_handshake_replay_key(station_id, timestamp, signature)`; the network
+address is not part of that identity. A verified handshake consumes a newly
+accepted replay key after timestamp, authorization, and signature validation
+but before session installation. A later server-side failure does not remove
+that key. The replay set retains at most `HANDSHAKE_REPLAY_MAX` records, expires
+only its ordered front prefix during admission, and evicts the oldest live
+record deterministically when capacity remains full.
+
+An active session is identified by the exact peer socket address and retains
+its authenticated station ID, AES-GCM owner, monotonic creation and last-seen
+times, and a private data-nonce set. Sessions are ordered from least to most
+recently seen. Installation and valid activity place a session at the
+most-recent end; only a valid matching keepalive or a fully validated secure
+data or ping packet counts as activity. Invalid, malformed, mismatched,
+expired, or replayed traffic does not touch the session.
+
+After network policy accepts any packet, including a handshake or an unknown
+packet type, the expired least-recent session prefix is removed before
+packet-type-specific state handling. The process may physically retain silent
+expired sessions until later allowed traffic, but an expired directly
+addressed session is never treated as active. At most `SESSION_MAX` sessions
+are retained. A successful same-address handshake replaces the live session
+and discards its nonce state without evicting an unrelated session. For a new
+address, expired sessions are removed before capacity is considered; if still
+full, exactly the least-recently-seen live session is evicted. Equal timestamps
+are resolved by the deterministic activity order.
+
+Secure-data nonce identity is the exact 12-byte nonce within its owning
+session. Identical bytes in different sessions are independent. A live replay
+is rejected before decryption and does not touch the session. A new nonce is
+retained only after decryption, JSON decoding, source-ID matching, and message
+type and required-field validation; it is recorded before the session is
+touched and before the ping or NMEA action. Each nonce set retains at most
+`DATA_NONCE_MAX_PER_SESSION` records, expires only its ordered front prefix,
+and evicts the oldest live nonce deterministically when capacity remains full.
+Replacing, expiring, or capacity-evicting a session discards all nonce state
+owned by that session.
+
+`stats()` returns an immutable point-in-time `SecureStateStats` snapshot. It
+reports accepted, rejected or replayed, expired, capacity-evicted, created,
+replaced, touched, and owning-session-discarded lifecycle counts as applicable,
+plus current and peak handshake-replay, session, and data-nonce counts. Every
+removed record has exactly one removal reason. Reading statistics invokes
+neither clock, performs no cleanup, exposes no mutable state, and does not
+change an earlier snapshot.
+
+This section governs only process-local secure state. It does not redefine
+secure packet formats, cryptographic algorithms, the signed handshake
+transcript, session-key derivation, or `nmea_sproxy` protocol compatibility.
+
+## 12. Routing snapshot boundary
 
 When routing state is present, the forwarding consumer must acquire one
 immutable routing snapshot per accepted string `IngressEvent`. If that snapshot
@@ -260,7 +336,7 @@ A routing-table replacement during processing affects the next event, not the
 event already in progress. A missing table, including a snapshot whose table is
 `None`, selects legacy forwarding and global deduplication mode.
 
-## 12. Forwarding and cleanup
+## 13. Forwarding and cleanup
 
 For emitted multipart output, the first fragment receives the primary `c`, `s`,
 and `g` TAG metadata. Continuation fragments receive the existing continuation
@@ -279,7 +355,7 @@ Fragments are sent sequentially. Send-failure semantics were not redesigned:
 this contract does not guarantee transactional delivery, rollback, replay, or
 recovery after a partial multi-fragment send.
 
-## 13. Explicit limitations and deferred decisions
+## 14. Explicit limitations and deferred decisions
 
 The following boundaries are compatibility limitations or deferred decisions,
 not additional guarantees:
@@ -299,7 +375,7 @@ not additional guarantees:
 7. Extraction checks checksum-field syntax but does not validate checksum
    arithmetic.
 
-## 14. Native implementation conformance
+## 15. Native implementation conformance
 
 A future native processor should be checked through differential tests against
 the Python reference for:
@@ -313,7 +389,7 @@ the Python reference for:
 
 Conformance does not define or require a C or C++ API or ABI.
 
-## 15. Campaign A baseline
+## 16. Campaign A baseline
 
 - Final branch: `main`.
 - Final full-suite result: `765 passed, 18 skipped in 10.30s` (783 collected).
