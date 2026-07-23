@@ -144,6 +144,15 @@ async def forward_loop(queue, routing_state=None):
     multipart_s_ctx: dict[AssemblyKey, str] = {}
     multipart_c_ctx: dict[AssemblyKey, int] = {}
     multipart_gid_ctx: dict[AssemblyKey, frozenset[str]] = {}
+
+    def _discard_multipart_contexts(
+        keys: tuple[AssemblyKey, ...],
+    ) -> None:
+        for key in keys:
+            multipart_s_ctx.pop(key, None)
+            multipart_c_ctx.pop(key, None)
+            multipart_gid_ctx.pop(key, None)
+
     while True:
         ev: IngressEvent = await queue.get()
         if not isinstance(ev.raw_line, str):
@@ -195,10 +204,7 @@ async def forward_loop(queue, routing_state=None):
 
             # Discarded generations must be cleared before the current
             # observation can establish metadata for a fresh generation.
-            for discarded_key in outcome.discarded_keys:
-                multipart_s_ctx.pop(discarded_key, None)
-                multipart_c_ctx.pop(discarded_key, None)
-                multipart_gid_ctx.pop(discarded_key, None)
+            _discard_multipart_contexts(outcome.discarded_keys)
 
             if (
                 outcome.status in {
@@ -245,6 +251,7 @@ async def forward_loop(queue, routing_state=None):
 
             if outcome.status in {
                 AssemblyStatus.INVALID,
+                AssemblyStatus.LIMIT_EXCEEDED,
                 AssemblyStatus.PENDING,
                 AssemblyStatus.DUPLICATE,
                 AssemblyStatus.CONFLICT,
@@ -340,9 +347,7 @@ async def forward_loop(queue, routing_state=None):
                 outcome.status is AssemblyStatus.COMPLETE
                 and outcome.group_key is not None
             ):
-                multipart_s_ctx.pop(outcome.group_key, None)
-                multipart_c_ctx.pop(outcome.group_key, None)
-                multipart_gid_ctx.pop(outcome.group_key, None)
+                _discard_multipart_contexts((outcome.group_key,))
 
 
 async def handle_socket(

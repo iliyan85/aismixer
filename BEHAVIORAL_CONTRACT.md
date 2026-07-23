@@ -72,9 +72,19 @@ otherwise mutate any multipart generation. Single-only traffic therefore does
 not trigger multipart expiry cleanup; pending generations remain unchanged
 until a later multipart operation applies the normal lifecycle rules.
 
-For input with a declared total greater than `1`, any valid ordinal may open a
-multipart generation, and fragments may arrive fully out of order. A
-generation completes only when it contains one unique fragment for every
+By default, `max_fragments_per_group=None` places no limit on a multipart
+declaration, and `max_pending_groups=None` leaves the number of pending groups
+unbounded. Each option may instead be a positive integer. A structurally valid
+multipart declaration above `max_fragments_per_group` returns
+`AssemblyStatus.LIMIT_EXCEEDED` with `group_key=None`, empty sentences, and no
+discarded keys. This rejection is applied before key construction, clock use,
+expiry cleanup, or multipart-state access. Structurally invalid input remains
+`INVALID`, and the single-sentence fast path remains accepted when the fragment
+limit is `1`.
+
+For accepted input with a declared total greater than `1`, any valid ordinal
+may open a multipart generation, and fragments may arrive fully out of order.
+A generation completes only when it contains one unique fragment for every
 ordinal from `1` through the declared total. Completed sentences must be
 returned in ordinal order. Successful completion removes the assembler
 generation; a later fragment with the same `AssemblyKey` starts a fresh
@@ -92,11 +102,40 @@ live while `age < timeout` and expires when `age >= timeout`; exact duplicates
 do not refresh that time. Matching-key expiry is applied before the current
 fragment, so that fragment may open a fresh generation.
 
-`feed_outcome()` exposes the lifecycle statuses `invalid`, `single`, `pending`,
-`duplicate`, `conflict`, and `complete`. Its `discarded_keys` is a
-deterministically sorted tuple of every `AssemblyKey` discarded by that call,
-including a conflicting or expired matching generation and any generation
-removed by an opportunistic expiry sweep.
+`max_pending_groups` is one instance-wide, process-local cap shared by all
+source identities and multipart keys. It applies only when a fragment must
+create a new group. When capacity is full, all groups expired at the current
+time are removed before any live group is evicted. If capacity remains full,
+exactly one live victim is selected by the smallest
+`(group.last_progress_at, AssemblyKey)`: the least-recently-progressed group
+wins, with `AssemblyKey` ordering as the deterministic timestamp tie-break.
+Duplicates, unique progress in an existing group, conflicts, and completion do
+not cause capacity eviction.
+
+`feed_outcome()` exposes the lifecycle statuses `invalid`, `single`,
+`limit_exceeded`, `pending`, `duplicate`, `conflict`, and `complete`. Its
+`discarded_keys` is a deterministically sorted tuple of every `AssemblyKey`
+discarded by that call, including a conflicting or expired matching generation,
+any generation removed by an opportunistic expiry sweep, and a live
+capacity-eviction victim.
+
+`cleanup_expired(now=None)` returns a deterministically sorted tuple of every
+group it removes, using the injected clock only when `now` is omitted.
+`reset()` returns all pending keys in deterministic sorted order and clears the
+group state; both methods return `()` when they remove nothing. Each reset call,
+including an empty reset, increments the reset-call counter. Reset also counts
+the groups it discards, but does not count them as expired or capacity-evicted,
+and it preserves the configured timeout, clock, limits, cumulative statistics,
+and peak statistics.
+
+`stats()` returns an immutable point-in-time `AssemblerStats` snapshot with
+`invalid`, `single`, `limit_exceeded`, `pending`, `duplicates`, `conflicts`,
+`completed`, `expired`, `capacity_evicted`, `reset_discarded`, `resets`,
+`current_groups`, `peak_groups`, `current_fragments`, and `peak_fragments`.
+Exactly one outcome counter advances per `feed_outcome()` call; lifecycle
+counters advance only for their corresponding removal reason. Reading
+statistics neither invokes the clock nor performs cleanup, and earlier
+snapshots do not change.
 
 ## 6. Blank sequential-ID compatibility
 
@@ -121,9 +160,10 @@ between TAG `g` and the NMEA fragment fields.
 
 A non-empty completion-arrival `s` must override an earlier cached `s`. When
 completion carries no non-empty `s`, the cached earlier value becomes the
-ingress-source candidate. Conflict and expiry discard context for their
-discarded generation. Normal completion consumes the context after processing,
-including a no-route completion or a completion suppressed by deduplication.
+ingress-source candidate. Conflict, expiry, and capacity eviction discard
+context for their discarded generation. Normal completion consumes the context
+after processing, including a no-route completion or a completion suppressed by
+deduplication.
 
 Final precedence among configured station ID, configured input identity or
 alias, ingress source metadata, and remote-IP fallback remains governed by the
@@ -137,12 +177,12 @@ generation must select the minimum valid observed value, independently of
 arrival order and of which ordinal completes the group. An exact duplicate may
 lower that minimum but must not raise it.
 
-Conflict and expiry discard timestamp context for the affected generation.
-Normal completion consumes timestamp context after processing, including
-no-route and dedup-suppressed completion. If preservation is enabled but no
-valid value was observed, emitted output uses the existing server-time
-fallback. If preservation is disabled, ingress timestamps are ignored and the
-server-time fallback is used.
+Conflict, expiry, and capacity eviction discard timestamp context for the
+affected generation. Normal completion consumes timestamp context after
+processing, including no-route and dedup-suppressed completion. If preservation
+is enabled but no valid value was observed, emitted output uses the existing
+server-time fallback. If preservation is disabled, ingress timestamps are
+ignored and the server-time fallback is used.
 
 A valid multipart `c:0` must be preserved as `0`. Single-sentence `c:0` retains
 the existing compatibility behaviour of falling back to server time. This
@@ -162,11 +202,11 @@ ID must be created once per completed logical group, and every emitted fragment
 of that group must use the same output ID. With preservation disabled, a new ID
 must always be generated.
 
-Conflict, expiry, and normal completion clean group-ID context according to the
-assembler generation lifecycle, including no-route and dedup-suppressed
-completion. Ingress TAG-`g` part and total fields do not participate in
-`AssemblyKey`, and the forwarding core does not validate their consistency
-against the NMEA ordinal and total.
+Conflict, expiry, capacity eviction, and normal completion clean group-ID
+context according to the assembler generation lifecycle, including no-route
+and dedup-suppressed completion. Ingress TAG-`g` part and total fields do not
+participate in `AssemblyKey`, and the forwarding core does not validate their
+consistency against the NMEA ordinal and total.
 
 ## 10. Deduplication
 
@@ -227,10 +267,17 @@ and `g` TAG metadata. Continuation fragments receive the existing continuation
 form containing `g` without repeating primary `c` or `s`.
 
 Normal multipart completion consumes its metadata contexts even when no route
-matches or deduplication suppresses all output. Fragments are sent sequentially.
-Send-failure semantics were not redesigned: this contract does not guarantee
-transactional delivery, rollback, replay, or recovery after a partial
-multi-fragment send.
+matches or deduplication suppresses all output. Every key reported through an
+assembler outcome's `discarded_keys` must remove the forwarding core's cached
+multipart `s`, `c`, and `g` contexts before metadata from the current arrival is
+observed. If the forwarding core directly invokes `cleanup_expired()` or
+`reset()`, it must apply their returned keys through the same cleanup path.
+External assembler callers are likewise responsible for consuming returned
+lifecycle keys to synchronize metadata they own.
+
+Fragments are sent sequentially. Send-failure semantics were not redesigned:
+this contract does not guarantee transactional delivery, rollback, replay, or
+recovery after a partial multi-fragment send.
 
 ## 13. Explicit limitations and deferred decisions
 
@@ -241,18 +288,15 @@ not additional guarantees:
    section 6 for the live TTL correlation window.
 2. TAG-`g` part and total consistency is neither assembler identity nor checked
    against the NMEA part and total by the forwarding core.
-3. Direct external calls to the legacy assembler `cleanup_expired()` or
-   `reset()` APIs do not report lifecycle keys and therefore do not synchronize
-   forward-loop multipart metadata contexts.
-4. The forwarding consumer defensively rejects non-string `raw_line` values,
+3. The forwarding consumer defensively rejects non-string `raw_line` values,
    but this contract does not redefine upstream secure-ingress JSON schema
    validation.
-5. Single-sentence and multipart `c:0` behaviour is intentionally not unified.
-6. Send-failure recovery and transactional multi-fragment delivery remain out
+4. Single-sentence and multipart `c:0` behaviour is intentionally not unified.
+5. Send-failure recovery and transactional multi-fragment delivery remain out
    of scope.
-7. Durable storage, AIS semantic decoding, analytics, and spoof detection are
+6. Durable storage, AIS semantic decoding, analytics, and spoof detection are
    not part of this contract.
-8. Extraction checks checksum-field syntax but does not validate checksum
+7. Extraction checks checksum-field syntax but does not validate checksum
    arithmetic.
 
 ## 14. Native implementation conformance

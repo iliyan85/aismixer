@@ -3,7 +3,12 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 import assembler as assembler_module
-from assembler import AIVDMAssembler, AssemblyOutcome, AssemblyStatus
+from assembler import (
+    AIVDMAssembler,
+    AssemblerStats,
+    AssemblyOutcome,
+    AssemblyStatus,
+)
 
 
 class FakeClock:
@@ -715,7 +720,7 @@ def test_cleanup_expired_uses_injected_clock_at_timeout_boundary():
 
     clock.now = 1.0
 
-    assert assembler.cleanup_expired() is None
+    assert assembler.cleanup_expired() == (key,)
     assert key not in assembler._groups
     assert assembler.feed("source-a", second) is None
     assert assembler.feed("source-a", first) == [first, second]
@@ -736,7 +741,7 @@ def test_cleanup_expired_removes_only_expired_group_objects():
     live_group = assembler._groups[live_key]
     calls_before = clock.calls
 
-    assert assembler.cleanup_expired(now=1.0) is None
+    assert assembler.cleanup_expired(now=1.0) == (expired_key,)
 
     assert clock.calls == calls_before
     assert expired_key not in assembler._groups
@@ -825,7 +830,10 @@ def test_reset_clears_all_pending_groups():
         ("source-b", "8", "A", 2),
     }
 
-    assert assembler.reset() is None
+    assert assembler.reset() == (
+        ("source-a", "7", "A", 2),
+        ("source-b", "8", "A", 2),
+    )
     assert assembler._groups == {}
     assert not hasattr(assembler, "fragments")
     assert not hasattr(assembler, "timestamps")
@@ -842,8 +850,8 @@ def test_reset_is_safe_when_empty():
     first = "!AIVDM,2,1,7,A,payload1,0*00"
     second = "!AIVDM,2,2,7,A,payload2,0*00"
 
-    assert assembler.reset() is None
-    assert assembler.reset() is None
+    assert assembler.reset() == ()
+    assert assembler.reset() == ()
     assert assembler._groups == {}
     assert assembler.feed("src", first) is None
     assert assembler.feed("src", second) == [first, second]
@@ -892,3 +900,660 @@ def test_feed_does_not_assemble_fragments_with_different_total_count():
 
     assert assembler.feed("source-a", first) is None
     assert assembler.feed("source-a", second) is None
+
+
+def _b5_sentence(
+    total,
+    current,
+    seq_id,
+    payload,
+    channel="A",
+):
+    return (
+        f"!AIVDM,{total},{current},{seq_id},{channel},{payload},0*00"
+    )
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    ["max_fragments_per_group", "max_pending_groups"],
+)
+@pytest.mark.parametrize("value", [None, 1, 7])
+def test_assembler_limits_accept_none_and_positive_integers(
+    parameter,
+    value,
+):
+    assembler = AIVDMAssembler(**{parameter: value})
+
+    assert getattr(assembler, parameter) == value
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    ["max_fragments_per_group", "max_pending_groups"],
+)
+@pytest.mark.parametrize("value", [0, -1, -99])
+def test_assembler_limits_reject_integers_below_one(parameter, value):
+    with pytest.raises(ValueError):
+        AIVDMAssembler(**{parameter: value})
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    ["max_fragments_per_group", "max_pending_groups"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [True, False, "1", 1.0, object()],
+    ids=["true", "false", "string", "float", "object"],
+)
+def test_assembler_limits_reject_non_integer_types(parameter, value):
+    with pytest.raises(TypeError):
+        AIVDMAssembler(**{parameter: value})
+
+
+def test_default_fragment_limit_is_unbounded():
+    assembler = AIVDMAssembler(clock=FakeClock())
+    sentence = _b5_sentence(1_000_000, 1, "7", "payload")
+
+    outcome = assembler.feed_outcome("source", sentence)
+
+    assert assembler.max_fragments_per_group is None
+    assert outcome.status is AssemblyStatus.PENDING
+    assert outcome.group_key == ("source", "7", "A", 1_000_000)
+
+
+def test_fragment_limit_accepts_declaration_equal_to_limit():
+    assembler = AIVDMAssembler(
+        clock=FakeClock(),
+        max_fragments_per_group=3,
+    )
+
+    outcome = assembler.feed_outcome(
+        "source",
+        _b5_sentence(3, 1, "7", "payload"),
+    )
+
+    assert outcome.status is AssemblyStatus.PENDING
+    assert outcome.group_key == ("source", "7", "A", 3)
+
+
+def test_fragment_limit_rejection_is_clock_cleanup_and_state_free():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        timeout=1.0,
+        clock=clock,
+        max_fragments_per_group=2,
+    )
+    retained = _b5_sentence(2, 1, "1", "retained")
+    rejected = _b5_sentence(3, 1, "2", "rejected")
+    retained_key = ("retained-source", "1", "A", 2)
+
+    assembler.feed_outcome("retained-source", retained)
+    clock.now = 1.0
+    state_before = _multipart_state_snapshot(assembler)
+    calls_before = clock.calls
+    stats_before = assembler.stats()
+
+    first = assembler.feed_outcome("rejected-source", rejected)
+    second = assembler.feed_outcome("rejected-source", rejected)
+
+    for outcome in (first, second):
+        assert outcome == AssemblyOutcome(
+            AssemblyStatus.LIMIT_EXCEEDED,
+        )
+    assert assembler.feed("rejected-source", rejected) is None
+    assert clock.calls == calls_before
+    assert _multipart_state_snapshot(assembler) == state_before
+    assert retained_key in assembler._groups
+
+    stats = assembler.stats()
+    assert stats.limit_exceeded == stats_before.limit_exceeded + 3
+    assert stats.expired == stats_before.expired
+
+
+def test_fragment_limit_one_preserves_single_and_invalid_fast_paths():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        clock=clock,
+        max_fragments_per_group=1,
+    )
+    single = _b5_sentence(1, 1, "", "single")
+
+    single_outcome = assembler.feed_outcome("source", single)
+    invalid_outcome = assembler.feed_outcome(
+        "source",
+        _b5_sentence(0, 1, "7", "invalid"),
+    )
+    limited_outcome = assembler.feed_outcome(
+        "source",
+        _b5_sentence(2, 1, "7", "limited"),
+    )
+
+    assert single_outcome.status is AssemblyStatus.SINGLE
+    assert single_outcome.sentences == (single,)
+    assert invalid_outcome.status is AssemblyStatus.INVALID
+    assert limited_outcome.status is AssemblyStatus.LIMIT_EXCEEDED
+    assert clock.calls == 0
+    assert assembler._groups == {}
+
+
+def test_capacity_evicts_one_victim_and_evicted_key_reopens_fresh():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        timeout=100.0,
+        clock=clock,
+        max_pending_groups=2,
+    )
+    old_a_first = _b5_sentence(2, 1, "1", "old-a")
+    fresh_a_first = _b5_sentence(2, 1, "1", "fresh-a")
+    a_second = _b5_sentence(2, 2, "1", "a-second")
+    b_first = _b5_sentence(2, 1, "2", "b-first")
+    b_second = _b5_sentence(2, 2, "2", "b-second")
+    c_first = _b5_sentence(2, 1, "3", "c-first")
+    key_a = ("source-a", "1", "A", 2)
+    key_b = ("source-b", "2", "A", 2)
+    key_c = ("source-c", "3", "A", 2)
+
+    assembler.feed_outcome("source-a", old_a_first)
+    evicted_group = assembler._groups[key_a]
+    clock.now = 1.0
+    assembler.feed_outcome("source-b", b_first)
+    clock.now = 2.0
+
+    admitted = assembler.feed_outcome("source-c", c_first)
+
+    assert admitted.status is AssemblyStatus.PENDING
+    assert admitted.discarded_keys == (key_a,)
+    assert set(assembler._groups) == {key_b, key_c}
+    assert key_a not in assembler._groups
+    assert evicted_group.fragments_by_ordinal == {1: old_a_first}
+    assert assembler.stats().capacity_evicted == 1
+
+    clock.now = 3.0
+    assert (
+        assembler.feed_outcome("source-b", b_second).status
+        is AssemblyStatus.COMPLETE
+    )
+    clock.now = 4.0
+    reopened = assembler.feed_outcome("source-a", a_second)
+
+    assert reopened.status is AssemblyStatus.PENDING
+    assert assembler._groups[key_a].fragments_by_ordinal == {2: a_second}
+
+    completed = assembler.feed_outcome("source-a", fresh_a_first)
+
+    assert completed.status is AssemblyStatus.COMPLETE
+    assert completed.sentences == (fresh_a_first, a_second)
+    assert old_a_first not in completed.sentences
+
+
+def test_capacity_victim_uses_least_recent_unique_progress():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        timeout=100.0,
+        clock=clock,
+        max_pending_groups=2,
+    )
+    a_first = _b5_sentence(3, 1, "1", "a-first")
+    a_second = _b5_sentence(3, 2, "1", "a-second")
+    b_first = _b5_sentence(2, 1, "2", "b-first")
+    c_first = _b5_sentence(2, 1, "3", "c-first")
+    key_a = ("source-a", "1", "A", 3)
+    key_b = ("source-b", "2", "A", 2)
+    key_c = ("source-c", "3", "A", 2)
+
+    assembler.feed_outcome("source-a", a_first)
+    clock.now = 1.0
+    assembler.feed_outcome("source-b", b_first)
+    clock.now = 2.0
+    progress = assembler.feed_outcome("source-a", a_second)
+    clock.now = 3.0
+    admitted = assembler.feed_outcome("source-c", c_first)
+
+    assert progress.status is AssemblyStatus.PENDING
+    assert progress.discarded_keys == ()
+    assert admitted.discarded_keys == (key_b,)
+    assert set(assembler._groups) == {key_a, key_c}
+
+
+def test_capacity_victim_ties_break_by_assembly_key():
+    clock = FakeClock(now=5.0)
+    assembler = AIVDMAssembler(
+        timeout=100.0,
+        clock=clock,
+        max_pending_groups=2,
+    )
+    first = _b5_sentence(2, 1, "1", "first")
+    second = _b5_sentence(2, 1, "2", "second")
+    third = _b5_sentence(2, 1, "3", "third")
+    key_a = ("source-a", "2", "A", 2)
+    key_b = ("source-b", "1", "A", 2)
+    key_c = ("source-c", "3", "A", 2)
+
+    assembler.feed_outcome("source-b", first)
+    assembler.feed_outcome("source-a", second)
+    admitted = assembler.feed_outcome("source-c", third)
+
+    assert admitted.discarded_keys == (key_a,)
+    assert set(assembler._groups) == {key_b, key_c}
+
+
+def test_full_capacity_does_not_evict_for_existing_group_lifecycle():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        timeout=100.0,
+        clock=clock,
+        max_pending_groups=2,
+    )
+    a_first = _b5_sentence(3, 1, "1", "a-first")
+    a_second = _b5_sentence(3, 2, "1", "a-second")
+    b_first = _b5_sentence(2, 1, "2", "b-first")
+    b_second = _b5_sentence(2, 2, "2", "b-second")
+    key_a = ("source-a", "1", "A", 3)
+    key_b = ("source-b", "2", "A", 2)
+
+    assembler.feed_outcome("source-a", a_first)
+    assembler.feed_outcome("source-b", b_first)
+
+    duplicate = assembler.feed_outcome("source-a", a_first)
+    progress = assembler.feed_outcome("source-a", a_second)
+    complete = assembler.feed_outcome("source-b", b_second)
+
+    assert duplicate.status is AssemblyStatus.DUPLICATE
+    assert duplicate.discarded_keys == ()
+    assert progress.status is AssemblyStatus.PENDING
+    assert progress.discarded_keys == ()
+    assert complete.status is AssemblyStatus.COMPLETE
+    assert complete.discarded_keys == ()
+    assert set(assembler._groups) == {key_a}
+    assert key_b not in assembler._groups
+    assert assembler.stats().capacity_evicted == 0
+
+
+def test_full_capacity_conflict_invalidates_only_matching_group():
+    assembler = AIVDMAssembler(
+        clock=FakeClock(),
+        max_pending_groups=2,
+    )
+    a_first = _b5_sentence(2, 1, "1", "a-first")
+    a_conflict = _b5_sentence(2, 1, "1", "a-conflict")
+    b_first = _b5_sentence(2, 1, "2", "b-first")
+    key_a = ("source-a", "1", "A", 2)
+    key_b = ("source-b", "2", "A", 2)
+
+    assembler.feed_outcome("source-a", a_first)
+    assembler.feed_outcome("source-b", b_first)
+    conflict = assembler.feed_outcome("source-a", a_conflict)
+
+    assert conflict.status is AssemblyStatus.CONFLICT
+    assert conflict.discarded_keys == (key_a,)
+    assert set(assembler._groups) == {key_b}
+    assert assembler.stats().capacity_evicted == 0
+
+
+def test_full_capacity_isolated_paths_do_not_evict_or_expire():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        timeout=1.0,
+        clock=clock,
+        max_fragments_per_group=2,
+        max_pending_groups=1,
+    )
+    retained = _b5_sentence(2, 1, "1", "retained")
+    retained_key = ("retained-source", "1", "A", 2)
+
+    assembler.feed_outcome("retained-source", retained)
+    clock.now = 1.0
+    state_before = _multipart_state_snapshot(assembler)
+    calls_before = clock.calls
+
+    invalid = assembler.feed_outcome(
+        "other-source",
+        _b5_sentence(0, 1, "2", "invalid"),
+    )
+    single = assembler.feed_outcome(
+        "other-source",
+        _b5_sentence(1, 1, "", "single"),
+    )
+    limited = assembler.feed_outcome(
+        "other-source",
+        _b5_sentence(3, 1, "3", "limited"),
+    )
+
+    assert invalid.status is AssemblyStatus.INVALID
+    assert single.status is AssemblyStatus.SINGLE
+    assert limited.status is AssemblyStatus.LIMIT_EXCEEDED
+    assert all(
+        outcome.discarded_keys == ()
+        for outcome in (invalid, single, limited)
+    )
+    assert clock.calls == calls_before
+    assert _multipart_state_snapshot(assembler) == state_before
+    assert retained_key in assembler._groups
+    assert assembler.stats().capacity_evicted == 0
+    assert assembler.stats().expired == 0
+
+
+def test_capacity_expires_dead_groups_before_selecting_live_victim():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        timeout=1.0,
+        clock=clock,
+        max_pending_groups=2,
+    )
+    a_first = _b5_sentence(2, 1, "1", "a-first")
+    b_first = _b5_sentence(2, 1, "2", "b-first")
+    c_first = _b5_sentence(2, 1, "3", "c-first")
+    key_a = ("source-a", "1", "A", 2)
+    key_b = ("source-b", "2", "A", 2)
+    key_c = ("source-c", "3", "A", 2)
+
+    assembler.feed_outcome("source-a", a_first)
+    clock.now = 0.5
+    assembler.feed_outcome("source-b", b_first)
+    clock.now = 1.0
+    admitted = assembler.feed_outcome("source-c", c_first)
+
+    assert admitted.discarded_keys == (key_a,)
+    assert set(assembler._groups) == {key_b, key_c}
+    stats = assembler.stats()
+    assert stats.expired == 1
+    assert stats.capacity_evicted == 0
+
+
+def test_capacity_evicts_live_group_immediately_before_timeout():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        timeout=1.0,
+        clock=clock,
+        max_pending_groups=1,
+    )
+    a_first = _b5_sentence(2, 1, "1", "a-first")
+    b_first = _b5_sentence(2, 1, "2", "b-first")
+    key_a = ("source-a", "1", "A", 2)
+    key_b = ("source-b", "2", "A", 2)
+
+    assembler.feed_outcome("source-a", a_first)
+    clock.now = 0.999
+    admitted = assembler.feed_outcome("source-b", b_first)
+
+    assert admitted.discarded_keys == (key_a,)
+    assert set(assembler._groups) == {key_b}
+    stats = assembler.stats()
+    assert stats.expired == 0
+    assert stats.capacity_evicted == 1
+
+
+def test_cleanup_expired_returns_sorted_keys_and_retains_live_groups():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    b_first = _b5_sentence(2, 1, "2", "b-first")
+    a_first = _b5_sentence(2, 1, "1", "a-first")
+    live_first = _b5_sentence(2, 1, "3", "live-first")
+    key_a = ("source-a", "1", "A", 2)
+    key_b = ("source-b", "2", "A", 2)
+    live_key = ("source-live", "3", "A", 2)
+
+    assembler.feed_outcome("source-b", b_first)
+    assembler.feed_outcome("source-a", a_first)
+    clock.now = 0.5
+    assembler.feed_outcome("source-live", live_first)
+    calls_before = clock.calls
+
+    discarded = assembler.cleanup_expired(now=1.0)
+
+    assert discarded == (key_a, key_b)
+    assert clock.calls == calls_before
+    assert set(assembler._groups) == {live_key}
+    assert assembler.stats().expired == 2
+    assert assembler.cleanup_expired(now=1.0) == ()
+    assert assembler.stats().expired == 2
+
+
+def test_cleanup_expired_without_now_invokes_clock_once():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    first = _b5_sentence(2, 1, "1", "first")
+    key = ("source", "1", "A", 2)
+
+    assembler.feed_outcome("source", first)
+    clock.now = 1.0
+    calls_before = clock.calls
+
+    assert assembler.cleanup_expired() == (key,)
+    assert clock.calls == calls_before + 1
+    assert assembler.cleanup_expired(now=1.0) == ()
+    assert clock.calls == calls_before + 1
+
+
+def test_reset_returns_sorted_keys_and_preserves_configuration_and_stats():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        timeout=7.5,
+        clock=clock,
+        max_fragments_per_group=4,
+        max_pending_groups=3,
+    )
+    b_first = _b5_sentence(2, 1, "2", "b-first")
+    a_first = _b5_sentence(3, 1, "1", "a-first")
+    key_a = ("source-a", "1", "A", 3)
+    key_b = ("source-b", "2", "A", 2)
+
+    assembler.feed_outcome("source-b", b_first)
+    assembler.feed_outcome("source-a", a_first)
+    before = assembler.stats()
+
+    discarded = assembler.reset()
+
+    assert discarded == (key_a, key_b)
+    assert assembler._groups == {}
+    assert assembler.timeout == 7.5
+    assert assembler._clock is clock
+    assert assembler.max_fragments_per_group == 4
+    assert assembler.max_pending_groups == 3
+
+    after = assembler.stats()
+    assert after.pending == before.pending
+    assert after.peak_groups == before.peak_groups
+    assert after.peak_fragments == before.peak_fragments
+    assert after.reset_discarded == 2
+    assert after.resets == 1
+    assert after.expired == 0
+    assert after.capacity_evicted == 0
+    assert after.current_groups == 0
+    assert after.current_fragments == 0
+
+    assert assembler.reset() == ()
+    empty_reset_stats = assembler.stats()
+    assert empty_reset_stats.resets == 2
+    assert empty_reset_stats.reset_discarded == 2
+
+
+def test_new_assembler_statistics_are_zero():
+    assembler = AIVDMAssembler()
+
+    assert assembler.stats() == AssemblerStats(
+        invalid=0,
+        single=0,
+        limit_exceeded=0,
+        pending=0,
+        duplicates=0,
+        conflicts=0,
+        completed=0,
+        expired=0,
+        capacity_evicted=0,
+        reset_discarded=0,
+        resets=0,
+        current_groups=0,
+        peak_groups=0,
+        current_fragments=0,
+        peak_fragments=0,
+    )
+
+
+def test_statistics_count_exactly_one_outcome_per_feed_call():
+    assembler = AIVDMAssembler(
+        clock=FakeClock(),
+        max_fragments_per_group=2,
+    )
+    single = _b5_sentence(1, 1, "", "single")
+    conflict_first = _b5_sentence(2, 1, "1", "first")
+    conflict_other = _b5_sentence(2, 1, "1", "other")
+    complete_first = _b5_sentence(2, 1, "2", "complete-first")
+    complete_second = _b5_sentence(2, 2, "2", "complete-second")
+
+    assert (
+        assembler.feed_outcome("source", "!AIVDM,broken").status
+        is AssemblyStatus.INVALID
+    )
+    assert assembler.feed("source", single) == [single]
+    assert (
+        assembler.feed_outcome(
+            "source",
+            _b5_sentence(3, 1, "3", "limited"),
+        ).status
+        is AssemblyStatus.LIMIT_EXCEEDED
+    )
+    assert (
+        assembler.feed_outcome("source", conflict_first).status
+        is AssemblyStatus.PENDING
+    )
+    assert (
+        assembler.feed_outcome("source", conflict_first).status
+        is AssemblyStatus.DUPLICATE
+    )
+    assert (
+        assembler.feed_outcome("source", conflict_other).status
+        is AssemblyStatus.CONFLICT
+    )
+    assert (
+        assembler.feed_outcome("source", complete_first).status
+        is AssemblyStatus.PENDING
+    )
+    assert (
+        assembler.feed_outcome("source", complete_second).status
+        is AssemblyStatus.COMPLETE
+    )
+
+    stats = assembler.stats()
+    assert stats.invalid == 1
+    assert stats.single == 1
+    assert stats.limit_exceeded == 1
+    assert stats.pending == 2
+    assert stats.duplicates == 1
+    assert stats.conflicts == 1
+    assert stats.completed == 1
+    assert sum(
+        (
+            stats.invalid,
+            stats.single,
+            stats.limit_exceeded,
+            stats.pending,
+            stats.duplicates,
+            stats.conflicts,
+            stats.completed,
+        )
+    ) == 8
+
+
+def test_statistics_track_final_retained_state_and_peaks():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        timeout=100.0,
+        clock=clock,
+        max_pending_groups=2,
+    )
+    a_first = _b5_sentence(3, 1, "1", "a-first")
+    a_second = _b5_sentence(3, 2, "1", "a-second")
+    a_third = _b5_sentence(3, 3, "1", "a-third")
+    b_first = _b5_sentence(2, 1, "2", "b-first")
+    b_second = _b5_sentence(2, 2, "2", "b-second")
+
+    assembler.feed_outcome("source-a", a_first)
+    assembler.feed_outcome("source-b", b_first)
+    assembler.feed_outcome("source-a", a_second)
+    before_completion = assembler.stats()
+
+    assert before_completion.current_groups == len(assembler._groups) == 2
+    assert before_completion.current_fragments == 3
+    assert before_completion.peak_groups == 2
+    assert before_completion.peak_fragments == 3
+    assert before_completion.peak_groups <= assembler.max_pending_groups
+
+    assembler.feed_outcome("source-b", b_second)
+    after_b_completion = assembler.stats()
+
+    assert after_b_completion.current_groups == 1
+    assert after_b_completion.current_fragments == 2
+    assert after_b_completion.peak_groups == 2
+    assert after_b_completion.peak_fragments == 3
+
+    assembler.feed_outcome("source-a", a_third)
+    after_all_completion = assembler.stats()
+
+    assert after_all_completion.current_groups == 0
+    assert after_all_completion.current_fragments == 0
+    assert after_all_completion.peak_groups == 2
+    assert after_all_completion.peak_fragments == 3
+    assert before_completion.current_groups == 2
+    assert before_completion.current_fragments == 3
+
+    with pytest.raises(FrozenInstanceError):
+        before_completion.pending = 99
+
+
+def test_stats_does_not_call_clock_or_clean_expired_state():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    first = _b5_sentence(2, 1, "1", "first")
+    key = ("source", "1", "A", 2)
+
+    assembler.feed_outcome("source", first)
+    original_snapshot = assembler.stats()
+    clock.now = 1.0
+    calls_before = clock.calls
+
+    current_snapshot = assembler.stats()
+
+    assert clock.calls == calls_before
+    assert key in assembler._groups
+    assert current_snapshot.expired == 0
+    assert current_snapshot.current_groups == 1
+    assert original_snapshot == current_snapshot
+
+    assert assembler.cleanup_expired(now=1.0) == (key,)
+    assert original_snapshot.expired == 0
+    assert original_snapshot.current_groups == 1
+    assert assembler.stats().expired == 1
+
+
+def test_lifecycle_statistics_keep_removal_reasons_distinct():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(
+        timeout=1.0,
+        clock=clock,
+        max_pending_groups=1,
+    )
+    a_first = _b5_sentence(2, 1, "1", "a-first")
+    b_first = _b5_sentence(2, 1, "2", "b-first")
+    c_first = _b5_sentence(2, 1, "3", "c-first")
+    c_conflict = _b5_sentence(2, 1, "3", "c-conflict")
+    d_first = _b5_sentence(2, 1, "4", "d-first")
+
+    assembler.feed_outcome("source-a", a_first)
+    clock.now = 0.5
+    assembler.feed_outcome("source-b", b_first)
+    clock.now = 1.5
+    assembler.cleanup_expired()
+    assembler.feed_outcome("source-c", c_first)
+    assembler.feed_outcome("source-c", c_conflict)
+    assembler.feed_outcome("source-d", d_first)
+    assembler.reset()
+
+    stats = assembler.stats()
+    assert stats.capacity_evicted == 1
+    assert stats.expired == 1
+    assert stats.conflicts == 1
+    assert stats.reset_discarded == 1
+    assert stats.resets == 1

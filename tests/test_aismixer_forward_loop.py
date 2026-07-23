@@ -2053,6 +2053,146 @@ def test_expired_generation_clears_multipart_gid_context(monkeypatch):
     assert all("-111*" not in leading_tag(message) for message in messages)
 
 
+def test_capacity_eviction_clears_all_multipart_contexts_only_for_victim(
+    monkeypatch,
+):
+    clock = FakeClock()
+    assembler_instance = AIVDMAssembler(
+        timeout=10.0,
+        clock=clock,
+        max_pending_groups=2,
+    )
+    assembler_key = "shared-receiver"
+
+    stale_a_first = make_nmea_sentence("AIVDM,2,1,7,A,11EVAO,0")
+    fresh_a_first = make_nmea_sentence("AIVDM,2,1,7,A,11EVAN,0")
+    fresh_a_second = make_nmea_sentence("AIVDM,2,2,7,A,22EVAN,0")
+    live_b_first = make_nmea_sentence("AIVDM,2,1,8,A,11EVBL,0")
+    live_b_second = make_nmea_sentence("AIVDM,2,2,8,A,22EVBL,0")
+    group_c_first = make_nmea_sentence("AIVDM,2,1,9,A,11EVIC,0")
+    group_c_second = make_nmea_sentence("AIVDM,2,2,9,A,22EVIC,0")
+
+    stale_a_arrival = (
+        f"\\c:111,s:stale_a,g:1-2-111*00\\{stale_a_first}"
+    )
+    live_b_arrival = (
+        f"\\c:222,s:live_b,g:1-2-222*00\\{live_b_first}"
+    )
+    generated_gids = iter(("333333", "444444"))
+    generator_calls = []
+
+    def generate_gid(digits):
+        generator_calls.append(digits)
+        return next(generated_gids)
+
+    monkeypatch.setattr(aismixer, "_gen_numeric_gid_fixed", generate_gid)
+
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            station_id="",
+            assembler_instance=assembler_instance,
+        )
+        try:
+            clock.now = 0.0
+            await queue.put(
+                make_event(stale_a_arrival, assembler_key=assembler_key)
+            )
+            await asyncio.sleep(0)
+
+            clock.now = 0.1
+            await queue.put(
+                make_event(live_b_arrival, assembler_key=assembler_key)
+            )
+            await asyncio.sleep(0)
+
+            # Group C admission evicts the least-recently-progressed group A.
+            clock.now = 0.2
+            await queue.put(
+                make_event(group_c_first, assembler_key=assembler_key)
+            )
+            await asyncio.sleep(0)
+            assert fake_forwarder.messages == []
+
+            clock.now = 0.3
+            await queue.put(
+                make_event(group_c_second, assembler_key=assembler_key)
+            )
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=2,
+            )
+
+            # Reopen A out of order without metadata. Evicted metadata must
+            # not leak into this fresh generation.
+            clock.now = 0.4
+            await queue.put(
+                make_event(fresh_a_second, assembler_key=assembler_key)
+            )
+            await asyncio.sleep(0)
+
+            clock.now = 0.5
+            await queue.put(
+                make_event(fresh_a_first, assembler_key=assembler_key)
+            )
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=4,
+            )
+
+            # B remained live throughout A's eviction and retains its own
+            # metadata until normal completion.
+            clock.now = 0.6
+            await queue.put(
+                make_event(live_b_second, assembler_key=assembler_key)
+            )
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=6,
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    messages = fake_forwarder.messages
+
+    assert len(messages) == 6
+    assert group_c_first in messages[0]
+    assert group_c_second in messages[1]
+    assert fresh_a_first in messages[2]
+    assert fresh_a_second in messages[3]
+    assert live_b_first in messages[4]
+    assert live_b_second in messages[5]
+    assert stale_a_first not in "".join(messages)
+
+    fresh_a_tag = leading_tag(messages[2])
+    fresh_a_timestamp = re.fullmatch(
+        r"c:(\d+),s:192_0_2_10,g:1-2-444444\*[0-9A-F]{2}",
+        fresh_a_tag,
+    )
+    assert fresh_a_timestamp is not None
+    assert fresh_a_timestamp.group(1) != "111"
+    assert "stale_a" not in fresh_a_tag
+    assert "-111*" not in fresh_a_tag
+
+    assert re.fullmatch(
+        r"c:222,s:live_b,g:1-2-222\*[0-9A-F]{2}",
+        leading_tag(messages[4]),
+    )
+    assert re.fullmatch(
+        r"g:2-2-222\*[0-9A-F]{2}",
+        leading_tag(messages[5]),
+    )
+    assert generator_calls == [
+        aismixer.G_ID_DIGITS,
+        aismixer.G_ID_DIGITS,
+    ]
+
+
 def test_forward_loop_legacy_mode_calls_send_not_send_to(monkeypatch):
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
