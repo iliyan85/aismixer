@@ -9,30 +9,122 @@ from assembler import AIVDMAssembler, AssemblyOutcome, AssemblyStatus
 class FakeClock:
     def __init__(self, now=0.0):
         self.now = now
+        self.calls = 0
 
     def __call__(self):
+        self.calls += 1
         return self.now
 
 
-def test_feed_outcome_reports_invalid_input():
-    outcome = AIVDMAssembler().feed_outcome("src", "not an NMEA sentence")
+def _multipart_state_snapshot(assembler):
+    return (
+        {
+            key: dict(group)
+            for key, group in assembler.fragments.items()
+        },
+        dict(assembler.timestamps),
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "!AIVDM,1,1,,A,payload",
+        "!AIVDM,x,1,,A,payload,0*00",
+        "!AIVDM,1,x,,A,payload,0*00",
+        "!AIVDM,0,1,,A,payload,0*00",
+        "!AIVDM,1,0,,A,payload,0*00",
+        "!AIVDM,1,2,,A,payload,0*00",
+    ],
+    ids=[
+        "too-few-fields",
+        "non-integer-total",
+        "non-integer-current",
+        "total-below-one",
+        "single-current-below-one",
+        "single-current-above-total",
+    ],
+)
+def test_feed_outcome_invalid_input_is_state_and_clock_free(line):
+    clock = FakeClock()
+    assembler = AIVDMAssembler(clock=clock)
+    pending = "!AIVDM,2,1,7,A,pending,0*00"
+
+    assert (
+        assembler.feed_outcome("pending-src", pending).status
+        is AssemblyStatus.PENDING
+    )
+    clock.now = assembler.timeout
+    state_before = _multipart_state_snapshot(assembler)
+    calls_before = clock.calls
+
+    outcome = assembler.feed_outcome("src", line)
 
     assert outcome.status is AssemblyStatus.INVALID
     assert outcome.group_key is None
     assert outcome.sentences == ()
     assert outcome.discarded_keys == ()
+    assert clock.calls == calls_before
+    assert _multipart_state_snapshot(assembler) == state_before
 
 
 def test_feed_outcome_reports_single_sentence():
-    assembler = AIVDMAssembler()
+    clock = FakeClock()
+    assembler = AIVDMAssembler(clock=clock)
     sentence = "!AIVDM,1,1,,A,payload,0*00"
 
-    outcome = assembler.feed_outcome("src", sentence)
+    first = assembler.feed_outcome("src", sentence)
+    second = assembler.feed_outcome("src", sentence)
 
-    assert outcome.status is AssemblyStatus.SINGLE
-    assert outcome.group_key is None
-    assert outcome.sentences == (sentence,)
-    assert outcome.discarded_keys == ()
+    for outcome in (first, second):
+        assert outcome.status is AssemblyStatus.SINGLE
+        assert outcome.group_key is None
+        assert outcome.sentences == (sentence,)
+        assert outcome.sentences[0] is sentence
+        assert outcome.discarded_keys == ()
+    assert clock.calls == 0
+    assert _multipart_state_snapshot(assembler) == ({}, {})
+
+
+def test_single_sentence_does_not_expire_or_mutate_pending_group():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    old_first = "!AIVDM,2,1,7,A,OLD,0*00"
+    fresh_first = "!AIVDM,2,1,7,A,FRESH,0*00"
+    fresh_second = "!AIVDM,2,2,7,A,FRESH-SECOND,0*00"
+    single = "!AIVDM,1,1,,A,single,0*00"
+    key = ("src", "7", "A", 2)
+
+    pending = assembler.feed_outcome("src", old_first)
+
+    assert pending.status is AssemblyStatus.PENDING
+    assert clock.calls == 1
+
+    state_before = _multipart_state_snapshot(assembler)
+    calls_before = clock.calls
+    clock.now = 1.1
+
+    single_outcome = assembler.feed_outcome("other-src", single)
+
+    assert single_outcome.status is AssemblyStatus.SINGLE
+    assert single_outcome.group_key is None
+    assert single_outcome.sentences == (single,)
+    assert single_outcome.sentences[0] is single
+    assert single_outcome.discarded_keys == ()
+    assert clock.calls == calls_before
+    assert _multipart_state_snapshot(assembler) == state_before
+
+    fresh_pending = assembler.feed_outcome("src", fresh_second)
+
+    assert fresh_pending.status is AssemblyStatus.PENDING
+    assert fresh_pending.group_key == key
+    assert fresh_pending.discarded_keys == (key,)
+    assert clock.calls == calls_before + 1
+
+    complete = assembler.feed_outcome("src", fresh_first)
+
+    assert complete.status is AssemblyStatus.COMPLETE
+    assert complete.sentences == (fresh_first, fresh_second)
 
 
 def test_feed_outcome_reports_pending_then_complete():
@@ -243,10 +335,18 @@ def test_feed_returns_none_when_current_exceeds_total():
 
 
 def test_feed_returns_single_part_sentence():
-    assembler = AIVDMAssembler()
+    clock = FakeClock()
+    assembler = AIVDMAssembler(clock=clock)
     sentence = "!AIVDM,1,1,,A,payload,0*00"
 
-    assert assembler.feed("src", sentence) == [sentence]
+    first = assembler.feed("src", sentence)
+    second = assembler.feed("src", sentence)
+
+    assert first == [sentence]
+    assert second == [sentence]
+    assert first[0] is sentence
+    assert second[0] is sentence
+    assert clock.calls == 0
 
 
 def test_feed_assembles_valid_multipart_sentences():

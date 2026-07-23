@@ -63,12 +63,22 @@ part, and total fields are not promoted into assembler identity.
 
 ## 5. Multipart lifecycle
 
-Any valid ordinal may open a multipart generation, and fragments may arrive
-fully out of order. A generation completes only when it contains one unique
-fragment for every ordinal from `1` through the declared total. Completed
-sentences must be returned in ordinal order. Successful completion removes the
-assembler generation; a later fragment with the same `AssemblyKey` starts a
-fresh generation.
+A structurally valid input with declared total `1` and current ordinal `1`
+takes a state-free fast path. `feed_outcome()` immediately returns
+`AssemblyStatus.SINGLE` with `group_key=None`, `sentences=(line,)`, and
+`discarded_keys=()`, preserving the exact original input string. This path does
+not invoke the assembler clock and does not create, expire, discard, or
+otherwise mutate any multipart generation. Single-only traffic therefore does
+not trigger multipart expiry cleanup; pending generations remain unchanged
+until a later multipart operation applies the normal lifecycle rules.
+
+For input with a declared total greater than `1`, any valid ordinal may open a
+multipart generation, and fragments may arrive fully out of order. A
+generation completes only when it contains one unique fragment for every
+ordinal from `1` through the declared total. Completed sentences must be
+returned in ordinal order. Successful completion removes the assembler
+generation; a later fragment with the same `AssemblyKey` starts a fresh
+generation.
 
 An exact repeat of the full sentence at an occupied ordinal is idempotent and
 does not refresh assembly TTL. Forward-loop metadata observations carried by
