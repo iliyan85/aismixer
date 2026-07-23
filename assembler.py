@@ -23,6 +23,18 @@ class AssemblyOutcome:
     discarded_keys: tuple[AssemblyKey, ...] = ()
 
 
+@dataclass
+class _AssemblyGroup:
+    """Indexed fragments and unique-progress time for one live generation."""
+
+    fragments_by_ordinal: dict[int, str]
+    last_progress_at: float
+
+    @property
+    def received_count(self) -> int:
+        return len(self.fragments_by_ordinal)
+
+
 class AIVDMAssembler:
     """Correlate multipart NMEA sentences within a bounded TTL window.
 
@@ -34,8 +46,7 @@ class AIVDMAssembler:
     """
 
     def __init__(self, timeout=1.0, clock=None):
-        self.fragments = {}
-        self.timestamps = {}
+        self._groups: dict[AssemblyKey, _AssemblyGroup] = {}
         self.timeout = timeout  # seconds
         self._clock = time.monotonic if clock is None else clock
 
@@ -75,15 +86,25 @@ class AIVDMAssembler:
 
         now = self._clock()
         discarded_keys = []
-        timestamp = self.timestamps.get(key)
-        if timestamp is not None and now - timestamp >= self.timeout:
-            del self.fragments[key]
-            del self.timestamps[key]
+        group = self._groups.get(key)
+        if (
+            group is not None
+            and now - group.last_progress_at >= self.timeout
+        ):
+            del self._groups[key]
             discarded_keys.append(key)
+            group = None
 
-        group = self.fragments.setdefault(key, {})
-        if current in group:
-            if group[current] == line:
+        if group is None:
+            group = _AssemblyGroup(
+                fragments_by_ordinal={},
+                last_progress_at=now,
+            )
+            self._groups[key] = group
+
+        fragments = group.fragments_by_ordinal
+        if current in fragments:
+            if fragments[current] == line:
                 discarded_keys.extend(self._cleanup_expired(now))
                 return AssemblyOutcome(
                     AssemblyStatus.DUPLICATE,
@@ -91,8 +112,7 @@ class AIVDMAssembler:
                     discarded_keys=tuple(sorted(discarded_keys)),
                 )
 
-            del self.fragments[key]
-            del self.timestamps[key]
+            del self._groups[key]
             discarded_keys.append(key)
             discarded_keys.extend(self._cleanup_expired(now))
             return AssemblyOutcome(
@@ -101,15 +121,15 @@ class AIVDMAssembler:
                 discarded_keys=tuple(sorted(discarded_keys)),
             )
 
-        group[current] = line
-        self.timestamps[key] = now
+        fragments[current] = line
+        group.last_progress_at = now
 
-        if all(ordinal in group for ordinal in range(1, total + 1)):
+        # Validated, unique ordinals make cardinality a complete O(1) check.
+        if group.received_count == total:
             full_lines = tuple(
-                group[ordinal] for ordinal in range(1, total + 1)
+                fragments[ordinal] for ordinal in range(1, total + 1)
             )
-            del self.fragments[key]
-            del self.timestamps[key]
+            del self._groups[key]
             return AssemblyOutcome(
                 AssemblyStatus.COMPLETE,
                 group_key=key,
@@ -133,14 +153,12 @@ class AIVDMAssembler:
     def _cleanup_expired(self, now) -> tuple[AssemblyKey, ...]:
         expired_keys = sorted(
             key
-            for key, timestamp in self.timestamps.items()
-            if now - timestamp >= self.timeout
+            for key, group in self._groups.items()
+            if now - group.last_progress_at >= self.timeout
         )
         for key in expired_keys:
-            del self.fragments[key]
-            del self.timestamps[key]
+            del self._groups[key]
         return tuple(expired_keys)
 
     def reset(self):
-        self.fragments.clear()
-        self.timestamps.clear()
+        self._groups.clear()

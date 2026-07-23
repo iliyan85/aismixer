@@ -17,13 +17,27 @@ class FakeClock:
 
 
 def _multipart_state_snapshot(assembler):
-    return (
-        {
-            key: dict(group)
-            for key, group in assembler.fragments.items()
-        },
-        dict(assembler.timestamps),
-    )
+    return {
+        key: (
+            dict(group.fragments_by_ordinal),
+            group.received_count,
+            group.last_progress_at,
+        )
+        for key, group in assembler._groups.items()
+    }
+
+
+class MembershipBudgetDict(dict):
+    def __init__(self, values, allowed_checks):
+        super().__init__(values)
+        self.allowed_checks = allowed_checks
+        self.membership_checks = 0
+
+    def __contains__(self, key):
+        self.membership_checks += 1
+        if self.membership_checks > self.allowed_checks:
+            raise AssertionError("unexpected ordinal membership scan")
+        return super().__contains__(key)
 
 
 @pytest.mark.parametrize(
@@ -83,7 +97,63 @@ def test_feed_outcome_reports_single_sentence():
         assert outcome.sentences[0] is sentence
         assert outcome.discarded_keys == ()
     assert clock.calls == 0
-    assert _multipart_state_snapshot(assembler) == ({}, {})
+    assert _multipart_state_snapshot(assembler) == {}
+
+
+def test_group_state_indexes_unique_progress_out_of_order():
+    clock = FakeClock(now=10.0)
+    assembler = AIVDMAssembler(clock=clock)
+    first = "!AIVDM,3,1,7,A,payload1,0*00"
+    third = "!AIVDM,3,3,7,A,payload3,0*00"
+    key = ("src", "7", "A", 3)
+
+    assert not hasattr(assembler, "fragments")
+    assert not hasattr(assembler, "timestamps")
+
+    first_pending = assembler.feed_outcome("src", third)
+
+    assert first_pending.status is AssemblyStatus.PENDING
+    assert set(assembler._groups) == {key}
+    group = assembler._groups[key]
+    assert group.fragments_by_ordinal == {3: third}
+    assert group.fragments_by_ordinal[3] is third
+    assert group.received_count == 1
+    assert group.last_progress_at == 10.0
+
+    clock.now = 10.5
+    second_pending = assembler.feed_outcome("src", first)
+
+    assert second_pending.status is AssemblyStatus.PENDING
+    assert assembler._groups[key] is group
+    assert group.fragments_by_ordinal == {1: first, 3: third}
+    assert group.fragments_by_ordinal[1] is first
+    assert group.fragments_by_ordinal[3] is third
+    assert group.received_count == 2
+    assert group.last_progress_at == 10.5
+
+
+def test_incomplete_admission_does_not_scan_declared_ordinal_range():
+    assembler = AIVDMAssembler(clock=FakeClock())
+    first = "!AIVDM,1000000,1,7,A,payload1,0*00"
+    second = "!AIVDM,1000000,2,7,A,payload2,0*00"
+    key = ("src", "7", "A", 1_000_000)
+
+    assert (
+        assembler.feed_outcome("src", first).status
+        is AssemblyStatus.PENDING
+    )
+    group = assembler._groups[key]
+    fragments = MembershipBudgetDict(
+        group.fragments_by_ordinal,
+        allowed_checks=1,
+    )
+    group.fragments_by_ordinal = fragments
+
+    outcome = assembler.feed_outcome("src", second)
+
+    assert outcome.status is AssemblyStatus.PENDING
+    assert fragments.membership_checks <= 1
+    assert group.received_count == 2
 
 
 def test_single_sentence_does_not_expire_or_mutate_pending_group():
@@ -147,12 +217,13 @@ def test_feed_outcome_reports_pending_then_complete():
 
 
 def test_feed_outcome_preserves_out_of_order_completion():
-    assembler = AIVDMAssembler()
+    assembler = AIVDMAssembler(clock=FakeClock())
     first = "!AIVDM,2,1,7,A,payload1,0*00"
     second = "!AIVDM,2,2,7,A,payload2,0*00"
     key = ("src", "7", "A", 2)
 
     pending = assembler.feed_outcome("src", second)
+    completed_group = assembler._groups[key]
     complete = assembler.feed_outcome("src", first)
 
     assert pending.status is AssemblyStatus.PENDING
@@ -160,24 +231,45 @@ def test_feed_outcome_preserves_out_of_order_completion():
     assert complete.status is AssemblyStatus.COMPLETE
     assert complete.group_key == key
     assert complete.sentences == (first, second)
+    assert complete.sentences[0] is first
+    assert complete.sentences[1] is second
     assert complete.discarded_keys == ()
+    assert key not in assembler._groups
+
+    fresh_pending = assembler.feed_outcome("src", first)
+
+    assert fresh_pending.status is AssemblyStatus.PENDING
+    assert assembler._groups[key] is not completed_group
+    assert assembler._groups[key].fragments_by_ordinal == {1: first}
 
 
 def test_feed_outcome_reports_exact_duplicate():
-    assembler = AIVDMAssembler()
+    clock = FakeClock()
+    assembler = AIVDMAssembler(clock=clock)
     first = "!AIVDM,2,1,7,A,payload1,0*00"
     second = "!AIVDM,2,2,7,A,payload2,0*00"
     key = ("src", "7", "A", 2)
 
     pending = assembler.feed_outcome("src", first)
+    group = assembler._groups[key]
+    state_before = _multipart_state_snapshot(assembler)
+    clock.now = 0.5
     duplicate = assembler.feed_outcome("src", first)
-    complete = assembler.feed_outcome("src", second)
 
     assert pending.status is AssemblyStatus.PENDING
     assert duplicate.status is AssemblyStatus.DUPLICATE
     assert duplicate.group_key == key
     assert duplicate.sentences == ()
     assert duplicate.discarded_keys == ()
+    assert assembler._groups[key] is group
+    assert _multipart_state_snapshot(assembler) == state_before
+    assert group.fragments_by_ordinal == {1: first}
+    assert group.fragments_by_ordinal[1] is first
+    assert group.received_count == 1
+    assert group.last_progress_at == 0.0
+
+    complete = assembler.feed_outcome("src", second)
+
     assert complete.status is AssemblyStatus.COMPLETE
     assert complete.sentences == (first, second)
 
@@ -190,6 +282,7 @@ def test_feed_outcome_reports_conflict_and_discarded_key():
     key = ("src", "7", "A", 2)
 
     pending = assembler.feed_outcome("src", first_a)
+    invalidated_group = assembler._groups[key]
     conflict = assembler.feed_outcome("src", first_b)
 
     assert pending.status is AssemblyStatus.PENDING
@@ -197,8 +290,16 @@ def test_feed_outcome_reports_conflict_and_discarded_key():
     assert conflict.group_key == key
     assert conflict.sentences == ()
     assert conflict.discarded_keys == (key,)
+    assert key not in assembler._groups
+    assert first_b not in invalidated_group.fragments_by_ordinal.values()
 
     fresh_pending = assembler.feed_outcome("src", second)
+    replacement_group = assembler._groups[key]
+
+    assert replacement_group is not invalidated_group
+    assert replacement_group.fragments_by_ordinal == {2: second}
+    assert replacement_group.received_count == 1
+
     complete = assembler.feed_outcome("src", first_a)
 
     assert fresh_pending.status is AssemblyStatus.PENDING
@@ -215,6 +316,7 @@ def test_feed_outcome_reports_expired_generation_before_fresh_state():
     key = ("src", "7", "A", 2)
 
     old_pending = assembler.feed_outcome("src", old_first)
+    expired_group = assembler._groups[key]
     clock.now = 1.0
     fresh_pending = assembler.feed_outcome("src", fresh_second)
 
@@ -223,6 +325,13 @@ def test_feed_outcome_reports_expired_generation_before_fresh_state():
     assert fresh_pending.group_key == key
     assert fresh_pending.sentences == ()
     assert fresh_pending.discarded_keys == (key,)
+    fresh_group = assembler._groups[key]
+    assert fresh_group is not expired_group
+    assert fresh_group.fragments_by_ordinal == {2: fresh_second}
+    assert fresh_group.fragments_by_ordinal[2] is fresh_second
+    assert fresh_group.received_count == 1
+    assert fresh_group.last_progress_at == 1.0
+    assert old_first not in fresh_group.fragments_by_ordinal.values()
 
     complete = assembler.feed_outcome("src", fresh_first)
 
@@ -257,6 +366,84 @@ def test_feed_outcome_reports_unrelated_expired_keys():
     assert outcome.group_key == key_c
     assert outcome.sentences == ()
     assert outcome.discarded_keys == (key_a, key_b)
+    assert set(assembler._groups) == {key_c}
+
+
+def test_duplicate_reports_unrelated_expired_keys_without_refresh():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    source_b_first = "!AIVDM,2,1,2,B,source-b,0*00"
+    source_a_first = "!AIVDM,2,1,1,A,source-a,0*00"
+    target_first = "!AIVDM,2,1,3,A,target,0*00"
+    key_a = ("source-a", "1", "A", 2)
+    key_b = ("source-b", "2", "B", 2)
+    target_key = ("target", "3", "A", 2)
+
+    assembler.feed_outcome("source-b", source_b_first)
+    assembler.feed_outcome("source-a", source_a_first)
+    clock.now = 0.5
+    assembler.feed_outcome("target", target_first)
+    target_group = assembler._groups[target_key]
+
+    clock.now = 1.0
+    duplicate = assembler.feed_outcome("target", target_first)
+
+    assert duplicate.status is AssemblyStatus.DUPLICATE
+    assert duplicate.discarded_keys == (key_a, key_b)
+    assert set(assembler._groups) == {target_key}
+    assert assembler._groups[target_key] is target_group
+    assert target_group.received_count == 1
+    assert target_group.last_progress_at == 0.5
+
+
+def test_conflict_reports_unrelated_expired_keys_in_sorted_order():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    source_b_first = "!AIVDM,2,1,2,B,source-b,0*00"
+    source_a_first = "!AIVDM,2,1,1,A,source-a,0*00"
+    target_first = "!AIVDM,2,1,3,A,target-a,0*00"
+    target_conflict = "!AIVDM,2,1,3,A,target-b,0*00"
+    key_a = ("source-a", "1", "A", 2)
+    key_b = ("source-b", "2", "B", 2)
+    target_key = ("target", "3", "A", 2)
+
+    assembler.feed_outcome("source-b", source_b_first)
+    assembler.feed_outcome("source-a", source_a_first)
+    clock.now = 0.5
+    assembler.feed_outcome("target", target_first)
+
+    clock.now = 1.0
+    conflict = assembler.feed_outcome("target", target_conflict)
+
+    assert conflict.status is AssemblyStatus.CONFLICT
+    assert conflict.group_key == target_key
+    assert conflict.discarded_keys == (key_a, key_b, target_key)
+    assert conflict.discarded_keys.count(target_key) == 1
+    assert assembler._groups == {}
+
+
+def test_completion_does_not_sweep_unrelated_expired_group():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    unrelated_first = "!AIVDM,2,1,1,A,unrelated,0*00"
+    target_first = "!AIVDM,2,1,3,A,target-1,0*00"
+    target_second = "!AIVDM,2,2,3,A,target-2,0*00"
+    unrelated_key = ("unrelated", "1", "A", 2)
+    target_key = ("target", "3", "A", 2)
+
+    assembler.feed_outcome("unrelated", unrelated_first)
+    unrelated_group = assembler._groups[unrelated_key]
+    clock.now = 0.5
+    assembler.feed_outcome("target", target_first)
+
+    clock.now = 1.0
+    complete = assembler.feed_outcome("target", target_second)
+
+    assert complete.status is AssemblyStatus.COMPLETE
+    assert complete.sentences == (target_first, target_second)
+    assert complete.discarded_keys == ()
+    assert target_key not in assembler._groups
+    assert assembler._groups[unrelated_key] is unrelated_group
 
 
 def test_feed_remains_compatible_with_structured_outcomes():
@@ -522,14 +709,41 @@ def test_cleanup_expired_uses_injected_clock_at_timeout_boundary():
     assembler = AIVDMAssembler(timeout=1.0, clock=clock)
     first = "!AIVDM,2,1,7,A,payload1,0*00"
     second = "!AIVDM,2,2,7,A,payload2,0*00"
+    key = ("source-a", "7", "A", 2)
 
     assert assembler.feed("source-a", first) is None
 
     clock.now = 1.0
 
     assert assembler.cleanup_expired() is None
+    assert key not in assembler._groups
     assert assembler.feed("source-a", second) is None
     assert assembler.feed("source-a", first) == [first, second]
+
+
+def test_cleanup_expired_removes_only_expired_group_objects():
+    clock = FakeClock()
+    assembler = AIVDMAssembler(timeout=1.0, clock=clock)
+    expired_first = "!AIVDM,2,1,1,A,expired,0*00"
+    live_first = "!AIVDM,2,1,2,A,live,0*00"
+    expired_key = ("expired", "1", "A", 2)
+    live_key = ("live", "2", "A", 2)
+
+    assembler.feed_outcome("expired", expired_first)
+    expired_group = assembler._groups[expired_key]
+    clock.now = 0.5
+    assembler.feed_outcome("live", live_first)
+    live_group = assembler._groups[live_key]
+    calls_before = clock.calls
+
+    assert assembler.cleanup_expired(now=1.0) is None
+
+    assert clock.calls == calls_before
+    assert expired_key not in assembler._groups
+    assert expired_group is not live_group
+    assert assembler._groups[live_key] is live_group
+    assert live_group.fragments_by_ordinal == {1: live_first}
+    assert live_group.last_progress_at == 0.5
 
 
 def test_unique_fragment_refreshes_timeout_window():
@@ -606,8 +820,15 @@ def test_reset_clears_all_pending_groups():
 
     assert assembler.feed("source-a", first_a) is None
     assert assembler.feed("source-b", first_b) is None
+    assert set(assembler._groups) == {
+        ("source-a", "7", "A", 2),
+        ("source-b", "8", "A", 2),
+    }
 
     assert assembler.reset() is None
+    assert assembler._groups == {}
+    assert not hasattr(assembler, "fragments")
+    assert not hasattr(assembler, "timestamps")
 
     assert assembler.feed("source-a", second_a) is None
     assert assembler.feed("source-b", second_b) is None
@@ -623,6 +844,7 @@ def test_reset_is_safe_when_empty():
 
     assert assembler.reset() is None
     assert assembler.reset() is None
+    assert assembler._groups == {}
     assert assembler.feed("src", first) is None
     assert assembler.feed("src", second) == [first, second]
 
