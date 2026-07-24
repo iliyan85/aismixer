@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | Обработка и маршрутизиране на AIS потоци</title>
   <link rel="canonical" href="https://aismixer.net/bg/">
-  <meta name="description" content="AISMixer приема, нормализира, дедуплицира, маркира, маршрутизира и препраща AIS NMEA 0183 потоци през контролирани UDP и UDPSEC крайни точки.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183, обработка на AIS потоци, логическа маршрутизация, UDPSEC, nmea_sproxy, AIVDM, AIVDO, aismixerctl, морски данни">
+  <meta name="description" content="AISMixer обработва и маршрутизира AIS NMEA 0183 потоци с детерминирани жизнени цикли за multipart съобщения, дедупликация, TAG метаданни и ограничено UDPSEC състояние.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, детерминирана обработка на AIS потоци, логическо маршрутизиране, UDPSEC, nmea_sproxy, AIVDM, AIVDO, aismixerctl, морски данни">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
-  <meta property="og:description" content="Нормализиране, дедупликация, TAG метаданни, маршрутизиране и препращане на AIS NMEA 0183 потоци.">
+  <meta property="og:description" content="Детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, изрично локално състояние и автентикиран UDPSEC транспорт.">
   <meta property="og:url" content="https://aismixer.net/bg/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,14 +28,10 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
-  <meta name="twitter:description" content="Normalize · Deduplicate · Tag · Route · Forward за AIS NMEA 0183 потоци.">
+  <meta name="twitter:description" content="Детерминирана AIS обработка · Изрично състояние · Логическо маршрутизиране · Автентикиран UDPSEC">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="Преглед на платформата AISMixer за обработка и маршрутизиране на AIS потоци">
 
-  <link rel="alternate" hreflang="en" href="https://aismixer.net/">
-  <link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/">
-  <link rel="alternate" hreflang="ro" href="https://aismixer.net/ro/">
-  <link rel="alternate" hreflang="x-default" href="https://aismixer.net/">
   <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
   <link rel="icon" href="/assets/img/favicon-32.png" sizes="32x32" type="image/png">
   <link rel="apple-touch-icon" href="/assets/img/apple-touch-icon.png">
@@ -52,7 +48,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
-    "description": "Платформа с отворен код за приемане, нормализиране, дедупликация, TAG метаданни, маршрутизиране и препращане на AIS NMEA 0183 потоци.",
+    "description": "Платформа с отворен код за детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, изрично локално състояние и автентикиран UDPSEC транспорт.",
     "url": "https://aismixer.net/bg/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -67,9 +63,13 @@
     ],
     "inLanguage": "bg",
     "isAccessibleForFree": true,
-    "keywords": ["AIS NMEA 0183", "обработка на потоци", "логическа маршрутизация", "UDPSEC", "nmea_sproxy", "AIVDM", "AIVDO"]
+    "keywords": ["AIS NMEA 0183", "детерминирана обработка на потоци", "логическо маршрутизиране", "UDPSEC", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
+  <link rel="alternate" hreflang="en" href="https://aismixer.net/">
+  <link rel="alternate" hreflang="bg" href="https://aismixer.net/bg/">
+  <link rel="alternate" hreflang="ro" href="https://aismixer.net/ro/">
+  <link rel="alternate" hreflang="x-default" href="https://aismixer.net/">
 </head>
 <body>
   <a class="skip-link" href="#main-content">Към основното съдържание</a>
@@ -78,7 +78,7 @@
       <a class="brand" href="#top" aria-label="Начална страница на AISMixer">
         <span class="logo" aria-hidden="true">🛰️</span>
         <span class="brand-name">AISMixer</span>
-        <span class="chip">AIS stream platform</span>
+        <span class="chip">Платформа за AIS потоци</span>
       </a>
       <div class="toggles">
         <nav class="language-switcher" aria-label="Език">
@@ -107,12 +107,12 @@
         <div class="chip">Отворен код • Python • AIS NMEA 0183</div>
         <h1>AISMixer</h1>
         <p class="hero-kicker">Платформа за обработка и маршрутизиране на AIS потоци</p>
-        <p class="tagline">Normalize · Deduplicate · Tag · Route · Forward</p>
+        <p class="tagline">Нормализира · Дедуплицира · Маркира · Маршрутизира · Препраща</p>
         <p class="lead">
           Приемайте AIS източници, превръщайте трафика от приемниците в един
-          контролиран логически поток и го доставяйте до нужните UDP egress цели.
+          контролиран логически поток и го доставяйте до нужните именувани UDP изходи.
         </p>
-        <div class="cta" aria-label="Връзки към проекта">
+        <div class="cta" role="group" aria-label="Връзки към проекта">
           <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Хранилището в GitHub</a>
           <a class="button" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Разгледайте GitHub Wiki</a>
         </div>
@@ -121,10 +121,10 @@
         <div class="icons" aria-hidden="true">📡 → 🧭 → 📤</div>
         <p class="card-heading" id="logical-stream-title">Един логически AIS поток</p>
         <ul class="list">
-          <li>Приема plain UDP и автентикиран UDPSEC ingress.</li>
+          <li>Приема некриптиран UDP и автентикиран UDPSEC входящ трафик.</li>
           <li>Извлича и сглобява <span class="kbd">!AIVDM</span> и <span class="kbd">!AIVDO</span>.</li>
           <li>Дедуплицира, управлява TAG метаданните и прилага маршрутизация.</li>
-          <li>Препраща приетите данни към избрани именувани UDP egress цели.</li>
+          <li>Препраща приетите данни към избрани именувани UDP изходи.</li>
         </ul>
       </aside>
     </div>
@@ -140,8 +140,8 @@
       <div class="grid">
         <article class="card">
           <div class="icons" aria-hidden="true">📡</div>
-          <h3>Гъвкав ingress</h3>
-          <p>Приема plain UDP през IPv4 или IPv6, както и автентикиран криптиран UDPSEC трафик от станции.</p>
+          <h3>Гъвкав входящ трафик</h3>
+          <p>Приема некриптиран UDP през IPv4 или IPv6, както и автентикиран и криптиран UDPSEC трафик от станции.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧾</div>
@@ -151,22 +151,22 @@
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
           <h3>Multipart сглобяване</h3>
-          <p>Фрагментите могат да пристигат в напълно произволен ред; завършените групи се извеждат по ред на позициите. Точно повторение не променя състоянието, а различно съдържание на заета позиция обезсилва текущата група.</p>
+          <p>Сглобява фрагменти, пристигнали в напълно произволен ред, в завършени логически съобщения и ги извежда по реда на позициите.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔁</div>
           <h3>Дедупликация в почти реално време</h3>
-          <p>Взема едно решение за дедупликация за всяка завършена multipart група, така че всички нейни фрагменти се потискат или изпращат заедно; използва глобален обхват в broadcast режим и обхват по цели при маршрутизация.</p>
+          <p>Взема едно атомарно за групата решение за всяко завършено multipart съобщение — глобално в broadcast режим или отделно за всяка цел при маршрутизиране.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🏷️</div>
           <h3>Контролирани TAG метаданни</h3>
-          <p>Избира NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span> и <span class="kbd">g</span> детерминирано през жизнения цикъл на multipart групата и държи метаданните отделени от идентичността за маршрутизация.</p>
+          <p>Управлява NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span> и <span class="kbd">g</span> през жизнения цикъл на multipart съобщението, като държи метаданните отделени от идентичността за маршрутизиране.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">📤</div>
           <h3>Избрано препращане</h3>
-          <p>Игнорира ненизовите входни данни преди маршрутизация и извличане. Всяко прието низово събитие използва едно неизменяемо моментно състояние на маршрутизацията, след което се препраща към всички изходи в broadcast режим или към избраните именувани UDP egress цели.</p>
+          <p>Препраща приетите изречения към всеки конфигуриран UDP изход в broadcast режим или към именуваните цели, избрани от логическото маршрутизиране.</p>
         </article>
       </div>
     </section>
@@ -174,21 +174,29 @@
     <section id="processing-contract" class="section">
       <div class="section-heading">
         <p class="eyebrow">Проверено референтно поведение</p>
-        <h2>Детерминиран договор за обработка</h2>
-        <p class="section-intro">Python реализацията е тестваният еталон за приемането на входни събития, сглобяването, метаданните, дедупликацията, маршрутизацията и препращането. Всяка бъдеща нативна реализация ще се проверява спрямо същите наблюдаеми резултати.</p>
+        <h2>Детерминирана обработка и изрично състояние</h2>
+        <p class="section-intro">Реализацията на Python определя наблюдаемото поведение при входни събития, сглобяване, метаданни, дедупликация, маршрутизиране и почистване. Точните граници и гранични случаи остават в нормативния договор за поведение.</p>
       </div>
-      <div class="grid feature-row">
+      <div class="grid state-grid">
         <article class="card">
-          <h3>Ingress граница</h3>
-          <p>До обработка се допускат само низови входни данни. Данните от друг тип се игнорират преди маршрутизация и извличане, а всяко прието низово събитие използва едно неизменяемо моментно състояние на маршрутизацията.</p>
+          <div class="icons" aria-hidden="true">🚪</div>
+          <h3>Граница на входа и моментното състояние</h3>
+          <p>До обработка се допуска само <span class="kbd">IngressEvent</span>, чието <span class="kbd">raw_line</span> е низ. Една неизменяема моментна снимка на маршрутизацията управлява всяко прието събитие. Когато тя съдържа таблица за маршрутизация, едно съответствие с източник се прилага към всички извлечени изречения; едновременна промяна засяга следващо събитие.</p>
         </article>
         <article class="card">
-          <h3>Multipart lifecycle</h3>
-          <p>Фрагментите могат да пристигат в напълно произволен ред. Точно повторение на вече заета позиция не променя състоянието; различно съдържание на същата позиция обезсилва текущата група.</p>
+          <div class="icons" aria-hidden="true">🧩</div>
+          <h3>Жизнен цикъл на multipart съобщенията</h3>
+          <p>Фрагментите могат да пристигат в напълно произволен ред. Точно повторение на заета позиция е идемпотентно за сглобяването и не подновява времето на живот; противоречащо съдържание обезсилва текущото поколение. TAG контекстът следва същите граници на групата.</p>
         </article>
         <article class="card">
-          <h3>Метаданни и маршрутизация</h3>
-          <p>Изборът на TAG <span class="kbd">s</span>, <span class="kbd">c</span> и <span class="kbd">g</span> следва детерминирани правила, обвързани с жизнения цикъл. Дедупликацията на multipart съобщение е атомарна за цялата подредена група.</p>
+          <div class="icons" aria-hidden="true">🔁</div>
+          <h3>Жизнен цикъл на дедупликацията</h3>
+          <p>Едно решение обхваща цялата подредена multipart група. Наследеният режим използва глобален обхват, а режимът с маршрутизиране — независим обхват за всяка цел. Наблюдението на дубликат не удължава запазения жизнен цикъл на дедупликацията.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">⏱️</div>
+          <h3>Детерминирано локално състояние</h3>
+          <p>Локалните за процеса TTL жизнени цикли са изрично определени и тествани. Изтеклото състояние се обработва преди детерминираното премахване на живо състояние, когато е зададен лимит на капацитета.</p>
         </article>
       </div>
       <div class="callout">
@@ -196,20 +204,98 @@
       </div>
     </section>
 
+    <section id="state-under-load" class="section section-emphasis">
+      <div class="section-heading">
+        <p class="eyebrow">Изрична отговорност за жизнения цикъл</p>
+        <h2>Детерминирано състояние под натоварване</h2>
+        <p class="section-intro">Референтната реализация определя изрично задържаното състояние, напредъка на времето на живот, допускането според капацитета, почистването и наблюдението, вместо да разчита на случайното поведение на контейнерите от данни.</p>
+      </div>
+      <div class="grid state-grid">
+        <article class="card state-card">
+          <div class="icons" aria-hidden="true">🔁</div>
+          <h3>Състояние на дедупликацията</h3>
+          <p>Идентичността е точното изречение или подреденият multipart кортеж в глобален обхват или в обхвата на конкретна цел. TTL е детерминиран, дубликатите не подновяват задържането, а изтеклите записи се премахват, преди да бъде премахнат най-старият активен запис.</p>
+          <p>Конструкторът на Python обекта приема незадължителен <span class="kbd">max_entries</span>; текущото свързване в услугата го оставя със стойност <span class="kbd">None</span>, затова този размер е неограничен в текущата услуга.</p>
+        </article>
+        <article class="card state-card">
+          <div class="icons" aria-hidden="true">🧩</div>
+          <h3>Състояние на multipart сглобяването</h3>
+          <p>Фрагментите заемат поредни позиции. Уникалният напредък подновява времето на живот на групата, а точното повторение — не. Конфликтът, изтичането, премахването поради капацитет, завършването и нулирането остават отделни резултати от жизнения цикъл и почистват свързания TAG контекст.</p>
+          <p>Конструкторът на Python обекта приема незадължителни <span class="kbd">max_fragments_per_group</span> и <span class="kbd">max_pending_groups</span>; текущото свързване в услугата оставя и двата със стойност <span class="kbd">None</span>.</p>
+        </article>
+        <article class="card state-card">
+          <div class="icons" aria-hidden="true">🔐</div>
+          <h3>Защита от повторения и сесии</h3>
+          <p>Записите за защита от повторение при handshake, активните сесии и записите с nonce стойности за всяка сесия са твърдо ограничени. Монотонното време управлява локалния жизнен цикъл; изтеклото състояние се премахва преди детерминираното премахване на живо състояние.</p>
+          <p>Сесиите се подреждат според скорошната валидна активност. Успешен handshake от същия адрес заменя само тази сесия и нейното nonce състояние. Цялото състояние за сигурност е локално за процеса и се губи при рестарт.</p>
+        </article>
+        <article class="card state-card">
+          <div class="icons" aria-hidden="true">📊</div>
+          <h3>Наблюдаемо състояние</h3>
+          <p>Дедупликацията, сглобяването и защитеното състояние предоставят неизменяеми моментни статистики за проверка и регресионно тестване. Прочитането на моментна снимка не стартира почистване и не променя по-ранна снимка.</p>
+          <p>Това е основа за бъдеща диференциална проверка за съответствие, а не завършена система за наблюдение или изнасяне на метрики към Prometheus.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><strong>Локално по замисъл.</strong> Това състояние не се запазва трайно и не се споделя между процеси. Все още няма координатор за многопроцесна работа.</p>
+    </section>
+
+    <section id="native-foundation" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Референтна семантика и поетапно развитие</p>
+        <h2>Референтна основа, подготвена за нативна реализация</h2>
+        <p class="section-intro">Документираното наблюдаемо поведение позволява бъдещата реализация да напредва на етапи, докато текущата Python реализация остава референтна.</p>
+      </div>
+      <div class="pipeline reference-pipeline" role="group" aria-label="Път от тестваната Python референция до бъдещ поетапен нативен процесор">
+        <div class="pipeline-node">
+          <strong>Тествана Python референция</strong>
+          <span class="status-badge status-implemented">Реализирано сега</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Наблюдаем договор за поведение</strong>
+          <span class="status-badge status-implemented">Документирано и тествано</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Диференциални тестове за съответствие</strong>
+          <span class="status-badge status-future">Бъдещ метод за проверка</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node pipeline-node-future">
+          <strong>Поетапен нативен процесор</strong>
+          <span class="status-badge status-future">Бъдещ — не е реализиран</span>
+        </div>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <h3>Наблюдаема повърхност за сравнение</h3>
+          <p>Диференциалните тестове могат да сравняват подредения изход, TAG метаданните, целите за маршрутизиране, решенията за дедупликация, резултатите от жизнения цикъл и изричните случаи без изход.</p>
+        </article>
+        <article class="card">
+          <h3>Поетапно разделяне</h3>
+          <p>Изричната отговорност за състоянието и границите на почистването позволяват обработващата работа да се отделя постепенно, без да изисква еднократно цялостно пренаписване на изпълнението.</p>
+        </article>
+        <article class="card">
+          <h3>Границите остават изрични</h3>
+          <p>Днес не съществува нативен процесор. Не са избрани C или C++ API, ABI или стратегия за свързване и тази актуализация на документацията не прави твърдение за производителността.</p>
+        </article>
+      </div>
+    </section>
+
     <section id="routing" class="section">
       <div class="section-heading">
         <p class="eyebrow">Маршрутизиране и логически зони</p>
         <h2>Опишете политиката на потока чрез идентичности на източници</h2>
-        <p class="section-intro">Статичната логическа маршрутизация свързва именувани ingress източници с именувани UDP egress цели чрез преизползваеми множества и подредени маршрути.</p>
+        <p class="section-intro">Статичното логическо маршрутизиране свързва именувани входни източници с именувани UDP изходни цели чрез многократно използваеми множества от източници и подредени маршрути.</p>
       </div>
-      <div class="pipeline" aria-label="Път на логическата маршрутизация">
-        <div class="pipeline-node"><strong>Именуван ingress</strong><span>UDP и UDPSEC източници</span></div>
+      <div class="pipeline" role="group" aria-label="Път на логическата маршрутизация">
+        <div class="pipeline-node"><strong>Именуван вход</strong><span>UDP и UDPSEC източници</span></div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node"><strong>Логически зони</strong><span>Множества от идентичности на източници</span></div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node"><strong>Подредени маршрути</strong><span>Декларативен избор на цели</span></div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node"><strong>Именуван egress</strong><span>Избрани UDP цели</span></div>
+        <div class="pipeline-node"><strong>Именуван изход</strong><span>Избрани UDP цели</span></div>
       </div>
       <div class="grid feature-row">
         <article class="card">
@@ -230,20 +316,20 @@
 
     <section id="runtime-control" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Управление на маршрутизацията в движение</p>
-        <h2>Променяйте активните маршрути, без да прекъсвате потока</h2>
-        <p class="section-intro">Незадължителна локална управляваща равнина (control plane) през Unix-domain socket предоставя ясни операции по маршрутизация чрез глобално инсталираната команда <span class="kbd">aismixerctl</span>.</p>
+        <p class="eyebrow">Управление на маршрутизирането по време на работа</p>
+        <h2>Променяйте активните маршрути, без да прекъсвате слоя за данни</h2>
+        <p class="section-intro">Незадължителен локален управляващ слой през Unix-domain сокет предоставя кратки операции по маршрутизиране чрез глобално инсталираната команда <span class="kbd">aismixerctl</span>.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
           <h3>Състояние на маршрутизацията</h3>
-          <p>Показва активното поколение, състоянието, логическите зони, подредените маршрути и идентичностите на целите.</p>
+          <p>Показва активното поколение, дали маршрутизирането е включено, логическите зони, подредените маршрути и идентичностите на целите.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⚡</div>
           <h3>Атомарна подмяна или изключване</h3>
-          <p>Валидира цялата кандидат-конфигурация преди смяна на неизменяемото състояние на маршрутизацията или връщане към legacy broadcast режим.</p>
+          <p>Проверява пълната предложена конфигурация преди подмяната на неизменяемото моментно състояние на маршрутизацията или връщането към наследения broadcast режим.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🛡️</div>
@@ -252,7 +338,7 @@
         </article>
       </div>
       <div class="callout">
-        <p><strong>Умишлено локално и ограничено до текущия процес.</strong> Промените по време на работа не се запазват след рестарт, конфигурационните файлове не се пренаписват, а ingress и egress адаптери не се създават динамично. Правата върху Unix socket са текущата граница за достъп; няма application-level control token.</p>
+        <p><strong>Умишлено локално и ограничено до текущия процес.</strong> Маршрутите по време на работа не се запазват след рестарт, конфигурационните файлове не се пренаписват, а входни или изходни адаптери не се създават динамично. Правата върху Unix сокета са текущата граница за оторизация; няма управляващ token на ниво приложение.</p>
       </div>
     </section>
 
@@ -260,26 +346,55 @@
       <div class="section-heading">
         <p class="eyebrow">Контрол на мрежовите крайни точки</p>
         <h2>Ограничете разрешените източници и изходните адреси</h2>
-        <p class="section-intro">Малки контроли на ниво приложение улесняват включването на IPv4 и IPv6 крайни точки в по-широките firewall и routing правила на оператора.</p>
+        <p class="section-intro">Малки механизми за контрол на ниво приложение улесняват включването на IPv4 и IPv6 крайни точки в по-широките правила на оператора за защитна стена и маршрутизиране.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
           <div class="icons" aria-hidden="true">🚧</div>
-          <h3>Ingress <span class="kbd">allow_from</span></h3>
-          <p>Ограничете UDP и UDPSEC listeners до буквални IP адреси или CIDR мрежи, включително с изрична пълна забрана.</p>
+          <h3>Входен <span class="kbd">allow_from</span></h3>
+          <p>Ограничете UDP и UDPSEC слушателите до конкретно зададени IP адреси или CIDR мрежи, включително с възможност за изрична пълна забрана.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">📍</div>
           <h3>Изходен <span class="kbd">source_ip</span></h3>
-          <p>Обвържете egress socket с буквален IPv4 или IPv6 адрес на източника и ограничете DNS разрешаването на целта до същата адресна фамилия.</p>
+          <p>Обвържете изходящия сокет с конкретно зададен IPv4 или IPv6 адрес на източника и ограничете преобразуването на адреса на целта до същото адресно семейство.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧱</div>
           <h3>Част от многослойна граница</h3>
-          <p>Тези политики допълват правилата на операционната система за firewall и маршрутизация; не ги заменят.</p>
+          <p>Тези политики допълват правилата на операционната система за защитна стена и маршрутизиране; те не ги заменят.</p>
         </article>
       </div>
-      <p class="boundary-note"><span class="kbd">source_ip</span> задава обвързване с адрес на източника, а не избор на мрежов интерфейс, routing table, socket mark или SDN.</p>
+      <p class="boundary-note"><span class="kbd">source_ip</span> задава обвързване с адрес на източника, а не избор на мрежов интерфейс, таблица за маршрутизиране, маркиране на сокет или SDN.</p>
+    </section>
+
+    <section id="secure-state" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Жизнен цикъл на UDPSEC</p>
+        <h2>Автентикиран транспорт с ограничено локално състояние</h2>
+        <p class="section-intro">Текущият UDPSEC път през <span class="kbd">nmea_sproxy</span> и AISMixer съчетава автентикирано договаряне на ключове и криптиран трафик с изрична отговорност за защитата от повторения, сесиите и nonce стойностите.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔑</div>
+          <h3>Автентикирано установяване на сесия</h3>
+          <p>Станциите се автентикират с ECDSA. Сесийните ключове, получени чрез ECDH, позволяват на текущото прокси да защитава AIS и ping/pong трафика с автентикирано AES-GCM криптиране.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🛡️</div>
+          <h3>Ограничена защита от повторения</h3>
+          <p>Записите за защита от повторение при handshake, активните сесии и приетите nonce стойности за данни на всяка сесия са твърдо ограничени. Монотонното време управлява локалните TTL и подреждането, а изтичането предхожда премахването на живо състояние.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">♻️</div>
+          <h3>Почистване, задвижвано от трафика</h3>
+          <p>Разрешеният трафик задвижва почистването на изтеклите записи вместо фонов таймер. Състоянието за защита от повторения, сесиите и nonce стойностите е локално за процеса, не се запазва трайно и се губи при рестарт на услугата.</p>
+        </article>
+      </div>
+      <div class="callout">
+        <p><strong>Граница на сигурността:</strong> в рамките на реализирания си обхват UDPSEC защитава автентичността и поверителността на транспорта и обработва повторенията; той не доказва, че AIS съдържанието е физически или семантично достоверно.</p>
+        <p>Прочетете <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">политиката за сигурност</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">договора за поведение</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ръководството за <span class="kbd">nmea_sproxy</span></a> и <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a> за подробните граници.</p>
+      </div>
     </section>
 
     <section id="receivers" class="section section-emphasis">
@@ -288,7 +403,7 @@
         <h2>Свържете мрежови или физически AIS приемници чрез nmea_sproxy</h2>
         <p class="section-intro"><span class="kbd">nmea_sproxy</span> е проксито при станцията, което свързва един локален AIS източник с една конфигурирана AISMixer цел.</p>
       </div>
-      <div class="architecture-path" aria-label="Свързване на физически AIS приемник чрез nmea_sproxy към AISMixer">
+      <div class="architecture-path" role="group" aria-label="Свързване на физически AIS приемник чрез nmea_sproxy към AISMixer">
         <div class="path-node">
           <span class="icons" aria-hidden="true">📻</span>
           <strong>Физически AIS приемник</strong>
@@ -303,7 +418,7 @@
         </div>
         <div class="path-connector">
           <span aria-hidden="true">→</span>
-          <small>UDPSEC или изрично доверен plain UDP</small>
+          <small>UDPSEC или изрично доверен некриптиран UDP</small>
         </div>
         <div class="path-node">
           <span class="icons" aria-hidden="true">🛰️</span>
@@ -322,8 +437,8 @@
         <article class="card">
           <h3>Реализирани изходи</h3>
           <ul class="list">
-            <li>Автентикиран криптиран UDPSEC с проверка за активност и повторно свързване.</li>
-            <li>Изрично конфигуриран plain UDP за доверена LAN, VPN или равностойна мрежова граница.</li>
+            <li>Автентикиран и криптиран UDPSEC с ограничения жизнен цикъл на сесията, описан по-горе.</li>
+            <li>Изрично конфигуриран некриптиран UDP за доверена LAN, VPN или равностойна граница.</li>
           </ul>
         </article>
         <article class="card">
@@ -332,31 +447,31 @@
         </article>
       </div>
       <div class="callout">
-        <p>Мрежов приемник може да подава локален UDP към <span class="kbd">nmea_sproxy</span> или директно към AISMixer според внедряването. Основният AISMixer процес не чете серийни портове директно. Довереният plain UDP не предоставя UDPSEC криптиране, автентикация, защита срещу повторение или протокол за активност.</p>
+        <p>Мрежов приемник може да подава локален UDP към <span class="kbd">nmea_sproxy</span> или директно към AISMixer според внедряването. Основният AISMixer процес не чете серийни портове директно. Довереният некриптиран UDP не предоставя UDPSEC криптиране, автентикация, защита срещу повторение или проверка за активност.</p>
       </div>
     </section>
 
     <section id="operations" class="section">
       <div class="section-heading">
         <p class="eyebrow">Внедряване и експлоатация</p>
-        <h2>Практичен жизнен цикъл за нативни Linux инсталации</h2>
-        <p class="section-intro">Управляваното от хранилището внедряване поддържа runtime файловете, операторските настройки, systemd интеграцията и локалното управление на маршрутизацията съгласувани.</p>
+        <h2>Жизнен цикъл за Linux и systemd, създаден за реални инсталации</h2>
+        <p class="section-intro">Управляваното от хранилището внедряване поддържа съгласувани файловете за изпълнение, операторското състояние, интеграцията със systemd и локалното управление на маршрутизирането.</p>
       </div>
       <div class="grid">
         <article class="card">
           <div class="icons" aria-hidden="true">⚙️</div>
-          <h3>Systemd услуга от хранилището</h3>
-          <p>Нативната услуга създава <span class="kbd">/run/aismixer</span>, докато AISMixer работи, и поддържа незадължителния локален control socket.</p>
+          <h3>systemd услуга, управлявана от хранилището</h3>
+          <p>Услугата създава <span class="kbd">/run/aismixer</span>, докато AISMixer работи, и поддържа незадължителния локален управляващ сокет.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔄</div>
-          <h3>Install, update и uninstall</h3>
-          <p>Lifecycle скриптовете разпознават root и sudo и поддържат инсталираните runtime файлове и service units.</p>
+          <h3>Инсталиране, актуализиране и деинсталиране</h3>
+          <p>Скриптовете за жизнения цикъл съобразяват работата с root или sudo и поддържат внедрените файлове за изпълнение и unit файловете на услугата.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🗝️</div>
           <h3>Запазени операторски настройки</h3>
-          <p>Обичайните install, update и uninstall операции запазват конфигурацията на оператора и криптографските ключове.</p>
+          <p>Обичайните операции за инсталиране, актуализиране и деинсталиране запазват конфигурацията на оператора и криптографските ключове.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧰</div>
@@ -369,34 +484,35 @@
     <section id="documentation" class="section">
       <div class="section-heading">
         <p class="eyebrow">Документация и състояние на проекта</p>
-        <h2>Реализираната основа е ясно отделена от следващите стъпки</h2>
-        <p class="section-intro">Wiki съдържа подробностите за архитектура, конфигурация, маршрутизация, сигурност и експлоатация. Roadmap проследява бъдещата работа без обещани срокове.</p>
+        <h2>Реализирана основа, ясно отделена от следващите стъпки</h2>
+        <p class="section-intro">Wiki е подробното ръководство за архитектура, конфигурация, маршрутизиране, сигурност и експлоатация. Roadmap проследява бъдещата работа без обещани срокове.</p>
       </div>
       <div class="status-grid">
         <article class="card status-card status-now">
-          <p class="status-label">Реализирано сега</p>
+          <h3 class="status-label">Реализирано сега</h3>
           <ul class="list">
             <li>Логическа маршрутизация, зони и дедупликация по цели.</li>
-            <li>Управление на runtime маршрутизацията чрез <span class="kbd">aismixerctl</span>.</li>
-            <li>ACL за крайни точки и обвързване с адрес на източника.</li>
-            <li>Вход от физически приемници чрез <span class="kbd">nmea_sproxy</span>.</li>
-            <li>UDPSEC и изрично доверен plain-UDP изход от проксито.</li>
-            <li>Устойчив нативен жизнен цикъл за systemd внедряване.</li>
+            <li>Управление на маршрутизирането по време на работа чрез <span class="kbd">aismixerctl</span>.</li>
+            <li>Детерминирани жизнени цикли за дедупликация, сглобяване и multipart TAG метаданни.</li>
+            <li>Твърдо ограничено състояние за защитата от повторения, сесиите и nonce стойностите за всяка сесия.</li>
+            <li>Неизменяеми статистики на състоянието и тествана Python референция за поведението.</li>
+            <li>Контрол на крайните точки, вход от физически приемници през nmea_sproxy и доверен режим с некриптиран UDP.</li>
+            <li>systemd <span class="kbd">RuntimeDirectory</span>, скриптове за жизнения цикъл и глобален CLI за маршрутизиране.</li>
           </ul>
         </article>
         <article class="card status-card status-next">
-          <p class="status-label">Планирано след това</p>
+          <h3 class="status-label">Планирана работа</h3>
           <ul class="list">
-            <li>Внедряване с Docker и разширен Quickstart материал.</li>
-            <li>Coordinator процес с ingress workers и egress workers.</li>
-            <li>IPC разпространение на състоянието на маршрутизацията и допълнителни адаптери.</li>
-            <li>Опции за персистентна runtime маршрутизация и презареждане на конфигурацията.</li>
-            <li>Разпределена маршрутизация и развитие на P2P обмен.</li>
-            <li>Изследвания на spoof/anomaly detection; такава функция още не е реализирана.</li>
+            <li>Изрично определяне на собственика на услугата, групов достъп до контролния сокет и проверка на внедряването под Linux и Raspberry Pi.</li>
+            <li>Поетапен координатор с отделни входни и изходни работни процеси, наблюдение и IPC за състоянието на маршрутизирането.</li>
+            <li>Проучване на контролираното възстановяване на състоянието на маршрутизирането, безопасното презареждане на конфигурацията и историята за връщане назад.</li>
+            <li>По-богата наблюдаемост за маршрути, цели, поколения, управление, метрики и състояние на услугата.</li>
+            <li>Изследване на морската сигурност, качеството на приемниците и откриването на подправяне или аномалии — днес няма реализиран детектор.</li>
+            <li>По-късно може да бъдат добавени адаптери извън UDP, автентикирано отдалечено управление, P2P обмен и филтри според съдържанието.</li>
           </ul>
         </article>
       </div>
-      <div class="card links" aria-label="Връзки към документацията">
+      <div class="card links" role="group" aria-label="Връзки към документацията">
         <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Основно хранилище</a>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a href="https://github.com/iliyan85/aismixer/wiki/Quick-Start" target="_blank" rel="noopener">Quick Start</a>
@@ -410,7 +526,7 @@
 
   <footer>
     <div class="container footer-inner">
-      <span>© 2026 AISMixer project</span>
+      <span>© 2026 AISMixer</span>
       <span class="muted">Обработка и маршрутизиране на AIS потоци с отворен код</span>
     </div>
   </footer>

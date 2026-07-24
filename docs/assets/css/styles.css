@@ -343,6 +343,10 @@ a:focus-visible {
   padding: 0 0 0 19px;
 }
 
+.list li {
+  overflow-wrap: break-word;
+}
+
 .hero-summary .list {
   color: var(--muted);
 }
@@ -353,6 +357,7 @@ a:focus-visible {
   border-radius: 6px;
   background: color-mix(in oklab, var(--panel) 90%, transparent);
   font: 92% ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  overflow-wrap: anywhere;
 }
 
 .section {
@@ -401,6 +406,26 @@ a:focus-visible {
   margin-top: 18px;
 }
 
+.state-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.state-card {
+  position: relative;
+  overflow: hidden;
+  padding-top: 24px;
+}
+
+.state-card::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 4px;
+  background: linear-gradient(90deg, var(--accent), var(--primary));
+  content: "";
+}
+
 .pipeline {
   display: flex;
   align-items: stretch;
@@ -430,11 +455,48 @@ a:focus-visible {
   font-size: 13px;
 }
 
+.pipeline-node strong {
+  overflow-wrap: break-word;
+}
+
 .pipeline-arrow {
   align-self: center;
   color: var(--accent);
   font-size: 22px;
   font-weight: 800;
+}
+
+.reference-pipeline {
+  margin-bottom: 18px;
+}
+
+.pipeline-node-future {
+  border-style: dashed;
+  border-color: color-mix(in oklab, var(--primary) 58%, var(--border));
+}
+
+.pipeline-node .status-badge {
+  align-self: center;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .03em;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+.pipeline-node .status-implemented {
+  border-color: color-mix(in oklab, var(--accent) 45%, var(--border));
+  background: color-mix(in oklab, var(--accent) 11%, var(--el));
+  color: color-mix(in oklab, var(--accent) 76%, var(--text));
+}
+
+.pipeline-node .status-future {
+  border-color: color-mix(in oklab, var(--primary) 45%, var(--border));
+  background: color-mix(in oklab, var(--primary) 11%, var(--el));
+  color: color-mix(in oklab, var(--primary) 76%, var(--text));
 }
 
 .boundary-note {
@@ -610,6 +672,10 @@ footer {
 }
 
 @media (max-width: 780px) {
+  .state-grid {
+    grid-template-columns: 1fr;
+  }
+
   .pipeline {
     align-items: stretch;
     flex-direction: column;

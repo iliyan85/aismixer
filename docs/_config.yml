@@ -3,4 +3,4 @@ description: Open-source platform for receiving, normalizing, deduplicating, tag
 url: https://aismixer.net
 baseurl: ""
 markdown: kramdown
-source_sync_commit: "567cba22e051c21725f5b2be9fc15ed142ae65c6"
+source_sync_commit: "1de120d2d971c32c0a479546e5b6b7fb5163345b"

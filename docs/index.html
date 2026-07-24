@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | AIS Stream Processing and Routing Platform</title>
   <link rel="canonical" href="https://aismixer.net/">
-  <meta name="description" content="AISMixer receives, normalizes, deduplicates, tags, routes, and forwards AIS NMEA 0183 streams across controlled UDP and UDPSEC endpoints.">
+  <meta name="description" content="AISMixer processes and routes AIS NMEA 0183 streams with deterministic multipart, deduplication, TAG, and bounded UDPSEC state lifecycles.">
   <meta name="keywords" content="AISMixer, AIS NMEA 0183, AIS stream processing, logical routing, UDPSEC, nmea_sproxy, AIVDM, AIVDO, aismixerctl, maritime data">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | AIS Stream Processing and Routing Platform">
-  <meta property="og:description" content="Normalize, deduplicate, tag, route, and forward AIS NMEA 0183 streams with AISMixer.">
+  <meta property="og:description" content="Deterministic AIS NMEA 0183 processing, logical routing, explicit local state, and authenticated UDPSEC transport.">
   <meta property="og:url" content="https://aismixer.net/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,7 +28,7 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | AIS Stream Processing and Routing Platform">
-  <meta name="twitter:description" content="Normalize · Deduplicate · Tag · Route · Forward AIS NMEA 0183 streams.">
+  <meta name="twitter:description" content="Deterministic AIS processing · Explicit state · Logical routing · Authenticated UDPSEC">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="AISMixer AIS stream processing and routing platform overview">
 
@@ -48,7 +48,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
-    "description": "Open-source platform for receiving, normalizing, deduplicating, tagging, routing, and forwarding AIS NMEA 0183 streams.",
+    "description": "Open-source platform for deterministic AIS NMEA 0183 processing, logical routing, explicit local state, and authenticated UDPSEC transport.",
     "url": "https://aismixer.net/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -112,7 +112,7 @@
           Receive AIS feeds, turn receiver traffic into one controlled logical
           stream, and deliver it to the UDP egress targets that need it.
         </p>
-        <div class="cta" aria-label="Project links">
+        <div class="cta" role="group" aria-label="Project links">
           <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">View the GitHub repository</a>
           <a class="button" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Explore the GitHub Wiki</a>
         </div>
@@ -151,22 +151,22 @@
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
           <h3>Multipart assembly</h3>
-          <p>Fragments may arrive fully out of order; complete groups are emitted in ordinal order. An exact repeat is idempotent, while conflicting content at an occupied ordinal invalidates the live group.</p>
+          <p>Assemble fully out-of-order fragments into complete logical messages and emit them in ordinal order.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔁</div>
           <h3>Near-real-time deduplication</h3>
-          <p>Make one deduplication decision for each complete multipart group, suppressing or emitting every fragment together; use global scope in broadcast mode and target scope in routing mode.</p>
+          <p>Make one group-atomic decision for each complete multipart message, globally in broadcast mode or separately for each routing target.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🏷️</div>
           <h3>Controlled TAG metadata</h3>
-          <p>Select NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span>, and <span class="kbd">g</span> deterministically across the multipart lifecycle, and keep metadata separate from routing identity.</p>
+          <p>Control NMEA TAG <span class="kbd">s</span>, <span class="kbd">c</span>, and <span class="kbd">g</span> across the multipart lifecycle while keeping metadata separate from routing identity.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">📤</div>
           <h3>Selected forwarding</h3>
-          <p>Ignore non-string payloads before routing and extraction. Each accepted string event uses one immutable routing snapshot, then forwards to every configured output in broadcast mode or to its selected named UDP targets.</p>
+          <p>Forward accepted sentences to every configured UDP output in broadcast mode or to the named targets selected by logical routing.</p>
         </article>
       </div>
     </section>
@@ -174,25 +174,111 @@
     <section id="processing-contract" class="section">
       <div class="section-heading">
         <p class="eyebrow">Tested reference behaviour</p>
-        <h2>A deterministic processing contract</h2>
-        <p class="section-intro">The Python processor is the tested reference for ingress acceptance, assembly, metadata, deduplication, routing, and forwarding. Any future native processor will be checked against the same observable outcomes.</p>
+        <h2>Deterministic processing and explicit state</h2>
+        <p class="section-intro">The Python implementation defines observable event, assembly, metadata, deduplication, routing, and cleanup behaviour. Exact boundaries and edge cases remain in the normative behavioural contract.</p>
       </div>
-      <div class="grid feature-row">
+      <div class="grid state-grid">
         <article class="card">
-          <h3>Ingress boundary</h3>
-          <p>Only string payloads enter processing. Non-string payloads are ignored before routing and extraction, while every accepted string event uses one immutable routing snapshot.</p>
+          <div class="icons" aria-hidden="true">🚪</div>
+          <h3>Ingress and snapshot boundary</h3>
+          <p>Only an <span class="kbd">IngressEvent</span> whose <span class="kbd">raw_line</span> is a string enters processing. One immutable routing snapshot governs each accepted event. When it contains a routing table, one source match governs all extracted sentences; a concurrent update affects a later event.</p>
         </article>
         <article class="card">
+          <div class="icons" aria-hidden="true">🧩</div>
           <h3>Multipart lifecycle</h3>
-          <p>Fragments may arrive fully out of order. Exact repeats at an occupied ordinal are idempotent; conflicting content there invalidates the live generation.</p>
+          <p>Fragments may arrive fully out of order. An exact duplicate at an occupied ordinal is idempotent for assembly and does not refresh lifetime; conflicting content invalidates the live generation. TAG context follows the same group boundaries.</p>
         </article>
         <article class="card">
-          <h3>Metadata and routing</h3>
-          <p>TAG <span class="kbd">s</span>, <span class="kbd">c</span>, and <span class="kbd">g</span> selection follows deterministic, lifecycle-aware rules. Multipart deduplication is group-atomic, with one decision for the complete ordered group.</p>
+          <div class="icons" aria-hidden="true">🔁</div>
+          <h3>Deduplication lifecycle</h3>
+          <p>One decision covers the complete ordered multipart group. Legacy mode uses global scope; routing mode uses independent target scope. A duplicate observation does not extend the retained deduplication lifetime.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">⏱️</div>
+          <h3>Deterministic local state</h3>
+          <p>Process-local TTL lifecycles are explicit and tested. Expired state is handled before deterministic eviction of live state when a configured capacity applies.</p>
         </article>
       </div>
       <div class="callout">
         <p><strong>Need the exact edge-case semantics?</strong> <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">Read the behavioural contract</a>.</p>
+      </div>
+    </section>
+
+    <section id="state-under-load" class="section section-emphasis">
+      <div class="section-heading">
+        <p class="eyebrow">Explicit lifecycle ownership</p>
+        <h2>Deterministic state under load</h2>
+        <p class="section-intro">The reference implementation makes retained state, lifetime progress, capacity admission, cleanup, and observation explicit instead of relying on incidental container behaviour.</p>
+      </div>
+      <div class="grid state-grid">
+        <article class="card state-card">
+          <div class="icons" aria-hidden="true">🔁</div>
+          <h3>Deduplication state</h3>
+          <p>Identity is the exact sentence or ordered multipart tuple, in a global or per-target scope. TTL is deterministic, duplicates do not refresh retention, and expired entries are removed before the oldest live entry is evicted.</p>
+          <p>The Python object accepts optional <span class="kbd">max_entries</span>; current service wiring leaves it at <span class="kbd">None</span>, so this dimension is unbounded in the current service.</p>
+        </article>
+        <article class="card state-card">
+          <div class="icons" aria-hidden="true">🧩</div>
+          <h3>Multipart assembly state</h3>
+          <p>Fragments occupy ordinal slots. Unique progress refreshes group lifetime; an exact duplicate does not. Conflict, expiry, capacity removal, completion, and reset remain distinct lifecycle outcomes and clean related TAG context.</p>
+          <p>The Python object accepts optional <span class="kbd">max_fragments_per_group</span> and <span class="kbd">max_pending_groups</span>; current service wiring leaves both at <span class="kbd">None</span>.</p>
+        </article>
+        <article class="card state-card">
+          <div class="icons" aria-hidden="true">🔐</div>
+          <h3>Secure replay and sessions</h3>
+          <p>Handshake replay records, active sessions, and per-session nonce records are hard-bounded. Monotonic time owns local lifetime; expired state is removed before deterministic live eviction.</p>
+          <p>Sessions are ordered by recent valid activity. A successful same-address handshake replaces only that session and its nonce state. All secure state is process-local and is lost at restart.</p>
+        </article>
+        <article class="card state-card">
+          <div class="icons" aria-hidden="true">📊</div>
+          <h3>Observable state</h3>
+          <p>Deduplication, assembly, and secure state expose immutable point-in-time statistics for inspection and regression testing. Reading a snapshot does not run cleanup or alter an earlier snapshot.</p>
+          <p>This is a basis for future differential conformance, not a complete monitoring or Prometheus export system.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><strong>Local by design.</strong> This state is non-durable and is not shared across processes. A multiprocessing coordinator does not exist yet.</p>
+    </section>
+
+    <section id="native-foundation" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Reference semantics and staged evolution</p>
+        <h2>A native-ready reference foundation</h2>
+        <p class="section-intro">Documented observable behaviour allows future implementation work to proceed in stages while the current Python runtime remains the reference.</p>
+      </div>
+      <div class="pipeline reference-pipeline" role="group" aria-label="Path from the tested Python reference to a future staged native processor">
+        <div class="pipeline-node">
+          <strong>Tested Python reference</strong>
+          <span class="status-badge status-implemented">Implemented now</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Observable behavioural contract</strong>
+          <span class="status-badge status-implemented">Documented and tested</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Differential conformance tests</strong>
+          <span class="status-badge status-future">Future validation method</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node pipeline-node-future">
+          <strong>Staged native processor</strong>
+          <span class="status-badge status-future">Future — not implemented</span>
+        </div>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <h3>Observable comparison surface</h3>
+          <p>Differential tests can compare ordered output, TAG metadata, routing targets, deduplication decisions, lifecycle outcomes, and explicit no-output cases.</p>
+        </article>
+        <article class="card">
+          <h3>Staged separation</h3>
+          <p>Explicit state ownership and cleanup boundaries support incremental extraction of processing work instead of requiring one large runtime rewrite.</p>
+        </article>
+        <article class="card">
+          <h3>Boundaries remain explicit</h3>
+          <p>No native processor exists today. No C or C++ API, ABI, or binding strategy has been selected, and this documentation update makes no performance claim.</p>
+        </article>
       </div>
     </section>
 
@@ -202,7 +288,7 @@
         <h2>Express stream policy with source identities</h2>
         <p class="section-intro">Static logical routing connects named ingress sources to named UDP egress targets through reusable source sets and ordered routes.</p>
       </div>
-      <div class="pipeline" aria-label="Logical routing flow">
+      <div class="pipeline" role="group" aria-label="Logical routing flow">
         <div class="pipeline-node"><strong>Named ingress</strong><span>UDP and UDPSEC sources</span></div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node"><strong>Logical zones</strong><span>Sets of source identities</span></div>
@@ -282,13 +368,42 @@
       <p class="boundary-note"><span class="kbd">source_ip</span> is source-address binding—not interface selection, routing-table selection, socket marking, or SDN.</p>
     </section>
 
+    <section id="secure-state" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">UDPSEC lifecycle</p>
+        <h2>Authenticated transport with bounded local state</h2>
+        <p class="section-intro">The current <span class="kbd">nmea_sproxy</span> and AISMixer UDPSEC path combines authenticated key agreement and encrypted traffic with explicit replay, session, and nonce ownership.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔑</div>
+          <h3>Authenticated session setup</h3>
+          <p>Stations authenticate with ECDSA. ECDH-derived session keys let the current proxy protect AIS and ping/pong traffic with authenticated AES-GCM encryption.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🛡️</div>
+          <h3>Bounded replay protection</h3>
+          <p>Handshake replay records, active sessions, and each session’s accepted data nonces are hard-bounded. Monotonic time governs local TTL and ordering, and expiry precedes live-state eviction.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">♻️</div>
+          <h3>Traffic-driven cleanup</h3>
+          <p>Allowed traffic drives expiry cleanup rather than a background timer. Replay, session, and nonce state is process-local, non-durable, and lost when the service restarts.</p>
+        </article>
+      </div>
+      <div class="callout">
+        <p><strong>Security boundary:</strong> UDPSEC protects transport authenticity, confidentiality, and replay handling within its implemented scope; it does not prove that an AIS payload is physically or semantically truthful.</p>
+        <p>Read the <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">security policy</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">behavioural contract</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>, and <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a> for the detailed boundaries.</p>
+      </div>
+    </section>
+
     <section id="receivers" class="section section-emphasis">
       <div class="section-heading">
         <p class="eyebrow">nmea_sproxy and physical AIS receivers</p>
         <h2>Connect networked or physical AIS receivers through nmea_sproxy</h2>
         <p class="section-intro"><span class="kbd">nmea_sproxy</span> is the station-side proxy that connects one local AIS source to one configured AISMixer destination.</p>
       </div>
-      <div class="architecture-path" aria-label="Physical AIS receiver connection through nmea_sproxy to AISMixer">
+      <div class="architecture-path" role="group" aria-label="Physical AIS receiver connection through nmea_sproxy to AISMixer">
         <div class="path-node">
           <span class="icons" aria-hidden="true">📻</span>
           <strong>Physical AIS receiver</strong>
@@ -322,7 +437,7 @@
         <article class="card">
           <h3>Implemented outputs</h3>
           <ul class="list">
-            <li>Authenticated encrypted UDPSEC with liveness and reconnection.</li>
+            <li>Authenticated encrypted UDPSEC using the bounded session lifecycle described above.</li>
             <li>Explicit plain UDP for a trusted LAN, VPN, or equivalent boundary.</li>
           </ul>
         </article>
@@ -339,14 +454,14 @@
     <section id="operations" class="section">
       <div class="section-heading">
         <p class="eyebrow">Deployment and operations</p>
-        <h2>A native Linux lifecycle built for real installations</h2>
+        <h2>A Linux and systemd lifecycle built for real installations</h2>
         <p class="section-intro">The repository-managed deployment keeps runtime files, operator state, systemd integration, and local routing control aligned.</p>
       </div>
       <div class="grid">
         <article class="card">
           <div class="icons" aria-hidden="true">⚙️</div>
           <h3>Repository-managed systemd</h3>
-          <p>The native service provisions <span class="kbd">/run/aismixer</span> while AISMixer is running and supports the optional local control socket.</p>
+          <p>The service provisions <span class="kbd">/run/aismixer</span> while AISMixer is running and supports the optional local control socket.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔄</div>
@@ -374,29 +489,30 @@
       </div>
       <div class="status-grid">
         <article class="card status-card status-now">
-          <p class="status-label">Implemented now</p>
+          <h3 class="status-label">Implemented now</h3>
           <ul class="list">
             <li>Logical routing, zones, and target-scoped deduplication.</li>
             <li>Runtime routing control with <span class="kbd">aismixerctl</span>.</li>
-            <li>Endpoint ACLs and source-address binding.</li>
-            <li>Physical receiver input through <span class="kbd">nmea_sproxy</span>.</li>
-            <li>UDPSEC and explicitly trusted plain-UDP proxy output.</li>
-            <li>Hardened native systemd deployment lifecycle.</li>
+            <li>Deterministic deduplication, assembly, and multipart TAG lifecycles.</li>
+            <li>Hard-bounded secure replay, session, and per-session nonce state.</li>
+            <li>Immutable state statistics and a tested Python behavioural reference.</li>
+            <li>Endpoint controls, physical receiver input through nmea_sproxy, and trusted plain-UDP proxy mode.</li>
+            <li>systemd <span class="kbd">RuntimeDirectory</span>, lifecycle scripts, and the global routing CLI.</li>
           </ul>
         </article>
         <article class="card status-card status-next">
-          <p class="status-label">Planned next</p>
+          <h3 class="status-label">Planned work</h3>
           <ul class="list">
-            <li>Docker deployment and expanded Quickstart material.</li>
-            <li>A coordinator process with ingress workers and egress workers.</li>
-            <li>IPC routing-state distribution and additional adapters.</li>
-            <li>Persistent runtime routing options and configuration reload.</li>
-            <li>Distributed or P2P routing development.</li>
-            <li>Spoof/anomaly research—not an implemented detector today.</li>
+            <li>Explicit service ownership, control-socket group access, and Linux/Raspberry Pi deployment verification.</li>
+            <li>A staged coordinator with dedicated ingress and egress workers, supervision, and routing-state IPC.</li>
+            <li>Research into controlled routing-state restoration, safe configuration reload, and rollback history.</li>
+            <li>Richer route, target, generation, control, metrics, and health observability.</li>
+            <li>Maritime security, receiver quality, and spoof/anomaly research—not an implemented detector today.</li>
+            <li>Later expansion may add non-UDP adapters, authenticated remote control, P2P exchange, and content-aware filters.</li>
           </ul>
         </article>
       </div>
-      <div class="card links" aria-label="Documentation links">
+      <div class="card links" role="group" aria-label="Documentation links">
         <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Main repository</a>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a href="https://github.com/iliyan85/aismixer/wiki/Quick-Start" target="_blank" rel="noopener">Quick Start</a>
