@@ -301,6 +301,13 @@ address, expired sessions are removed before capacity is considered; if still
 full, exactly the least-recently-seen live session is evicted. Equal timestamps
 are resolved by the deterministic activity order.
 
+State operations that receive a session object first require exact retained
+object identity at the supplied or stored address before performing lifecycle
+cleanup. An already replaced, capacity-evicted, or otherwise removed handle is
+rejected without cleanup, ordering changes, nonce access, or statistics
+changes. A handle that is current when the operation begins still undergoes
+normal exact-boundary expiry and is removed and accounted once if expired.
+
 Secure-data nonce identity is the exact 12-byte nonce within its owning
 session. Identical bytes in different sessions are independent. A live replay
 is rejected before decryption and does not touch the session. A new nonce is
@@ -400,3 +407,22 @@ Conformance does not define or require a C or C++ API or ABI.
   production behaviour change and select no new policy.
 
 This contract was consolidated at the end of Campaign A.
+
+## 17. Campaign B closure baseline
+
+- Closure snapshot date: 2026-07-24.
+- Branch: `main`.
+- Audited source commit:
+  `15a594501b0acbfa07e21b79fe863c22e1d07a4a` (`15a5945`).
+- Environment: Python 3.14.5 on Windows 11
+  (`Windows-11-10.0.26200-SP0`, AMD64).
+- Focused results:
+  - deduplication: `39 passed`;
+  - multipart assembly and forwarding integration: `173 passed`;
+  - secure state and protocol helpers: `222 passed`;
+  - proxy/service compatibility: `94 passed`.
+- Final full-suite result: `919 passed, 18 skipped, 0 failed`
+  (937 collected).
+- `git diff --check`: passed.
+- This is a Campaign B closure snapshot, not a guarantee that future test
+  counts will remain identical.
