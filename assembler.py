@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from enum import Enum
 import time
 
+from core.ingress_frame import decode_frame_slice
 from core.parsed_sentence import ParsedSentence
 
 
@@ -138,9 +139,11 @@ class AIVDMAssembler:
             return self._outcome(AssemblyStatus.INVALID)
 
         sentence_span = parsed.match.sentence_span
-        sentence_text = parsed.frame.payload[
-            sentence_span.start:sentence_span.end
-        ].decode("utf-8", errors="ignore")
+        sentence_text = decode_frame_slice(
+            parsed.frame,
+            sentence_span.start,
+            sentence_span.end,
+        )
         return self._feed_validated_fragment(
             source_identity=parsed.frame.assembler_key,
             sentence_text=sentence_text,

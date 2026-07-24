@@ -4,7 +4,11 @@ import pytest
 
 from assembler import AIVDMAssembler, AssemblyStatus
 from core.event import IngressEvent
-from core.ingress_frame import IngressFrame, frame_from_ingress_event
+from core.ingress_frame import (
+    IngressFrame,
+    PayloadTextMode,
+    frame_from_ingress_event,
+)
 from core.nmea_scanner import ByteSpan, NMEAScanMatch, scan_nmea_sentences
 from core.parsed_sentence import (
     ParsedFragment,
@@ -390,6 +394,47 @@ def test_non_adjacent_tag_is_not_parsed():
     )
 
 
+@pytest.mark.parametrize(
+    "raw,expected_sequential_id,expected_channel",
+    [
+        (
+            "!AIVDM,2,1,seq\ud800,A,payload,0*00",
+            "seq\ud800",
+            "A",
+        ),
+        (
+            "!AIVDM,2,1,seq,A\udfff,payload,0*00",
+            "seq",
+            "A\udfff",
+        ),
+    ],
+    ids=["sequential-id", "channel"],
+)
+def test_legacy_surrogates_are_preserved_in_fragment_metadata(
+    raw,
+    expected_sequential_id,
+    expected_channel,
+):
+    parsed = parse_one_legacy(raw)
+
+    assert parsed.frame.text_mode is PayloadTextMode.UTF8_SURROGATEPASS
+    assert parsed.fragment == ParsedFragment(
+        declared_total=2,
+        ordinal=1,
+        sequential_id=expected_sequential_id,
+        channel=expected_channel,
+    )
+
+
+def test_legacy_surrogate_is_preserved_in_tag_s_value():
+    raw = "\\s:boat\ud800,c:1\\" + SENTENCE
+
+    parsed = parse_one_legacy(raw)
+
+    assert parsed.tag.s_value == "boat\ud800"
+    assert parsed.tag == expected_tag_from_legacy(raw)
+
+
 def test_utf8_ignore_policy_applies_only_to_matched_parsing_views():
     tag = b"\\s:bo\xffat,c:0\xff01,g:1-2-0\xff07\\"
     sentence = b"!AIVDM,2\xff,1,seq\xffid, B\xff ,payload,0*00"
@@ -399,6 +444,7 @@ def test_utf8_ignore_policy_applies_only_to_matched_parsing_views():
     parsed = parse_frame_sentences(frame)
 
     assert len(parsed) == 1
+    assert frame.text_mode is PayloadTextMode.UTF8_IGNORE
     assert parsed[0].fragment == ParsedFragment(2, 1, "seqid", " B ")
     assert parsed[0].tag == ParsedTagMetadata(
         s_value="boat",
@@ -406,6 +452,16 @@ def test_utf8_ignore_policy_applies_only_to_matched_parsing_views():
         c_value=1,
         g_value=ParsedGroupTag(1, 2, "007", "007"),
     )
+
+
+def test_bytes_native_surrogate_sequence_uses_utf8_ignore_mode():
+    sentence = b"!AIVDM,2,1,seq\xed\xa0\x80id,A,payload,0*00"
+    frame = make_frame(sentence)
+
+    parsed = parse_frame_sentences(frame)
+
+    assert frame.text_mode is PayloadTextMode.UTF8_IGNORE
+    assert parsed[0].fragment == ParsedFragment(2, 1, "seqid", "A")
 
 
 def test_span_validation_accepts_scanner_output():

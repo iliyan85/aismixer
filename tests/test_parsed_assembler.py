@@ -6,7 +6,11 @@ from assembler import (
     AssemblyStatus,
 )
 from core.event import IngressEvent
-from core.ingress_frame import IngressFrame, frame_from_ingress_event
+from core.ingress_frame import (
+    IngressFrame,
+    PayloadTextMode,
+    frame_from_ingress_event,
+)
 from core.parsed_sentence import (
     ParsedFragment,
     ParsedSentence,
@@ -416,6 +420,36 @@ def test_frame_from_event_materializes_only_the_legacy_sentence():
     )
 
 
+def test_legacy_single_sentence_materialization_preserves_surrogate():
+    harness = DifferentialHarness()
+    single = sentence(1, 1, "", "payload\ud800")
+    case = make_case(single)
+
+    outcome = harness.feed(case)
+
+    assert case.parsed.frame.text_mode is PayloadTextMode.UTF8_SURROGATEPASS
+    assert outcome == AssemblyOutcome(
+        AssemblyStatus.SINGLE,
+        sentences=(single,),
+    )
+
+
+def test_legacy_multipart_storage_and_completion_preserve_surrogates():
+    harness = DifferentialHarness()
+    first_text = sentence(2, 1, "7", "first\ud800")
+    second_text = sentence(2, 2, "7", "second\udfff")
+    first = make_case(first_text)
+    second = make_case(second_text)
+
+    pending = harness.feed(first)
+    complete = harness.feed(second)
+
+    assert pending.status is AssemblyStatus.PENDING
+    assert harness.legacy.stats() == harness.parsed.stats()
+    assert complete.status is AssemblyStatus.COMPLETE
+    assert complete.sentences == (first_text, second_text)
+
+
 def test_invalid_utf8_materialization_ignores_only_bytes_in_sentence_span():
     sentence_bytes = b"!AIVDM,2\xff,1,7,A,pay\xffload,0*00"
     case = make_bytes_case(
@@ -429,6 +463,7 @@ def test_invalid_utf8_materialization_ignores_only_bytes_in_sentence_span():
 
     expected_sentence = "!AIVDM,2,1,7,A,payload,0*00"
     assert case.sentence_text == expected_sentence
+    assert case.parsed.frame.text_mode is PayloadTextMode.UTF8_IGNORE
     assert outcome.status is AssemblyStatus.PENDING
     assert outcome.group_key == ("source", "7", "A", 2)
     group = harness.parsed._groups[outcome.group_key]

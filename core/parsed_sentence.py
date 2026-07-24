@@ -1,14 +1,15 @@
 """Parse metadata from scanner spans without retaining decoded payload views.
 
-Only the matched sentence and associated TAG slices are decoded temporarily.
-They use UTF-8 with ``errors="ignore"`` to preserve the current plain-UDP
-conversion policy while allowing arbitrary bytes-native frames to be parsed.
+Only the matched sentence and associated TAG slices are decoded temporarily,
+according to the explicit text mode carried by their ingress frame. Legacy
+frames preserve surrogate code points; bytes-native frames ignore invalid
+UTF-8 by default.
 """
 
 from dataclasses import dataclass
 from typing import Optional
 
-from core.ingress_frame import IngressFrame
+from core.ingress_frame import IngressFrame, decode_frame_slice
 from core.nmea_scanner import NMEAScanMatch, scan_nmea_sentences
 
 
@@ -51,9 +52,11 @@ def parse_scanned_sentence(
     _validate_match(frame, match)
 
     sentence_span = match.sentence_span
-    sentence_text = frame.payload[
-        sentence_span.start:sentence_span.end
-    ].decode("utf-8", errors="ignore")
+    sentence_text = decode_frame_slice(
+        frame,
+        sentence_span.start,
+        sentence_span.end,
+    )
 
     tag = _parse_tag_metadata(frame, match)
     fragment = _parse_fragment(sentence_text)
@@ -135,9 +138,10 @@ def _parse_tag_metadata(
             g_value=None,
         )
 
-    tag_text = frame.payload[tag_span.start:tag_span.end].decode(
-        "utf-8",
-        errors="ignore",
+    tag_text = decode_frame_slice(
+        frame,
+        tag_span.start,
+        tag_span.end,
     )
     body = tag_text[1:-1].split("*", 1)[0]
 
