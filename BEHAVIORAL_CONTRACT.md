@@ -20,10 +20,13 @@ specification, a spoof-detection specification, or a native ABI.
 ## 2. Event boundary
 
 An `IngressEvent.raw_line` must satisfy `isinstance(raw_line, str)` to enter
-processing. This includes subclasses of `str`. A non-string value is ignored
-before routing, extraction, assembly, or deduplication, and later queued events
-must continue to be processed. In particular, the forwarding core does not
-decode `bytes` implicitly.
+processing. The producer and queue boundary remains `IngressEvent`; the
+forwarding consumer adapts each accepted event to an immutable, bytes-based
+`IngressFrame`. This includes subclasses of `str`, and the legacy text adapter
+uses an explicit mode that preserves surrogate code points. A non-string value
+produces no frame and is ignored before routing, extraction, assembly, or
+deduplication, and later queued events must continue to be processed. In
+particular, the forwarding core does not decode `bytes` implicitly.
 
 An accepted string may contain no accepted AIS sentence. Such an event still
 follows the normal event-level routing snapshot and match when routing is
@@ -32,18 +35,20 @@ the consumer.
 
 ## 3. Accepted sentence extraction
 
-The forwarding core extracts `VDM` and `VDO` sentences for the supported AIS
-talker identifiers `AI`, `AB`, `AD`, `AN`, `AR`, `AS`, `AT`, `AX`, and `BS`.
-Each extracted sentence must begin with `!`, use one of those talker/family
-combinations, and end with `*` followed by exactly two hexadecimal characters.
-The extractor requires this checksum-field syntax but does not recompute or
-verify the NMEA checksum value.
+The forwarding core scans the accepted frame payload as bytes and extracts
+`VDM` and `VDO` sentences for the supported AIS talker identifiers `AI`, `AB`,
+`AD`, `AN`, `AR`, `AS`, `AT`, `AX`, and `BS`. Each extracted sentence must
+begin with `!`, use one of those talker/family combinations, and end with `*`
+followed by exactly two hexadecimal characters. Extraction requires this
+checksum-field syntax but does not recompute or verify the NMEA checksum value.
 
 Input may contain surrounding text and multiple accepted sentences. Matches
 must be processed in input order. A backslash-delimited TAG block is associated
 with a sentence only when its closing backslash immediately precedes that
-sentence. TAG fields are parsed from that associated block; this association
-does not imply validation of the TAG checksum.
+sentence. Associated TAG fields and NMEA fragment metadata are parsed once from
+their byte spans, decoding only the required slices according to the frame's
+explicit text mode. TAG association does not imply validation of the TAG
+checksum.
 
 ## 4. Multipart assembly identity
 
@@ -61,6 +66,13 @@ fragment ordinal determines the occupied slot but is not another key field.
 
 TAG `g` is metadata and does not participate in `AssemblyKey`. Its group ID,
 part, and total fields are not promoted into assembler identity.
+
+The production forwarding loop passes each `ParsedSentence` to
+`feed_parsed_outcome()`, which enters the same established assembler lifecycle.
+The Python compatibility implementation materializes the exact matched
+sentence span as a string; pending groups and `AssemblyOutcome.sentences`
+continue to store and return sentence strings. The public string-based
+assembler API remains available.
 
 ## 5. Multipart lifecycle
 
@@ -172,11 +184,15 @@ existing `choose_s_value()` source policy.
 
 ## 8. Multipart TAG `c`
 
-An ingress `c` candidate must be non-empty and satisfy `str.isdigit()`. Valid
-values are converted to integers and compared numerically. A multipart
-generation must select the minimum valid observed value, independently of
-arrival order and of which ordinal completes the group. An exact duplicate may
-lower that minimum but must not raise it.
+The final ingress `c` value is usable only when it is non-empty,
+`str.isdigit()` is true, and conversion by `int()` succeeds. A digit-like value
+such as `²`, for which `isdigit()` is true but `int()` raises, is an invalid
+candidate and must not terminate forwarding. Usable values are converted to
+integers and compared numerically, so leading zeroes normalize and Unicode
+decimal digits accepted by `int()` remain valid. A multipart generation must
+select the minimum valid observed value, independently of arrival order and of
+which ordinal completes the group. An exact duplicate may lower that minimum
+but must not raise it.
 
 Conflict, expiry, and capacity eviction discard timestamp context for the
 affected generation. Normal completion consumes timestamp context after

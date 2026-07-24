@@ -16,9 +16,14 @@ from core.parsed_sentence import (
     ParsedSentence,
     ParsedTagMetadata,
     parse_frame_sentences,
+    parse_leading_s_value,
     parse_scanned_sentence,
 )
-from core.s_policy import extract_g_tuple, parse_tag_pairs_before_index
+from core.s_policy import (
+    extract_g_tuple,
+    extract_incoming_s,
+    parse_tag_pairs_before_index,
+)
 from meta_cleaner import extract_nmea_sentences
 
 
@@ -162,6 +167,45 @@ def test_frame_parser_returns_tuple_and_controls_vdo_selection():
         ]
         for parsed in vdo_results
     ) == (vdo, vdm)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "\\",
+        "\\\\",
+        r"\x:1,no-colon\trailing",
+        r"\s:\!AIVDM,1,1,,A,payload,0*00",
+        r"\s:first,s:second*00\ignored",
+        r"\x:1,s:a:b*00\ignored",
+        r"\s:before*00,s:after\ignored",
+        r"prefix \s:not-leading*00\ignored",
+        "\\s:boat\ud800*00\\ignored",
+    ],
+    ids=[
+        "empty",
+        "incomplete",
+        "empty-tag",
+        "no-s",
+        "empty-s",
+        "first-s-wins",
+        "colon-in-value",
+        "checksum-boundary",
+        "not-leading",
+        "surrogate",
+    ],
+)
+def test_leading_s_frame_helper_matches_legacy_extractor(raw):
+    frame = frame_from_legacy(raw)
+
+    assert parse_leading_s_value(frame) == extract_incoming_s(raw)
+
+
+def test_leading_s_frame_helper_uses_bytes_frame_text_mode():
+    frame = make_frame(b"\\s:bo\xffat*00\\ignored")
+
+    assert parse_leading_s_value(frame) == "boat"
 
 
 @pytest.mark.parametrize(

@@ -483,6 +483,161 @@ def test_forward_loop_preserves_ingress_c_but_station_id_wins_for_s(monkeypatch)
     assert SENTENCE in messages[0]
 
 
+def test_forward_loop_uses_campaign_c_path_once_per_accepted_event(
+    monkeypatch,
+):
+    class GuardedAssembler(AIVDMAssembler):
+        def __init__(self):
+            super().__init__()
+            self.parsed_inputs = []
+
+        def feed_outcome(self, *_args, **_kwargs):
+            raise AssertionError("legacy string assembler path was called")
+
+        def feed_parsed_outcome(self, parsed):
+            self.parsed_inputs.append(parsed)
+            return super().feed_parsed_outcome(parsed)
+
+    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_state = RecordingRoutingState(routing_table)
+    guarded_assembler = GuardedAssembler()
+    frame_calls = []
+    leading_s_calls = []
+    parse_calls = []
+    source_candidate_calls = []
+
+    original_frame_adapter = aismixer.frame_from_ingress_event
+    original_leading_s_parser = aismixer.parse_leading_s_value
+    original_frame_parser = aismixer.parse_frame_sentences
+    original_source_policy = aismixer.choose_s_value_from_candidates
+
+    def record_frame_adapter(event):
+        frame = original_frame_adapter(event)
+        frame_calls.append((event, frame))
+        return frame
+
+    def record_leading_s_parser(frame):
+        leading_s_calls.append(frame)
+        return original_leading_s_parser(frame)
+
+    def record_frame_parser(frame, include_vdo=False):
+        assert routing_state.snapshot_calls == 1
+        assert routing_table.source_ids == ["udp:source_a"]
+        parse_calls.append((frame, include_vdo))
+        return original_frame_parser(frame, include_vdo=include_vdo)
+
+    def record_source_policy(
+        global_station_id,
+        source_name_or_id,
+        incoming_s,
+        remote_ip,
+    ):
+        source_candidate_calls.append(
+            (
+                global_station_id,
+                source_name_or_id,
+                incoming_s,
+                remote_ip,
+            )
+        )
+        return original_source_policy(
+            global_station_id,
+            source_name_or_id,
+            incoming_s,
+            remote_ip,
+        )
+
+    def fail_legacy_call(*_args, **_kwargs):
+        raise AssertionError("legacy forwarding parser path was called")
+
+    for legacy_name in (
+        "extract_nmea_sentences",
+        "parse_tag_pairs_before_index",
+        "extract_g_tuple",
+        "choose_s_value",
+    ):
+        monkeypatch.setattr(
+            aismixer,
+            legacy_name,
+            fail_legacy_call,
+            raising=False,
+        )
+    monkeypatch.setattr(
+        aismixer,
+        "frame_from_ingress_event",
+        record_frame_adapter,
+    )
+    monkeypatch.setattr(
+        aismixer,
+        "parse_leading_s_value",
+        record_leading_s_parser,
+    )
+    monkeypatch.setattr(
+        aismixer,
+        "parse_frame_sentences",
+        record_frame_parser,
+    )
+    monkeypatch.setattr(
+        aismixer,
+        "choose_s_value_from_candidates",
+        record_source_policy,
+    )
+
+    raw_line = (
+        "\\s:leading*00\\detached "
+        + "\\s:associated,c:7*00\\"
+        + SENTENCE
+        + "\n"
+        + "\\s:,c:8*00\\"
+        + AIVDO_SENTENCE
+    )
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [
+                make_secure_event(None),
+                make_event(raw_line, source_id="udp:source_a"),
+            ],
+            expected_targeted_sends=2,
+            routing_state=routing_state,
+            station_id="",
+            assembler_instance=guarded_assembler,
+        )
+    )
+
+    assert len(frame_calls) == 2
+    assert frame_calls[0][1] is None
+    frame = frame_calls[1][1]
+    assert frame is not None
+    assert leading_s_calls == [frame]
+    assert parse_calls == [(frame, True)]
+    assert len(guarded_assembler.parsed_inputs) == 2
+    assert all(
+        parsed.frame is frame
+        for parsed in guarded_assembler.parsed_inputs
+    )
+    assert routing_state.snapshot_calls == 1
+    assert routing_table.source_ids == ["udp:source_a"]
+    assert source_candidate_calls == [
+        ("", "associated", "leading", "192.0.2.10"),
+        ("", "", "leading", "192.0.2.10"),
+    ]
+
+    assert fake_forwarder.messages == []
+    assert [
+        target_ids
+        for target_ids, _message in fake_forwarder.targeted_messages
+    ] == [("udp:aishub",), ("udp:aishub",)]
+    messages = [
+        message
+        for _target_ids, message in fake_forwarder.targeted_messages
+    ]
+    assert SENTENCE in messages[0]
+    assert AIVDO_SENTENCE in messages[1]
+    assert leading_tag(messages[0]).startswith("c:7,s:associated*")
+    assert leading_tag(messages[1]).startswith("c:8,s:leading*")
+
+
 def test_forward_loop_ignores_non_ais_input_without_crashing(monkeypatch):
     messages = asyncio.run(
         run_forward_loop_events(monkeypatch, [make_event("not ais input")], expected_sends=0)
@@ -657,6 +812,66 @@ def test_non_string_event_skips_routing_snapshot_and_match(monkeypatch):
     target_ids, message = fake_forwarder.targeted_messages[0]
     assert target_ids == ("udp:aishub",)
     assert SENTENCE in message
+
+
+def test_accepted_non_ais_event_still_snapshots_and_matches_once(
+    monkeypatch,
+):
+    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_state = RecordingRoutingState(routing_table)
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [make_event("not ais input", source_id="udp:source_a")],
+            routing_state=routing_state,
+        )
+    )
+
+    assert routing_state.snapshot_calls == 1
+    assert routing_table.source_ids == ["udp:source_a"]
+    assert fake_forwarder.messages == []
+    assert fake_forwarder.targeted_messages == []
+
+
+def test_surrogate_digit_like_c_and_single_zero_use_nonfatal_fallbacks(
+    monkeypatch,
+):
+    fallback_timestamp = 1700000000
+    third_sentence = make_nmea_sentence(
+        "AIVDM,1,1,,C,35Muq?002>G?svP00<:O?vN60<0,0"
+    )
+    monkeypatch.setattr(
+        "meta_writer.time.time",
+        lambda: fallback_timestamp,
+    )
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [
+                make_event("\ud800\\c:\u00b2\\" + SENTENCE),
+                make_event("\\c:0\\" + SECOND_SENTENCE),
+                make_event("\\c:2\\" + third_sentence),
+            ],
+            expected_broadcast_sends=3,
+        )
+    )
+
+    assert len(fake_forwarder.messages) == 3
+    assert SENTENCE in fake_forwarder.messages[0]
+    assert SECOND_SENTENCE in fake_forwarder.messages[1]
+    assert third_sentence in fake_forwarder.messages[2]
+    assert leading_tag(fake_forwarder.messages[0]).startswith(
+        f"c:{fallback_timestamp},s:test_station*"
+    )
+    assert "\u00b2" not in leading_tag(fake_forwarder.messages[0])
+    assert leading_tag(fake_forwarder.messages[1]).startswith(
+        f"c:{fallback_timestamp},s:test_station*"
+    )
+    assert leading_tag(fake_forwarder.messages[2]).startswith(
+        "c:2,s:test_station*"
+    )
 
 
 def test_forward_loop_deduplicates_duplicate_plain_aivdm(monkeypatch):
@@ -1328,6 +1543,42 @@ def test_earlier_s_is_reused_when_completion_has_no_s(
     # Contract fallback: earlier metadata supplies a source when completion
     # carries no source of its own.
     assert first_tag.startswith(f"c:123,s:early,g:1-2-{group_id}*")
+
+
+def test_structural_non_numeric_g_enables_multipart_s_cache(
+    monkeypatch,
+):
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11SNON,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22SNON,0")
+    monkeypatch.setattr(
+        aismixer,
+        "_gen_numeric_gid_fixed",
+        lambda _digits: "999999",
+    )
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [
+                make_event("\\s:early,g:1-2-name\\" + first),
+                make_event("\\g:2-2-name\\" + second),
+            ],
+            expected_broadcast_sends=2,
+            station_id="",
+        )
+    )
+
+    assert len(fake_forwarder.messages) == 2
+    assert first in fake_forwarder.messages[0]
+    assert second in fake_forwarder.messages[1]
+    assert re.fullmatch(
+        r"c:\d+,s:early,g:1-2-999999\*[0-9A-F]{2}",
+        leading_tag(fake_forwarder.messages[0]),
+    )
+    assert re.fullmatch(
+        r"g:2-2-999999\*[0-9A-F]{2}",
+        leading_tag(fake_forwarder.messages[1]),
+    )
 
 
 def test_dedup_suppressed_completion_clears_multipart_s_context(

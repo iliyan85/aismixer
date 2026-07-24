@@ -5,16 +5,20 @@ import os
 import time
 from assembler import AIVDMAssembler, AssemblyKey, AssemblyStatus
 from meta_writer import wrap_with_meta
-from meta_cleaner import extract_nmea_sentences
 from secrets import randbelow
 from forwarder import Forwarder
 from dedup import Deduplicator
 from core.event import IngressEvent
+from core.ingress_frame import frame_from_ingress_event
 from core.network_policy import NetworkPolicy, compile_ingress_policy
+from core.parsed_sentence import (
+    parse_frame_sentences,
+    parse_leading_s_value,
+)
 from core.runtime_control import build_optional_routing_control_server
 from core.runtime_routing import load_optional_routing_table
 from core.routing_state import RoutingState
-from core.s_policy import choose_s_value, parse_tag_pairs_before_index, extract_g_tuple
+from core.s_policy import choose_s_value_from_candidates
 from core.source_identity import build_udp_source_id
 from core.state.s_cache import touch_s
 from aismixer_secure import secure_server
@@ -155,7 +159,8 @@ async def forward_loop(queue, routing_state=None):
 
     while True:
         ev: IngressEvent = await queue.get()
-        if not isinstance(ev.raw_line, str):
+        frame = frame_from_ingress_event(ev)
+        if frame is None:
             continue
 
         event_routing_table = None
@@ -163,44 +168,34 @@ async def forward_loop(queue, routing_state=None):
             event_routing_table = routing_state.snapshot().table
         route_target_ids = ()
         if event_routing_table is not None:
-            route_target_ids = event_routing_table.match(ev.source_id).target_ids
+            route_target_ids = event_routing_table.match(
+                frame.source_id
+            ).target_ids
 
-        # Zero-copy friendly: взимаме индекси към ev.raw_line, не търсим с find()
-        for sl in extract_nmea_sentences(
-            ev.raw_line,
-            want_idx=True,
+        event_leading_s = parse_leading_s_value(frame)
+        parsed_sentences = parse_frame_sentences(
+            frame,
             include_vdo=True,
-        ):
-            pos = sl.start
-            clean_line = ev.raw_line[sl.start:sl.end]
+        )
+        for parsed in parsed_sentences:
+            g_value = parsed.tag.g_value
+            current_ingress_gid = (
+                g_value.preservable_group_id
+                if g_value is not None
+                else None
+            )
 
-            # 1) ТАГ блокът точно преди изречението (ако има)
-            if getattr(sl, "tag_end", -1) >= 0:
-                tag_pairs = parse_tag_pairs_before_index(ev.raw_line, pos)
-            else:
-                tag_pairs = {}
-
-            g_info = extract_g_tuple(tag_pairs)  # (part, total, gid) или None
-            current_ingress_gid: str | None = None
-            if g_info:
-                _, _, candidate_gid = g_info
-                if candidate_gid and candidate_gid.isdigit():
-                    current_ingress_gid = candidate_gid
-
-            # Parse the current valid TAG c for direct single-sentence use
+            # Use the parsed TAG c for direct single-sentence output
             # and deterministic multipart timestamp selection below.
-            c_ingress = tag_pairs.get('c')
             valid_c = (
-                int(c_ingress)
+                parsed.tag.c_value
                 if C_PRESERVE_INGRESS_C
-                and c_ingress
-                and c_ingress.isdigit()
                 else None
             )
             ts_for_header = valid_c
 
             # 2) Сглобяване на мултипарт
-            outcome = assembler.feed_outcome(ev.assembler_key, clean_line)
+            outcome = assembler.feed_parsed_outcome(parsed)
 
             # Discarded generations must be cleared before the current
             # observation can establish metadata for a fresh generation.
@@ -244,10 +239,10 @@ async def forward_loop(queue, routing_state=None):
                 outcome.status
                 in {AssemblyStatus.PENDING, AssemblyStatus.DUPLICATE}
                 and outcome.group_key is not None
-                and 's' in tag_pairs
-                and g_info
+                and parsed.tag.s_value is not None
+                and g_value is not None
             ):
-                multipart_s_ctx[outcome.group_key] = tag_pairs['s']
+                multipart_s_ctx[outcome.group_key] = parsed.tag.s_value
 
             if outcome.status in {
                 AssemblyStatus.INVALID,
@@ -307,7 +302,7 @@ async def forward_loop(queue, routing_state=None):
                 )
                 emit_group = bool(eligible_target_ids)
 
-            incoming_s = tag_pairs.get('s')
+            incoming_s = parsed.tag.s_value
             if (
                 outcome.status is AssemblyStatus.COMPLETE
                 and outcome.group_key is not None
@@ -319,8 +314,13 @@ async def forward_loop(queue, routing_state=None):
             for i, full_line in enumerate(multipart if emit_group else ()):
                 is_first = i == 0
                 # 3) Построй финалното s
-                s_value = choose_s_value(
-                    STATION_ID, ev.alias_for_s or incoming_s, ev.raw_line, ev.remote_ip)
+                source_name_or_id = frame.alias_for_s or incoming_s
+                s_value = choose_s_value_from_candidates(
+                    STATION_ID,
+                    source_name_or_id,
+                    event_leading_s,
+                    frame.remote_ip,
+                )
                 touch_s(s_value)  # TTL поддръжка за s
 
                 # g: добавяме при multipart или ако е разрешено и за single

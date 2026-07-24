@@ -81,6 +81,24 @@ def parse_frame_sentences(
     )
 
 
+def parse_leading_s_value(frame: IngressFrame) -> Optional[str]:
+    """Return the legacy source candidate from the frame's leading TAG block."""
+    payload = frame.payload
+    if not payload or payload[0] != ord("\\"):
+        return None
+
+    tag_end = payload.find(b"\\", 1)
+    if tag_end == -1:
+        return None
+
+    body = decode_frame_slice(frame, 1, tag_end).split("*", 1)[0]
+    for pair in body.split(","):
+        key, separator, value = pair.partition(":")
+        if separator and key == "s":
+            return value
+    return None
+
+
 def _validate_match(frame: IngressFrame, match: NMEAScanMatch) -> None:
     payload = frame.payload
     sentence_span = match.sentence_span

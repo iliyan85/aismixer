@@ -119,11 +119,35 @@ def choose_s_value(
       4) по IP (fallback)
     Всичко минава през sanitize + лимит до 15.
     """
+    incoming_s = None
+    if (
+        not global_station_id
+        and (
+            not source_name_or_id
+            or source_name_or_id == "ANONYMOUS"
+        )
+    ):
+        incoming_s = extract_incoming_s(incoming_raw)
+
+    return choose_s_value_from_candidates(
+        global_station_id,
+        source_name_or_id,
+        incoming_s,
+        remote_ip,
+    )
+
+
+def choose_s_value_from_candidates(
+    global_station_id: Optional[str],
+    source_name_or_id: Optional[str],
+    incoming_s: Optional[str],
+    remote_ip: Optional[str],
+) -> str:
+    """Choose and sanitize a source value from already parsed candidates."""
     if global_station_id:
         return sanitize_s(global_station_id)
     if source_name_or_id and source_name_or_id != "ANONYMOUS":
         return sanitize_s(source_name_or_id)
-    inc = extract_incoming_s(incoming_raw)
-    if inc:
-        return sanitize_s(inc)
+    if incoming_s:
+        return sanitize_s(incoming_s)
     return ip_to_s(remote_ip)
