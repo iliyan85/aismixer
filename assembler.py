@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from enum import Enum
 import time
 
+from core.parsed_sentence import ParsedSentence
+
 
 AssemblyKey = tuple[str, str, str, int]
 
@@ -117,22 +119,64 @@ class AIVDMAssembler:
         if total < 1 or current < 1 or current > total:
             return self._outcome(AssemblyStatus.INVALID)
 
-        if total == 1:
+        return self._feed_validated_fragment(
+            source_identity=source_identity,
+            sentence_text=line,
+            declared_total=total,
+            ordinal=current,
+            sequential_id=parts[3],
+            channel=parts[4],
+        )
+
+    def feed_parsed_outcome(
+        self,
+        parsed: ParsedSentence,
+    ) -> AssemblyOutcome:
+        """Process one parse-once sentence through the assembler lifecycle."""
+        fragment = parsed.fragment
+        if fragment is None:
+            return self._outcome(AssemblyStatus.INVALID)
+
+        sentence_span = parsed.match.sentence_span
+        sentence_text = parsed.frame.payload[
+            sentence_span.start:sentence_span.end
+        ].decode("utf-8", errors="ignore")
+        return self._feed_validated_fragment(
+            source_identity=parsed.frame.assembler_key,
+            sentence_text=sentence_text,
+            declared_total=fragment.declared_total,
+            ordinal=fragment.ordinal,
+            sequential_id=fragment.sequential_id,
+            channel=fragment.channel,
+        )
+
+    def _feed_validated_fragment(
+        self,
+        source_identity: str,
+        sentence_text: str,
+        declared_total: int,
+        ordinal: int,
+        sequential_id: str,
+        channel: str,
+    ) -> AssemblyOutcome:
+        if declared_total == 1:
             return self._outcome(
                 AssemblyStatus.SINGLE,
-                sentences=(line,),
+                sentences=(sentence_text,),
             )
 
         if (
             self.max_fragments_per_group is not None
-            and total > self.max_fragments_per_group
+            and declared_total > self.max_fragments_per_group
         ):
             return self._outcome(AssemblyStatus.LIMIT_EXCEEDED)
 
-        seq_id = parts[3]
-        channel = parts[4]
-
-        key: AssemblyKey = (source_identity, seq_id, channel, total)
+        key: AssemblyKey = (
+            source_identity,
+            sequential_id,
+            channel,
+            declared_total,
+        )
 
         now = self._clock()
         discarded_keys: list[AssemblyKey] = []
@@ -163,8 +207,8 @@ class AIVDMAssembler:
             self._groups[key] = group
 
         fragments = group.fragments_by_ordinal
-        if current in fragments:
-            if fragments[current] == line:
+        if ordinal in fragments:
+            if fragments[ordinal] == sentence_text:
                 discarded_keys.extend(self._cleanup_expired(now))
                 return self._outcome(
                     AssemblyStatus.DUPLICATE,
@@ -181,13 +225,14 @@ class AIVDMAssembler:
                 discarded_keys=tuple(sorted(discarded_keys)),
             )
 
-        fragments[current] = line
+        fragments[ordinal] = sentence_text
         group.last_progress_at = now
 
         # Validated, unique ordinals make cardinality a complete O(1) check.
-        if group.received_count == total:
+        if group.received_count == declared_total:
             full_lines = tuple(
-                fragments[ordinal] for ordinal in range(1, total + 1)
+                fragments[index]
+                for index in range(1, declared_total + 1)
             )
             del self._groups[key]
             return self._outcome(
