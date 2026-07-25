@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
-from core.event import IngressEvent
+from core.ingress_frame import frame_from_text_payload
 from core.network_policy import NetworkPolicy
 from core.source_identity import build_udpsec_source_id
 
@@ -719,23 +719,27 @@ async def secure_server(
                     sock.sendto(encrypt_secure_json_message(aesgcm, response), addr)
                     continue
 
-                if DEBUG:
-                    print(
-                        f"{wall_now()} [SECURE] "
-                        f"From {station_id}: {msg['payload']}")
-
                 src_for_queue = sec_input_id or station_id or "ANONYMOUS"
                 peer = addr if 'addr' in locals() else None
                 remote_ip = peer[0] if isinstance(
                     peer, tuple) and peer else None
                 assembler_key = f"{peer[0]}:{peer[1]}" if isinstance(
                     peer, tuple) and peer else (remote_ip or "sec")
-                await queue.put(IngressEvent(kind="sec",
-                                             source_id=build_udpsec_source_id(station_id),
-                                             alias_for_s=src_for_queue,
-                                             remote_ip=remote_ip,
-                                             assembler_key=assembler_key,
-                                             raw_line=msg["payload"]))
+                frame = frame_from_text_payload(
+                    kind="sec",
+                    source_id=build_udpsec_source_id(station_id),
+                    alias_for_s=src_for_queue,
+                    remote_ip=remote_ip,
+                    assembler_key=assembler_key,
+                    payload=msg["payload"],
+                )
+                if frame is not None:
+                    await queue.put(frame)
+
+                if DEBUG:
+                    print(
+                        f"{wall_now()} [SECURE] "
+                        f"From {station_id}: {msg['payload']}")
 
             except Exception as e:
                 print(

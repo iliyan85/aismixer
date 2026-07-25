@@ -4,7 +4,7 @@
 
 This document defines the currently tested Python processing contract for:
 
-- ingress event acceptance;
+- ingress frame production and compatibility-event acceptance;
 - AIS NMEA sentence extraction;
 - multipart assembly;
 - TAG metadata ownership;
@@ -19,19 +19,31 @@ specification, a spoof-detection specification, or a native ABI.
 
 ## 2. Event boundary
 
-An `IngressEvent.raw_line` must satisfy `isinstance(raw_line, str)` to enter
-processing. The producer and queue boundary remains `IngressEvent`; the
-forwarding consumer adapts each accepted event to an immutable, bytes-based
-`IngressFrame`. This includes subclasses of `str`, and the legacy text adapter
-uses an explicit mode that preserves surrogate code points. A non-string value
-produces no frame and is ignored before routing, extraction, assembly, or
-deduplication, and later queued events must continue to be processed. In
-particular, the forwarding core does not decode `bytes` implicitly.
+The built-in UDP and UDPSEC producers enqueue immutable `IngressFrame`
+instances. `mixer_loop()` transports queue items unchanged and performs no
+conversion, validation, routing, or parsing. The forwarding consumer accepts a
+direct frame by object identity and retains compatibility for `IngressEvent`
+through one adapter. A compatibility event's `raw_line` must satisfy
+`isinstance(raw_line, str)`, including subclasses; its explicit legacy-text
+mode preserves surrogate code points.
 
-An accepted string may contain no accepted AIS sentence. Such an event still
-follows the normal event-level routing snapshot and match when routing is
-configured, then produces no output after extraction; it does not terminate
-the consumer.
+An invalid compatibility event or any unsupported queue-item type is ignored
+before routing, extraction, assembly, or deduplication, and later queued items
+must continue to be processed. In particular, a bare `bytes` or `str` queue
+item is not implicitly converted; bytes must already be owned by an
+`IngressFrame`.
+
+UDP datagrams retain their historical full-datagram normalization: decode as
+UTF-8 with `errors="ignore"`, apply Python `str.strip()`, then encode the
+normalized text as UTF-8 frame bytes. These frames use `UTF8_IGNORE`, including
+when normalization produces an empty payload. UDPSEC NMEA payload strings are
+not stripped; they use surrogate-preserving UTF-8 conversion and
+`UTF8_SURROGATEPASS`.
+
+An accepted frame may contain no accepted AIS sentence, including an empty
+payload. It still follows the normal frame-level routing snapshot and match
+when routing is configured, then produces no output after extraction; it does
+not terminate the consumer.
 
 ## 3. Accepted sentence extraction
 
@@ -145,10 +157,10 @@ and peak statistics.
 `invalid`, `single`, `limit_exceeded`, `pending`, `duplicates`, `conflicts`,
 `completed`, `expired`, `capacity_evicted`, `reset_discarded`, `resets`,
 `current_groups`, `peak_groups`, `current_fragments`, and `peak_fragments`.
-Exactly one outcome counter advances per `feed_outcome()` call; lifecycle
-counters advance only for their corresponding removal reason. Reading
-statistics neither invokes the clock nor performs cleanup, and earlier
-snapshots do not change.
+Exactly one normal outcome counter advances per call to either
+`feed_outcome()` or `feed_parsed_outcome()`; lifecycle counters advance only
+for their corresponding removal reason. Reading statistics neither invokes
+the clock nor performs cleanup, and earlier snapshots do not change.
 
 ## 6. Blank sequential-ID compatibility
 
@@ -335,6 +347,11 @@ and evicts the oldest live nonce deterministically when capacity remains full.
 Replacing, expiring, or capacity-evicting a session discards all nonce state
 owned by that session.
 
+An NMEA message that contains the required `payload` key but whose value is not
+a string retains that accepted nonce and touches its session before frame
+construction is attempted. It produces no frame or queue item and is not
+promoted to a protocol exception; later packets continue to be processed.
+
 `stats()` returns an immutable point-in-time `SecureStateStats` snapshot. It
 reports accepted, rejected or replayed, expired, capacity-evicted, created,
 replaced, touched, and owning-session-discarded lifecycle counts as applicable,
@@ -350,14 +367,15 @@ transcript, session-key derivation, or `nmea_sproxy` protocol compatibility.
 ## 12. Routing snapshot boundary
 
 When routing state is present, the forwarding consumer must acquire one
-immutable routing snapshot per accepted string `IngressEvent`. If that snapshot
-contains a table, the event source must be matched once. A non-string
-`raw_line` acquires no snapshot and performs no match.
+immutable routing snapshot per accepted or successfully coerced frame. If that
+snapshot contains a table, `frame.source_id` must be matched once. Unsupported
+queue items and invalid compatibility events acquire no snapshot and perform
+no match.
 
-All accepted sentences extracted from one event must use the same match result.
-A routing-table replacement during processing affects the next event, not the
-event already in progress. A missing table, including a snapshot whose table is
-`None`, selects legacy forwarding and global deduplication mode.
+All accepted sentences extracted from one frame must use the same match result.
+A routing-table replacement during processing affects the next accepted frame,
+not the frame already in progress. A missing table, including a snapshot whose
+table is `None`, selects legacy forwarding and global deduplication mode.
 
 ## 13. Forwarding and cleanup
 
@@ -387,15 +405,12 @@ not additional guarantees:
    section 6 for the live TTL correlation window.
 2. TAG-`g` part and total consistency is neither assembler identity nor checked
    against the NMEA part and total by the forwarding core.
-3. The forwarding consumer defensively rejects non-string `raw_line` values,
-   but this contract does not redefine upstream secure-ingress JSON schema
-   validation.
-4. Single-sentence and multipart `c:0` behaviour is intentionally not unified.
-5. Send-failure recovery and transactional multi-fragment delivery remain out
+3. Single-sentence and multipart `c:0` behaviour is intentionally not unified.
+4. Send-failure recovery and transactional multi-fragment delivery remain out
    of scope.
-6. Durable storage, AIS semantic decoding, analytics, and spoof detection are
+5. Durable storage, AIS semantic decoding, analytics, and spoof detection are
    not part of this contract.
-7. Extraction checks checksum-field syntax but does not validate checksum
+6. Extraction checks checksum-field syntax but does not validate checksum
    arithmetic.
 
 ## 15. Native implementation conformance

@@ -14,6 +14,11 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from core.ingress_frame import (
+    IngressFrame,
+    PayloadTextMode,
+    decode_frame_slice,
+)
 from core.network_policy import NetworkPolicy
 
 
@@ -622,8 +627,19 @@ def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
 
     stats = state.stats()
     assert len(fake_queue.items) == 1
-    assert fake_queue.items[0].source_id == "udpsec:boat_001"
-    assert fake_queue.items[0].raw_line == "!AIVDM,1,1,,A,payload,0*00"
+    frame = fake_queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    assert frame.kind == "sec"
+    assert frame.source_id == "udpsec:boat_001"
+    assert frame.alias_for_s == "boat_001"
+    assert frame.remote_ip == "127.0.0.1"
+    assert frame.assembler_key == "127.0.0.1:50123"
+    assert frame.payload == b"!AIVDM,1,1,,A,payload,0*00"
+    assert frame.text_mode is PayloadTextMode.UTF8_SURROGATEPASS
+    assert (
+        decode_frame_slice(frame, 0, len(frame.payload))
+        == "!AIVDM,1,1,,A,payload,0*00"
+    )
     assert session.last_seen == 1010.0
     assert len(session.seen_data_nonces) == 1
     assert stats.sessions_touched == 1
@@ -653,7 +669,11 @@ def test_secure_server_allowed_peer_preserves_data_behavior(monkeypatch):
 
     assert len(fake_queue.items) == 1
     assert fake_queue.items[0].source_id == "udpsec:boat_001"
-    assert fake_queue.items[0].raw_line == "!AIVDM,1,1,,A,payload,0*00"
+    assert fake_queue.items[0].payload == b"!AIVDM,1,1,,A,payload,0*00"
+    assert (
+        fake_queue.items[0].text_mode
+        is PayloadTextMode.UTF8_SURROGATEPASS
+    )
 
 
 def test_secure_server_denied_data_peer_gets_no_no_session_response(monkeypatch):
@@ -745,9 +765,135 @@ def test_secure_server_source_id_uses_station_not_sec_input_id(monkeypatch):
     )
 
     assert len(fake_queue.items) == 1
-    event = fake_queue.items[0]
-    assert event.source_id == "udpsec:boat_001"
-    assert event.alias_for_s == "configured_listener_alias"
+    frame = fake_queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    assert frame.source_id == "udpsec:boat_001"
+    assert frame.alias_for_s == "configured_listener_alias"
+
+
+def test_secure_server_preserves_unstripped_surrogate_payload(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    payload = " before\ud800after "
+    state = secure.SecureState()
+    session, _ = _install_test_session(secure, state, addr, key)
+    packet = _encrypted_data_packet(
+        secure,
+        key,
+        nonce,
+        payload=payload,
+    )
+    surrogate_log_attempts = []
+
+    def strict_console_print(*values, **_kwargs):
+        rendered = " ".join(str(value) for value in values)
+        if "\ud800" in rendered:
+            surrogate_log_attempts.append(rendered)
+            raise UnicodeEncodeError(
+                "charmap",
+                "\ud800",
+                0,
+                1,
+                "character maps to undefined",
+            )
+
+    monkeypatch.setattr(builtins, "print", strict_console_print)
+
+    fake_queue, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+    )
+
+    assert len(fake_queue.items) == 1
+    frame = fake_queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    assert frame.payload == str.encode(
+        payload,
+        "utf-8",
+        errors="surrogatepass",
+    )
+    assert frame.text_mode is PayloadTextMode.UTF8_SURROGATEPASS
+    assert decode_frame_slice(frame, 0, len(frame.payload)) == payload
+    assert len(surrogate_log_attempts) == 1
+    assert session.last_seen == 1010.0
+    assert state.stats().data_nonces_accepted == 1
+    assert state.stats().sessions_touched == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [None, 123, False, [], {}],
+    ids=["null", "number", "boolean", "list", "object"],
+)
+def test_secure_server_non_string_payload_retains_state_and_later_valid_works(
+    monkeypatch,
+    payload,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    key = b"\x01" * 32
+    first_nonce = b"\x02" * 12
+    second_nonce = b"\x03" * 12
+    addr = ("127.0.0.1", 50123)
+    state = secure.SecureState()
+    session, _ = _install_test_session(secure, state, addr, key)
+    first_packet = _encrypted_data_packet(
+        secure,
+        key,
+        first_nonce,
+        payload=payload,
+    )
+    second_packet = _encrypted_data_packet(
+        secure,
+        key,
+        second_nonce,
+        payload="later valid",
+    )
+    construction_observations = []
+    original_constructor = secure.frame_from_text_payload
+
+    def record_constructor(**kwargs):
+        stats = state.stats()
+        construction_observations.append(
+            (
+                kwargs["payload"],
+                stats.data_nonces_accepted,
+                stats.sessions_touched,
+                len(session.seen_data_nonces),
+            )
+        )
+        return original_constructor(**kwargs)
+
+    monkeypatch.setattr(
+        secure,
+        "frame_from_text_payload",
+        record_constructor,
+    )
+
+    fake_queue, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(first_packet, addr), (second_packet, addr)],
+        state=state,
+    )
+
+    assert construction_observations == [
+        (payload, 1, 1, 1),
+        ("later valid", 2, 2, 2),
+    ]
+    assert len(fake_queue.items) == 1
+    frame = fake_queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    assert decode_frame_slice(frame, 0, len(frame.payload)) == "later valid"
+    assert frame.text_mode is PayloadTextMode.UTF8_SURROGATEPASS
+    assert len(session.seen_data_nonces) == 2
+    assert session.last_seen == 1010.0
+    stats = state.stats()
+    assert stats.data_nonces_accepted == 2
+    assert stats.sessions_touched == 2
 
 
 def test_secure_server_rejects_duplicate_data_nonce_after_first_valid_packet(monkeypatch):

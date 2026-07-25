@@ -8,8 +8,10 @@ from meta_writer import wrap_with_meta
 from secrets import randbelow
 from forwarder import Forwarder
 from dedup import Deduplicator
-from core.event import IngressEvent
-from core.ingress_frame import frame_from_ingress_event
+from core.ingress_frame import (
+    coerce_ingress_frame,
+    frame_from_udp_datagram,
+)
 from core.network_policy import NetworkPolicy, compile_ingress_policy
 from core.parsed_sentence import (
     parse_frame_sentences,
@@ -138,10 +140,10 @@ def compile_input_policies(entries, kind):
 
 
 async def forward_loop(queue, routing_state=None):
-    """Forward events using one immutable routing snapshot per IngressEvent.
+    """Forward frames using one immutable routing snapshot per accepted frame.
 
-    RoutingState replacements affect the next event pulled from the queue, not
-    the event currently being processed.
+    RoutingState replacements affect the next accepted frame, not the frame
+    currently being processed.
     """
 
     # Multipart metadata follows the assembler's correlation identity.
@@ -158,8 +160,8 @@ async def forward_loop(queue, routing_state=None):
             multipart_gid_ctx.pop(key, None)
 
     while True:
-        ev: IngressEvent = await queue.get()
-        frame = frame_from_ingress_event(ev)
+        item = await queue.get()
+        frame = coerce_ingress_frame(item)
         if frame is None:
             continue
 
@@ -365,23 +367,26 @@ async def handle_socket(
         if not policy.allows(source_ip):
             continue
 
-        raw_line = data.decode(errors="ignore").strip()
-
-        if DEBUG:
-            source_fmt = format_source(source_ip, source_port)
-            print(f"{ts()} INPUT {source_fmt} => {raw_line}")
-
         mapped_alias = alias_map.get(source_ip) if alias_map else None
         alias_for_s = fixed_alias or mapped_alias
         assembler_key = f"{source_ip}:{source_port}"
         source_id = build_udp_source_id(fixed_alias, mapped_alias, source_ip)
 
-        await queue.put(IngressEvent(kind="udp",
-                                     source_id=source_id,
-                                     alias_for_s=alias_for_s,
-                                     remote_ip=source_ip,
-                                     assembler_key=assembler_key,
-                                     raw_line=raw_line))
+        frame = frame_from_udp_datagram(
+            data=data,
+            kind="udp",
+            source_id=source_id,
+            alias_for_s=alias_for_s,
+            remote_ip=source_ip,
+            assembler_key=assembler_key,
+        )
+
+        if DEBUG:
+            source_fmt = format_source(source_ip, source_port)
+            normalized_text = frame.payload.decode("utf-8")
+            print(f"{ts()} INPUT {source_fmt} => {normalized_text}")
+
+        await queue.put(frame)
 
 
 async def main():

@@ -21,24 +21,71 @@ class IngressFrame:
     text_mode: PayloadTextMode = PayloadTextMode.UTF8_IGNORE
 
 
-def frame_from_ingress_event(event: IngressEvent) -> Optional[IngressFrame]:
-    raw_line = event.raw_line
-    if not isinstance(raw_line, str):
+def frame_from_text_payload(
+    *,
+    kind: IngressKind,
+    source_id: str,
+    alias_for_s: Optional[str],
+    remote_ip: Optional[str],
+    assembler_key: str,
+    payload: object,
+) -> Optional[IngressFrame]:
+    if not isinstance(payload, str):
         return None
 
     return IngressFrame(
-        kind=event.kind,
-        source_id=event.source_id,
-        alias_for_s=event.alias_for_s,
-        remote_ip=event.remote_ip,
-        assembler_key=event.assembler_key,
+        kind=kind,
+        source_id=source_id,
+        alias_for_s=alias_for_s,
+        remote_ip=remote_ip,
+        assembler_key=assembler_key,
         payload=str.encode(
-            raw_line,
+            payload,
             "utf-8",
             errors="surrogatepass",
         ),
         text_mode=PayloadTextMode.UTF8_SURROGATEPASS,
     )
+
+
+def frame_from_udp_datagram(
+    *,
+    data: bytes,
+    kind: IngressKind,
+    source_id: str,
+    alias_for_s: Optional[str],
+    remote_ip: Optional[str],
+    assembler_key: str,
+) -> IngressFrame:
+    normalized_text = data.decode("utf-8", errors="ignore").strip()
+    return IngressFrame(
+        kind=kind,
+        source_id=source_id,
+        alias_for_s=alias_for_s,
+        remote_ip=remote_ip,
+        assembler_key=assembler_key,
+        payload=normalized_text.encode("utf-8"),
+        text_mode=PayloadTextMode.UTF8_IGNORE,
+    )
+
+
+def frame_from_ingress_event(event: IngressEvent) -> Optional[IngressFrame]:
+    return frame_from_text_payload(
+        kind=event.kind,
+        source_id=event.source_id,
+        alias_for_s=event.alias_for_s,
+        remote_ip=event.remote_ip,
+        assembler_key=event.assembler_key,
+        payload=event.raw_line,
+    )
+
+
+def coerce_ingress_frame(item: object) -> Optional[IngressFrame]:
+    if isinstance(item, IngressFrame):
+        return item
+    if isinstance(item, IngressEvent):
+        return frame_from_ingress_event(item)
+    return None
 
 
 def decode_frame_slice(

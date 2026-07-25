@@ -4,8 +4,14 @@ import re
 import pytest
 
 import aismixer
+import core.ingress_frame as ingress_frame_module
 from assembler import AIVDMAssembler
 from core.event import IngressEvent
+from core.ingress_frame import (
+    IngressFrame,
+    PayloadTextMode,
+    decode_frame_slice,
+)
 from core.network_policy import NetworkPolicy
 from core.routing import RoutingResult, RoutingTable
 from core.routing_state import RoutingSnapshot, RoutingState
@@ -96,6 +102,25 @@ def make_event(
     )
 
 
+def make_direct_frame(
+    payload,
+    source_id="udp:192.0.2.10",
+    alias_for_s=None,
+    remote_ip="192.0.2.10",
+    assembler_key="192.0.2.10:17778",
+    text_mode=PayloadTextMode.UTF8_IGNORE,
+):
+    return IngressFrame(
+        kind="udp",
+        source_id=source_id,
+        alias_for_s=alias_for_s,
+        remote_ip=remote_ip,
+        assembler_key=assembler_key,
+        payload=payload,
+        text_mode=text_mode,
+    )
+
+
 def make_secure_event(raw_line):
     return IngressEvent(
         kind="secure",
@@ -110,6 +135,13 @@ def make_secure_event(raw_line):
 def leading_tag(message):
     end = message.find("\\", 1)
     return message[1:end]
+
+
+def tag_block(body):
+    checksum = 0
+    for character in body:
+        checksum ^= ord(character)
+    return f"\\{body}*{checksum:02X}\\"
 
 
 def make_routing_table(routes=None, zones=None):
@@ -161,10 +193,11 @@ class RecordingRoutingState:
         return self._snapshot
 
 
-def test_handle_socket_creates_ingress_event_with_udp_source_id(monkeypatch):
+def test_handle_socket_creates_ingress_frame_with_udp_source_id(monkeypatch):
     queue = _FakeQueue()
+    packet = ("\u2003" + SENTENCE + "\u00a0").encode("utf-8")
     fake_loop = _OnePacketLoop(
-        (SENTENCE.encode(), ("192.0.2.10", 17778))
+        (packet, ("192.0.2.10", 17778))
     )
 
     monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
@@ -181,13 +214,16 @@ def test_handle_socket_creates_ingress_event_with_udp_source_id(monkeypatch):
         )
 
     assert len(queue.items) == 1
-    event = queue.items[0]
-    assert event.kind == "udp"
-    assert event.source_id == "udp:balchik_roof"
-    assert event.alias_for_s == "balchik_roof"
-    assert event.remote_ip == "192.0.2.10"
-    assert event.assembler_key == "192.0.2.10:17778"
-    assert event.raw_line == SENTENCE
+    frame = queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    assert frame.kind == "udp"
+    assert frame.source_id == "udp:balchik_roof"
+    assert frame.alias_for_s == "balchik_roof"
+    assert frame.remote_ip == "192.0.2.10"
+    assert frame.assembler_key == "192.0.2.10:17778"
+    assert frame.payload == SENTENCE.encode("utf-8")
+    assert frame.text_mode is PayloadTextMode.UTF8_IGNORE
+    assert decode_frame_slice(frame, 0, len(frame.payload)) == SENTENCE
 
 
 def test_handle_socket_allows_packet_matching_ingress_policy(monkeypatch):
@@ -213,8 +249,73 @@ def test_handle_socket_allows_packet_matching_ingress_policy(monkeypatch):
         )
 
     assert len(queue.items) == 1
-    assert queue.items[0].remote_ip == "192.0.2.10"
-    assert queue.items[0].raw_line == SENTENCE
+    frame = queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    assert frame.kind == "udp"
+    assert frame.source_id == "udp:192.0.2.10"
+    assert frame.alias_for_s is None
+    assert frame.remote_ip == "192.0.2.10"
+    assert frame.assembler_key == "192.0.2.10:17778"
+    assert frame.payload == SENTENCE.encode("utf-8")
+    assert frame.text_mode is PayloadTextMode.UTF8_IGNORE
+
+
+def test_handle_socket_uses_alias_map_when_fixed_alias_is_absent(
+    monkeypatch,
+):
+    queue = _FakeQueue()
+    fake_loop = _OnePacketLoop(
+        (SENTENCE.encode(), ("192.0.2.10", 17778))
+    )
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                queue,
+                alias_map={"192.0.2.10": "dock_gate"},
+            )
+        )
+
+    assert len(queue.items) == 1
+    frame = queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    assert frame.source_id == "udp:dock_gate"
+    assert frame.alias_for_s == "dock_gate"
+    assert frame.remote_ip == "192.0.2.10"
+    assert frame.assembler_key == "192.0.2.10:17778"
+    assert frame.payload == SENTENCE.encode("utf-8")
+    assert frame.text_mode is PayloadTextMode.UTF8_IGNORE
+
+
+def test_handle_socket_enqueues_frame_when_datagram_normalizes_empty(
+    monkeypatch,
+):
+    queue = _FakeQueue()
+    packet = "\u2003 \t\r\n\u00a0".encode("utf-8")
+    fake_loop = _OnePacketLoop(
+        (packet, ("192.0.2.10", 17778))
+    )
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                queue,
+            )
+        )
+
+    assert len(queue.items) == 1
+    frame = queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    assert frame.payload == b""
+    assert frame.text_mode is PayloadTextMode.UTF8_IGNORE
 
 
 def test_handle_socket_denied_packet_does_not_decode_or_enqueue(monkeypatch):
@@ -230,9 +331,17 @@ def test_handle_socket_denied_packet_does_not_decode_or_enqueue(monkeypatch):
     def fail_source_id(*_args, **_kwargs):
         raise AssertionError("source identity should not be built")
 
+    def fail_frame_construction(*_args, **_kwargs):
+        raise AssertionError("frame should not be constructed")
+
     monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
     monkeypatch.setattr(aismixer, "DEBUG", False)
     monkeypatch.setattr(aismixer, "build_udp_source_id", fail_source_id)
+    monkeypatch.setattr(
+        aismixer,
+        "frame_from_udp_datagram",
+        fail_frame_construction,
+    )
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(
@@ -266,6 +375,34 @@ def test_handle_socket_empty_ingress_policy_drops_all_packets(monkeypatch):
         )
 
     assert queue.items == []
+
+
+def test_mixer_loop_passes_queue_items_through_unchanged():
+    async def run():
+        input_queue = asyncio.Queue()
+        output_queue = asyncio.Queue()
+        frame = make_direct_frame(SENTENCE.encode("utf-8"))
+        unsupported = object()
+        task = asyncio.create_task(
+            aismixer.mixer_loop([input_queue], output_queue)
+        )
+        try:
+            await input_queue.put(frame)
+            await input_queue.put(unsupported)
+            first = await asyncio.wait_for(output_queue.get(), timeout=0.5)
+            second = await asyncio.wait_for(output_queue.get(), timeout=0.5)
+            return frame, unsupported, first, second
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    frame, unsupported, first, second = asyncio.run(run())
+
+    assert first is frame
+    assert second is unsupported
 
 
 async def wait_for_sends(fake_forwarder, task, count, timeout=0.5):
@@ -501,19 +638,28 @@ def test_forward_loop_uses_campaign_c_path_once_per_accepted_event(
     routing_table = RecordingRoutingTable(("udp:aishub",))
     routing_state = RecordingRoutingState(routing_table)
     guarded_assembler = GuardedAssembler()
-    frame_calls = []
+    coercion_calls = []
+    adapter_calls = []
     leading_s_calls = []
     parse_calls = []
     source_candidate_calls = []
 
-    original_frame_adapter = aismixer.frame_from_ingress_event
+    original_coercer = aismixer.coerce_ingress_frame
+    original_frame_adapter = (
+        ingress_frame_module.frame_from_ingress_event
+    )
     original_leading_s_parser = aismixer.parse_leading_s_value
     original_frame_parser = aismixer.parse_frame_sentences
     original_source_policy = aismixer.choose_s_value_from_candidates
 
+    def record_coercer(item):
+        frame = original_coercer(item)
+        coercion_calls.append((item, frame))
+        return frame
+
     def record_frame_adapter(event):
         frame = original_frame_adapter(event)
-        frame_calls.append((event, frame))
+        adapter_calls.append((event, frame))
         return frame
 
     def record_leading_s_parser(frame):
@@ -564,6 +710,11 @@ def test_forward_loop_uses_campaign_c_path_once_per_accepted_event(
         )
     monkeypatch.setattr(
         aismixer,
+        "coerce_ingress_frame",
+        record_coercer,
+    )
+    monkeypatch.setattr(
+        ingress_frame_module,
         "frame_from_ingress_event",
         record_frame_adapter,
     )
@@ -605,10 +756,14 @@ def test_forward_loop_uses_campaign_c_path_once_per_accepted_event(
         )
     )
 
-    assert len(frame_calls) == 2
-    assert frame_calls[0][1] is None
-    frame = frame_calls[1][1]
+    assert len(coercion_calls) == 2
+    assert coercion_calls[0][1] is None
+    frame = coercion_calls[1][1]
     assert frame is not None
+    assert adapter_calls == [
+        (coercion_calls[0][0], None),
+        (coercion_calls[1][0], frame),
+    ]
     assert leading_s_calls == [frame]
     assert parse_calls == [(frame, True)]
     assert len(guarded_assembler.parsed_inputs) == 2
@@ -636,6 +791,204 @@ def test_forward_loop_uses_campaign_c_path_once_per_accepted_event(
     assert AIVDO_SENTENCE in messages[1]
     assert leading_tag(messages[0]).startswith("c:7,s:associated*")
     assert leading_tag(messages[1]).startswith("c:8,s:leading*")
+
+
+def test_direct_frame_bypasses_legacy_adapter_and_preserves_identity(
+    monkeypatch,
+):
+    class ParsedOnlyAssembler(AIVDMAssembler):
+        def __init__(self):
+            super().__init__()
+            self.parsed_inputs = []
+
+        def feed_outcome(self, *_args, **_kwargs):
+            raise AssertionError("legacy assembler path must not run")
+
+        def feed_parsed_outcome(self, parsed):
+            self.parsed_inputs.append(parsed)
+            return super().feed_parsed_outcome(parsed)
+
+    frame = make_direct_frame(
+        ("\\c:7,s:direct*00\\" + SENTENCE).encode("utf-8"),
+    )
+    parsed_frames = []
+    original_parser = aismixer.parse_frame_sentences
+    assembler_instance = ParsedOnlyAssembler()
+
+    def fail_adapter(*_args, **_kwargs):
+        raise AssertionError("direct frames must not use the legacy adapter")
+
+    def record_parser(parsed_frame, include_vdo=False):
+        parsed_frames.append(parsed_frame)
+        return original_parser(
+            parsed_frame,
+            include_vdo=include_vdo,
+        )
+
+    monkeypatch.setattr(
+        ingress_frame_module,
+        "frame_from_ingress_event",
+        fail_adapter,
+    )
+    monkeypatch.setattr(
+        aismixer,
+        "parse_frame_sentences",
+        record_parser,
+    )
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [frame],
+            expected_broadcast_sends=1,
+            station_id="",
+            assembler_instance=assembler_instance,
+        )
+    )
+
+    assert parsed_frames == [frame]
+    assert len(assembler_instance.parsed_inputs) == 1
+    assert assembler_instance.parsed_inputs[0].frame is frame
+    assert fake_forwarder.messages == [
+        tag_block("c:7,s:direct") + SENTENCE + "\r\n"
+    ]
+    assert fake_forwarder.targeted_messages == []
+
+
+def test_legacy_event_invokes_compatibility_adapter_exactly_once(
+    monkeypatch,
+):
+    event = make_event("\\c:8,s:legacy*00\\" + SENTENCE)
+    adapter_inputs = []
+    original_adapter = ingress_frame_module.frame_from_ingress_event
+
+    def record_adapter(item):
+        adapter_inputs.append(item)
+        return original_adapter(item)
+
+    monkeypatch.setattr(
+        ingress_frame_module,
+        "frame_from_ingress_event",
+        record_adapter,
+    )
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [event],
+            expected_broadcast_sends=1,
+            station_id="",
+        )
+    )
+
+    assert adapter_inputs == [event]
+    assert fake_forwarder.messages == [
+        tag_block("c:8,s:legacy") + SENTENCE + "\r\n"
+    ]
+
+
+def test_mixed_frame_event_unsupported_and_later_frame_preserve_order(
+    monkeypatch,
+):
+    third_sentence = make_nmea_sentence(
+        "AIVDM,1,1,,C,35Muq?002>G?svP00<:O?vN60<0,0"
+    )
+    first_frame = make_direct_frame(
+        ("\\c:1,s:frame_one*00\\" + SENTENCE).encode("utf-8"),
+        source_id="udp:source_a",
+    )
+    event = make_event(
+        "\\c:2,s:event*00\\" + SECOND_SENTENCE,
+        source_id="udp:source_a",
+    )
+    later_frame = make_direct_frame(
+        ("\\c:3,s:frame_two*00\\" + third_sentence).encode("utf-8"),
+        source_id="udp:source_a",
+    )
+    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_state = RecordingRoutingState(routing_table)
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [first_frame, event, object(), later_frame],
+            expected_targeted_sends=3,
+            routing_state=routing_state,
+            station_id="",
+        )
+    )
+
+    assert routing_state.snapshot_calls == 3
+    assert routing_table.source_ids == [
+        "udp:source_a",
+        "udp:source_a",
+        "udp:source_a",
+    ]
+    assert fake_forwarder.messages == []
+    assert fake_forwarder.targeted_messages == [
+        (
+            ("udp:aishub",),
+            tag_block("c:1,s:frame_one") + SENTENCE + "\r\n",
+        ),
+        (
+            ("udp:aishub",),
+            tag_block("c:2,s:event") + SECOND_SENTENCE + "\r\n",
+        ),
+        (
+            ("udp:aishub",),
+            tag_block("c:3,s:frame_two") + third_sentence + "\r\n",
+        ),
+    ]
+
+
+def test_direct_empty_and_non_ais_frames_each_snapshot_and_match_once(
+    monkeypatch,
+):
+    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_state = RecordingRoutingState(routing_table)
+    frames = [
+        make_direct_frame(b"", source_id="udp:empty"),
+        make_direct_frame(b"not ais", source_id="udp:non-ais"),
+    ]
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            frames,
+            routing_state=routing_state,
+        )
+    )
+
+    assert routing_state.snapshot_calls == 2
+    assert routing_table.source_ids == ["udp:empty", "udp:non-ais"]
+    assert fake_forwarder.messages == []
+    assert fake_forwarder.targeted_messages == []
+
+
+def test_direct_multi_sentence_frame_shares_routing_snapshot_and_match(
+    monkeypatch,
+):
+    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_state = RecordingRoutingState(routing_table)
+    frame = make_direct_frame(
+        (SENTENCE + "\n" + SECOND_SENTENCE).encode("utf-8"),
+        source_id="udp:source_a",
+    )
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [frame],
+            expected_targeted_sends=2,
+            routing_state=routing_state,
+        )
+    )
+
+    assert routing_state.snapshot_calls == 1
+    assert routing_table.source_ids == ["udp:source_a"]
+    assert len(fake_forwarder.targeted_messages) == 2
+    assert SENTENCE in fake_forwarder.targeted_messages[0][1]
+    assert SECOND_SENTENCE in fake_forwarder.targeted_messages[1][1]
 
 
 def test_forward_loop_ignores_non_ais_input_without_crashing(monkeypatch):
