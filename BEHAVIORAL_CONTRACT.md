@@ -17,7 +17,7 @@ It is the reference contract for differential testing of a future native
 processor. It is not a full AIS protocol specification, a storage or analytics
 specification, a spoof-detection specification, or a native ABI.
 
-## 2. Event boundary
+## 2. Ingress frame and compatibility-event boundary
 
 The built-in UDP and UDPSEC producers enqueue immutable `IngressFrame`
 instances. `mixer_loop()` transports queue items unchanged and performs no
@@ -26,6 +26,10 @@ direct frame by object identity and retains compatibility for `IngressEvent`
 through one adapter. A compatibility event's `raw_line` must satisfy
 `isinstance(raw_line, str)`, including subclasses; its explicit legacy-text
 mode preserves surrogate code points.
+
+After coercion, direct frames and adapted compatibility events enter one common
+frame-processing pipeline. There is no parallel legacy routing, scanning,
+parsing, assembly, metadata, deduplication, or forwarding path.
 
 An invalid compatibility event or any unsupported queue-item type is ignored
 before routing, extraction, assembly, or deduplication, and later queued items
@@ -54,13 +58,19 @@ begin with `!`, use one of those talker/family combinations, and end with `*`
 followed by exactly two hexadecimal characters. Extraction requires this
 checksum-field syntax but does not recompute or verify the NMEA checksum value.
 
+Scanner results are immutable matches containing half-open byte spans into the
+original frame payload. Scanning itself neither decodes nor copies sentence or
+TAG payload bytes.
+
 Input may contain surrounding text and multiple accepted sentences. Matches
 must be processed in input order. A backslash-delimited TAG block is associated
 with a sentence only when its closing backslash immediately precedes that
 sentence. Associated TAG fields and NMEA fragment metadata are parsed once from
 their byte spans, decoding only the required slices according to the frame's
 explicit text mode. TAG association does not imply validation of the TAG
-checksum.
+checksum. Each immutable `ParsedSentence` retains its originating frame, scan
+match and spans, and parsed fragment and TAG metadata rather than a decoded
+full-payload copy.
 
 ## 4. Multipart assembly identity
 
@@ -83,19 +93,22 @@ The production forwarding loop passes each `ParsedSentence` to
 `feed_parsed_outcome()`, which enters the same established assembler lifecycle.
 The Python compatibility implementation materializes the exact matched
 sentence span as a string; pending groups and `AssemblyOutcome.sentences`
-continue to store and return sentence strings. The public string-based
-assembler API remains available.
+continue to store and return sentence strings. The public legacy string APIs
+`feed()` and `feed_outcome()` remain available.
 
 ## 5. Multipart lifecycle
 
 A structurally valid input with declared total `1` and current ordinal `1`
-takes a state-free fast path. `feed_outcome()` immediately returns
-`AssemblyStatus.SINGLE` with `group_key=None`, `sentences=(line,)`, and
-`discarded_keys=()`, preserving the exact original input string. This path does
-not invoke the assembler clock and does not create, expire, discard, or
-otherwise mutate any multipart generation. Single-only traffic therefore does
-not trigger multipart expiry cleanup; pending generations remain unchanged
-until a later multipart operation applies the normal lifecycle rules.
+takes a state-free fast path through either `feed_outcome()` or
+`feed_parsed_outcome()`. Both return `AssemblyStatus.SINGLE` with
+`group_key=None` and `discarded_keys=()`. The legacy `feed_outcome()` result is
+`sentences=(line,)` and preserves the exact original input string object; the
+parsed path materializes the exact matched sentence span as its one sentence
+string. This path does not invoke the assembler clock and does not create,
+expire, discard, or otherwise mutate any multipart generation. Single-only
+traffic therefore does not trigger multipart expiry cleanup; pending
+generations remain unchanged until a later multipart operation applies the
+normal lifecycle rules.
 
 By default, `max_fragments_per_group=None` places no limit on a multipart
 declaration, and `max_pending_groups=None` leaves the number of pending groups
@@ -137,12 +150,12 @@ wins, with `AssemblyKey` ordering as the deterministic timestamp tie-break.
 Duplicates, unique progress in an existing group, conflicts, and completion do
 not cause capacity eviction.
 
-`feed_outcome()` exposes the lifecycle statuses `invalid`, `single`,
-`limit_exceeded`, `pending`, `duplicate`, `conflict`, and `complete`. Its
-`discarded_keys` is a deterministically sorted tuple of every `AssemblyKey`
-discarded by that call, including a conflicting or expired matching generation,
-any generation removed by an opportunistic expiry sweep, and a live
-capacity-eviction victim.
+`feed_outcome()` and `feed_parsed_outcome()` expose the lifecycle statuses
+`invalid`, `single`, `limit_exceeded`, `pending`, `duplicate`, `conflict`, and
+`complete`. Their `discarded_keys` value is a deterministically sorted tuple of
+every `AssemblyKey` discarded by that call, including a conflicting or expired
+matching generation, any generation removed by an opportunistic expiry sweep,
+and a live capacity-eviction victim.
 
 `cleanup_expired(now=None)` returns a deterministically sorted tuple of every
 group it removes, using the injected clock only when `now` is omitted.
@@ -456,4 +469,31 @@ This contract was consolidated at the end of Campaign A.
   (937 collected).
 - `git diff --check`: passed.
 - This is a Campaign B closure snapshot, not a guarantee that future test
+  counts will remain identical.
+
+## 18. Campaign C closure baseline
+
+- Closure snapshot date: 2026-07-25.
+- Branch: `main`.
+- Audited source commit:
+  `8f3e608611bfc9e6c4f0dc92e5087618917a354d` (`8f3e608`).
+- Environment: Python 3.14.5 on Windows 11
+  (`Windows-11-10.0.26200-SP0`, AMD64).
+- Focused results:
+  - ingress frame and compatibility coercion: `48 passed`;
+  - bytes-native scanner and parsed sentence: `157 passed`;
+  - legacy and parsed assembler paths: `109 passed`;
+  - UDP producer: `6 passed`;
+  - UDPSEC producer and secure state: `228 passed`;
+  - complete forwarding loop: `91 passed`;
+  - routing and deduplication: `247 passed, 15 skipped`.
+- Final full-suite result: `1164 passed, 18 skipped, 0 failed`
+  (1182 collected).
+- `git diff --check`: passed.
+- Built-in UDP and UDPSEC producers enqueue immutable `IngressFrame`
+  instances. Legacy `IngressEvent` compatibility remains through one adapter
+  into the same frame-processing pipeline.
+- Campaign C introduced no native implementation or bindings and defined no
+  native processor API or ABI.
+- This is a Campaign C closure snapshot, not a guarantee that future test
   counts will remain identical.

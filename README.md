@@ -92,7 +92,7 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP targets    |
 - Named ingress `source_id` and egress `target_id` identities.
 - Logical source zones with `include`, `union`, `intersection`, and
   `difference`, consumed by ordered routes.
-- One immutable routing snapshot per accepted string `IngressEvent`.
+- One immutable routing snapshot and source match per accepted `IngressFrame`.
 - Optional atomic runtime routing replacement through the Unix-domain NDJSON
   control plane and `aismixerctl`.
 - `routing.status`, `routing.replace`, and `routing.disable`.
@@ -107,19 +107,29 @@ AISMixer keeps the **data plane** and **control plane** separate.
 
 ### 📡 Data plane
 
-The data plane receives AIS data and builds an internal `IngressEvent`. The
-forwarding boundary ignores a non-string `raw_line` before routing and
-extraction. For each accepted string event, the data plane captures one
-immutable routing snapshot, matches `source_id` once, extracts NMEA sentences,
-assembles multipart messages, applies global or target-scoped deduplication,
-constructs outbound TAG metadata, and forwards accepted sentences to UDP
-egress destinations.
+Built-in UDP and UDPSEC producers create immutable `IngressFrame` objects, and
+`mixer_loop()` transports queue items unchanged. At the forwarding boundary,
+`forward_loop()` accepts direct frames by object identity and retains one
+compatibility adapter for valid legacy `IngressEvent` objects; invalid
+compatibility events and unsupported queue items are ignored before routing.
+
+For each accepted frame, the data plane captures one immutable routing snapshot
+and matches `source_id` once. It scans the frame payload as bytes, parses NMEA
+fragment fields and relevant TAG metadata once, passes parsed sentences to the
+assembler, applies global or target-scoped deduplication, constructs outbound
+TAG metadata, and forwards accepted sentences to UDP egress destinations. The
+Python compatibility assembler currently materializes and stores matched
+sentence strings.
+
+This processing boundary prepares the service for a future native
+implementation, but Campaign C neither defines nor provides a native API or
+ABI.
 
 - **Legacy mode:** global deduplication and broadcast to all forwarders.
 - **Routing mode:** logical source matching, per-target deduplication, and
   targeted forwarding to named UDP egress destinations.
-- One routing snapshot is captured per accepted string `IngressEvent`; a
-  concurrent control update affects the next event, not the one already being
+- One routing snapshot and source match are used per accepted frame; a
+  concurrent control update affects the next frame, not the one already being
   processed.
 
 ### 🎛️ Control plane
@@ -139,6 +149,7 @@ replaces the process-local routing state.
 | `aismixerctl.py` | Operator CLI for runtime routing control |
 | `aismixer_secure.py` | UDPSEC handshake, authentication, and decryption |
 | `nmea_sproxy/` | Station-side network proxy: one input to one AISMixer UDPSEC or UDP input |
+| `core/ingress_frame.py` / `core/nmea_scanner.py` / `core/parsed_sentence.py` | Immutable ingress frames, bytes-native scan spans, and parsed fragment/TAG metadata |
 | `assembler.py` | Multipart `!AIVDM`/`!AIVDO` reassembly |
 | `dedup.py` | Global or target-scoped duplicate suppression |
 | `meta_writer.py` / `meta_cleaner.py` | NMEA TAG output and ingress cleanup |
@@ -153,14 +164,19 @@ contract for the Python reference implementation and the basis for future
 differential testing of a native processor. This README remains an operational
 overview, not a duplicate normative specification.
 
-The forwarding boundary accepts `str` instances, including subclasses, and
-ignores non-string payloads before routing and extraction. Multipart assembly
-supports fully out-of-order arrivals: an exact repeat at an occupied ordinal is
-idempotent for assembly, while a different sentence at that ordinal invalidates
-the live assembler generation. Multipart deduplication decisions are
-group-atomic, and multipart TAG `s`, `c`, and `g` state follows assembler
-lifecycle boundaries. Each accepted ingress event uses one immutable routing
-snapshot.
+The forwarding boundary accepts immutable `IngressFrame` objects directly and
+retains one adapter for legacy `IngressEvent` objects whose `raw_line` is a
+`str`, including subclasses. Invalid compatibility events and unsupported
+items are ignored before routing. Each accepted frame uses one routing snapshot
+and source match; its payload is scanned as bytes, and fragment fields and
+relevant TAG metadata are parsed once. The Python compatibility assembler
+currently materializes matched sentence spans as strings.
+
+Multipart assembly supports fully out-of-order arrivals: an exact repeat at an
+occupied ordinal is idempotent for assembly, while a different sentence at
+that ordinal invalidates the live assembler generation. Multipart
+deduplication decisions are group-atomic, and multipart TAG `s`, `c`, and `g`
+state follows assembler lifecycle boundaries.
 
 Deduplication state, multipart assembly state, forwarding-owned multipart
 metadata, and secure replay/session/nonce state have explicit, deterministic,
@@ -259,7 +275,7 @@ Routing mode is enabled by adding a valid top-level `routing:` section.
 
 In routing mode:
 
-- matching uses the internal `IngressEvent.source_id`;
+- matching uses the accepted frame's internal `source_id`;
 - matching does **not** use the emitted NMEA TAG `s` value;
 - route targets must reference named forwarders;
 - unknown or unsupported target IDs fail startup validation;
@@ -727,8 +743,8 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP цели       |
 - Именувани входни `source_id` и изходни `target_id` идентификатори.
 - Логически зони на източници с `include`, `union`, `intersection` и
   `difference`, използвани от подредени маршрути.
-- Една неизменяема моментна снимка на маршрутизацията за всеки приет
-  `IngressEvent`, чийто `raw_line` е `str`.
+- Една неизменяема моментна снимка на маршрутизацията и едно съпоставяне на
+  източника за всеки приет `IngressFrame`.
 - Незадължителна атомарна подмяна на маршрутизацията по време на работа чрез
   Unix-domain socket с NDJSON протокол и `aismixerctl`.
 - `routing.status`, `routing.replace` и `routing.disable`.
@@ -745,20 +761,31 @@ AISMixer разделя **слоя за данни** (`data plane`) и **сло�
 
 ### 📡 Слой за данни
 
-Слоят за данни приема AIS данните и създава вътрешен `IngressEvent`. Границата
-за препращане пренебрегва `raw_line`, който не е `str`, преди маршрутизирането и
-извличането. За всяко прието събитие слоят взема една неизменяема моментна
-снимка на маршрутизацията, съпоставя `source_id` веднъж, извлича NMEA
-изреченията, сглобява multipart съобщенията, прилага глобална или отделна за
-всяка цел дедупликация, изгражда изходните TAG метаданни и препраща приетите
-изречения към UDP дестинациите.
+Вградените UDP и UDPSEC входове създават неизменяеми `IngressFrame` обекти, а
+`mixer_loop()` пренася елементите от опашката непроменени. На границата за
+препращане `forward_loop()` приема директните `IngressFrame` обекти със
+запазена идентичност на обекта и поддържа един адаптер за съвместимост с
+валидни legacy `IngressEvent` обекти; невалидните събития за съвместимост и
+неподдържаните елементи от опашката се пренебрегват преди маршрутизирането.
+
+За всеки приет `IngressFrame` слоят за данни взема една неизменяема моментна
+снимка на маршрутизацията и съпоставя `source_id` веднъж. Той сканира payload-а
+на `IngressFrame` обекта като байтове, парсва веднъж NMEA полетата на фрагмента
+и приложимите TAG метаданни, подава парснатите изречения към assembler-а,
+прилага глобална или отделна за всяка цел дедупликация, изгражда изходните TAG
+метаданни и препраща приетите изречения към UDP дестинациите. Python
+реализацията на assembler-а за съвместимост в момента материализира и
+съхранява съвпадналите изречения като низове.
+
+Тази граница на обработката подготвя услугата за бъдеща нативна реализация, но
+Campaign C нито дефинира, нито предоставя нативен API или ABI.
 
 - **Legacy режим:** глобална дедупликация и broadcast към всички forwarder-и.
 - **Routing режим:** логическо съпоставяне на източника, дедупликация по цел и
   целево препращане към именувани UDP дестинации.
-- За всеки приет `IngressEvent`, чийто `raw_line` е `str`, се взема една моментна
-  снимка на маршрутизацията; паралелна промяна в слоя за управление засяга
-  следващото събитие, а не вече обработваното.
+- За всеки приет `IngressFrame` се използват една моментна снимка на
+  маршрутизацията и едно съпоставяне на източника; паралелна промяна в слоя за
+  управление засяга следващия `IngressFrame`, а не вече обработвания.
 
 ### 🎛️ Слой за управление
 
@@ -777,6 +804,7 @@ AISMixer разделя **слоя за данни** (`data plane`) и **сло�
 | `aismixerctl.py` | Операторски CLI за управление на маршрутизацията по време на работа |
 | `aismixer_secure.py` | UDPSEC handshake, автентикация и декриптиране |
 | `nmea_sproxy/` | Мрежово прокси при станцията: един вход към един UDPSEC или UDP вход на AISMixer |
+| `core/ingress_frame.py` / `core/nmea_scanner.py` / `core/parsed_sentence.py` | Неизменяеми входни `IngressFrame` обекти, байтови диапазони от сканирането и парснати метаданни за фрагменти/TAG блокове |
 | `assembler.py` | Сглобяване на multipart `!AIVDM`/`!AIVDO` |
 | `dedup.py` | Глобална дедупликация или дедупликация по цел |
 | `meta_writer.py` / `meta_cleaner.py` | NMEA TAG изход и почистване на входа |
@@ -791,15 +819,22 @@ AISMixer разделя **слоя за данни** (`data plane`) и **сло�
 бъдещо диференциално тестване на нативен процесор. Този README остава
 оперативен преглед, а не дублирана нормативна спецификация.
 
-Границата за препращане приема екземпляри на `str`, включително негови
-подкласове, и пренебрегва останалите стойности преди маршрутизирането и
-извличането. Multipart сглобяването поддържа фрагменти в напълно произволен ред:
-точно повторение на изречението на вече заета поредна позиция е идемпотентно за
+Границата за препращане приема директно неизменяеми `IngressFrame` обекти и
+запазва един адаптер за legacy `IngressEvent` обекти, чийто `raw_line` е `str`,
+включително подкласове. Невалидните събития за съвместимост и неподдържаните
+елементи се пренебрегват преди маршрутизирането. За всеки приет `IngressFrame`
+се използват една моментна снимка на маршрутизацията и едно съпоставяне на
+източника; payload-ът се сканира като байтове, а полетата на фрагмента и
+приложимите TAG метаданни се парсват веднъж. Python реализацията на assembler-а
+за съвместимост в момента материализира съвпадналите диапазони на изреченията
+като низове.
+
+Multipart сглобяването поддържа фрагменти в напълно произволен ред: точно
+повторение на изречението на вече заета поредна позиция е идемпотентно за
 сглобяването, а различно изречение на същата позиция обезсилва активното
 поколение на assembler-а. Решенията за multipart дедупликация са атомарни за
 цялата група, а състоянието на TAG `s`, `c` и `g` следва границите на жизнения
-цикъл на assembler-а. Всеки приет `IngressEvent` се обработва с една
-неизменяема моментна снимка на маршрутизацията.
+цикъл на assembler-а.
 
 Състоянието за дедупликация, състоянието за multipart сглобяване, multipart
 метаданните, управлявани от слоя за препращане, и защитеното състояние за replay,
@@ -903,7 +938,7 @@ forwarders:
 
 В този режим:
 
-- съпоставянето използва вътрешния `IngressEvent.source_id`;
+- съпоставянето използва вътрешния `source_id` на приетия `IngressFrame`;
 - съпоставянето **не** използва излъчения NMEA TAG `s`;
 - целите на маршрутите трябва да сочат към именувани forwarder-и;
 - при неизвестен или неподдържан `target_id` проверката при стартиране завършва
@@ -1386,8 +1421,8 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | Destinații UDP |
 - Identități denumite `source_id` pentru ingress și `target_id` pentru egress.
 - Zone logice de surse cu `include`, `union`, `intersection` și `difference`,
   consumate de rute ordonate.
-- Un singur snapshot imuabil de rutare pentru fiecare `IngressEvent` acceptat
-  al cărui `raw_line` este un șir.
+- Un singur snapshot imuabil de rutare și o singură potrivire a sursei pentru
+  fiecare `IngressFrame` acceptat.
 - Înlocuirea atomică opțională a rutării la runtime prin planul de control
   NDJSON pe socket din domeniul Unix și `aismixerctl`.
 - `routing.status`, `routing.replace` și `routing.disable`.
@@ -1403,20 +1438,31 @@ AISMixer păstrează separate **planul de date** și **planul de control**.
 
 ### 📡 Planul de date
 
-Planul de date primește date AIS și construiește un `IngressEvent` intern.
-Limita de redirecționare ignoră un `raw_line` care nu este un șir înainte de
-rutare și extragere. Pentru fiecare eveniment acceptat al cărui `raw_line` este
-un șir, planul de date preia un singur snapshot imuabil de rutare, potrivește
-`source_id` o singură dată, extrage propozițiile NMEA, asamblează mesajele multipart, aplică
-deduplicarea globală sau separată pe destinații, construiește metadatele TAG de
-ieșire și redirecționează propozițiile acceptate spre destinațiile UDP egress.
+Producătorii UDP și UDPSEC integrați creează obiecte `IngressFrame` imuabile,
+iar `mixer_loop()` transportă elementele cozii fără să le modifice. La limita
+de forwarding, `forward_loop()` acceptă direct cadrele păstrând identitatea
+obiectului și menține un singur adaptor de compatibilitate pentru obiectele
+legacy `IngressEvent` valide; evenimentele de compatibilitate nevalide și
+elementele nesuportate sunt ignorate înainte de rutare.
+
+Pentru fiecare cadru acceptat, planul de date preia un singur snapshot imuabil
+de rutare și potrivește `source_id` o singură dată. Scanează payload-ul cadrului
+la nivel de octeți, parsează o singură dată câmpurile fragmentului NMEA și
+metadatele TAG relevante, transmite propozițiile parsate către assembler,
+aplică deduplicarea globală sau separată pe destinații, construiește metadatele
+TAG de ieșire și redirecționează propozițiile acceptate spre destinațiile UDP
+egress. Implementarea Python de compatibilitate a assemblerului materializează
+și stochează momentan propozițiile potrivite ca șiruri.
+
+Această limită de procesare pregătește serviciul pentru o implementare nativă
+viitoare, dar Campaign C nu definește și nu oferă un API sau ABI nativ.
 
 - **Modul legacy:** deduplicare globală și broadcast către toate forwarderele.
 - **Modul de rutare:** potrivirea sursei logice, deduplicare pentru fiecare
   destinație și redirecționare direcționată către destinații UDP egress denumite.
-- Se preia un singur snapshot de rutare pentru fiecare `IngressEvent` acceptat
-  al cărui `raw_line` este un șir; o actualizare de control concurentă afectează
-  evenimentul următor, nu pe cel deja în curs de procesare.
+- Pentru fiecare cadru acceptat se folosesc un singur snapshot de rutare și o
+  singură potrivire a sursei; o actualizare de control concurentă afectează
+  cadrul următor, nu pe cel deja în curs de procesare.
 
 ### 🎛️ Planul de control
 
@@ -1435,6 +1481,7 @@ imuabil nou și înlocuiește atomic starea de rutare locală procesului.
 | `aismixerctl.py` | CLI pentru controlul rutării la runtime de către operator |
 | `aismixer_secure.py` | Handshake UDPSEC, autentificare și decriptare |
 | `nmea_sproxy/` | Proxy de rețea la stație: o intrare spre o intrare AISMixer UDPSEC sau UDP |
+| `core/ingress_frame.py` / `core/nmea_scanner.py` / `core/parsed_sentence.py` | Cadre `IngressFrame` imuabile, intervale de scanare la nivel de octeți și metadate fragment/TAG parsate |
 | `assembler.py` | Reasamblarea mesajelor multipart `!AIVDM`/`!AIVDO` |
 | `dedup.py` | Suprimarea duplicatelor global sau separat pentru fiecare destinație |
 | `meta_writer.py` / `meta_cleaner.py` | Ieșire NMEA TAG și curățarea ingress-ului |
@@ -1449,15 +1496,22 @@ verificat prin teste, pentru implementarea Python de referință și baza pentru
 viitoarea testare diferențială a unui procesor nativ. Acest README rămâne o
 prezentare generală operațională, nu o copie a specificației normative.
 
-Limita de redirecționare acceptă instanțe `str`, inclusiv subclase, și ignoră
-payload-urile care nu sunt șiruri înainte de rutare și extragere. Asamblarea
-multipart acceptă sosiri într-o ordine complet arbitrară: repetarea exactă a
-unei propoziții la un ordinal deja ocupat este idempotentă pentru asamblare, iar
-o propoziție diferită la același ordinal invalidează generația activă a
-assemblerului. Deciziile de deduplicare multipart sunt atomice la nivel de grup,
-iar starea TAG `s`, `c` și `g` urmează limitele ciclului de viață al
-assemblerului. Fiecare eveniment ingress acceptat folosește un singur snapshot
-imuabil de rutare.
+Limita de redirecționare acceptă direct obiecte `IngressFrame` imuabile și
+păstrează un singur adaptor pentru obiectele legacy `IngressEvent` al căror
+`raw_line` este un `str`, inclusiv subclase. Evenimentele de compatibilitate
+nevalide și elementele nesuportate sunt ignorate înainte de rutare. Pentru
+fiecare cadru acceptat se folosesc un singur snapshot de rutare și o singură
+potrivire a sursei; payload-ul este scanat la nivel de octeți, iar câmpurile
+fragmentului și metadatele TAG relevante sunt parsate o singură dată.
+Implementarea Python de compatibilitate a assemblerului materializează momentan
+intervalele propozițiilor identificate ca șiruri.
+
+Asamblarea multipart acceptă sosiri într-o ordine complet arbitrară: repetarea
+exactă a unei propoziții la un ordinal deja ocupat este idempotentă pentru
+asamblare, iar o propoziție diferită la același ordinal invalidează generația
+activă a assemblerului. Deciziile de deduplicare multipart sunt atomice la
+nivel de grup, iar starea TAG `s`, `c` și `g` urmează limitele ciclului de viață
+al assemblerului.
 
 Starea de deduplicare, starea asamblării multipart, metadatele multipart
 gestionate de componenta de forwarding și starea securizată pentru replay,
@@ -1561,7 +1615,7 @@ valide.
 
 În modul de rutare:
 
-- potrivirea folosește `IngressEvent.source_id` intern;
+- potrivirea folosește `source_id` intern al cadrului acceptat;
 - potrivirea **nu** folosește valoarea NMEA TAG `s` emisă;
 - destinațiile rutelor trebuie să facă referire la forwardere denumite;
 - ID-urile de destinație necunoscute sau nesuportate determină eșecul validării
