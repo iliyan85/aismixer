@@ -55,11 +55,16 @@
     "author": {
       "@type": "Person",
       "name": "Iliyan Iliev",
-      "url": "https://github.com/iliyan85"
+      "honorificSuffix": "PhD",
+      "url": "https://github.com/iliyan85",
+      "sameAs": [
+        "https://github.com/iliyan85",
+        "https://orcid.org/0000-0002-8354-8930",
+        "https://www.researchgate.net/profile/Iliyan-Iliev-11"
+      ]
     },
     "sameAs": [
-      "https://github.com/iliyan85/aismixer",
-      "https://github.com/iliyan85/aismixer/wiki"
+      "https://github.com/iliyan85/aismixer"
     ],
     "inLanguage": "bg",
     "isAccessibleForFree": true,
@@ -95,6 +100,7 @@
             <span>Română</span>
           </a>
         </nav>
+        <a class="btn" href="#community">Общност</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
       </div>
@@ -173,30 +179,66 @@
 
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Проверено референтно поведение</p>
-        <h2>Детерминирана обработка и изрично състояние</h2>
-        <p class="section-intro">Реализацията на Python определя наблюдаемото поведение при входни събития, сглобяване, метаданни, дедупликация, маршрутизиране и почистване. Точните граници и гранични случаи остават в нормативния договор за поведение.</p>
+        <p class="eyebrow">Граница на представянето от Campaign C</p>
+        <h2>Неизменяеми кадри и еднократен анализ</h2>
+        <p class="section-intro">Python реализацията вече пренася неизменяеми входни кадри през байтова граница с еднократен анализ. Точните правила за жизнения цикъл и граничните случаи остават в нормативния договор за поведение.</p>
+      </div>
+      <div class="pipeline representation-pipeline" role="group" aria-label="Продукционен път на представянето от Campaign C">
+        <div class="pipeline-node">
+          <strong>UDP / UDPSEC производители</strong>
+          <span>Неизменяем <span class="kbd">IngressFrame</span></span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Независима от представянето опашка</strong>
+          <span><span class="kbd">mixer_loop()</span> пренася елементите без промяна</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Един обхват за кадъра</strong>
+          <span>Незадължителен наследен адаптер; неизменяема моментна снимка на маршрутизацията и съпоставяне на източника</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Байтово сканиране и еднократен анализ</strong>
+          <span>Неизменяеми интервали, анализирани полета на NMEA фрагмента и TAG метаданни</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Анализиран вход към модула за сглобяване</strong>
+          <span>Съществуващите метаданни, дедупликация, маршрутизиране и препращане</span>
+        </div>
       </div>
       <div class="grid state-grid">
         <article class="card">
           <div class="icons" aria-hidden="true">🚪</div>
-          <h3>Граница на входа и моментното състояние</h3>
-          <p>До обработка се допуска само <span class="kbd">IngressEvent</span>, чието <span class="kbd">raw_line</span> е низ. Една неизменяема моментна снимка на маршрутизацията управлява всяко прието събитие. Когато тя съдържа таблица за маршрутизация, едно съответствие с източник се прилага към всички извлечени изречения; едновременна промяна засяга следващо събитие.</p>
+          <h3>Неизменяема входна граница</h3>
+          <p>Вградените UDP и UDPSEC производители създават неизменяеми <span class="kbd">IngressFrame</span> обекти. <span class="kbd">forward_loop()</span> приема директните кадри със запазена обектна идентичност и запазва един адаптер за валидни наследени <span class="kbd">IngressEvent</span> обекти. Невалидните събития за съвместимост и неподдържаните елементи в опашката се игнорират преди маршрутизирането.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧾</div>
+          <h3>Сканиране на ниво байтове</h3>
+          <p>Всеки приет кадър се сканира като байтове. Резултатите са неизменяеми полуотворени интервали в оригиналния payload, така че сканирането не декодира и не копира текста на изреченията и TAG блоковете.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔎</div>
+          <h3>Еднократен анализ на полетата на фрагмента и TAG метаданните</h3>
+          <p>Относимите полета на NMEA фрагмента и TAG метаданните се анализират веднъж от интервалите според текстовия режим на кадъра. Всеки приет кадър използва една неизменяема моментна снимка на маршрутизацията и едно съпоставяне на източника; те управляват всички приети изречения в този кадър.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
-          <h3>Жизнен цикъл на multipart съобщенията</h3>
-          <p>Фрагментите могат да пристигат в напълно произволен ред. Точно повторение на заета позиция е идемпотентно за сглобяването и не подновява времето на живот; противоречащо съдържание обезсилва текущото поколение. TAG контекстът следва същите граници на групата.</p>
-        </article>
-        <article class="card">
-          <div class="icons" aria-hidden="true">🔁</div>
-          <h3>Жизнен цикъл на дедупликацията</h3>
-          <p>Едно решение обхваща цялата подредена multipart група. Наследеният режим използва глобален обхват, а режимът с маршрутизиране — независим обхват за всяка цел. Наблюдението на дубликат не удължава запазения жизнен цикъл на дедупликацията.</p>
+          <h3>Единен жизнен цикъл на сглобяването</h3>
+          <p>Продукционният път използва <span class="kbd">feed_parsed_outcome()</span>. API-то за анализирани изречения и публичните наследени API функции за низове използват един и същ жизнен цикъл; съвместимата Python реализация засега материализира и съхранява изреченията като низове.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⏱️</div>
           <h3>Детерминирано локално състояние</h3>
           <p>Локалните за процеса TTL жизнени цикли са изрично определени и тествани. Изтеклото състояние се обработва преди детерминираното премахване на живо състояние, когато е зададен лимит на капацитета.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧭</div>
+          <h3>Граница за бъдещо нативно съответствие</h3>
+          <p>Campaign C установи стабилна граница на представянето за бъдещи диференциални проверки. Тя не въведе нативна реализация, bindings, API или ABI на процесор, CMake, многопроцесна обработка или твърдения за производителност.</p>
         </article>
       </div>
       <div class="callout">
@@ -243,7 +285,7 @@
       <div class="section-heading">
         <p class="eyebrow">Референтна семантика и поетапно развитие</p>
         <h2>Референтна основа, подготвена за нативна реализация</h2>
-        <p class="section-intro">Документираното наблюдаемо поведение позволява бъдещата реализация да напредва на етапи, докато текущата Python реализация остава референтна.</p>
+        <p class="section-intro">Campaign C установи стабилна граница на представянето. Документираното наблюдаемо поведение позволява бъдещата реализация да напредва на етапи, докато текущата Python реализация остава референтна.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="Път от тестваната Python референция до бъдещ поетапен нативен процесор">
         <div class="pipeline-node">
@@ -392,7 +434,7 @@
         </article>
       </div>
       <div class="callout">
-        <p><strong>Граница на сигурността:</strong> в рамките на реализирания си обхват UDPSEC защитава автентичността и поверителността на транспорта и обработва повторенията; той не доказва, че AIS съдържанието е физически или семантично достоверно.</p>
+        <p><strong>Граница на сигурността:</strong> в рамките на реализирания си обхват UDPSEC защитава автентичността и поверителността на транспорта и обработва повторенията; той не доказва, че AIS съдържанието е физически или семантично достоверно. AISMixer в момента няма реализиран детектор за подправяне или аномалии в AIS.</p>
         <p>Прочетете <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">политиката за сигурност</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">договора за поведение</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ръководството за <span class="kbd">nmea_sproxy</span></a> и <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a> за подробните граници.</p>
       </div>
     </section>
@@ -491,6 +533,8 @@
         <article class="card status-card status-now">
           <h3 class="status-label">Реализирано сега</h3>
           <ul class="list">
+            <li>Неизменяема продукционна граница с <span class="kbd">IngressFrame</span> и един запазен адаптер за наследени <span class="kbd">IngressEvent</span> обекти.</li>
+            <li>Сканиране на ниво байтове, неизменяеми полуотворени интервали, еднократен анализ на полетата на NMEA фрагмента и TAG метаданните и продукционен път през анализирания вход на модула за сглобяване.</li>
             <li>Логическа маршрутизация, зони и дедупликация по цели.</li>
             <li>Управление на маршрутизирането по време на работа чрез <span class="kbd">aismixerctl</span>.</li>
             <li>Детерминирани жизнени цикли за дедупликация, сглобяване и multipart TAG метаданни.</li>
@@ -503,12 +547,12 @@
         <article class="card status-card status-next">
           <h3 class="status-label">Планирана работа</h3>
           <ul class="list">
-            <li>Изрично определяне на собственика на услугата, групов достъп до контролния сокет и проверка на внедряването под Linux и Raspberry Pi.</li>
-            <li>Поетапен координатор с отделни входни и изходни работни процеси, наблюдение и IPC за състоянието на маршрутизирането.</li>
-            <li>Проучване на контролираното възстановяване на състоянието на маршрутизирането, безопасното презареждане на конфигурацията и историята за връщане назад.</li>
-            <li>По-богата наблюдаемост за маршрути, цели, поколения, управление, метрики и състояние на услугата.</li>
-            <li>Изследване на морската сигурност, качеството на приемниците и откриването на подправяне или аномалии — днес няма реализиран детектор.</li>
-            <li>По-късно може да бъдат добавени адаптери извън UDP, автентикирано отдалечено управление, P2P обмен и филтри според съдържанието.</li>
+            <li>Стабилен договор за процесора и повърхност за диференциално съответствие.</li>
+            <li>Нативна реализация или bindings; днес няма такива.</li>
+            <li>Байтово състояние на модула за сглобяване и на изхода отвъд текущата Python граница за съвместимост с низове.</li>
+            <li>Бенчмаркове и профилиране преди твърдения за производителност.</li>
+            <li>Многопроцесна обработка, ясна собственост върху процесите, координация и наблюдение.</li>
+            <li>По-широка архитектура за входни и изходни адаптери отвъд текущите UDP пътища.</li>
           </ul>
         </article>
       </div>
@@ -522,12 +566,72 @@
         <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Политика за сигурност</a>
       </div>
     </section>
+
+    <section id="community" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Общност на проекта</p>
+        <h2>Общност и контакт</h2>
+        <p class="section-intro">Изберете канала според вида на съобщението. Публичните въпроси и идеи помагат и на други потребители; личният имейл е за непублични запитвания.</p>
+      </div>
+      <div class="grid state-grid community-grid">
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">💬</div>
+          <h3>Задайте публичен въпрос</h3>
+          <p>Използвайте GitHub Discussions за въпроси относно използването, конфигурацията, архитектурата и експлоатацията.</p>
+          <a class="button" href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Отворете GitHub Discussions</a>
+        </article>
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">💡</div>
+          <h3>Споделете идея</h3>
+          <p>GitHub Discussions е подходящо място за архитектурни предложения, идеи за интеграция, опит от внедряване, полеви AIS тестове и академично или изследователско сътрудничество, което може да се обсъжда публично.</p>
+          <a class="button" href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Споделете идея публично</a>
+        </article>
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">🐞</div>
+          <h3>Докладвайте проблем</h3>
+          <p>Използвайте GitHub Issues за възпроизводими дефекти и конкретна работа по хранилището, а не за обща лична кореспонденция.</p>
+          <a class="button" href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Отворете GitHub Issues</a>
+        </article>
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">✉️</div>
+          <h3>Личен контакт</h3>
+          <p>За непублични технически, оперативни, академични запитвания или предложения за сътрудничество.</p>
+          <address class="contact-address">
+            <a class="contact-email" href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">iliyan85@gmail.com</a>
+          </address>
+        </article>
+      </div>
+      <aside class="callout" aria-label="Предупреждение за публичност и сигурност">
+        <p><strong>GitHub Discussions и Issues са публични.</strong> Не публикувайте идентификационни данни, частни ключове, чувствителни местоположения на приемници, лични данни, поверителни логове или непублични подробности за сътрудничество.</p>
+        <p>При уязвимости в сигурността следвайте <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">политиката за сигурност</a> на проекта. Не докладвайте уязвимости чрез публични Discussions или Issues.</p>
+      </aside>
+      <article class="card maintainer-card">
+        <div>
+          <p class="eyebrow">Отговорник за поддръжката</p>
+          <h3>Iliyan Iliev, PhD</h3>
+          <p class="maintainer-role">Отговорник за поддръжката на AISMixer</p>
+          <p>Разработчик и изследовател в областта на сървърните и мрежовите системи с интереси в обработката на AIS/NMEA данни, морската и регионалната сигурност, транспорта и туризма.</p>
+        </div>
+        <div class="links maintainer-links" role="group" aria-label="Връзки към отговорника за поддръжката">
+          <a href="https://github.com/iliyan85" target="_blank" rel="noopener">GitHub профил</a>
+          <a href="https://orcid.org/0000-0002-8354-8930" target="_blank" rel="noopener">ORCID</a>
+          <a href="https://www.researchgate.net/profile/Iliyan-Iliev-11" target="_blank" rel="noopener">ResearchGate</a>
+          <a href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">Личен имейл</a>
+        </div>
+      </article>
+    </section>
   </main>
 
   <footer>
     <div class="container footer-inner">
       <span>© 2026 AISMixer</span>
-      <span class="muted">Обработка и маршрутизиране на AIS потоци с отворен код</span>
+      <nav class="footer-links" aria-label="Връзки в долната част">
+        <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a>
+        <a href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Discussions</a>
+        <a href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Issues</a>
+        <a href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">Контакт</a>
+      </nav>
     </div>
   </footer>
 </body>

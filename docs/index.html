@@ -55,11 +55,16 @@
     "author": {
       "@type": "Person",
       "name": "Iliyan Iliev",
-      "url": "https://github.com/iliyan85"
+      "honorificSuffix": "PhD",
+      "url": "https://github.com/iliyan85",
+      "sameAs": [
+        "https://github.com/iliyan85",
+        "https://orcid.org/0000-0002-8354-8930",
+        "https://www.researchgate.net/profile/Iliyan-Iliev-11"
+      ]
     },
     "sameAs": [
-      "https://github.com/iliyan85/aismixer",
-      "https://github.com/iliyan85/aismixer/wiki"
+      "https://github.com/iliyan85/aismixer"
     ],
     "inLanguage": "en",
     "isAccessibleForFree": true,
@@ -95,6 +100,7 @@
             <span>Română</span>
           </a>
         </nav>
+        <a class="btn" href="#community">Community</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
       </div>
@@ -173,30 +179,66 @@
 
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Tested reference behaviour</p>
-        <h2>Deterministic processing and explicit state</h2>
-        <p class="section-intro">The Python implementation defines observable event, assembly, metadata, deduplication, routing, and cleanup behaviour. Exact boundaries and edge cases remain in the normative behavioural contract.</p>
+        <p class="eyebrow">Campaign C representation boundary</p>
+        <h2>Immutable frames and parse-once processing</h2>
+        <p class="section-intro">The Python implementation now carries immutable ingress frames through a bytes-native, parse-once boundary. Exact lifecycle rules and edge cases remain in the normative behavioural contract.</p>
+      </div>
+      <div class="pipeline representation-pipeline" role="group" aria-label="Campaign C production data representation path">
+        <div class="pipeline-node">
+          <strong>UDP / UDPSEC producers</strong>
+          <span>Immutable <span class="kbd">IngressFrame</span></span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Representation-neutral queue</strong>
+          <span><span class="kbd">mixer_loop()</span> transports items unchanged</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>One frame scope</strong>
+          <span>Optional legacy adapter; immutable routing snapshot and source match</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Bytes-native parse once</strong>
+          <span>Immutable spans and parsed fragment/TAG metadata</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Parsed assembler path</strong>
+          <span>Existing metadata, deduplication, routing, and forwarding</span>
+        </div>
       </div>
       <div class="grid state-grid">
         <article class="card">
           <div class="icons" aria-hidden="true">🚪</div>
-          <h3>Ingress and snapshot boundary</h3>
-          <p>Only an <span class="kbd">IngressEvent</span> whose <span class="kbd">raw_line</span> is a string enters processing. One immutable routing snapshot governs each accepted event. When it contains a routing table, one source match governs all extracted sentences; a concurrent update affects a later event.</p>
+          <h3>Immutable ingress boundary</h3>
+          <p>Built-in UDP and UDPSEC producers create immutable <span class="kbd">IngressFrame</span> objects. <span class="kbd">forward_loop()</span> accepts direct frames by object identity and retains one adapter for valid legacy <span class="kbd">IngressEvent</span> objects. Invalid compatibility events and unsupported queue items are ignored before routing.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧾</div>
+          <h3>Bytes-native sentence scanning</h3>
+          <p>Each accepted frame is scanned as bytes. Scanner results are immutable half-open spans into the original payload, so scanning does not decode or copy sentence and TAG text.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔎</div>
+          <h3>Parse-once fragment and TAG metadata</h3>
+          <p>Relevant NMEA fragment fields and TAG metadata are parsed once from the spans using the frame text mode. Each accepted frame takes one immutable routing snapshot and one source match; they govern all accepted sentences in that frame.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
-          <h3>Multipart lifecycle</h3>
-          <p>Fragments may arrive fully out of order. An exact duplicate at an occupied ordinal is idempotent for assembly and does not refresh lifetime; conflicting content invalidates the live generation. TAG context follows the same group boundaries.</p>
-        </article>
-        <article class="card">
-          <div class="icons" aria-hidden="true">🔁</div>
-          <h3>Deduplication lifecycle</h3>
-          <p>One decision covers the complete ordered multipart group. Legacy mode uses global scope; routing mode uses independent target scope. A duplicate observation does not extend the retained deduplication lifetime.</p>
+          <h3>One shared assembler lifecycle</h3>
+          <p>Production uses <span class="kbd">feed_parsed_outcome()</span>. Parsed and public legacy string APIs converge on the same lifecycle; the Python compatibility assembler currently materializes and stores sentence strings.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⏱️</div>
           <h3>Deterministic local state</h3>
           <p>Process-local TTL lifecycles are explicit and tested. Expired state is handled before deterministic eviction of live state when a configured capacity applies.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧭</div>
+          <h3>Future native conformance boundary</h3>
+          <p>Campaign C established a stable representation boundary for future differential work. It introduced no native implementation, binding, processor API, ABI, CMake, multiprocessing, or performance claim.</p>
         </article>
       </div>
       <div class="callout">
@@ -243,7 +285,7 @@
       <div class="section-heading">
         <p class="eyebrow">Reference semantics and staged evolution</p>
         <h2>A native-ready reference foundation</h2>
-        <p class="section-intro">Documented observable behaviour allows future implementation work to proceed in stages while the current Python runtime remains the reference.</p>
+        <p class="section-intro">Campaign C established a stable representation boundary. Documented observable behaviour allows future implementation work to proceed in stages while the current Python runtime remains the reference.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="Path from the tested Python reference to a future staged native processor">
         <div class="pipeline-node">
@@ -392,7 +434,7 @@
         </article>
       </div>
       <div class="callout">
-        <p><strong>Security boundary:</strong> UDPSEC protects transport authenticity, confidentiality, and replay handling within its implemented scope; it does not prove that an AIS payload is physically or semantically truthful.</p>
+        <p><strong>Security boundary:</strong> UDPSEC protects transport authenticity, confidentiality, and replay handling within its implemented scope; it does not prove that an AIS payload is physically or semantically truthful. AISMixer does not currently implement an AIS spoofing or anomaly detector.</p>
         <p>Read the <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">security policy</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">behavioural contract</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>, and <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a> for the detailed boundaries.</p>
       </div>
     </section>
@@ -491,6 +533,8 @@
         <article class="card status-card status-now">
           <h3 class="status-label">Implemented now</h3>
           <ul class="list">
+            <li>Immutable <span class="kbd">IngressFrame</span> production boundary with one retained legacy <span class="kbd">IngressEvent</span> adapter.</li>
+            <li>Bytes-native scanning, immutable half-open spans, parse-once fragment/TAG metadata, and the parsed assembler production path.</li>
             <li>Logical routing, zones, and target-scoped deduplication.</li>
             <li>Runtime routing control with <span class="kbd">aismixerctl</span>.</li>
             <li>Deterministic deduplication, assembly, and multipart TAG lifecycles.</li>
@@ -503,12 +547,12 @@
         <article class="card status-card status-next">
           <h3 class="status-label">Planned work</h3>
           <ul class="list">
-            <li>Explicit service ownership, control-socket group access, and Linux/Raspberry Pi deployment verification.</li>
-            <li>A staged coordinator with dedicated ingress and egress workers, supervision, and routing-state IPC.</li>
-            <li>Research into controlled routing-state restoration, safe configuration reload, and rollback history.</li>
-            <li>Richer route, target, generation, control, metrics, and health observability.</li>
-            <li>Maritime security, receiver quality, and spoof/anomaly research—not an implemented detector today.</li>
-            <li>Later expansion may add non-UDP adapters, authenticated remote control, P2P exchange, and content-aware filters.</li>
+            <li>A stable processor contract and differential conformance surface.</li>
+            <li>A native implementation or bindings; none exists today.</li>
+            <li>Bytes-native assembler and output state beyond the current Python string compatibility boundary.</li>
+            <li>Benchmarks and profiling before any performance claim.</li>
+            <li>Multiprocessing, clear process ownership, coordination, and supervision.</li>
+            <li>A broader ingress and egress adapter architecture beyond the current UDP pathways.</li>
           </ul>
         </article>
       </div>
@@ -522,12 +566,72 @@
         <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Security policy</a>
       </div>
     </section>
+
+    <section id="community" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Project community</p>
+        <h2>Community and contact</h2>
+        <p class="section-intro">Choose the channel that fits the conversation. Public questions and ideas help other users; private email is for enquiries that should not be posted publicly.</p>
+      </div>
+      <div class="grid state-grid community-grid">
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">💬</div>
+          <h3>Ask a public question</h3>
+          <p>Use GitHub Discussions for usage, configuration, architecture, and operational questions.</p>
+          <a class="button" href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Open GitHub Discussions</a>
+        </article>
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">💡</div>
+          <h3>Share an idea</h3>
+          <p>Discussions is suitable for architecture proposals, integration ideas, deployment experience, AIS field testing, and academic or research collaboration that can be discussed publicly.</p>
+          <a class="button" href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Share an idea publicly</a>
+        </article>
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">🐞</div>
+          <h3>Report a problem</h3>
+          <p>Use GitHub Issues for reproducible defects and concrete repository work, not general private correspondence.</p>
+          <a class="button" href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Open GitHub Issues</a>
+        </article>
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">✉️</div>
+          <h3>Contact privately</h3>
+          <p>Private technical, operational, academic, or collaboration enquiries.</p>
+          <address class="contact-address">
+            <a class="contact-email" href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">iliyan85@gmail.com</a>
+          </address>
+        </article>
+      </div>
+      <aside class="callout" aria-label="Public discussion and security warning">
+        <p><strong>GitHub Discussions and Issues are public.</strong> Do not post credentials, private keys, sensitive receiver locations, personal data, confidential logs, or non-public collaboration details.</p>
+        <p>For security vulnerabilities, follow the repository <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">security policy</a>. Do not report vulnerabilities through public Discussions or Issues.</p>
+      </aside>
+      <article class="card maintainer-card">
+        <div>
+          <p class="eyebrow">Maintainer</p>
+          <h3>Iliyan Iliev, PhD</h3>
+          <p class="maintainer-role">AISMixer maintainer</p>
+          <p>Backend and network systems developer and researcher with interests in AIS/NMEA processing, maritime and regional security, transport, and tourism.</p>
+        </div>
+        <div class="links maintainer-links" role="group" aria-label="Maintainer links">
+          <a href="https://github.com/iliyan85" target="_blank" rel="noopener">GitHub profile</a>
+          <a href="https://orcid.org/0000-0002-8354-8930" target="_blank" rel="noopener">ORCID</a>
+          <a href="https://www.researchgate.net/profile/Iliyan-Iliev-11" target="_blank" rel="noopener">ResearchGate</a>
+          <a href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">Private email</a>
+        </div>
+      </article>
+    </section>
   </main>
 
   <footer>
     <div class="container footer-inner">
       <span>© 2026 AISMixer project</span>
-      <span class="muted">Open-source AIS stream processing and routing</span>
+      <nav class="footer-links" aria-label="Footer links">
+        <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a>
+        <a href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Discussions</a>
+        <a href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Issues</a>
+        <a href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">Contact</a>
+      </nav>
     </div>
   </footer>
 </body>

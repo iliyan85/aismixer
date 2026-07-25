@@ -55,11 +55,16 @@
     "author": {
       "@type": "Person",
       "name": "Iliyan Iliev",
-      "url": "https://github.com/iliyan85"
+      "honorificSuffix": "PhD",
+      "url": "https://github.com/iliyan85",
+      "sameAs": [
+        "https://github.com/iliyan85",
+        "https://orcid.org/0000-0002-8354-8930",
+        "https://www.researchgate.net/profile/Iliyan-Iliev-11"
+      ]
     },
     "sameAs": [
-      "https://github.com/iliyan85/aismixer",
-      "https://github.com/iliyan85/aismixer/wiki"
+      "https://github.com/iliyan85/aismixer"
     ],
     "inLanguage": "ro",
     "isAccessibleForFree": true,
@@ -95,6 +100,7 @@
             <span>Română</span>
           </a>
         </nav>
+        <a class="btn" href="#community">Comunitate</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a class="btn" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
       </div>
@@ -174,30 +180,66 @@
 
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Comportament de referință testat</p>
-        <h2>Procesare deterministă și stare explicită</h2>
-        <p class="section-intro">Implementarea Python definește comportamentul observabil al evenimentelor, asamblării, metadatelor, deduplicării, rutării și curățării. Limitele exacte și cazurile marginale rămân în contractul comportamental normativ.</p>
+        <p class="eyebrow">Limita de reprezentare din Campaign C</p>
+        <h2>Cadre imuabile și parsare unică</h2>
+        <p class="section-intro">Implementarea Python transportă acum cadre ingress imuabile printr-o limită la nivel de octeți cu parsare unică. Regulile exacte ale ciclului de viață și cazurile marginale rămân în contractul comportamental normativ.</p>
+      </div>
+      <div class="pipeline representation-pipeline" role="group" aria-label="Traseul de producție al reprezentării din Campaign C">
+        <div class="pipeline-node">
+          <strong>Producători UDP / UDPSEC</strong>
+          <span><span class="kbd">IngressFrame</span> imuabil</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Coadă independentă de reprezentare</strong>
+          <span><span class="kbd">mixer_loop()</span> transportă elementele fără modificări</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Un singur context pentru fiecare cadru</strong>
+          <span>Adaptor legacy opțional; snapshot imuabil de rutare și potrivirea sursei</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Scanare în octeți și parsare unică</strong>
+          <span>Intervale imuabile, câmpuri parsate ale fragmentului NMEA și metadate TAG</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Intrare parsată în modulul de asamblare</strong>
+          <span>Metadatele, deduplicarea, rutarea și redirecționarea existente</span>
+        </div>
       </div>
       <div class="grid state-grid">
         <article class="card">
           <div class="icons" aria-hidden="true">🚪</div>
-          <h3>Limita de ingress și snapshot</h3>
-          <p>Numai un <span class="kbd">IngressEvent</span> al cărui <span class="kbd">raw_line</span> este un șir intră în procesare. Un singur snapshot imuabil de rutare guvernează fiecare eveniment acceptat. Când snapshot-ul conține un tabel de rutare, o singură potrivire a sursei se aplică tuturor propozițiilor extrase; o actualizare concurentă afectează un eveniment ulterior.</p>
+          <h3>Limită ingress imuabilă</h3>
+          <p>Producătorii UDP și UDPSEC integrați creează obiecte <span class="kbd">IngressFrame</span> imuabile. <span class="kbd">forward_loop()</span> acceptă direct cadrele păstrând identitatea obiectului și menține un singur adaptor pentru obiectele legacy <span class="kbd">IngressEvent</span> valide. Evenimentele de compatibilitate nevalide și elementele nesuportate din coadă sunt ignorate înainte de rutare.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧾</div>
+          <h3>Scanare la nivel de octeți</h3>
+          <p>Fiecare cadru acceptat este scanat ca octeți. Rezultatele sunt intervale imuabile semi-deschise în payload-ul original, astfel încât scanarea nu decodează și nu copiază textul propozițiilor și al blocurilor TAG.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔎</div>
+          <h3>Câmpuri ale fragmentului și metadate TAG parsate o singură dată</h3>
+          <p>Câmpurile relevante ale fragmentului NMEA și metadatele TAG sunt parsate o singură dată din intervale, conform modului text al cadrului. Fiecare cadru acceptat primește un snapshot imuabil de rutare și o singură potrivire a sursei; acestea guvernează toate propozițiile acceptate din acel cadru.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
-          <h3>Ciclul de viață multipart</h3>
-          <p>Fragmentele pot sosi complet în afara ordinii. Un duplicat exact într-un ordinal ocupat este idempotent pentru asamblare și nu reîmprospătează durata de viață; conținutul conflictual invalidează generația activă. Contextul TAG urmează aceleași limite de grup.</p>
-        </article>
-        <article class="card">
-          <div class="icons" aria-hidden="true">🔁</div>
-          <h3>Ciclul de viață al deduplicării</h3>
-          <p>O singură decizie acoperă întregul grup multipart ordonat. Modul legacy folosește o sferă globală; modul de rutare folosește sfere independente pentru fiecare destinație. Observarea unui duplicat nu prelungește durata de păstrare în deduplicare.</p>
+          <h3>Un singur ciclu de viață al asamblării</h3>
+          <p>Calea de producție folosește <span class="kbd">feed_parsed_outcome()</span>. Intrarea parsată și API-urile publice legacy pentru șiruri converg către același ciclu de viață; implementarea Python de compatibilitate materializează și stochează momentan propozițiile ca șiruri.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⏱️</div>
           <h3>Stare locală deterministă</h3>
           <p>Ciclurile de viață TTL locale procesului sunt explicite și testate. Starea expirată este tratată înaintea evacuării deterministe a stării active atunci când se aplică o capacitate configurată.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🧭</div>
+          <h3>Limită pentru conformitate nativă viitoare</h3>
+          <p>Campaign C a stabilit o limită stabilă de reprezentare pentru viitoare verificări diferențiale. Nu a introdus o implementare nativă, binding-uri, un API sau ABI de procesor, CMake, multiprocesare ori afirmații de performanță.</p>
         </article>
       </div>
       <div class="callout">
@@ -244,7 +286,7 @@
       <div class="section-heading">
         <p class="eyebrow">Semantică de referință și evoluție etapizată</p>
         <h2>O bază de referință pregătită pentru o implementare nativă viitoare</h2>
-        <p class="section-intro">Comportamentul observabil documentat permite ca viitoarea implementare să avanseze etapizat, în timp ce runtime-ul Python actual rămâne referința.</p>
+        <p class="section-intro">Campaign C a stabilit o limită stabilă de reprezentare. Comportamentul observabil documentat permite ca viitoarea implementare să avanseze etapizat, în timp ce runtime-ul Python actual rămâne referința.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="Traseul de la referința Python testată la un viitor procesor nativ etapizat">
         <div class="pipeline-node">
@@ -393,7 +435,7 @@
         </article>
       </div>
       <div class="callout">
-        <p><strong>Limita de securitate:</strong> UDPSEC protejează autenticitatea și confidențialitatea transportului și tratează reluările în limitele implementate; nu dovedește că un payload AIS este adevărat fizic sau semantic.</p>
+        <p><strong>Limita de securitate:</strong> UDPSEC protejează autenticitatea și confidențialitatea transportului și tratează reluările în limitele implementate; nu dovedește că un payload AIS este adevărat fizic sau semantic. AISMixer nu implementează în prezent un detector de spoofing sau anomalii AIS.</p>
         <p>Citiți <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">politica de securitate</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">contractul comportamental</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> și <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki-ul</a> pentru limitele detaliate.</p>
       </div>
     </section>
@@ -492,6 +534,8 @@
         <article class="card status-card status-now">
           <h3 class="status-label">Implementat acum</h3>
           <ul class="list">
+            <li>Limită de producție imuabilă cu <span class="kbd">IngressFrame</span> și un singur adaptor păstrat pentru obiectele legacy <span class="kbd">IngressEvent</span>.</li>
+            <li>Scanare la nivel de octeți, intervale imuabile semi-deschise, parsarea unică a câmpurilor fragmentului NMEA și a metadatelor TAG și calea de producție prin intrarea parsată în modulul de asamblare.</li>
             <li>Rutare logică, zone și deduplicare separată pentru fiecare destinație.</li>
             <li>Controlul rutării la runtime prin <span class="kbd">aismixerctl</span>.</li>
             <li>Cicluri de viață deterministe pentru deduplicare, asamblare și TAG multipart.</li>
@@ -504,12 +548,12 @@
         <article class="card status-card status-next">
           <h3 class="status-label">Activități planificate</h3>
           <ul class="list">
-            <li>Stabilirea explicită a proprietarului serviciului, acces de grup la socketul de control și verificarea instalării pe Linux și Raspberry Pi.</li>
-            <li>Un coordonator etapizat cu workeri ingress și egress dedicați, supraveghere și IPC pentru starea rutării.</li>
-            <li>Cercetare privind restaurarea controlată a stării rutării, reîncărcarea sigură a configurației și istoricul de revenire.</li>
-            <li>Observabilitate mai bogată pentru rute, destinații, generații, control, metrici și stare de sănătate.</li>
-            <li>Cercetare privind securitatea maritimă, calitatea receptoarelor și spoofingul sau anomaliile — fără un detector implementat în prezent.</li>
-            <li>Extinderile ulterioare pot adăuga adaptoare non-UDP, control de la distanță autentificat, schimb P2P și filtre bazate pe conținut.</li>
+            <li>Un contract stabil pentru procesor și o suprafață de conformitate diferențială.</li>
+            <li>O implementare nativă sau binding-uri; în prezent nu există.</li>
+            <li>Stare la nivel de octeți pentru modulul de asamblare și pentru ieșire, dincolo de limita Python actuală de compatibilitate cu șiruri.</li>
+            <li>Benchmark-uri și profilare înaintea oricărei afirmații de performanță.</li>
+            <li>Multiprocesare, responsabilitate clară asupra proceselor, coordonare și supraveghere.</li>
+            <li>O arhitectură mai largă pentru adaptoarele ingress și egress, dincolo de traseele UDP actuale.</li>
           </ul>
         </article>
       </div>
@@ -523,12 +567,72 @@
         <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Politica de securitate</a>
       </div>
     </section>
+
+    <section id="community" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Comunitatea proiectului</p>
+        <h2>Comunitate și contact</h2>
+        <p class="section-intro">Alegeți canalul potrivit tipului de mesaj. Întrebările și ideile publice îi ajută și pe alți utilizatori; adresa de e-mail personală este pentru solicitări nepublice.</p>
+      </div>
+      <div class="grid state-grid community-grid">
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">💬</div>
+          <h3>Adresați o întrebare publică</h3>
+          <p>Folosiți GitHub Discussions pentru întrebări despre utilizare, configurare, arhitectură și operare.</p>
+          <a class="button" href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Deschideți GitHub Discussions</a>
+        </article>
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">💡</div>
+          <h3>Propuneți o idee</h3>
+          <p>GitHub Discussions este potrivit pentru propuneri de arhitectură, idei de integrare, experiențe de implementare, testare AIS în teren și colaborări academice sau de cercetare care pot fi discutate public.</p>
+          <a class="button" href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Propuneți public o idee</a>
+        </article>
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">🐞</div>
+          <h3>Raportați o problemă</h3>
+          <p>Folosiți GitHub Issues pentru defecte reproductibile și activități concrete în depozitul proiectului, nu pentru corespondență privată generală.</p>
+          <a class="button" href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Deschideți GitHub Issues</a>
+        </article>
+        <article class="card community-card">
+          <div class="icons" aria-hidden="true">✉️</div>
+          <h3>Contact privat</h3>
+          <p>Pentru întrebări tehnice, operaționale sau academice și propuneri de colaborare care nu sunt publice.</p>
+          <address class="contact-address">
+            <a class="contact-email" href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">iliyan85@gmail.com</a>
+          </address>
+        </article>
+      </div>
+      <aside class="callout" aria-label="Avertisment privind caracterul public și securitatea">
+        <p><strong>GitHub Discussions și Issues sunt publice.</strong> Nu publicați date de autentificare, chei private, locații sensibile ale receptoarelor, date cu caracter personal, jurnale confidențiale sau detalii nepublice despre colaborări.</p>
+        <p>Pentru vulnerabilități de securitate, urmați <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">politica de securitate</a> a proiectului. Nu raportați vulnerabilități prin Discussions sau Issues publice.</p>
+      </aside>
+      <article class="card maintainer-card">
+        <div>
+          <p class="eyebrow">Responsabil de întreținere</p>
+          <h3>Iliyan Iliev, PhD</h3>
+          <p class="maintainer-role">Responsabil de întreținerea AISMixer</p>
+          <p>Dezvoltator și cercetător în sisteme backend și de rețea, interesat de procesarea AIS/NMEA, securitatea maritimă și regională, transport și turism.</p>
+        </div>
+        <div class="links maintainer-links" role="group" aria-label="Legături ale responsabilului de întreținere">
+          <a href="https://github.com/iliyan85" target="_blank" rel="noopener">Profil GitHub</a>
+          <a href="https://orcid.org/0000-0002-8354-8930" target="_blank" rel="noopener">ORCID</a>
+          <a href="https://www.researchgate.net/profile/Iliyan-Iliev-11" target="_blank" rel="noopener">ResearchGate</a>
+          <a href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">E-mail privat</a>
+        </div>
+      </article>
+    </section>
   </main>
 
   <footer>
     <div class="container footer-inner">
       <span>© 2026 proiectul AISMixer</span>
-      <span class="muted">Procesarea și rutarea open-source a fluxurilor AIS</span>
+      <nav class="footer-links" aria-label="Legături în subsol">
+        <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a>
+        <a href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Discussions</a>
+        <a href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Issues</a>
+        <a href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">Contact</a>
+      </nav>
     </div>
   </footer>
 </body>
