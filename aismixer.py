@@ -3,7 +3,10 @@ import socket
 import yaml
 import os
 import time
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from functools import partial
+from typing import Any
 from forwarder import Forwarder
 from core.data_plane import (
     ProcessingSnapshot,
@@ -35,6 +38,17 @@ def ts() -> str:
 
 def format_source(ip, port):
     return f"[{ip}]:{port}" if ':' in ip else f"{ip}:{port}"
+
+
+def _ingress_task_name(role, index, entry, ip, port):
+    configured_id = entry.get("id")
+    label = (
+        configured_id
+        if isinstance(configured_id, str) and configured_id
+        else format_source(ip, port)
+    )
+    safe_label = label.encode("unicode_escape").decode("ascii")[:80]
+    return f"{role}-ingress:{index}:{safe_label}"
 
 
 def load_config():
@@ -114,16 +128,12 @@ class _EgressBatch:
     completion: asyncio.Future
 
 
-async def ingress_fan_in_loop(input_queues, output_queue):
-    """Preserve queue-item identity and ordering through one ingress fan-in."""
+@dataclass(frozen=True, slots=True)
+class _RuntimeTaskSpec:
+    """Private lazy specification for one supervised runtime task."""
 
-    async def reader(q):
-        while True:
-            item = await q.get()
-            await output_queue.put(item)
-
-    tasks = [asyncio.create_task(reader(q)) for q in input_queues]
-    await asyncio.gather(*tasks)
+    name: str
+    coroutine_factory: Callable[[], Coroutine[Any, Any, None]]
 
 
 async def _cancel_and_await_tasks(tasks):
@@ -132,6 +142,70 @@ async def _cancel_and_await_tasks(tasks):
             task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _supervise_named_tasks(task_specs):
+    """Fail fast while owning every named task through final outcome retrieval."""
+
+    specs = tuple(task_specs)
+    if not specs:
+        raise RuntimeError("Runtime supervision requires at least one task")
+
+    tasks = []
+    try:
+        for spec in specs:
+            coroutine = spec.coroutine_factory()
+            try:
+                task = asyncio.create_task(coroutine, name=spec.name)
+            except BaseException:
+                close = getattr(coroutine, "close", None)
+                if close is not None:
+                    close()
+                raise
+            tasks.append(task)
+
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        completed_tasks = tuple(task for task in tasks if task.done())
+
+        for task in completed_tasks:
+            if task.cancelled():
+                continue
+            failure = task.exception()
+            if failure is not None:
+                raise failure
+
+        completed_task = completed_tasks[0]
+        if completed_task.cancelled():
+            raise RuntimeError(
+                "Essential runtime task "
+                f"{completed_task.get_name()!r} was cancelled unexpectedly"
+            )
+        raise RuntimeError(
+            "Essential runtime task "
+            f"{completed_task.get_name()!r} terminated unexpectedly"
+        )
+    finally:
+        await _cancel_and_await_tasks(tasks)
+
+
+async def ingress_fan_in_loop(input_queues, output_queue):
+    """Preserve queue identity while owning every private reader task."""
+
+    async def reader(q):
+        while True:
+            item = await q.get()
+            await output_queue.put(item)
+
+    if not input_queues:
+        await asyncio.get_running_loop().create_future()
+
+    await _supervise_named_tasks(
+        _RuntimeTaskSpec(
+            name=f"ingress-reader:{index}",
+            coroutine_factory=partial(reader, queue),
+        )
+        for index, queue in enumerate(input_queues)
+    )
 
 
 def _cancel_or_retrieve_completion(completion):
@@ -250,26 +324,30 @@ async def _run_runtime_stages(
 ):
     """Run exactly one processor stage and one egress stage as one lifecycle."""
 
-    processor_task = asyncio.create_task(
-        processor_stage_loop(
-            ingress_queue,
-            egress_queue,
-            routing_state=routing_state,
-            processor=processor,
+    await _supervise_named_tasks(
+        (
+            _RuntimeTaskSpec(
+                name="processor-stage",
+                coroutine_factory=partial(
+                    processor_stage_loop,
+                    ingress_queue,
+                    egress_queue,
+                    routing_state=routing_state,
+                    processor=processor,
+                ),
+            ),
+            _RuntimeTaskSpec(
+                name="egress-stage",
+                coroutine_factory=partial(
+                    egress_stage_loop,
+                    egress_queue,
+                    output_forwarder,
+                    debug=debug,
+                    timestamp=timestamp,
+                ),
+            ),
         )
     )
-    egress_task = asyncio.create_task(
-        egress_stage_loop(
-            egress_queue,
-            output_forwarder,
-            debug=debug,
-            timestamp=timestamp,
-        )
-    )
-    try:
-        await asyncio.gather(processor_task, egress_task)
-    finally:
-        await _cancel_and_await_tasks((processor_task, egress_task))
 
 
 async def handle_socket(
@@ -313,7 +391,7 @@ async def main():
     input_queues = []
     processor_queue = asyncio.Queue()
     egress_queue = asyncio.Queue(maxsize=1)
-    runtime_tasks = []
+    runtime_task_specs = []
     udp_sockets = []
     sec_input_policies = compile_input_policies(SEC_INPUTS, "sec_inputs")
     udp_input_policies = compile_input_policies(UDP_INPUTS, "udp_inputs")
@@ -330,27 +408,39 @@ async def main():
             control_server_started = True
 
         # Secure входове
-        for entry, ingress_policy in zip(SEC_INPUTS, sec_input_policies):
+        for index, (entry, ingress_policy) in enumerate(
+            zip(SEC_INPUTS, sec_input_policies)
+        ):
             q = asyncio.Queue()
             input_queues.append(q)
             ip = entry["listen_ip"]
             port = entry["listen_port"]
             sec_id = entry.get("id")
             print(f"{ts()} Secure listening on {format_source(ip, port)}")
-            runtime_tasks.append(
-                asyncio.create_task(
-                    secure_server(
+            runtime_task_specs.append(
+                _RuntimeTaskSpec(
+                    name=_ingress_task_name(
+                        "udpsec",
+                        index,
+                        entry,
+                        ip,
+                        port,
+                    ),
+                    coroutine_factory=partial(
+                        secure_server,
                         q,
                         ip,
                         port,
                         sec_input_id=sec_id,
                         ingress_policy=ingress_policy,
-                    )
+                    ),
                 )
             )
 
         # UDP входове
-        for entry, ingress_policy in zip(UDP_INPUTS, udp_input_policies):
+        for index, (entry, ingress_policy) in enumerate(
+            zip(UDP_INPUTS, udp_input_policies)
+        ):
             q = asyncio.Queue()
             input_queues.append(q)
             ip = entry["listen_ip"]
@@ -364,35 +454,61 @@ async def main():
             print(f"{ts()} Listening on {format_source(ip, port)}")
             # ако има id -> фиксиран alias за целия вход
             fixed_alias = entry.get("id")
-            runtime_tasks.append(
-                asyncio.create_task(
-                    handle_socket(
+            runtime_task_specs.append(
+                _RuntimeTaskSpec(
+                    name=_ingress_task_name(
+                        "udp",
+                        index,
+                        entry,
+                        ip,
+                        port,
+                    ),
+                    coroutine_factory=partial(
+                        handle_socket,
                         sock,
                         q,
                         fixed_alias,
                         alias_map=UDP_ALIAS_MAP if not fixed_alias else None,
                         ingress_policy=ingress_policy,
-                    )
+                    ),
                 )
             )
 
         # Ingress fan-in + processor + egress
-        runtime_tasks.append(
-            asyncio.create_task(
-                ingress_fan_in_loop(input_queues, processor_queue)
+        runtime_task_specs.extend(
+            (
+                _RuntimeTaskSpec(
+                    name="ingress-fan-in",
+                    coroutine_factory=partial(
+                        ingress_fan_in_loop,
+                        tuple(input_queues),
+                        processor_queue,
+                    ),
+                ),
+                _RuntimeTaskSpec(
+                    name="processor-stage",
+                    coroutine_factory=partial(
+                        processor_stage_loop,
+                        processor_queue,
+                        egress_queue,
+                        routing_state=routing_state,
+                        processor=data_plane_processor,
+                    ),
+                ),
+                _RuntimeTaskSpec(
+                    name="egress-stage",
+                    coroutine_factory=partial(
+                        egress_stage_loop,
+                        egress_queue,
+                        forwarder,
+                        debug=DEBUG,
+                        timestamp=ts,
+                    ),
+                ),
             )
         )
-        await _run_runtime_stages(
-            processor_queue,
-            egress_queue,
-            routing_state=routing_state,
-            processor=data_plane_processor,
-            output_forwarder=forwarder,
-            debug=DEBUG,
-            timestamp=ts,
-        )
+        await _supervise_named_tasks(runtime_task_specs)
     finally:
-        await _cancel_and_await_tasks(runtime_tasks)
         for sock in udp_sockets:
             sock.close()
         if control_server_started:

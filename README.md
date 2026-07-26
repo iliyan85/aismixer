@@ -116,6 +116,12 @@ Each non-empty complete processor-output batch then passes to a single egress
 stage, which dispatches it sequentially before the processor stage consumes
 the next item.
 
+All UDP and UDPSEC producer tasks, the ingress fan-in task, and the processor
+and egress tasks are supervised as one process-local lifecycle. Failure or
+unexpected completion of any one terminates the runtime after all remaining
+tasks are cancelled and awaited; no automatic restart, retry, or delivery
+replay is provided.
+
 For each accepted frame, the data plane captures one immutable routing snapshot
 and matches `source_id` once. It scans the frame payload as bytes, parses NMEA
 fragment fields and relevant TAG metadata once, passes parsed sentences to the
@@ -773,6 +779,12 @@ AISMixer разделя **слоя за данни** (`data plane`) и **сло�
 непразен пълен пакет от изходи на процесора се предава към един egress етап,
 който го изпраща последователно, преди етапът за обработка да приеме следващия
 елемент.
+
+Всички задачи за UDP и UDPSEC входовете, ingress fan-in задачата и задачите на
+етапите за обработка и egress се наблюдават като един локален за процеса жизнен
+цикъл. Грешка или неочаквано приключване на която и да е от тях прекратява
+runtime-а, след като останалите задачи бъдат отменени и изчакани; няма
+автоматично рестартиране, повторен опит или повторно изпращане на данните.
 
 За всеки приет `IngressFrame` слоят за данни взема една неизменяема моментна
 снимка на маршрутизацията и съпоставя `source_id` веднъж. Той сканира payload-а
@@ -1453,6 +1465,12 @@ legacy `IngressEvent` valide; evenimentele de compatibilitate nevalide și
 elementele nesuportate sunt ignorate înainte de rutare. Fiecare lot complet
 nevid de ieșiri ale procesorului ajunge apoi la o singură etapă egress, care îl
 expediază secvențial înainte ca etapa procesorului să consume următorul element.
+
+Toate task-urile producătorilor UDP și UDPSEC, ale fan-in-ului ingress și ale
+etapelor de procesare și egress sunt supravegheate ca un singur ciclu de viață
+local procesului. Eșecul sau finalizarea neașteptată a oricăruia termină
+runtime-ul după anularea și așteptarea celorlalte task-uri; nu există repornire
+automată, reîncercare sau reluare a livrării.
 
 Pentru fiecare cadru acceptat, planul de date preia un singur snapshot imuabil
 de rutare și potrivește `source_id` o singură dată. Scanează payload-ul cadrului

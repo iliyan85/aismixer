@@ -298,7 +298,7 @@ async def run_aismixer_main(
     monkeypatch,
     *,
     control_server=None,
-    stages_exc=None,
+    supervisor_exc=None,
     observer=None,
 ):
     observer = observer if observer is not None else {}
@@ -314,53 +314,21 @@ async def run_aismixer_main(
 
     forwarder = FakeForwarder()
     builder_calls = []
-    fan_in_cancelled = {"value": False}
-    stages_called = {
+    supervisor_called = {
         "value": False,
-        "ingress_queue": None,
-        "egress_queue": None,
-        "routing_state": None,
-        "processor": None,
-        "output_forwarder": None,
-        "debug": None,
-        "timestamp": None,
+        "specs": (),
     }
-    fan_in_started = asyncio.Event()
 
     def fake_builder(config, state, available_target_ids):
         builder_calls.append((config, state, available_target_ids))
         return control_server
 
-    async def fake_ingress_fan_in_loop(_input_queues, _output_queue):
-        fan_in_started.set()
-        try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
-            fan_in_cancelled["value"] = True
-            raise
-
-    async def fake_run_runtime_stages(
-        ingress_queue,
-        egress_queue,
-        *,
-        routing_state=None,
-        processor=None,
-        output_forwarder,
-        debug=False,
-        timestamp=None,
-    ):
-        observer["stages_called"] = True
-        stages_called["value"] = True
-        stages_called["ingress_queue"] = ingress_queue
-        stages_called["egress_queue"] = egress_queue
-        stages_called["routing_state"] = routing_state
-        stages_called["processor"] = processor
-        stages_called["output_forwarder"] = output_forwarder
-        stages_called["debug"] = debug
-        stages_called["timestamp"] = timestamp
-        await fan_in_started.wait()
-        if stages_exc is not None:
-            raise stages_exc
+    async def fake_supervise_named_tasks(task_specs):
+        observer["supervisor_called"] = True
+        supervisor_called["value"] = True
+        supervisor_called["specs"] = tuple(task_specs)
+        if supervisor_exc is not None:
+            raise supervisor_exc
 
     monkeypatch.setattr(aismixer, "SEC_INPUTS", [])
     monkeypatch.setattr(aismixer, "UDP_INPUTS", [])
@@ -370,21 +338,15 @@ async def run_aismixer_main(
     monkeypatch.setattr(aismixer, "build_optional_routing_control_server", fake_builder)
     monkeypatch.setattr(
         aismixer,
-        "ingress_fan_in_loop",
-        fake_ingress_fan_in_loop,
-    )
-    monkeypatch.setattr(
-        aismixer,
-        "_run_runtime_stages",
-        fake_run_runtime_stages,
+        "_supervise_named_tasks",
+        fake_supervise_named_tasks,
     )
 
     await aismixer.main()
 
     return {
         "builder_calls": builder_calls,
-        "fan_in_cancelled": fan_in_cancelled["value"],
-        "stages_called": stages_called,
+        "supervisor_called": supervisor_called,
         "routing_state": routing_state,
         "forwarder": forwarder,
         "forwarder_close_count": forwarder.close_count,
@@ -397,18 +359,29 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
     assert result["builder_calls"] == [
         ({"control": None}, result["routing_state"], ("udp:a",))
     ]
-    assert result["stages_called"]["value"] is True
-    assert result["stages_called"]["routing_state"] is result["routing_state"]
-    assert result["stages_called"]["processor"] is aismixer.data_plane_processor
-    assert result["stages_called"]["output_forwarder"] is result["forwarder"]
-    assert result["stages_called"]["debug"] is aismixer.DEBUG
-    assert result["stages_called"]["timestamp"] is aismixer.ts
-    assert (
-        result["stages_called"]["ingress_queue"]
-        is not result["stages_called"]["egress_queue"]
+    assert result["supervisor_called"]["value"] is True
+    specs = {
+        spec.name: spec
+        for spec in result["supervisor_called"]["specs"]
+    }
+    assert tuple(specs) == (
+        "ingress-fan-in",
+        "processor-stage",
+        "egress-stage",
     )
-    assert result["stages_called"]["egress_queue"].maxsize == 1
-    assert result["fan_in_cancelled"] is True
+    processor_factory = specs["processor-stage"].coroutine_factory
+    egress_factory = specs["egress-stage"].coroutine_factory
+    assert processor_factory.keywords == {
+        "routing_state": result["routing_state"],
+        "processor": aismixer.data_plane_processor,
+    }
+    assert egress_factory.args[1] is result["forwarder"]
+    assert egress_factory.keywords == {
+        "debug": aismixer.DEBUG,
+        "timestamp": aismixer.ts,
+    }
+    assert processor_factory.args[1] is egress_factory.args[0]
+    assert egress_factory.args[0].maxsize == 1
     assert result["forwarder_close_count"] == 1
 
 
@@ -419,11 +392,10 @@ def test_enabled_control_starts_and_closes_server(monkeypatch):
 
     assert server.start_count == 1
     assert server.close_count == 1
-    assert result["fan_in_cancelled"] is True
     assert result["forwarder_close_count"] == 1
 
 
-def test_server_closes_when_runtime_stages_raise(monkeypatch):
+def test_server_closes_when_runtime_supervisor_raises(monkeypatch):
     server = FakeControlServer()
 
     with pytest.raises(RuntimeError, match="forward failed"):
@@ -431,7 +403,7 @@ def test_server_closes_when_runtime_stages_raise(monkeypatch):
             run_aismixer_main(
                 monkeypatch,
                 control_server=server,
-                stages_exc=RuntimeError("forward failed"),
+                supervisor_exc=RuntimeError("forward failed"),
             )
         )
 
@@ -439,7 +411,7 @@ def test_server_closes_when_runtime_stages_raise(monkeypatch):
     assert server.close_count == 1
 
 
-def test_server_closes_when_runtime_stages_are_cancelled(monkeypatch):
+def test_server_closes_when_runtime_supervisor_is_cancelled(monkeypatch):
     server = FakeControlServer()
 
     with pytest.raises(asyncio.CancelledError):
@@ -447,7 +419,7 @@ def test_server_closes_when_runtime_stages_are_cancelled(monkeypatch):
             run_aismixer_main(
                 monkeypatch,
                 control_server=server,
-                stages_exc=asyncio.CancelledError(),
+                supervisor_exc=asyncio.CancelledError(),
             )
         )
 
@@ -455,7 +427,7 @@ def test_server_closes_when_runtime_stages_are_cancelled(monkeypatch):
     assert server.close_count == 1
 
 
-def test_server_start_failure_prevents_runtime_stages_and_propagates(monkeypatch):
+def test_server_start_failure_prevents_runtime_supervisor_and_propagates(monkeypatch):
     server = FakeControlServer(start_exc=PermissionError("bind denied"))
     observer = {}
 
@@ -470,7 +442,236 @@ def test_server_start_failure_prevents_runtime_stages_and_propagates(monkeypatch
 
     assert server.start_count == 1
     assert server.close_count == 0
-    assert observer.get("stages_called") is None
+    assert observer.get("supervisor_called") is None
+
+
+class _MainTestSocket:
+    def __init__(self, bind_exc=None):
+        self.bind_exc = bind_exc
+        self.bind_calls = []
+        self.close_count = 0
+
+    def setsockopt(self, *_args):
+        return None
+
+    def bind(self, address):
+        self.bind_calls.append(address)
+        if self.bind_exc is not None:
+            raise self.bind_exc
+
+    def setblocking(self, _blocking):
+        return None
+
+    def close(self):
+        self.close_count += 1
+
+
+class _MainTestSocketModule:
+    AF_INET = object()
+    AF_INET6 = object()
+    SOCK_DGRAM = object()
+    SOL_SOCKET = object()
+    SO_REUSEADDR = object()
+
+    def __init__(self, sockets):
+        self._sockets = iter(sockets)
+
+    def socket(self, _family, _socket_type):
+        return next(self._sockets)
+
+
+class _MainTestForwarder:
+    target_ids = ("udp:target",)
+
+    def __init__(self):
+        self.close_count = 0
+
+    def close(self):
+        self.close_count += 1
+
+
+def _configure_main_lifecycle_test(
+    monkeypatch,
+    *,
+    sec_inputs=(),
+    udp_inputs=(),
+    sockets=(),
+    control_server=None,
+    supervisor=None,
+):
+    state = RoutingState()
+    output_forwarder = _MainTestForwarder()
+
+    monkeypatch.setattr(aismixer, "SEC_INPUTS", list(sec_inputs))
+    monkeypatch.setattr(aismixer, "UDP_INPUTS", list(udp_inputs))
+    monkeypatch.setattr(aismixer, "config", {"control": None})
+    monkeypatch.setattr(aismixer, "routing_state", state)
+    monkeypatch.setattr(aismixer, "forwarder", output_forwarder)
+    monkeypatch.setattr(
+        aismixer,
+        "socket",
+        _MainTestSocketModule(sockets),
+    )
+    monkeypatch.setattr(
+        aismixer,
+        "build_optional_routing_control_server",
+        lambda *_args: control_server,
+    )
+    if supervisor is not None:
+        monkeypatch.setattr(
+            aismixer,
+            "_supervise_named_tasks",
+            supervisor,
+        )
+
+    return state, output_forwarder
+
+
+def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
+    async def scenario():
+        udp_socket = _MainTestSocket()
+        supervision_calls = []
+
+        async def fake_supervisor(task_specs):
+            supervision_calls.append(tuple(task_specs))
+
+        state, output_forwarder = _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure_station",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10111,
+                },
+            ),
+            udp_inputs=(
+                {
+                    "id": "plain_station",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10110,
+                },
+            ),
+            sockets=(udp_socket,),
+            supervisor=fake_supervisor,
+        )
+
+        await aismixer.main()
+
+        assert len(supervision_calls) == 1
+        specs = supervision_calls[0]
+        assert [spec.name for spec in specs] == [
+            "udpsec-ingress:0:secure_station",
+            "udp-ingress:0:plain_station",
+            "ingress-fan-in",
+            "processor-stage",
+            "egress-stage",
+        ]
+
+        secure_factory = specs[0].coroutine_factory
+        udp_factory = specs[1].coroutine_factory
+        fan_in_factory = specs[2].coroutine_factory
+        processor_factory = specs[3].coroutine_factory
+        egress_factory = specs[4].coroutine_factory
+
+        assert secure_factory.func is aismixer.secure_server
+        assert secure_factory.args[1:] == ("127.0.0.1", 10111)
+        assert secure_factory.keywords["sec_input_id"] == "secure_station"
+        assert udp_factory.func is aismixer.handle_socket
+        assert udp_factory.args[0] is udp_socket
+        assert udp_factory.args[2] == "plain_station"
+        assert fan_in_factory.func is aismixer.ingress_fan_in_loop
+        assert fan_in_factory.args[0] == (
+            secure_factory.args[0],
+            udp_factory.args[1],
+        )
+        assert processor_factory.func is aismixer.processor_stage_loop
+        assert processor_factory.keywords == {
+            "routing_state": state,
+            "processor": aismixer.data_plane_processor,
+        }
+        assert egress_factory.func is aismixer.egress_stage_loop
+        assert egress_factory.args[1] is output_forwarder
+        assert udp_socket.close_count == 1
+        assert output_forwarder.close_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_partial_listener_startup_failure_closes_started_resources(monkeypatch):
+    async def scenario():
+        control_server = FakeControlServer()
+        first_socket = _MainTestSocket()
+        bind_failure = OSError("second bind failed")
+        second_socket = _MainTestSocket(bind_exc=bind_failure)
+        supervisor_called = False
+
+        async def fake_supervisor(_task_specs):
+            nonlocal supervisor_called
+            supervisor_called = True
+
+        _, output_forwarder = _configure_main_lifecycle_test(
+            monkeypatch,
+            udp_inputs=(
+                {
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10110,
+                },
+                {
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10111,
+                },
+            ),
+            sockets=(first_socket, second_socket),
+            control_server=control_server,
+            supervisor=fake_supervisor,
+        )
+
+        with pytest.raises(OSError) as excinfo:
+            await aismixer.main()
+
+        assert excinfo.value is bind_failure
+        assert supervisor_called is False
+        assert first_socket.close_count == 1
+        assert second_socket.close_count == 1
+        assert control_server.start_count == 1
+        assert control_server.close_count == 1
+        assert output_forwarder.close_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_runtime_failure_closes_each_main_resource_exactly_once(monkeypatch):
+    async def scenario():
+        failure = RuntimeError("runtime failed")
+        control_server = FakeControlServer()
+        udp_socket = _MainTestSocket()
+
+        async def failing_supervisor(_task_specs):
+            raise failure
+
+        _, output_forwarder = _configure_main_lifecycle_test(
+            monkeypatch,
+            udp_inputs=(
+                {
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10110,
+                },
+            ),
+            sockets=(udp_socket,),
+            control_server=control_server,
+            supervisor=failing_supervisor,
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await aismixer.main()
+
+        assert excinfo.value is failure
+        assert udp_socket.close_count == 1
+        assert control_server.start_count == 1
+        assert control_server.close_count == 1
+        assert output_forwarder.close_count == 1
+
+    asyncio.run(scenario())
 
 
 def test_main_does_not_construct_a_second_routing_state(monkeypatch):

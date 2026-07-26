@@ -468,6 +468,26 @@ private runtime-orchestration mechanisms. They do not alter
 define neither a native API or ABI nor an IPC protocol. Campaign D3 introduces
 no multiprocessing, threads, worker pool, or second processor implementation.
 
+### Runtime lifecycle supervision
+
+Every essential long-lived runtime task—each UDP and UDPSEC ingress producer,
+ingress fan-in, the processor stage, and the egress stage—is owned by one
+process-local supervision lifecycle. The fan-in in turn owns its private reader
+tasks. Failure, cancellation, or unexpected normal return by any essential task
+terminates the runtime: every still-running sibling is cancelled, and all owned
+task outcomes are awaited and retrieved before the primary failure, or a clear
+unexpected-termination error, propagates. Exceptions are not left detached
+from the runtime lifecycle.
+
+External cancellation cancels and awaits all owned tasks and is re-raised.
+Stage cleanup resolves or cancels pending batch-completion acknowledgement
+state, and fan-in cleanup cancels and awaits every private reader, so neither a
+blocked acknowledgement nor a nested reader outlives its owner.
+
+This lifecycle defines termination only. It provides no automatic restart,
+retry, persistence, or delivery replay. Supervision is process-local and
+defines no coordinator/worker supervision or IPC protocol.
+
 ### Output formatting and cleanup
 
 For emitted multipart output, the first fragment receives the primary `c`, `s`,

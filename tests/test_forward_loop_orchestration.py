@@ -188,7 +188,10 @@ def test_invalid_item_is_ignored_before_snapshot_and_processing_then_loop_contin
     processor = ScriptedProcessor(())
     output_forwarder = RecordingForwarder()
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(
+        RuntimeError,
+        match="processor-stage.*cancelled unexpectedly",
+    ):
         asyncio.run(
             run_runtime_stages(
                 FiniteQueue(object(), frame),
@@ -226,7 +229,10 @@ def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
     )
     forwarder = RecordingForwarder()
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(
+        RuntimeError,
+        match="processor-stage.*cancelled unexpectedly",
+    ):
         asyncio.run(
             run_runtime_stages(
                 FiniteQueue(frame),
@@ -295,7 +301,10 @@ def test_whole_frame_processing_and_effects_complete_before_ordered_egress():
         (FIRST_SENTENCE + "\n" + SECOND_SENTENCE).encode("ascii")
     )
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(
+        RuntimeError,
+        match="processor-stage.*cancelled unexpectedly",
+    ):
         asyncio.run(
             run_runtime_stages(
                 FiniteQueue(frame),

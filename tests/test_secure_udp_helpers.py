@@ -287,6 +287,7 @@ class _FakeSecureSocket:
         self.bound = None
         self.blocking = None
         self.sent = []
+        self.close_count = 0
 
     def bind(self, addr):
         self.bound = addr
@@ -296,6 +297,9 @@ class _FakeSecureSocket:
 
     def sendto(self, data, addr):
         self.sent.append((data, addr))
+
+    def close(self):
+        self.close_count += 1
 
 
 class _FakeSecureLoop:
@@ -424,7 +428,36 @@ def _run_secure_server_with_packets(
             )
         )
 
+    assert fake_socket.close_count == 1
     return fake_queue, fake_socket
+
+
+def test_secure_server_closes_owned_socket_when_bind_fails(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    bind_failure = OSError("bind failed")
+
+    class BindFailingSocket(_FakeSecureSocket):
+        def bind(self, _addr):
+            raise bind_failure
+
+    fake_socket = BindFailingSocket()
+    monkeypatch.setattr(
+        secure,
+        "socket",
+        _FakeSocketModule(fake_socket, secure.socket),
+    )
+
+    with pytest.raises(OSError) as excinfo:
+        asyncio.run(
+            secure.secure_server(
+                _FakeQueue(),
+                "127.0.0.1",
+                9999,
+            )
+        )
+
+    assert excinfo.value is bind_failure
+    assert fake_socket.close_count == 1
 
 
 def _install_test_session(

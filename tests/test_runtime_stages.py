@@ -484,34 +484,15 @@ def test_main_wires_module_processor_and_forwarder_into_runtime_stages(
                 self.close_calls += 1
 
         output_forwarder = MainForwarder()
-        stage_calls = []
+        supervision_calls = []
         builder_calls = []
 
         def fake_builder(config, routing_state, target_ids):
             builder_calls.append((config, routing_state, target_ids))
             return None
 
-        async def fake_run_runtime_stages(
-            ingress_queue,
-            egress_queue,
-            *,
-            routing_state=None,
-            processor=None,
-            output_forwarder,
-            debug=False,
-            timestamp=None,
-        ):
-            stage_calls.append(
-                (
-                    ingress_queue,
-                    egress_queue,
-                    routing_state,
-                    processor,
-                    output_forwarder,
-                    debug,
-                    timestamp,
-                )
-            )
+        async def fake_supervise_named_tasks(task_specs):
+            supervision_calls.append(tuple(task_specs))
 
         monkeypatch.setattr(aismixer, "SEC_INPUTS", [])
         monkeypatch.setattr(aismixer, "UDP_INPUTS", [])
@@ -527,8 +508,8 @@ def test_main_wires_module_processor_and_forwarder_into_runtime_stages(
         )
         monkeypatch.setattr(
             aismixer,
-            "_run_runtime_stages",
-            fake_run_runtime_stages,
+            "_supervise_named_tasks",
+            fake_supervise_named_tasks,
         )
 
         await aismixer.main()
@@ -536,23 +517,35 @@ def test_main_wires_module_processor_and_forwarder_into_runtime_stages(
         assert builder_calls == [
             ({"control": None}, state, ("udp:target",))
         ]
-        assert len(stage_calls) == 1
-        (
-            ingress_queue,
-            egress_queue,
-            passed_state,
-            passed_processor,
-            passed_forwarder,
-            debug,
-            timestamp,
-        ) = stage_calls[0]
+        assert len(supervision_calls) == 1
+        specs = {spec.name: spec for spec in supervision_calls[0]}
+        assert tuple(specs) == (
+            "ingress-fan-in",
+            "processor-stage",
+            "egress-stage",
+        )
+
+        fan_in_factory = specs["ingress-fan-in"].coroutine_factory
+        processor_factory = specs["processor-stage"].coroutine_factory
+        egress_factory = specs["egress-stage"].coroutine_factory
+        assert fan_in_factory.func is aismixer.ingress_fan_in_loop
+        assert fan_in_factory.args[0] == ()
+        ingress_queue = fan_in_factory.args[1]
+        assert processor_factory.func is aismixer.processor_stage_loop
+        assert processor_factory.args[0] is ingress_queue
+        egress_queue = processor_factory.args[1]
+        assert egress_factory.func is aismixer.egress_stage_loop
+        assert egress_factory.args == (egress_queue, output_forwarder)
         assert isinstance(ingress_queue, asyncio.Queue)
         assert isinstance(egress_queue, asyncio.Queue)
-        assert passed_state is state
-        assert passed_processor is processor
-        assert passed_forwarder is output_forwarder
-        assert debug is False
-        assert timestamp is aismixer.ts
+        assert processor_factory.keywords == {
+            "routing_state": state,
+            "processor": processor,
+        }
+        assert egress_factory.keywords == {
+            "debug": False,
+            "timestamp": aismixer.ts,
+        }
         assert output_forwarder.close_calls == 1
 
     asyncio.run(scenario())

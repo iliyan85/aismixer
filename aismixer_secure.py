@@ -553,7 +553,8 @@ def derive_session_key(shared_secret, combined_sig):
     return h.finalize()
 
 
-async def secure_server(
+async def _secure_server_loop(
+    sock,
     queue,
     ip,
     port,
@@ -564,8 +565,6 @@ async def secure_server(
     wall_clock=None,
     monotonic_clock=None,
 ):
-    sock = socket.socket(
-        socket.AF_INET6 if ':' in ip else socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((ip, port))
     sock.setblocking(False)
     loop = asyncio.get_running_loop()
@@ -744,3 +743,36 @@ async def secure_server(
             except Exception as e:
                 print(
                     f"[!] Secure data error from {addr}: {type(e).__name__}: {e}")
+
+
+async def secure_server(
+    queue,
+    ip,
+    port,
+    sec_input_id=None,
+    ingress_policy=None,
+    *,
+    state=None,
+    wall_clock=None,
+    monotonic_clock=None,
+):
+    """Run one secure ingress producer and close its owned socket exactly once."""
+
+    sock = socket.socket(
+        socket.AF_INET6 if ':' in ip else socket.AF_INET,
+        socket.SOCK_DGRAM,
+    )
+    try:
+        await _secure_server_loop(
+            sock,
+            queue,
+            ip,
+            port,
+            sec_input_id=sec_input_id,
+            ingress_policy=ingress_policy,
+            state=state,
+            wall_clock=wall_clock,
+            monotonic_clock=monotonic_clock,
+        )
+    finally:
+        sock.close()
