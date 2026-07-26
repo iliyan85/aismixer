@@ -1,0 +1,371 @@
+import asyncio
+
+import pytest
+
+import aismixer
+from core.data_plane import ProcessorOutput, RoutingDisposition
+from core.ingress_frame import IngressFrame
+from core.python_data_plane import PythonDataPlaneProcessor
+from core.routing_state import RoutingSnapshot
+from dedup import Deduplicator
+
+
+FIRST_SENTENCE = "!AIVDM,1,1,,A,first-payload,0*00"
+SECOND_SENTENCE = "!AIVDM,1,1,,B,second-payload,0*00"
+
+
+def make_frame(payload=b"!AIVDM,1,1,,A,payload,0*00"):
+    return IngressFrame(
+        kind="udp",
+        source_id="udp:source",
+        alias_for_s=None,
+        remote_ip="192.0.2.10",
+        assembler_key="192.0.2.10:17778",
+        payload=payload,
+    )
+
+
+class FiniteQueue:
+    def __init__(self, *items):
+        self._items = list(items)
+
+    async def get(self):
+        if self._items:
+            return self._items.pop(0)
+        raise asyncio.CancelledError()
+
+
+class RecordingRoutingState:
+    def __init__(self, snapshot):
+        self._snapshot = snapshot
+        self.snapshot_calls = 0
+
+    def snapshot(self):
+        self.snapshot_calls += 1
+        return self._snapshot
+
+
+class ScriptedProcessor:
+    def __init__(self, *batches):
+        self._batches = list(batches)
+        self.calls = []
+
+    def process(self, frame, snapshot):
+        self.calls.append((frame, snapshot))
+        return self._batches.pop(0) if self._batches else ()
+
+
+class CompletionRecordingProcessor:
+    def __init__(self, delegate):
+        self._delegate = delegate
+        self.completed = False
+        self.outputs = None
+
+    def process(self, frame, snapshot):
+        outputs = self._delegate.process(frame, snapshot)
+        self.outputs = outputs
+        self.completed = True
+        return outputs
+
+
+class RecordingForwarder:
+    def __init__(self, fail_at=None):
+        self.events = []
+        self._fail_at = fail_at
+
+    async def send(self, message):
+        self.events.append(("broadcast", message))
+        self._raise_if_requested()
+
+    async def send_to(self, target_ids, message):
+        self.events.append(("targeted", tuple(target_ids), message))
+        self._raise_if_requested()
+
+    def _raise_if_requested(self):
+        if self._fail_at == len(self.events):
+            raise RuntimeError("send failed")
+
+
+class BoundaryObservingForwarder:
+    def __init__(
+        self,
+        processor,
+        deduplicator,
+        touched_s_values,
+        clock_observations,
+        gid_observations,
+        *,
+        fail_first=False,
+    ):
+        self._processor = processor
+        self._deduplicator = deduplicator
+        self._touched_s_values = touched_s_values
+        self._clock_observations = clock_observations
+        self._gid_observations = gid_observations
+        self._fail_first = fail_first
+        self.observations = []
+        self.attempted_messages = []
+
+    async def send(self, message):
+        self.observations.append(
+            {
+                "processor_completed": self._processor.completed,
+                "outputs": self._processor.outputs,
+                "dedup_stats": self._deduplicator.stats(),
+                "touched_s_values": tuple(self._touched_s_values),
+                "clock_observations": tuple(self._clock_observations),
+                "gid_observations": tuple(self._gid_observations),
+            }
+        )
+        self.attempted_messages.append(message)
+        if self._fail_first and len(self.attempted_messages) == 1:
+            raise RuntimeError("send failed")
+
+    async def send_to(self, _target_ids, _message):
+        raise AssertionError("boundary test expects legacy broadcast output")
+
+
+def make_boundary_processor():
+    touched_s_values = []
+    clock_observations = []
+    clock_values = iter((1001.9, 1002.9))
+    gid_observations = []
+    gid_values = iter(("111111", "222222"))
+    deduplicator = Deduplicator(clock=lambda: 0.0)
+
+    def wall_clock():
+        value = next(clock_values)
+        clock_observations.append(value)
+        return value
+
+    def generate_gid(digits):
+        value = next(gid_values)
+        gid_observations.append((digits, value))
+        return value
+
+    processor = CompletionRecordingProcessor(
+        PythonDataPlaneProcessor(
+            station_id="boundary",
+            always_tag_single=True,
+            gid_digits=6,
+            deduplicator=deduplicator,
+            wall_clock=wall_clock,
+            gid_generator=generate_gid,
+            touch_s_operation=touched_s_values.append,
+        )
+    )
+    return (
+        processor,
+        deduplicator,
+        touched_s_values,
+        clock_observations,
+        gid_observations,
+    )
+
+
+def test_invalid_item_is_ignored_before_snapshot_and_processing_then_loop_continues(
+    monkeypatch,
+):
+    frame = make_frame()
+    state = RecordingRoutingState(
+        RoutingSnapshot(generation=7, table=None)
+    )
+    processor = ScriptedProcessor(())
+    monkeypatch.setattr(aismixer, "forwarder", RecordingForwarder())
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.forward_loop(
+                FiniteQueue(object(), frame),
+                routing_state=state,
+                processor=processor,
+            )
+        )
+
+    assert state.snapshot_calls == 1
+    assert len(processor.calls) == 1
+    processed_frame, snapshot = processor.calls[0]
+    assert processed_frame is frame
+    assert snapshot.routing_generation == 7
+    assert snapshot.routing_table is None
+
+
+def test_processor_is_called_once_and_outputs_are_dispatched_sequentially(
+    monkeypatch,
+):
+    frame = make_frame()
+    state = RecordingRoutingState(
+        RoutingSnapshot(generation=3, table=None)
+    )
+    processor = ScriptedProcessor(
+        (
+            ProcessorOutput(
+                "first\r\n",
+                RoutingDisposition.LEGACY_BROADCAST,
+            ),
+            ProcessorOutput(
+                "second\r\n",
+                RoutingDisposition.TARGETED,
+                ("udp:second", "udp:first"),
+            ),
+        )
+    )
+    forwarder = RecordingForwarder()
+    monkeypatch.setattr(aismixer, "forwarder", forwarder)
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.forward_loop(
+                FiniteQueue(frame),
+                routing_state=state,
+                processor=processor,
+            )
+        )
+
+    assert state.snapshot_calls == 1
+    assert len(processor.calls) == 1
+    assert forwarder.events == [
+        ("broadcast", "first\r\n"),
+        (
+            "targeted",
+            ("udp:second", "udp:first"),
+            "second\r\n",
+        ),
+    ]
+
+
+def test_dispatch_failure_stops_before_later_output_dispatch(monkeypatch):
+    processor = ScriptedProcessor(
+        (
+            ProcessorOutput(
+                "first\r\n",
+                RoutingDisposition.LEGACY_BROADCAST,
+            ),
+            ProcessorOutput(
+                "second\r\n",
+                RoutingDisposition.LEGACY_BROADCAST,
+            ),
+        )
+    )
+    forwarder = RecordingForwarder(fail_at=1)
+    monkeypatch.setattr(aismixer, "forwarder", forwarder)
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(RuntimeError, match="send failed"):
+        asyncio.run(
+            aismixer.forward_loop(
+                FiniteQueue(make_frame()),
+                processor=processor,
+            )
+        )
+
+    assert len(processor.calls) == 1
+    assert forwarder.events == [("broadcast", "first\r\n")]
+
+
+def test_whole_frame_processing_and_effects_complete_before_ordered_egress(
+    monkeypatch,
+):
+    (
+        processor,
+        deduplicator,
+        touched_s_values,
+        clock_observations,
+        gid_observations,
+    ) = make_boundary_processor()
+    forwarder = BoundaryObservingForwarder(
+        processor,
+        deduplicator,
+        touched_s_values,
+        clock_observations,
+        gid_observations,
+    )
+    frame = make_frame(
+        (FIRST_SENTENCE + "\n" + SECOND_SENTENCE).encode("ascii")
+    )
+    monkeypatch.setattr(aismixer, "forwarder", forwarder)
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.forward_loop(
+                FiniteQueue(frame),
+                processor=processor,
+            )
+        )
+
+    outputs = processor.outputs
+    assert processor.completed is True
+    assert outputs is not None
+    assert len(outputs) == 2
+    assert outputs[0].message.endswith(FIRST_SENTENCE + "\r\n")
+    assert outputs[1].message.endswith(SECOND_SENTENCE + "\r\n")
+
+    first_send = forwarder.observations[0]
+    assert first_send == {
+        "processor_completed": True,
+        "outputs": outputs,
+        "dedup_stats": deduplicator.stats(),
+        "touched_s_values": ("boundary", "boundary"),
+        "clock_observations": (1001.9, 1002.9),
+        "gid_observations": (
+            (6, "111111"),
+            (6, "222222"),
+        ),
+    }
+    assert first_send["dedup_stats"].accepted == 2
+    assert forwarder.attempted_messages == [
+        output.message for output in outputs
+    ]
+
+
+def test_first_send_failure_keeps_completed_effects_and_later_output(
+    monkeypatch,
+):
+    (
+        processor,
+        deduplicator,
+        touched_s_values,
+        clock_observations,
+        gid_observations,
+    ) = make_boundary_processor()
+    forwarder = BoundaryObservingForwarder(
+        processor,
+        deduplicator,
+        touched_s_values,
+        clock_observations,
+        gid_observations,
+        fail_first=True,
+    )
+    frame = make_frame(
+        (FIRST_SENTENCE + "\n" + SECOND_SENTENCE).encode("ascii")
+    )
+    monkeypatch.setattr(aismixer, "forwarder", forwarder)
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(RuntimeError, match="send failed"):
+        asyncio.run(
+            aismixer.forward_loop(
+                FiniteQueue(frame),
+                processor=processor,
+            )
+        )
+
+    outputs = processor.outputs
+    assert processor.completed is True
+    assert outputs is not None
+    assert len(outputs) == 2
+    assert outputs[0].message.endswith(FIRST_SENTENCE + "\r\n")
+    assert outputs[1].message.endswith(SECOND_SENTENCE + "\r\n")
+    assert forwarder.attempted_messages == [outputs[0].message]
+
+    assert touched_s_values == ["boundary", "boundary"]
+    assert clock_observations == [1001.9, 1002.9]
+    assert gid_observations == [
+        (6, "111111"),
+        (6, "222222"),
+    ]
+    assert deduplicator.stats().accepted == 2
+    assert forwarder.observations[0]["outputs"] is outputs

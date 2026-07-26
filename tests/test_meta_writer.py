@@ -31,3 +31,32 @@ def test_wrap_with_meta_later_multipart_adds_only_g():
         wrap_with_meta(line, "boat", timestamp=123, is_first=False, g_triplet="2-2-99")
         == "\\g:2-2-99*5D\\" + line
     )
+
+
+def test_wrap_with_meta_uses_injected_clock_for_fallback_timestamp():
+    line = "!AIVDM,1,1,,A,payload,0*00"
+
+    wrapped = wrap_with_meta(
+        line,
+        "boat",
+        clock=lambda: 456.9,
+    )
+
+    assert wrapped == "\\c:456,s:boat*13\\" + line
+
+
+def test_wrap_with_meta_does_not_observe_clock_for_truthy_timestamp():
+    line = "!AIVDM,1,1,,A,payload,0*00"
+
+    def fail_clock():
+        raise AssertionError("clock must not be observed")
+
+    assert (
+        wrap_with_meta(
+            line,
+            "boat",
+            timestamp=123,
+            clock=fail_clock,
+        )
+        == "\\c:123,s:boat*14\\" + line
+    )

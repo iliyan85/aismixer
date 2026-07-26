@@ -5,7 +5,9 @@ import pytest
 
 import aismixer
 import core.ingress_frame as ingress_frame_module
+import core.python_data_plane as python_data_plane_module
 from assembler import AIVDMAssembler
+from core.python_data_plane import PythonDataPlaneProcessor
 from core.event import IngressEvent
 from core.ingress_frame import (
     IngressFrame,
@@ -173,10 +175,11 @@ def make_single_target_table(target_id, source_id="udp:source_a"):
     )
 
 
-class RecordingRoutingTable:
+class RecordingRoutingTable(RoutingTable):
     def __init__(self, target_ids):
-        self.target_ids = tuple(target_ids)
-        self.source_ids = []
+        super().__init__(resolved_zones={}, route_definitions=())
+        object.__setattr__(self, "target_ids", tuple(target_ids))
+        object.__setattr__(self, "source_ids", [])
 
     def match(self, source_id):
         self.source_ids.append(source_id)
@@ -442,19 +445,55 @@ async def cancel_task(task):
         pass
 
 
-async def run_forward_loop_events(monkeypatch, events, expected_sends):
+def make_test_processor(
+    *,
+    station_id="test_station",
+    assembler_instance=None,
+    deduplicator_instance=None,
+    preserve_ingress_c=True,
+    preserve_ingress_gid=True,
+    always_tag_single=False,
+    gid_digits=None,
+    wall_clock=None,
+    gid_generator=None,
+):
+    return PythonDataPlaneProcessor(
+        station_id=station_id,
+        preserve_ingress_c=preserve_ingress_c,
+        preserve_ingress_gid=preserve_ingress_gid,
+        always_tag_single=always_tag_single,
+        gid_digits=(
+            aismixer.G_ID_DIGITS
+            if gid_digits is None
+            else gid_digits
+        ),
+        assembler=assembler_instance,
+        deduplicator=deduplicator_instance,
+        wall_clock=wall_clock,
+        gid_generator=gid_generator,
+    )
+
+
+async def run_forward_loop_events(
+    monkeypatch,
+    events,
+    expected_sends,
+    *,
+    gid_generator=None,
+    wall_clock=None,
+):
     fake_forwarder = FakeForwarder()
     monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
-    monkeypatch.setattr(aismixer, "assembler", AIVDMAssembler())
-    monkeypatch.setattr(aismixer, "deduplicator", Deduplicator())
-    monkeypatch.setattr(aismixer, "STATION_ID", "test_station")
     monkeypatch.setattr(aismixer, "DEBUG", False)
-    monkeypatch.setattr(aismixer, "C_PRESERVE_INGRESS_C", True)
-    monkeypatch.setattr(aismixer, "G_PRESERVE_INGRESS_GID", True)
-    monkeypatch.setattr(aismixer, "G_ALWAYS_TAG_SINGLE", False)
+    processor = make_test_processor(
+        gid_generator=gid_generator,
+        wall_clock=wall_clock,
+    )
 
     queue = asyncio.Queue()
-    task = asyncio.create_task(aismixer.forward_loop(queue))
+    task = asyncio.create_task(
+        aismixer.forward_loop(queue, processor=processor)
+    )
     try:
         for event in events:
             await queue.put(event)
@@ -479,8 +518,13 @@ async def run_forward_loop_capture(
     station_id="test_station",
     on_send_to=None,
     assembler_instance=None,
+    deduplicator_instance=None,
     preserve_ingress_c=True,
     preserve_ingress_gid=True,
+    always_tag_single=False,
+    gid_digits=None,
+    wall_clock=None,
+    gid_generator=None,
 ):
     queue, task, fake_forwarder = await start_forward_loop_capture(
         monkeypatch,
@@ -488,8 +532,13 @@ async def run_forward_loop_capture(
         station_id=station_id,
         on_send_to=on_send_to,
         assembler_instance=assembler_instance,
+        deduplicator_instance=deduplicator_instance,
         preserve_ingress_c=preserve_ingress_c,
         preserve_ingress_gid=preserve_ingress_gid,
+        always_tag_single=always_tag_single,
+        gid_digits=gid_digits,
+        wall_clock=wall_clock,
+        gid_generator=gid_generator,
     )
     try:
         for event in events:
@@ -517,32 +566,36 @@ async def start_forward_loop_capture(
     station_id="test_station",
     on_send_to=None,
     assembler_instance=None,
+    deduplicator_instance=None,
     preserve_ingress_c=True,
     preserve_ingress_gid=True,
+    always_tag_single=False,
+    gid_digits=None,
+    wall_clock=None,
+    gid_generator=None,
 ):
     fake_forwarder = FakeForwarder(on_send_to=on_send_to)
     monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
-    if assembler_instance is None:
-        assembler_instance = AIVDMAssembler()
-    monkeypatch.setattr(aismixer, "assembler", assembler_instance)
-    monkeypatch.setattr(aismixer, "deduplicator", Deduplicator())
-    monkeypatch.setattr(aismixer, "STATION_ID", station_id)
     monkeypatch.setattr(aismixer, "DEBUG", False)
-    monkeypatch.setattr(
-        aismixer,
-        "C_PRESERVE_INGRESS_C",
-        preserve_ingress_c,
+    processor = make_test_processor(
+        station_id=station_id,
+        assembler_instance=assembler_instance,
+        deduplicator_instance=deduplicator_instance,
+        preserve_ingress_c=preserve_ingress_c,
+        preserve_ingress_gid=preserve_ingress_gid,
+        always_tag_single=always_tag_single,
+        gid_digits=gid_digits,
+        wall_clock=wall_clock,
+        gid_generator=gid_generator,
     )
-    monkeypatch.setattr(
-        aismixer,
-        "G_PRESERVE_INGRESS_GID",
-        preserve_ingress_gid,
-    )
-    monkeypatch.setattr(aismixer, "G_ALWAYS_TAG_SINGLE", False)
 
     queue = asyncio.Queue()
     task = asyncio.create_task(
-        aismixer.forward_loop(queue, routing_state=routing_state)
+        aismixer.forward_loop(
+            queue,
+            routing_state=routing_state,
+            processor=processor,
+        )
     )
     return queue, task, fake_forwarder
 
@@ -551,19 +604,22 @@ async def run_multipart_forward_loop(
     monkeypatch,
     first_fragment=MULTIPART_FIRST,
     second_fragment=MULTIPART_SECOND,
+    *,
+    gid_generator=None,
+    wall_clock=None,
 ):
     fake_forwarder = FakeForwarder()
     monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
-    monkeypatch.setattr(aismixer, "assembler", AIVDMAssembler())
-    monkeypatch.setattr(aismixer, "deduplicator", Deduplicator())
-    monkeypatch.setattr(aismixer, "STATION_ID", "test_station")
     monkeypatch.setattr(aismixer, "DEBUG", False)
-    monkeypatch.setattr(aismixer, "C_PRESERVE_INGRESS_C", True)
-    monkeypatch.setattr(aismixer, "G_PRESERVE_INGRESS_GID", True)
-    monkeypatch.setattr(aismixer, "G_ALWAYS_TAG_SINGLE", False)
+    processor = make_test_processor(
+        gid_generator=gid_generator,
+        wall_clock=wall_clock,
+    )
 
     queue = asyncio.Queue()
-    task = asyncio.create_task(aismixer.forward_loop(queue))
+    task = asyncio.create_task(
+        aismixer.forward_loop(queue, processor=processor)
+    )
     try:
         await queue.put(make_event(first_fragment))
         await asyncio.sleep(0.05)
@@ -648,9 +704,11 @@ def test_forward_loop_uses_campaign_c_path_once_per_accepted_event(
     original_frame_adapter = (
         ingress_frame_module.frame_from_ingress_event
     )
-    original_leading_s_parser = aismixer.parse_leading_s_value
-    original_frame_parser = aismixer.parse_frame_sentences
-    original_source_policy = aismixer.choose_s_value_from_candidates
+    original_leading_s_parser = python_data_plane_module.parse_leading_s_value
+    original_frame_parser = python_data_plane_module.parse_frame_sentences
+    original_source_policy = (
+        python_data_plane_module.choose_s_value_from_candidates
+    )
 
     def record_coercer(item):
         frame = original_coercer(item)
@@ -719,17 +777,17 @@ def test_forward_loop_uses_campaign_c_path_once_per_accepted_event(
         record_frame_adapter,
     )
     monkeypatch.setattr(
-        aismixer,
+        python_data_plane_module,
         "parse_leading_s_value",
         record_leading_s_parser,
     )
     monkeypatch.setattr(
-        aismixer,
+        python_data_plane_module,
         "parse_frame_sentences",
         record_frame_parser,
     )
     monkeypatch.setattr(
-        aismixer,
+        python_data_plane_module,
         "choose_s_value_from_candidates",
         record_source_policy,
     )
@@ -812,7 +870,7 @@ def test_direct_frame_bypasses_legacy_adapter_and_preserves_identity(
         ("\\c:7,s:direct*00\\" + SENTENCE).encode("utf-8"),
     )
     parsed_frames = []
-    original_parser = aismixer.parse_frame_sentences
+    original_parser = python_data_plane_module.parse_frame_sentences
     assembler_instance = ParsedOnlyAssembler()
 
     def fail_adapter(*_args, **_kwargs):
@@ -831,7 +889,7 @@ def test_direct_frame_bypasses_legacy_adapter_and_preserves_identity(
         fail_adapter,
     )
     monkeypatch.setattr(
-        aismixer,
+        python_data_plane_module,
         "parse_frame_sentences",
         record_parser,
     )
@@ -1455,17 +1513,13 @@ def test_conflicting_multipart_ingress_gids_generate_new_gid(
     second = make_nmea_sentence("AIVDM,2,2,7,A,22GIDB,0")
     earlier_arrival = f"\\g:1-2-111*00\\{first}"
     completion_arrival = f"\\c:123,g:2-2-222*00\\{second}"
-    monkeypatch.setattr(
-        aismixer,
-        "_gen_numeric_gid_fixed",
-        lambda _digits: "999999",
-    )
 
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
             monkeypatch,
             [make_event(earlier_arrival), make_event(completion_arrival)],
             expected_broadcast_sends=2,
+            gid_generator=lambda _digits: "999999",
         )
     )
 
@@ -1497,17 +1551,13 @@ def test_multipart_gid_agreement_uses_exact_string_identity(monkeypatch):
         make_event(f"\\g:1-2-001*00\\{first}"),
         make_event(f"\\g:2-2-1*00\\{second}"),
     ]
-    monkeypatch.setattr(
-        aismixer,
-        "_gen_numeric_gid_fixed",
-        lambda _digits: "999999",
-    )
 
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
             monkeypatch,
             events,
             expected_broadcast_sends=2,
+            gid_generator=lambda _digits: "999999",
         )
     )
 
@@ -1666,13 +1716,12 @@ def test_matching_multipart_ingress_gids_are_preserved(monkeypatch):
     def fail_generator(_digits):
         raise AssertionError("consistent ingress GID must be preserved")
 
-    monkeypatch.setattr(aismixer, "_gen_numeric_gid_fixed", fail_generator)
-
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
             monkeypatch,
             events,
             expected_broadcast_sends=2,
+            gid_generator=fail_generator,
         )
     )
 
@@ -1704,13 +1753,12 @@ def test_single_observed_multipart_gid_is_preserved(monkeypatch):
     def fail_generator(_digits):
         raise AssertionError("one observed ingress GID is sufficient")
 
-    monkeypatch.setattr(aismixer, "_gen_numeric_gid_fixed", fail_generator)
-
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
             monkeypatch,
             events,
             expected_broadcast_sends=3,
+            gid_generator=fail_generator,
         )
     )
 
@@ -1744,17 +1792,13 @@ def test_duplicate_fragment_with_different_gid_marks_group_gid_conflicted(
         make_event(f"\\g:1-2-111*00\\{first}"),
         make_event(second),
     ]
-    monkeypatch.setattr(
-        aismixer,
-        "_gen_numeric_gid_fixed",
-        lambda _digits: "999999",
-    )
 
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
             monkeypatch,
             events,
             expected_broadcast_sends=2,
+            gid_generator=lambda _digits: "999999",
         )
     )
 
@@ -1786,11 +1830,6 @@ def test_disabled_gid_preservation_ignores_consistent_multipart_gid(
         make_event(f"\\g:1-2-111*00\\{first}"),
         make_event(f"\\g:2-2-111*00\\{second}"),
     ]
-    monkeypatch.setattr(
-        aismixer,
-        "_gen_numeric_gid_fixed",
-        lambda _digits: "999999",
-    )
 
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
@@ -1798,6 +1837,7 @@ def test_disabled_gid_preservation_ignores_consistent_multipart_gid(
             events,
             expected_broadcast_sends=2,
             preserve_ingress_gid=False,
+            gid_generator=lambda _digits: "999999",
         )
     )
 
@@ -1825,13 +1865,12 @@ def test_multipart_without_valid_ingress_gid_generates_one_group_gid(
         generator_calls.append(digits)
         return "999999"
 
-    monkeypatch.setattr(aismixer, "_gen_numeric_gid_fixed", generate_gid)
-
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
             monkeypatch,
             [make_event(first), make_event(second)],
             expected_broadcast_sends=2,
+            gid_generator=generate_gid,
         )
     )
 
@@ -1903,11 +1942,6 @@ def test_structural_non_numeric_g_enables_multipart_s_cache(
 ):
     first = make_nmea_sentence("AIVDM,2,1,7,A,11SNON,0")
     second = make_nmea_sentence("AIVDM,2,2,7,A,22SNON,0")
-    monkeypatch.setattr(
-        aismixer,
-        "_gen_numeric_gid_fixed",
-        lambda _digits: "999999",
-    )
 
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
@@ -1918,6 +1952,7 @@ def test_structural_non_numeric_g_enables_multipart_s_cache(
             ],
             expected_broadcast_sends=2,
             station_id="",
+            gid_generator=lambda _digits: "999999",
         )
     )
 
@@ -2099,11 +2134,10 @@ def test_dedup_suppressed_completion_clears_multipart_gid_context(
         generator_calls.append(digits)
         return next(generated_gids)
 
-    monkeypatch.setattr(aismixer, "_gen_numeric_gid_fixed", generate_gid)
-
     async def run():
         queue, task, fake_forwarder = await start_forward_loop_capture(
             monkeypatch,
+            gid_generator=generate_gid,
         )
         try:
             for arrival in group_one:
@@ -2435,17 +2469,13 @@ def test_conflict_invalidation_clears_multipart_gid_context(monkeypatch):
         make_event(fresh_second, assembler_key=assembler_key),
         make_event(fresh_first, assembler_key=assembler_key),
     ]
-    monkeypatch.setattr(
-        aismixer,
-        "_gen_numeric_gid_fixed",
-        lambda _digits: "999999",
-    )
 
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
             monkeypatch,
             events,
             expected_broadcast_sends=2,
+            gid_generator=lambda _digits: "999999",
         )
     )
 
@@ -2602,16 +2632,12 @@ def test_expired_generation_clears_multipart_gid_context(monkeypatch):
     fresh_first = make_nmea_sentence("AIVDM,2,1,7,A,11GEPN,0")
     fresh_second = make_nmea_sentence("AIVDM,2,2,7,A,22GEPN,0")
     old_arrival = f"\\g:1-2-111*00\\{old_first}"
-    monkeypatch.setattr(
-        aismixer,
-        "_gen_numeric_gid_fixed",
-        lambda _digits: "999999",
-    )
 
     async def run():
         queue, task, fake_forwarder = await start_forward_loop_capture(
             monkeypatch,
             assembler_instance=assembler_instance,
+            gid_generator=lambda _digits: "999999",
         )
         try:
             await queue.put(
@@ -2689,13 +2715,12 @@ def test_capacity_eviction_clears_all_multipart_contexts_only_for_victim(
         generator_calls.append(digits)
         return next(generated_gids)
 
-    monkeypatch.setattr(aismixer, "_gen_numeric_gid_fixed", generate_gid)
-
     async def run():
         queue, task, fake_forwarder = await start_forward_loop_capture(
             monkeypatch,
             station_id="",
             assembler_instance=assembler_instance,
+            gid_generator=generate_gid,
         )
         try:
             clock.now = 0.0
@@ -3591,16 +3616,12 @@ def test_unrouted_completion_clears_multipart_gid_context(monkeypatch):
         f"\\g:1-2-111*00\\{unrouted_first}",
         f"\\g:2-2-111*00\\{unrouted_second}",
     )
-    monkeypatch.setattr(
-        aismixer,
-        "_gen_numeric_gid_fixed",
-        lambda _digits: "999999",
-    )
 
     async def run():
         queue, task, fake_forwarder = await start_forward_loop_capture(
             monkeypatch,
             routing_state=RoutingState(routing_table),
+            gid_generator=lambda _digits: "999999",
         )
         try:
             for arrival in unrouted_group:

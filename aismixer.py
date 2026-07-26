@@ -3,26 +3,18 @@ import socket
 import yaml
 import os
 import time
-from assembler import AIVDMAssembler, AssemblyKey, AssemblyStatus
-from meta_writer import wrap_with_meta
-from secrets import randbelow
 from forwarder import Forwarder
-from dedup import Deduplicator
+from core.data_plane import ProcessingSnapshot, RoutingDisposition
 from core.ingress_frame import (
     coerce_ingress_frame,
     frame_from_udp_datagram,
 )
 from core.network_policy import NetworkPolicy, compile_ingress_policy
-from core.parsed_sentence import (
-    parse_frame_sentences,
-    parse_leading_s_value,
-)
+from core.python_data_plane import PythonDataPlaneProcessor
 from core.runtime_control import build_optional_routing_control_server
 from core.runtime_routing import load_optional_routing_table
 from core.routing_state import RoutingState
-from core.s_policy import choose_s_value_from_candidates
 from core.source_identity import build_udp_source_id
-from core.state.s_cache import touch_s
 from aismixer_secure import secure_server
 
 try:
@@ -97,22 +89,16 @@ G_PRESERVE_INGRESS_GID = config.get("g_preserve_ingress_gid", True)
 G_ID_DIGITS = config.get("g_id_digits", 18)
 G_ALWAYS_TAG_SINGLE = config.get("g_always_tag_single", False)
 C_PRESERVE_INGRESS_C = config.get("c_preserve_ingress_c", True)
-
-
-def _gen_numeric_gid_fixed(digits: int) -> str:
-    """
-    Криптографски сигурно чисто числово gid с фиксирана дължина (без водещи нули).
-    Равномерно в интервала [10^(d-1) .. 10^d - 1].
-    """
-    base = 10 ** (digits - 1)
-    return str(base + randbelow(9 * base))
-
-
-deduplicator = Deduplicator()
 forwarder = Forwarder(FORWARDERS)
 initial_routing_table = load_optional_routing_table(config, forwarder.target_ids)
 routing_state = RoutingState(initial_routing_table)
-assembler = AIVDMAssembler()
+data_plane_processor = PythonDataPlaneProcessor(
+    station_id=STATION_ID,
+    preserve_ingress_c=C_PRESERVE_INGRESS_C,
+    preserve_ingress_gid=G_PRESERVE_INGRESS_GID,
+    always_tag_single=G_ALWAYS_TAG_SINGLE,
+    gid_digits=G_ID_DIGITS,
+)
 
 
 async def mixer_loop(input_queues, output_queue):
@@ -139,217 +125,49 @@ def compile_input_policies(entries, kind):
     )
 
 
-async def forward_loop(queue, routing_state=None):
-    """Forward frames using one immutable routing snapshot per accepted frame.
+async def forward_loop(queue, routing_state=None, processor=None):
+    """Coerce, snapshot, process, and sequentially dispatch ingress frames."""
 
-    RoutingState replacements affect the next accepted frame, not the frame
-    currently being processed.
-    """
-
-    # Multipart metadata follows the assembler's correlation identity.
-    multipart_s_ctx: dict[AssemblyKey, str] = {}
-    multipart_c_ctx: dict[AssemblyKey, int] = {}
-    multipart_gid_ctx: dict[AssemblyKey, frozenset[str]] = {}
-
-    def _discard_multipart_contexts(
-        keys: tuple[AssemblyKey, ...],
-    ) -> None:
-        for key in keys:
-            multipart_s_ctx.pop(key, None)
-            multipart_c_ctx.pop(key, None)
-            multipart_gid_ctx.pop(key, None)
-
+    active_processor = (
+        data_plane_processor
+        if processor is None
+        else processor
+    )
     while True:
         item = await queue.get()
         frame = coerce_ingress_frame(item)
         if frame is None:
             continue
 
-        event_routing_table = None
-        if routing_state is not None:
-            event_routing_table = routing_state.snapshot().table
-        route_target_ids = ()
-        if event_routing_table is not None:
-            route_target_ids = event_routing_table.match(
-                frame.source_id
-            ).target_ids
-
-        event_leading_s = parse_leading_s_value(frame)
-        parsed_sentences = parse_frame_sentences(
-            frame,
-            include_vdo=True,
-        )
-        for parsed in parsed_sentences:
-            g_value = parsed.tag.g_value
-            current_ingress_gid = (
-                g_value.preservable_group_id
-                if g_value is not None
-                else None
+        if routing_state is None:
+            processing_snapshot = ProcessingSnapshot(
+                routing_generation=0,
+                routing_table=None,
+            )
+        else:
+            processing_snapshot = ProcessingSnapshot.from_routing_snapshot(
+                routing_state.snapshot()
             )
 
-            # Use the parsed TAG c for direct single-sentence output
-            # and deterministic multipart timestamp selection below.
-            valid_c = (
-                parsed.tag.c_value
-                if C_PRESERVE_INGRESS_C
-                else None
-            )
-            ts_for_header = valid_c
+        outputs = active_processor.process(frame, processing_snapshot)
+        for output in outputs:
+            if DEBUG:
+                message = output.message
+                if message.endswith("\r\n"):
+                    message = message[:-2]
+                print(f"{ts()} OUTPUT => {message}")
 
-            # 2) Сглобяване на мултипарт
-            outcome = assembler.feed_parsed_outcome(parsed)
-
-            # Discarded generations must be cleared before the current
-            # observation can establish metadata for a fresh generation.
-            _discard_multipart_contexts(outcome.discarded_keys)
-
-            if (
-                outcome.status in {
-                    AssemblyStatus.PENDING,
-                    AssemblyStatus.DUPLICATE,
-                    AssemblyStatus.COMPLETE,
-                }
-                and outcome.group_key is not None
-                and valid_c is not None
-            ):
-                previous_c = multipart_c_ctx.get(outcome.group_key)
-                multipart_c_ctx[outcome.group_key] = (
-                    valid_c
-                    if previous_c is None
-                    else min(previous_c, valid_c)
+            if output.disposition is RoutingDisposition.LEGACY_BROADCAST:
+                await forwarder.send(output.message)
+            elif output.disposition is RoutingDisposition.TARGETED:
+                await forwarder.send_to(
+                    output.target_ids,
+                    output.message,
                 )
-
-            if (
-                outcome.status in {
-                    AssemblyStatus.PENDING,
-                    AssemblyStatus.DUPLICATE,
-                    AssemblyStatus.COMPLETE,
-                }
-                and outcome.group_key is not None
-                and G_PRESERVE_INGRESS_GID
-                and current_ingress_gid is not None
-            ):
-                previous_gids = multipart_gid_ctx.get(
-                    outcome.group_key,
-                    frozenset(),
-                )
-                multipart_gid_ctx[outcome.group_key] = (
-                    previous_gids | frozenset((current_ingress_gid,))
-                )
-
-            if (
-                outcome.status
-                in {AssemblyStatus.PENDING, AssemblyStatus.DUPLICATE}
-                and outcome.group_key is not None
-                and parsed.tag.s_value is not None
-                and g_value is not None
-            ):
-                multipart_s_ctx[outcome.group_key] = parsed.tag.s_value
-
-            if outcome.status in {
-                AssemblyStatus.INVALID,
-                AssemblyStatus.LIMIT_EXCEEDED,
-                AssemblyStatus.PENDING,
-                AssemblyStatus.DUPLICATE,
-                AssemblyStatus.CONFLICT,
-            }:
-                continue
-
-            multipart = outcome.sentences
-
-            if (
-                outcome.status is AssemblyStatus.COMPLETE
-                and outcome.group_key is not None
-            ):
-                selected_c = (
-                    multipart_c_ctx.get(outcome.group_key)
-                    if C_PRESERVE_INGRESS_C
-                    else None
-                )
-                # wrap_with_meta treats integer zero as a server-time fallback.
-                # Keep single-sentence behavior unchanged while rendering a
-                # valid multipart c:0 selected by the group-level policy.
-                ts_for_header = "0" if selected_c == 0 else selected_c
-
-            # --- изходно gid за тази група ---
-            if (
-                outcome.status is AssemblyStatus.COMPLETE
-                and outcome.group_key is not None
-            ):
-                observed_gids = multipart_gid_ctx.get(
-                    outcome.group_key,
-                    frozenset(),
-                )
-                if G_PRESERVE_INGRESS_GID and len(observed_gids) == 1:
-                    out_gid = next(iter(observed_gids))
-                else:
-                    out_gid = _gen_numeric_gid_fixed(G_ID_DIGITS)
-            elif G_PRESERVE_INGRESS_GID and current_ingress_gid is not None:
-                out_gid = current_ingress_gid
             else:
-                out_gid = _gen_numeric_gid_fixed(G_ID_DIGITS)
-
-            total_parts = len(multipart)
-            tag_single = (total_parts == 1 and G_ALWAYS_TAG_SINGLE)
-
-            logical_key = multipart[0] if total_parts == 1 else tuple(multipart)
-            eligible_target_ids = None
-            if event_routing_table is None:
-                emit_group = deduplicator.is_unique(logical_key)
-            else:
-                eligible_target_ids = tuple(
-                    target_id
-                    for target_id in route_target_ids
-                    if deduplicator.is_unique(logical_key, scope=target_id)
+                raise AssertionError(
+                    f"Unsupported routing disposition: {output.disposition!r}"
                 )
-                emit_group = bool(eligible_target_ids)
-
-            incoming_s = parsed.tag.s_value
-            if (
-                outcome.status is AssemblyStatus.COMPLETE
-                and outcome.group_key is not None
-            ):
-                incoming_s = incoming_s or multipart_s_ctx.get(
-                    outcome.group_key
-                )
-
-            for i, full_line in enumerate(multipart if emit_group else ()):
-                is_first = i == 0
-                # 3) Построй финалното s
-                source_name_or_id = frame.alias_for_s or incoming_s
-                s_value = choose_s_value_from_candidates(
-                    STATION_ID,
-                    source_name_or_id,
-                    event_leading_s,
-                    frame.remote_ip,
-                )
-                touch_s(s_value)  # TTL поддръжка за s
-
-                # g: добавяме при multipart или ако е разрешено и за single
-                if total_parts > 1 or tag_single:
-                    g_triplet = f"{i+1}-{total_parts}-{out_gid}"
-                else:
-                    g_triplet = None
-                wrapped_line = wrap_with_meta(
-                    full_line, s_value, ts_for_header, is_first=is_first, g_triplet=g_triplet)
-
-                if DEBUG:
-                    print(f"{ts()} OUTPUT => {wrapped_line}")
-
-                if event_routing_table is None:
-                    await forwarder.send(wrapped_line + '\r\n')
-                else:
-                    await forwarder.send_to(
-                        eligible_target_ids,
-                        wrapped_line + '\r\n',
-                    )
-
-            # 4) Successful multipart completion consumes its metadata.
-            if (
-                outcome.status is AssemblyStatus.COMPLETE
-                and outcome.group_key is not None
-            ):
-                _discard_multipart_contexts((outcome.group_key,))
 
 
 async def handle_socket(
@@ -457,7 +275,11 @@ async def main():
 
         # Mixer + Forwarder
         runtime_tasks.append(asyncio.create_task(mixer_loop(input_queues, mixer_queue)))
-        await forward_loop(mixer_queue, routing_state=routing_state)
+        await forward_loop(
+            mixer_queue,
+            routing_state=routing_state,
+            processor=data_plane_processor,
+        )
     finally:
         await _cancel_and_await_tasks(runtime_tasks)
         for sock in udp_sockets:

@@ -7,6 +7,7 @@ import pytest
 import aismixer
 from assembler import AIVDMAssembler
 from core.event import IngressEvent
+from core.python_data_plane import PythonDataPlaneProcessor
 from core.routing_control_protocol import ROUTING_CONTROL_PROTOCOL_VERSION
 from core.routing_control_unix import RoutingControlUnixServer
 from core.routing_control_unix_client import RoutingControlUnixClient
@@ -314,7 +315,11 @@ async def run_aismixer_main(
     forwarder = FakeForwarder()
     builder_calls = []
     mixer_cancelled = {"value": False}
-    forward_called = {"value": False, "routing_state": None}
+    forward_called = {
+        "value": False,
+        "routing_state": None,
+        "processor": None,
+    }
     mixer_started = asyncio.Event()
 
     def fake_builder(config, state, available_target_ids):
@@ -329,10 +334,11 @@ async def run_aismixer_main(
             mixer_cancelled["value"] = True
             raise
 
-    async def fake_forward_loop(_queue, routing_state=None):
+    async def fake_forward_loop(_queue, routing_state=None, processor=None):
         observer["forward_called"] = True
         forward_called["value"] = True
         forward_called["routing_state"] = routing_state
+        forward_called["processor"] = processor
         await mixer_started.wait()
         if forward_exc is not None:
             raise forward_exc
@@ -365,6 +371,7 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
     ]
     assert result["forward_called"]["value"] is True
     assert result["forward_called"]["routing_state"] is result["routing_state"]
+    assert result["forward_called"]["processor"] is aismixer.data_plane_processor
     assert result["mixer_cancelled"] is True
     assert result["forwarder_close_count"] == 1
 
@@ -483,19 +490,25 @@ def test_runtime_control_unix_stack_updates_forward_loop_routing(tmp_path, monke
         assert isinstance(server, RoutingControlUnixServer)
 
         monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
-        monkeypatch.setattr(aismixer, "deduplicator", Deduplicator())
-        monkeypatch.setattr(aismixer, "assembler", AIVDMAssembler())
-        monkeypatch.setattr(aismixer, "STATION_ID", "test_station")
         monkeypatch.setattr(aismixer, "DEBUG", False)
-        monkeypatch.setattr(aismixer, "C_PRESERVE_INGRESS_C", True)
-        monkeypatch.setattr(aismixer, "G_PRESERVE_INGRESS_GID", True)
-        monkeypatch.setattr(aismixer, "G_ALWAYS_TAG_SINGLE", False)
+        processor = PythonDataPlaneProcessor(
+            station_id="test_station",
+            preserve_ingress_c=True,
+            preserve_ingress_gid=True,
+            always_tag_single=False,
+            assembler=AIVDMAssembler(),
+            deduplicator=Deduplicator(),
+        )
 
         await server.start()
         client = RoutingControlUnixClient(path)
         queue = asyncio.Queue()
         forward_task = asyncio.create_task(
-            aismixer.forward_loop(queue, routing_state=routing_state)
+            aismixer.forward_loop(
+                queue,
+                routing_state=routing_state,
+                processor=processor,
+            )
         )
         try:
             status = await client.request(

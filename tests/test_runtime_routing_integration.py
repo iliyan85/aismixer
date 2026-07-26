@@ -8,6 +8,7 @@ import aismixer
 import forwarder as forwarder_module
 from assembler import AIVDMAssembler
 from core.event import IngressEvent
+from core.python_data_plane import PythonDataPlaneProcessor
 from core.routing import RoutingTable
 from core.runtime_routing import load_optional_routing_table
 from core.routing_state import RoutingState
@@ -170,18 +171,24 @@ async def run_routed_events(
         forwarder_module, "asyncio", _FakeAsyncioModule(fake_loop)
     )
     monkeypatch.setattr(aismixer, "forwarder", Forwarder(forwarders_config))
-    monkeypatch.setattr(aismixer, "deduplicator", Deduplicator())
-    monkeypatch.setattr(aismixer, "assembler", AIVDMAssembler())
-    monkeypatch.setattr(aismixer, "STATION_ID", "test_station")
     monkeypatch.setattr(aismixer, "DEBUG", False)
-    monkeypatch.setattr(aismixer, "C_PRESERVE_INGRESS_C", True)
-    monkeypatch.setattr(aismixer, "G_PRESERVE_INGRESS_GID", True)
-    monkeypatch.setattr(aismixer, "G_ALWAYS_TAG_SINGLE", False)
+    processor = PythonDataPlaneProcessor(
+        station_id="test_station",
+        preserve_ingress_c=True,
+        preserve_ingress_gid=True,
+        always_tag_single=False,
+        assembler=AIVDMAssembler(),
+        deduplicator=Deduplicator(),
+    )
 
     queue = real_asyncio.Queue()
     routing_state = RoutingState(routing_table)
     task = real_asyncio.create_task(
-        aismixer.forward_loop(queue, routing_state=routing_state)
+        aismixer.forward_loop(
+            queue,
+            routing_state=routing_state,
+            processor=processor,
+        )
     )
     try:
         for event in events:

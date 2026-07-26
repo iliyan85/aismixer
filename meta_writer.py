@@ -1,3 +1,4 @@
+from collections.abc import Callable
 import time
 
 
@@ -14,14 +15,18 @@ def format_header(content: str) -> str:
 
 
 def wrap_with_meta(
-        nmea_line: str,
-        station_id: str,
-        timestamp: int | None = None,
-        is_first: bool = True,
-        g_triplet: str | None = None) -> str:
+    nmea_line: str,
+    station_id: str,
+    timestamp: int | str | None = None,
+    is_first: bool = True,
+    g_triplet: str | None = None,
+    *,
+    clock: Callable[[], float] | None = None,
+) -> str:
 
     if not timestamp:
-        timestamp = int(time.time())
+        wall_clock = time.time if clock is None else clock
+        timestamp = int(wall_clock())
 
     parts = nmea_line.split(",")
     if len(parts) < 4:

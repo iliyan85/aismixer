@@ -390,7 +390,31 @@ A routing-table replacement during processing affects the next accepted frame,
 not the frame already in progress. A missing table, including a snapshot whose
 table is `None`, selects legacy forwarding and global deduplication mode.
 
-## 13. Forwarding and cleanup
+## 13. Campaign D processor/egress boundary
+
+`PythonDataPlaneProcessor.process(frame, snapshot)` completes synchronous
+processing of the entire accepted frame and constructs the complete returned
+tuple of `ProcessorOutput` values before orchestration begins its first
+asynchronous egress send. Routing matching, parsing, assembly, multipart
+metadata observation and cleanup, deduplication decisions, TAG formatting,
+wall-clock observations used for formatting, GID generation, and `touch_s`
+effects belonging to that frame therefore all occur before the first send
+begins.
+
+Orchestration dispatches the returned outputs sequentially in tuple order. A
+send failure stops dispatch before any later output is sent, but it does not
+undo processor state, deduplication state, multipart metadata cleanup,
+wall-clock observations, GID generation, `touch_s` effects, or already
+constructed later outputs. The boundary provides no transactional delivery,
+rollback, replay, delivery acknowledgement, or recovery guarantee, including
+after a partial multi-fragment send.
+
+This whole-frame-before-egress ordering intentionally replaces the former
+processing/send interleaving and is part of the Campaign D processor boundary.
+Routing generation is observational only and does not reset or otherwise
+mutate processor state.
+
+### Forwarding and cleanup
 
 For emitted multipart output, the first fragment receives the primary `c`, `s`,
 and `g` TAG metadata. Continuation fragments receive the existing continuation
@@ -404,10 +428,6 @@ observed. If the forwarding core directly invokes `cleanup_expired()` or
 `reset()`, it must apply their returned keys through the same cleanup path.
 External assembler callers are likewise responsible for consuming returned
 lifecycle keys to synchronize metadata they own.
-
-Fragments are sent sequentially. Send-failure semantics were not redesigned:
-this contract does not guarantee transactional delivery, rollback, replay, or
-recovery after a partial multi-fragment send.
 
 ## 14. Explicit limitations and deferred decisions
 
