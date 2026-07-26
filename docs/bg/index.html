@@ -179,66 +179,66 @@
 
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Граница на представянето от Campaign C</p>
-        <h2>Неизменяеми кадри и еднократен анализ</h2>
-        <p class="section-intro">Python реализацията вече пренася неизменяеми входни кадри през байтова граница с еднократен анализ. Точните правила за жизнения цикъл и граничните случаи остават в нормативния договор за поведение.</p>
+        <p class="eyebrow">Процесорна граница на Campaign D</p>
+        <h2>Изрични етапи на обработка и подреден egress</h2>
+        <p class="section-intro">Неизменяемите ingress кадри преминават през един ingress fan-in, един процесорен етап със синхронния референтен Python процесор и един подреден egress етап. Всички съществени runtime задачи са под общ fail-fast надзор в рамките на процеса. Точните правила за граничните случаи остават в нормативния договор за поведение.</p>
       </div>
-      <div class="pipeline representation-pipeline" role="group" aria-label="Продукционен път на представянето от Campaign C">
+      <div class="pipeline representation-pipeline" role="group" aria-label="Текущ продукционен път през процесорната граница на Campaign D">
         <div class="pipeline-node">
           <strong>UDP / UDPSEC производители</strong>
-          <span>Неизменяем <span class="kbd">IngressFrame</span></span>
+          <span>Неизменяеми <span class="kbd">IngressFrame</span> обекти</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Независима от представянето опашка</strong>
-          <span><span class="kbd">mixer_loop()</span> пренася елементите без промяна</span>
+          <strong>Ingress fan-in</strong>
+          <span>Пренася елементите без анализ или маршрутизиране</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Един обхват за кадъра</strong>
-          <span>Незадължителен наследен адаптер; неизменяема моментна снимка на маршрутизацията и съпоставяне на източника</span>
+          <strong><span class="kbd">PythonDataPlaneProcessor</span></strong>
+          <span>Една моментна снимка на маршрутизацията и едно синхронно извикване за приет кадър</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Байтово сканиране и еднократен анализ</strong>
-          <span>Неизменяеми интервали, анализирани полета на NMEA фрагмента и TAG метаданни</span>
+          <strong>Подреден пакет от стойности <span class="kbd">ProcessorOutput</span></strong>
+          <span>Пълният кортеж се конструира преди първото асинхронно изпращане</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Анализиран вход към модула за сглобяване</strong>
-          <span>Съществуващите метаданни, дедупликация, маршрутизиране и препращане</span>
+          <strong>Egress етап и UDP цели</strong>
+          <span>Последователно изпращане в реда на кортежа</span>
         </div>
       </div>
       <div class="grid state-grid">
         <article class="card">
           <div class="icons" aria-hidden="true">🚪</div>
-          <h3>Неизменяема входна граница</h3>
-          <p>Вградените UDP и UDPSEC производители създават неизменяеми <span class="kbd">IngressFrame</span> обекти. <span class="kbd">forward_loop()</span> приема директните кадри със запазена обектна идентичност и запазва един адаптер за валидни наследени <span class="kbd">IngressEvent</span> обекти. Невалидните събития за съвместимост и неподдържаните елементи в опашката се игнорират преди маршрутизирането.</p>
+          <h3>Неизменяема ingress граница</h3>
+          <p>Вградените UDP и UDPSEC производители създават неизменяеми <span class="kbd">IngressFrame</span> обекти. Валидните наследени <span class="kbd">IngressEvent</span> обекти преминават през един адаптер за съвместимост. Невалидните събития за съвместимост и неподдържаните елементи се отхвърлят преди придобиването на моментна снимка на маршрутизацията и извикването на процесора.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧾</div>
-          <h3>Сканиране на ниво байтове</h3>
-          <p>Всеки приет кадър се сканира като байтове. Резултатите са неизменяеми полуотворени интервали в оригиналния payload, така че сканирането не декодира и не копира текста на изреченията и TAG блоковете.</p>
+          <h3>Синхронен референтен процесор</h3>
+          <p><span class="kbd">DataPlaneProcessor</span> е изричният договор, а <span class="kbd">PythonDataPlaneProcessor</span> е единствената текуща продукционна и референтна реализация. Обработката остава изцяло на Python и локална за процеса.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
-          <h3>Еднократен анализ на полетата на фрагмента и TAG метаданните</h3>
-          <p>Относимите полета на NMEA фрагмента и TAG метаданните се анализират веднъж от интервалите според текстовия режим на кадъра. Всеки приет кадър използва една неизменяема моментна снимка на маршрутизацията и едно съпоставяне на източника; те управляват всички приети изречения в този кадър.</p>
+          <h3>Един кадър, една моментна снимка</h3>
+          <p>За всеки приет кадър се придобива една неизменяема моментна снимка на маршрутизацията и се извършва едно съпоставяне на източника. Процесорът се извиква точно веднъж за кадъра.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
-          <h3>Единен жизнен цикъл на сглобяването</h3>
-          <p>Продукционният път използва <span class="kbd">feed_parsed_outcome()</span>. API-то за анализирани изречения и публичните наследени API функции за низове използват един и същ жизнен цикъл; съвместимата Python реализация засега материализира и съхранява изреченията като низове.</p>
+          <h3>Подредена бариера за завършване</h3>
+          <p>Пълният <span class="kbd">tuple[ProcessorOutput, ...]</span> се конструира преди първото асинхронно изпращане. Непразният пакет блокира обработката на следващ кадър, докато egress етапът не завърши успешно последователното изпращане.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⏱️</div>
-          <h3>Детерминирано локално състояние</h3>
-          <p>Локалните за процеса TTL жизнени цикли са изрично определени и тествани. Изтеклото състояние се обработва преди детерминираното премахване на живо състояние, когато е зададен лимит на капацитета.</p>
+          <h3>Локален fail-fast надзор на runtime-а</h3>
+          <p>UDP и UDPSEC производителите, ingress fan-in, процесорният етап и egress етапът се управляват като един локален за процеса жизнен цикъл. Неуспех или неочаквано нормално завършване прекратява runtime-а, след като останалите задачи бъдат отменени и изчакани. Няма автоматичен рестарт, повторен опит, rollback или replay на доставката.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧭</div>
-          <h3>Граница за бъдещо нативно съответствие</h3>
-          <p>Campaign C установи стабилна граница на представянето за бъдещи диференциални проверки. Тя не въведе нативна реализация, bindings, API или ABI на процесор, CMake, многопроцесна обработка или твърдения за производителност.</p>
+          <h3>Бъдещите граници остават изрични</h3>
+          <p>Нативната обработка, coordinator/worker процесите, multiprocessing, междупроцесният надзор и IPC остават бъдеща работа. Campaign D не дефинира нативен API или ABI.</p>
         </article>
       </div>
       <div class="callout">
@@ -278,48 +278,48 @@
           <p>Това е основа за бъдеща диференциална проверка за съответствие, а не завършена система за наблюдение или изнасяне на метрики към Prometheus.</p>
         </article>
       </div>
-      <p class="boundary-note"><strong>Локално по замисъл.</strong> Това състояние не се запазва трайно и не се споделя между процеси. Все още няма координатор за многопроцесна работа.</p>
+      <p class="boundary-note"><strong>Локално по замисъл.</strong> Това състояние не се запазва трайно и не се споделя между процеси. Текущият runtime упражнява надзор над съществените asyncio задачи в рамките на един процес; coordinator/worker процеси, IPC и междупроцесна синхронизация на състоянието все още не съществуват.</p>
     </section>
 
     <section id="native-foundation" class="section">
       <div class="section-heading">
         <p class="eyebrow">Референтна семантика и поетапно развитие</p>
-        <h2>Референтна основа, подготвена за нативна реализация</h2>
-        <p class="section-intro">Campaign C установи стабилна граница на представянето. Документираното наблюдаемо поведение позволява бъдещата реализация да напредва на етапи, докато текущата Python реализация остава референтна.</p>
+        <h2>Референтна основа за бъдеща нативна реализация</h2>
+        <p class="section-intro">Campaign C установи неизменяемото ingress представяне на ниво байтове, а Campaign D добави текущия синхронен процесорен договор и изричната граница на runtime-а в рамките на един процес. <span class="kbd">PythonDataPlaneProcessor</span> остава единствената продукционна и референтна реализация.</p>
       </div>
-      <div class="pipeline reference-pipeline" role="group" aria-label="Път от тестваната Python референция до бъдещ поетапен нативен процесор">
+      <div class="pipeline reference-pipeline" role="group" aria-label="Поетапен път от неизменяемото ingress представяне до бъдеща диференциална реализация">
         <div class="pipeline-node">
-          <strong>Тествана Python референция</strong>
+          <strong>Неизменяемо ingress представяне</strong>
           <span class="status-badge status-implemented">Реализирано сега</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Наблюдаем договор за поведение</strong>
-          <span class="status-badge status-implemented">Документирано и тествано</span>
+          <strong>Синхронен договор <span class="kbd">DataPlaneProcessor</span></strong>
+          <span class="status-badge status-implemented">Реализирано сега</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Диференциални тестове за съответствие</strong>
-          <span class="status-badge status-future">Бъдещ метод за проверка</span>
+          <strong><span class="kbd">PythonDataPlaneProcessor</span> като референтна реализация</strong>
+          <span class="status-badge status-implemented">Реализирано сега</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node pipeline-node-future">
-          <strong>Поетапен нативен процесор</strong>
-          <span class="status-badge status-future">Бъдещ — не е реализиран</span>
+          <strong>Бъдеща диференциална реализация</strong>
+          <span class="status-badge status-future">Нативният процесор не е реализиран</span>
         </div>
       </div>
       <div class="grid feature-row">
         <article class="card">
-          <h3>Наблюдаема повърхност за сравнение</h3>
-          <p>Диференциалните тестове могат да сравняват подредения изход, TAG метаданните, целите за маршрутизиране, решенията за дедупликация, резултатите от жизнения цикъл и изричните случаи без изход.</p>
+          <h3>Реализирано сега</h3>
+          <p>Неизменяемите <span class="kbd">IngressFrame</span> обекти, байтовите интервали и анализираните метаданни, синхронният процесорен договор, <span class="kbd">PythonDataPlaneProcessor</span>, изричният процесорен етап, изричният egress етап и локалният за процеса надзор на задачите са реализирани.</p>
         </article>
         <article class="card">
-          <h3>Поетапно разделяне</h3>
-          <p>Изричната отговорност за състоянието и границите на почистването позволяват обработващата работа да се отделя постепенно, без да изисква еднократно цялостно пренаписване на изпълнението.</p>
+          <h3>Бъдеща архитектура</h3>
+          <p>Нативен процесор и диференциално изпълнение за проверка на съответствието, coordinator и специализирани ingress/egress worker процеси, multiprocessing, IPC и разпределение на routing snapshot-и, както и рестарт и възстановяване между процеси остават бъдеща работа.</p>
         </article>
         <article class="card">
           <h3>Границите остават изрични</h3>
-          <p>Днес не съществува нативен процесор. Не са избрани C или C++ API, ABI или стратегия за свързване и тази актуализация на документацията не прави твърдение за производителността.</p>
+          <p>Днес не съществува нативен процесор. Не са избрани C или C++ API, ABI или стратегия за bindings; текущият надзор остава в рамките на един процес и не се прави твърдение за производителност.</p>
         </article>
       </div>
     </section>
@@ -535,6 +535,8 @@
           <ul class="list">
             <li>Неизменяема продукционна граница с <span class="kbd">IngressFrame</span> и един запазен адаптер за наследени <span class="kbd">IngressEvent</span> обекти.</li>
             <li>Сканиране на ниво байтове, неизменяеми полуотворени интервали, еднократен анализ на полетата на NMEA фрагмента и TAG метаданните и продукционен път през анализирания вход на модула за сглобяване.</li>
+            <li>Изричен синхронен договор <span class="kbd">DataPlaneProcessor</span> и <span class="kbd">PythonDataPlaneProcessor</span> като единствена текуща продукционна и референтна реализация.</li>
+            <li>Един ingress fan-in, изричен процесорен етап, подреден egress етап с бариера за завършване на непразните пакети и локален за процеса fail-fast надзор.</li>
             <li>Логическа маршрутизация, зони и дедупликация по цели.</li>
             <li>Управление на маршрутизирането по време на работа чрез <span class="kbd">aismixerctl</span>.</li>
             <li>Детерминирани жизнени цикли за дедупликация, сглобяване и multipart TAG метаданни.</li>
@@ -547,11 +549,10 @@
         <article class="card status-card status-next">
           <h3 class="status-label">Планирана работа</h3>
           <ul class="list">
-            <li>Стабилен договор за процесора и повърхност за диференциално съответствие.</li>
-            <li>Нативна реализация или bindings; днес няма такива.</li>
+            <li>Нативна реализация, bindings и диференциално изпълнение за проверка на съответствието все още не съществуват.</li>
             <li>Байтово състояние на модула за сглобяване и на изхода отвъд текущата Python граница за съвместимост с низове.</li>
             <li>Бенчмаркове и профилиране преди твърдения за производителност.</li>
-            <li>Многопроцесна обработка, ясна собственост върху процесите, координация и наблюдение.</li>
+            <li>Coordinator и специализирани ingress/egress worker процеси, multiprocessing, IPC, разпределение на routing snapshot-и и политика за рестарт и възстановяване на worker процесите.</li>
             <li>По-широка архитектура за входни и изходни адаптери отвъд текущите UDP пътища.</li>
           </ul>
         </article>

@@ -179,66 +179,66 @@
 
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Campaign C representation boundary</p>
-        <h2>Immutable frames and parse-once processing</h2>
-        <p class="section-intro">The Python implementation now carries immutable ingress frames through a bytes-native, parse-once boundary. Exact lifecycle rules and edge cases remain in the normative behavioural contract.</p>
+        <p class="eyebrow">Campaign D processor boundary</p>
+        <h2>Explicit processing stages and ordered egress</h2>
+        <p class="section-intro">Immutable ingress frames now pass through one ingress fan-in, a processor stage that invokes the synchronous Python reference processor, and one ordered egress stage, all within one process-local supervised lifecycle. Exact lifecycle rules and edge cases remain in the normative behavioural contract.</p>
       </div>
-      <div class="pipeline representation-pipeline" role="group" aria-label="Campaign C production data representation path">
+      <div class="pipeline representation-pipeline" role="group" aria-label="Campaign D production data-plane stages">
         <div class="pipeline-node">
           <strong>UDP / UDPSEC producers</strong>
           <span>Immutable <span class="kbd">IngressFrame</span></span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Representation-neutral queue</strong>
-          <span><span class="kbd">mixer_loop()</span> transports items unchanged</span>
+          <strong>Ingress fan-in</strong>
+          <span>Queue transport without parsing or routing</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>One frame scope</strong>
-          <span>Optional legacy adapter; immutable routing snapshot and source match</span>
+          <strong><span class="kbd">PythonDataPlaneProcessor</span></strong>
+          <span>One snapshot and one synchronous call per accepted frame</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Bytes-native parse once</strong>
-          <span>Immutable spans and parsed fragment/TAG metadata</span>
+          <strong>Ordered <span class="kbd">ProcessorOutput</span> batch</strong>
+          <span>Complete tuple before asynchronous egress</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Parsed assembler path</strong>
-          <span>Existing metadata, deduplication, routing, and forwarding</span>
+          <strong>Egress stage and UDP targets</strong>
+          <span>Sequential dispatch in tuple order</span>
         </div>
       </div>
       <div class="grid state-grid">
         <article class="card">
           <div class="icons" aria-hidden="true">🚪</div>
           <h3>Immutable ingress boundary</h3>
-          <p>Built-in UDP and UDPSEC producers create immutable <span class="kbd">IngressFrame</span> objects. <span class="kbd">forward_loop()</span> accepts direct frames by object identity and retains one adapter for valid legacy <span class="kbd">IngressEvent</span> objects. Invalid compatibility events and unsupported queue items are ignored before routing.</p>
+          <p>Built-in UDP and UDPSEC producers create immutable <span class="kbd">IngressFrame</span> objects. Valid legacy <span class="kbd">IngressEvent</span> objects pass through one compatibility adapter; invalid or unsupported items are rejected before routing-snapshot acquisition and processor invocation.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧾</div>
-          <h3>Bytes-native sentence scanning</h3>
-          <p>Each accepted frame is scanned as bytes. Scanner results are immutable half-open spans into the original payload, so scanning does not decode or copy sentence and TAG text.</p>
+          <h3>Synchronous reference processor</h3>
+          <p><span class="kbd">DataPlaneProcessor</span> is the explicit contract. <span class="kbd">PythonDataPlaneProcessor</span> is the sole production and reference implementation; processing remains Python-only and process-local.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
-          <h3>Parse-once fragment and TAG metadata</h3>
-          <p>Relevant NMEA fragment fields and TAG metadata are parsed once from the spans using the frame text mode. Each accepted frame takes one immutable routing snapshot and one source match; they govern all accepted sentences in that frame.</p>
+          <h3>One frame, one snapshot</h3>
+          <p>Each accepted frame receives one immutable routing snapshot and one source match, and the processor is invoked exactly once for that frame.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
-          <h3>One shared assembler lifecycle</h3>
-          <p>Production uses <span class="kbd">feed_parsed_outcome()</span>. Parsed and public legacy string APIs converge on the same lifecycle; the Python compatibility assembler currently materializes and stores sentence strings.</p>
+          <h3>Ordered completion barrier</h3>
+          <p>The complete <span class="kbd">tuple[ProcessorOutput, ...]</span> is constructed before the first asynchronous send. A non-empty batch prevents later-frame processing until sequential egress completes successfully.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⏱️</div>
-          <h3>Deterministic local state</h3>
-          <p>Process-local TTL lifecycles are explicit and tested. Expired state is handled before deterministic eviction of live state when a configured capacity applies.</p>
+          <h3>Fail-fast runtime supervision</h3>
+          <p>UDP producers, UDPSEC producers, fan-in, processor, and egress share one process-local lifecycle. Failure or unexpected completion cancels and awaits sibling tasks; there is no automatic restart, retry, rollback, or delivery replay.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧭</div>
-          <h3>Future native conformance boundary</h3>
-          <p>Campaign C established a stable representation boundary for future differential work. It introduced no native implementation, binding, processor API, ABI, CMake, multiprocessing, or performance claim.</p>
+          <h3>Future boundaries remain explicit</h3>
+          <p>Native processing, coordinator/worker processes, multiprocessing, cross-process supervision, and IPC remain future work. Campaign D defines no native API or ABI.</p>
         </article>
       </div>
       <div class="callout">
@@ -278,48 +278,48 @@
           <p>This is a basis for future differential conformance, not a complete monitoring or Prometheus export system.</p>
         </article>
       </div>
-      <p class="boundary-note"><strong>Local by design.</strong> This state is non-durable and is not shared across processes. A multiprocessing coordinator does not exist yet.</p>
+      <p class="boundary-note"><strong>Local by design.</strong> This state is non-durable and is not shared across processes. The current runtime supervises essential asyncio tasks within one process; coordinator/worker processes, IPC, and cross-process state synchronization do not exist yet.</p>
     </section>
 
     <section id="native-foundation" class="section">
       <div class="section-heading">
         <p class="eyebrow">Reference semantics and staged evolution</p>
         <h2>A native-ready reference foundation</h2>
-        <p class="section-intro">Campaign C established a stable representation boundary. Documented observable behaviour allows future implementation work to proceed in stages while the current Python runtime remains the reference.</p>
+        <p class="section-intro">Campaign C established the immutable, bytes-native ingress representation. Campaign D now defines the synchronous processor contract and explicit single-process runtime boundary, while <span class="kbd">PythonDataPlaneProcessor</span> remains the sole production and reference implementation.</p>
       </div>
-      <div class="pipeline reference-pipeline" role="group" aria-label="Path from the tested Python reference to a future staged native processor">
+      <div class="pipeline reference-pipeline" role="group" aria-label="Implemented processor foundation and future differential implementation">
         <div class="pipeline-node">
-          <strong>Tested Python reference</strong>
+          <strong>Immutable ingress representation</strong>
           <span class="status-badge status-implemented">Implemented now</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Observable behavioural contract</strong>
-          <span class="status-badge status-implemented">Documented and tested</span>
+          <strong>Synchronous <span class="kbd">DataPlaneProcessor</span> contract</strong>
+          <span class="status-badge status-implemented">Implemented now</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Differential conformance tests</strong>
-          <span class="status-badge status-future">Future validation method</span>
+          <strong><span class="kbd">PythonDataPlaneProcessor</span> reference</strong>
+          <span class="status-badge status-implemented">Implemented now</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node pipeline-node-future">
-          <strong>Staged native processor</strong>
-          <span class="status-badge status-future">Future — not implemented</span>
+          <strong>Future differential implementation</strong>
+          <span class="status-badge status-future">Native processor not implemented</span>
         </div>
       </div>
       <div class="grid feature-row">
         <article class="card">
-          <h3>Observable comparison surface</h3>
-          <p>Differential tests can compare ordered output, TAG metadata, routing targets, deduplication decisions, lifecycle outcomes, and explicit no-output cases.</p>
+          <h3>Implemented now</h3>
+          <p>Immutable <span class="kbd">IngressFrame</span>, bytes-native scan spans and parsed metadata, the synchronous processor contract, <span class="kbd">PythonDataPlaneProcessor</span>, explicit processor and egress stages, and process-local task supervision are implemented.</p>
         </article>
         <article class="card">
-          <h3>Staged separation</h3>
-          <p>Explicit state ownership and cleanup boundaries support incremental extraction of processing work instead of requiring one large runtime rewrite.</p>
+          <h3>Future architecture</h3>
+          <p>A native processor and differential conformance execution, coordinator and dedicated ingress/egress worker processes, multiprocessing, IPC and routing-snapshot distribution, and cross-process restart and recovery remain future work.</p>
         </article>
         <article class="card">
           <h3>Boundaries remain explicit</h3>
-          <p>No native processor exists today. No C or C++ API, ABI, or binding strategy has been selected, and this documentation update makes no performance claim.</p>
+          <p>No native processor exists today. No C or C++ API, ABI, or binding strategy has been selected; current supervision remains within one process, and no performance claim is made.</p>
         </article>
       </div>
     </section>
@@ -535,6 +535,8 @@
           <ul class="list">
             <li>Immutable <span class="kbd">IngressFrame</span> production boundary with one retained legacy <span class="kbd">IngressEvent</span> adapter.</li>
             <li>Bytes-native scanning, immutable half-open spans, parse-once fragment/TAG metadata, and the parsed assembler production path.</li>
+            <li>The synchronous <span class="kbd">DataPlaneProcessor</span> contract and <span class="kbd">PythonDataPlaneProcessor</span> as the sole production and reference implementation.</li>
+            <li>Explicit ingress fan-in, processor, and ordered egress stages with a completion barrier and process-local fail-fast task supervision.</li>
             <li>Logical routing, zones, and target-scoped deduplication.</li>
             <li>Runtime routing control with <span class="kbd">aismixerctl</span>.</li>
             <li>Deterministic deduplication, assembly, and multipart TAG lifecycles.</li>
@@ -547,11 +549,10 @@
         <article class="card status-card status-next">
           <h3 class="status-label">Planned work</h3>
           <ul class="list">
-            <li>A stable processor contract and differential conformance surface.</li>
-            <li>A native implementation or bindings; none exists today.</li>
+            <li>A native implementation, bindings, and differential conformance execution; none exists today.</li>
             <li>Bytes-native assembler and output state beyond the current Python string compatibility boundary.</li>
             <li>Benchmarks and profiling before any performance claim.</li>
-            <li>Multiprocessing, clear process ownership, coordination, and supervision.</li>
+            <li>Coordinator and dedicated ingress/egress worker processes, multiprocessing, IPC, routing-snapshot distribution, and cross-process restart and recovery.</li>
             <li>A broader ingress and egress adapter architecture beyond the current UDP pathways.</li>
           </ul>
         </article>
