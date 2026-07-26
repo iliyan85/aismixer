@@ -1,0 +1,52 @@
+title: "[Question] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use Q&A for focused public questions about installation, update or uninstall workflows, configuration, UDP and UDPSEC ingress, `nmea_sproxy`, routing and zones, TAG handling, multipart assembly, deduplication, and operational boundaries.
+
+        Useful starting points: [Wiki](https://github.com/iliyan85/aismixer/wiki) and [Quick Start](https://github.com/iliyan85/aismixer/wiki/Quick-Start).
+
+        Report reproducible software defects through [GitHub Issues](https://github.com/iliyan85/aismixer/issues). Do not post security vulnerabilities in a Discussion or public Issue; follow the [Security policy](https://github.com/iliyan85/aismixer/blob/main/SECURITY.md) for private reporting. General proposals belong in the [Ideas category](https://github.com/iliyan85/aismixer/discussions/categories/ideas).
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: State one clear question.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context_and_goal
+    attributes:
+      label: Context and goal
+      description: Explain what you are trying to achieve, the expected result, and where AISMixer or nmea_sproxy fits in your setup.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Share relevant details such as the AISMixer version or commit, operating system, Python version, installation method, UDP, UDPSEC, or nmea_sproxy path, receiver or sending application type, and whether routing is enabled. Exact station locations, public IP addresses, keys, and confidential topology are not needed.
+
+  - type: textarea
+    id: already_tried
+    attributes:
+      label: What has already been tried
+      description: Include relevant commands, sanitized configuration excerpts, observed output, and documentation already consulted. Redact private keys, credentials, exact sensitive receiver locations, personal data, confidential logs, and private IP addressing when unnecessary.
+
+  - type: textarea
+    id: public_configuration_or_logs
+    attributes:
+      label: Relevant public configuration or logs
+      description: Include only minimal, sanitized excerpts that are needed to understand the question.
+
+  - type: checkboxes
+    id: public_information
+    attributes:
+      label: Public-information confirmation
+      options:
+        - label: I understand that this Discussion is public and I have not included credentials, private keys, sensitive receiver locations, personal data, confidential logs, or non-public collaboration details.
+          required: true

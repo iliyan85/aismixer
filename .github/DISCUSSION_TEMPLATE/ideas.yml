@@ -1,0 +1,54 @@
+title: "[Idea] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this category for architecture proposals, integration ideas, routing or data-plane evolution, deployment concepts, AIS field-test ideas, and publicly discussable academic or research collaboration.
+
+        A proposal is an invitation to discuss. It does not imply acceptance, priority, or a delivery commitment.
+
+        GitHub Discussions and GitHub Issues are public. Report reproducible software defects through [GitHub Issues](https://github.com/iliyan85/aismixer/issues). Do not include sensitive or non-public information, and do not post security vulnerabilities in either place; follow the [Security policy](https://github.com/iliyan85/aismixer/blob/main/SECURITY.md) for private reporting.
+
+  - type: textarea
+    id: problem_or_opportunity
+    attributes:
+      label: Problem or opportunity
+      description: Explain the limitation, need, or opportunity, who would benefit, and whether it comes from a real deployment or an anticipated use case.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_idea
+    attributes:
+      label: Proposed idea
+      description: Describe the concept and expected behavior. Implementation details are welcome but not required.
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: Describe a concrete operational, technical, research, or field-testing scenario.
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility_and_boundaries
+    attributes:
+      label: Compatibility and boundaries
+      description: Note possible effects on existing configurations, observable data-plane behavior, routing identity, metadata ownership, security boundaries, resource usage, or interoperability. "Not sure" is an acceptable answer.
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add diagrams, public logs, references, links, or related Issues or Discussions. Do not publish private receiver locations, credentials, keys, private network details, personal data, or confidential logs.
+
+  - type: checkboxes
+    id: public_information
+    attributes:
+      label: Public-information confirmation
+      options:
+        - label: I understand that this Discussion is public and I have not included credentials, private keys, sensitive receiver locations, personal data, confidential logs, or non-public collaboration details.
+          required: true
