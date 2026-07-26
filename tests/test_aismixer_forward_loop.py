@@ -380,14 +380,14 @@ def test_handle_socket_empty_ingress_policy_drops_all_packets(monkeypatch):
     assert queue.items == []
 
 
-def test_mixer_loop_passes_queue_items_through_unchanged():
+def test_ingress_fan_in_loop_passes_queue_items_through_unchanged():
     async def run():
         input_queue = asyncio.Queue()
         output_queue = asyncio.Queue()
         frame = make_direct_frame(SENTENCE.encode("utf-8"))
         unsupported = object()
         task = asyncio.create_task(
-            aismixer.mixer_loop([input_queue], output_queue)
+            aismixer.ingress_fan_in_loop([input_queue], output_queue)
         )
         try:
             await input_queue.put(frame)
@@ -483,16 +483,22 @@ async def run_forward_loop_events(
     wall_clock=None,
 ):
     fake_forwarder = FakeForwarder()
-    monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
-    monkeypatch.setattr(aismixer, "DEBUG", False)
     processor = make_test_processor(
         gid_generator=gid_generator,
         wall_clock=wall_clock,
     )
 
     queue = asyncio.Queue()
+    egress_queue = asyncio.Queue(maxsize=1)
     task = asyncio.create_task(
-        aismixer.forward_loop(queue, processor=processor)
+        aismixer._run_runtime_stages(
+            queue,
+            egress_queue,
+            processor=processor,
+            output_forwarder=fake_forwarder,
+            debug=False,
+            timestamp=aismixer.ts,
+        )
     )
     try:
         for event in events:
@@ -575,8 +581,6 @@ async def start_forward_loop_capture(
     gid_generator=None,
 ):
     fake_forwarder = FakeForwarder(on_send_to=on_send_to)
-    monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
-    monkeypatch.setattr(aismixer, "DEBUG", False)
     processor = make_test_processor(
         station_id=station_id,
         assembler_instance=assembler_instance,
@@ -590,13 +594,19 @@ async def start_forward_loop_capture(
     )
 
     queue = asyncio.Queue()
+    egress_queue = asyncio.Queue(maxsize=1)
     task = asyncio.create_task(
-        aismixer.forward_loop(
+        aismixer._run_runtime_stages(
             queue,
+            egress_queue,
             routing_state=routing_state,
             processor=processor,
+            output_forwarder=fake_forwarder,
+            debug=False,
+            timestamp=aismixer.ts,
         )
     )
+    await asyncio.sleep(0)
     return queue, task, fake_forwarder
 
 
@@ -609,16 +619,22 @@ async def run_multipart_forward_loop(
     wall_clock=None,
 ):
     fake_forwarder = FakeForwarder()
-    monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
-    monkeypatch.setattr(aismixer, "DEBUG", False)
     processor = make_test_processor(
         gid_generator=gid_generator,
         wall_clock=wall_clock,
     )
 
     queue = asyncio.Queue()
+    egress_queue = asyncio.Queue(maxsize=1)
     task = asyncio.create_task(
-        aismixer.forward_loop(queue, processor=processor)
+        aismixer._run_runtime_stages(
+            queue,
+            egress_queue,
+            processor=processor,
+            output_forwarder=fake_forwarder,
+            debug=False,
+            timestamp=aismixer.ts,
+        )
     )
     try:
         await queue.put(make_event(first_fragment))

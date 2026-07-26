@@ -20,8 +20,8 @@ specification, a spoof-detection specification, or a native ABI.
 ## 2. Ingress frame and compatibility-event boundary
 
 The built-in UDP and UDPSEC producers enqueue immutable `IngressFrame`
-instances. `mixer_loop()` transports queue items unchanged and performs no
-conversion, validation, routing, or parsing. The forwarding consumer accepts a
+instances. Ingress fan-in transports queue items unchanged and performs no
+conversion, validation, routing, or parsing. The processor stage accepts a
 direct frame by object identity and retains compatibility for `IngressEvent`
 through one adapter. A compatibility event's `raw_line` must satisfy
 `isinstance(raw_line, str)`, including subclasses; its explicit legacy-text
@@ -51,7 +51,7 @@ not terminate the consumer.
 
 ## 3. Accepted sentence extraction
 
-The forwarding core scans the accepted frame payload as bytes and extracts
+The Python data-plane processor scans the accepted frame payload as bytes and extracts
 `VDM` and `VDO` sentences for the supported AIS talker identifiers `AI`, `AB`,
 `AD`, `AN`, `AR`, `AS`, `AT`, `AX`, and `BS`. Each extracted sentence must
 begin with `!`, use one of those talker/family combinations, and end with `*`
@@ -89,7 +89,7 @@ fragment ordinal determines the occupied slot but is not another key field.
 TAG `g` is metadata and does not participate in `AssemblyKey`. Its group ID,
 part, and total fields are not promoted into assembler identity.
 
-The production forwarding loop passes each `ParsedSentence` to
+The Python data-plane processor passes each `ParsedSentence` to
 `feed_parsed_outcome()`, which enters the same established assembler lifecycle.
 The Python compatibility implementation materializes the exact matched
 sentence span as a string; pending groups and `AssemblyOutcome.sentences`
@@ -247,7 +247,7 @@ must always be generated.
 Conflict, expiry, capacity eviction, and normal completion clean group-ID
 context according to the assembler generation lifecycle, including no-route
 and dedup-suppressed completion. Ingress TAG-`g` part and total fields do not
-participate in `AssemblyKey`, and the forwarding core does not validate their
+participate in `AssemblyKey`, and the processor does not validate their
 consistency against the NMEA ordinal and total.
 
 ## 10. Deduplication
@@ -379,7 +379,7 @@ transcript, session-key derivation, or `nmea_sproxy` protocol compatibility.
 
 ## 12. Routing snapshot boundary
 
-When routing state is present, the forwarding consumer must acquire one
+When routing state is present, the processor stage must acquire one
 immutable routing snapshot per accepted or successfully coerced frame. If that
 snapshot contains a table, `frame.source_id` must be matched once. Unsupported
 queue items and invalid compatibility events acquire no snapshot and perform
@@ -401,20 +401,74 @@ wall-clock observations used for formatting, GID generation, and `touch_s`
 effects belonging to that frame therefore all occur before the first send
 begins.
 
-Orchestration dispatches the returned outputs sequentially in tuple order. A
-send failure stops dispatch before any later output is sent, but it does not
-undo processor state, deduplication state, multipart metadata cleanup,
+The single egress stage dispatches the returned outputs sequentially in tuple
+order. A send failure stops dispatch before any later output is sent, but it
+does not undo processor state, deduplication state, multipart metadata cleanup,
 wall-clock observations, GID generation, `touch_s` effects, or already
-constructed later outputs. The boundary provides no transactional delivery,
-rollback, replay, delivery acknowledgement, or recovery guarantee, including
-after a partial multi-fragment send.
+constructed later outputs. The runtime-only completion signal described below
+is an ordering barrier, not an acknowledgement to an ingress source or a
+network-delivery guarantee. The boundary provides no transactional delivery,
+rollback, replay, ingress acknowledgement, delivery acknowledgement, or
+recovery guarantee, including after a partial multi-fragment send.
 
 This whole-frame-before-egress ordering intentionally replaces the former
 processing/send interleaving and is part of the Campaign D processor boundary.
 Routing generation is observational only and does not reset or otherwise
 mutate processor state.
 
-### Forwarding and cleanup
+### Runtime stages and ordered handoff
+
+The Python reference runtime has one production path:
+
+```text
+ingress producers
+    -> ingress fan-in
+    -> processor stage
+    -> egress stage
+    -> network forwarders
+```
+
+The stages run in one process. Ingress fan-in preserves the established
+ordering into one processor-stage queue. Exactly one long-lived processor-stage
+consumer uses the runtime-owned, long-lived `PythonDataPlaneProcessor`, and
+exactly one long-lived egress-stage consumer dispatches its results. The egress
+stage performs no routing matching, parsing, assembly, multipart metadata work,
+deduplication, TAG construction, GID generation, or processor-state mutation.
+
+For each accepted frame, the processor stage coerces the queue item once,
+acquires exactly one routing snapshot, calls the configured
+`DataPlaneProcessor` exactly once, and treats the complete returned
+`tuple[ProcessorOutput, ...]` as that frame's one ordered processor batch.
+Unsupported queue items and invalid compatibility events are rejected before
+snapshot acquisition or processor invocation. An empty output batch may
+complete locally because it has no egress work.
+
+After handing a non-empty batch to egress, the processor stage must await an
+explicit process-local completion acknowledgement. It must not consume or
+process the next ingress item until egress has dispatched the current batch's
+final output and acknowledged success. Removing a batch from an inter-stage
+queue does not satisfy this barrier. Thus processor work cannot run ahead
+across frames while prior egress is incomplete. After the barrier completes
+successfully, the next accepted frame acquires its own snapshot; a routing
+replacement while the prior batch is blocked can affect that next frame, but
+routing generation remains observational and cannot reset processor state.
+
+If a processor call fails, no batch is handed to egress and the exception
+propagates through runtime lifecycle management. If egress fails, it signals
+that failure through the completion barrier, stops the current batch before
+later sends, and propagates the exception through runtime lifecycle management.
+The already completed processor effects retain the non-rollback semantics
+above, and no later accepted frame is processed after the failure. Runtime
+shutdown or cancellation must resolve or cancel pending stage work and
+acknowledgements so that no stage remains blocked or orphaned.
+
+The inter-stage queues, batch envelope, and completion acknowledgement are
+private runtime-orchestration mechanisms. They do not alter
+`DataPlaneProcessor`, `ProcessingSnapshot`, or `ProcessorOutput`, and they
+define neither a native API or ABI nor an IPC protocol. Campaign D3 introduces
+no multiprocessing, threads, worker pool, or second processor implementation.
+
+### Output formatting and cleanup
 
 For emitted multipart output, the first fragment receives the primary `c`, `s`,
 and `g` TAG metadata. Continuation fragments receive the existing continuation
@@ -422,9 +476,9 @@ form containing `g` without repeating primary `c` or `s`.
 
 Normal multipart completion consumes its metadata contexts even when no route
 matches or deduplication suppresses all output. Every key reported through an
-assembler outcome's `discarded_keys` must remove the forwarding core's cached
+assembler outcome's `discarded_keys` must remove the processor's cached
 multipart `s`, `c`, and `g` contexts before metadata from the current arrival is
-observed. If the forwarding core directly invokes `cleanup_expired()` or
+observed. If the processor directly invokes `cleanup_expired()` or
 `reset()`, it must apply their returned keys through the same cleanup path.
 External assembler callers are likewise responsible for consuming returned
 lifecycle keys to synchronize metadata they own.
@@ -437,7 +491,7 @@ not additional guarantees:
 1. Blank sequential IDs retain the cross-transmission ambiguity described in
    section 6 for the live TTL correlation window.
 2. TAG-`g` part and total consistency is neither assembler identity nor checked
-   against the NMEA part and total by the forwarding core.
+   against the NMEA part and total by the processor.
 3. Single-sentence and multipart `c:0` behaviour is intentionally not unified.
 4. Send-failure recovery and transactional multi-fragment delivery remain out
    of scope.

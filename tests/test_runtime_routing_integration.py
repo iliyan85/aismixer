@@ -170,8 +170,7 @@ async def run_routed_events(
     monkeypatch.setattr(
         forwarder_module, "asyncio", _FakeAsyncioModule(fake_loop)
     )
-    monkeypatch.setattr(aismixer, "forwarder", Forwarder(forwarders_config))
-    monkeypatch.setattr(aismixer, "DEBUG", False)
+    output_forwarder = Forwarder(forwarders_config)
     processor = PythonDataPlaneProcessor(
         station_id="test_station",
         preserve_ingress_c=True,
@@ -182,12 +181,17 @@ async def run_routed_events(
     )
 
     queue = real_asyncio.Queue()
+    egress_queue = real_asyncio.Queue(maxsize=1)
     routing_state = RoutingState(routing_table)
     task = real_asyncio.create_task(
-        aismixer.forward_loop(
+        aismixer._run_runtime_stages(
             queue,
+            egress_queue,
             routing_state=routing_state,
             processor=processor,
+            output_forwarder=output_forwarder,
+            debug=False,
+            timestamp=aismixer.ts,
         )
     )
     try:

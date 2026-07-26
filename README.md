@@ -81,7 +81,7 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP targets    |
 - Group-atomic multipart deduplication decisions: global in legacy mode and
   scoped to each `target_id` in routing mode.
 - Explicit, tested process-local TTL lifecycles for deduplication, assembly,
-  forwarding-owned multipart metadata, and secure ingress state.
+  processor-owned multipart metadata, and secure ingress state.
 - Optional constructor-level process-local limits in the Python reference state
   objects, plus immutable statistics snapshots for deduplication, assembly, and
   secure state.
@@ -108,10 +108,13 @@ AISMixer keeps the **data plane** and **control plane** separate.
 ### 📡 Data plane
 
 Built-in UDP and UDPSEC producers create immutable `IngressFrame` objects, and
-`mixer_loop()` transports queue items unchanged. At the forwarding boundary,
-`forward_loop()` accepts direct frames by object identity and retains one
+a single ingress fan-in transports queue items unchanged to the processor
+stage. That stage accepts direct frames by object identity and retains one
 compatibility adapter for valid legacy `IngressEvent` objects; invalid
 compatibility events and unsupported queue items are ignored before routing.
+Each non-empty complete processor-output batch then passes to a single egress
+stage, which dispatches it sequentially before the processor stage consumes
+the next item.
 
 For each accepted frame, the data plane captures one immutable routing snapshot
 and matches `source_id` once. It scans the frame payload as bytes, parses NMEA
@@ -122,8 +125,8 @@ Python compatibility assembler currently materializes and stores matched
 sentence strings.
 
 This processing boundary prepares the service for a future native
-implementation, but Campaign C neither defines nor provides a native API or
-ABI.
+implementation, but Campaign D remains Python-only and process-local and
+defines no native API, ABI, or IPC protocol.
 
 - **Legacy mode:** global deduplication and broadcast to all forwarders.
 - **Routing mode:** logical source matching, per-target deduplication, and
@@ -143,7 +146,7 @@ replaces the process-local routing state.
 
 | Component | Role |
 |---|---|
-| `aismixer.py` | Main runtime, ingress tasks, mixer loop, forwarding loop, optional control lifecycle |
+| `aismixer.py` | Main runtime, ingress tasks and fan-in, processor and egress stages, optional control lifecycle |
 | `core/routing.py` / `core/routing_state.py` | Logical routing and process-local immutable snapshots |
 | `core/routing_control*.py` | Versioned control protocol, service, and Unix-domain transport |
 | `aismixerctl.py` | Operator CLI for runtime routing control |
@@ -164,7 +167,7 @@ contract for the Python reference implementation and the basis for future
 differential testing of a native processor. This README remains an operational
 overview, not a duplicate normative specification.
 
-The forwarding boundary accepts immutable `IngressFrame` objects directly and
+The processor stage accepts immutable `IngressFrame` objects directly and
 retains one adapter for legacy `IngressEvent` objects whose `raw_line` is a
 `str`, including subclasses. Invalid compatibility events and unsupported
 items are ignored before routing. Each accepted frame uses one routing snapshot
@@ -178,7 +181,7 @@ that ordinal invalidates the live assembler generation. Multipart
 deduplication decisions are group-atomic, and multipart TAG `s`, `c`, and `g`
 state follows assembler lifecycle boundaries.
 
-Deduplication state, multipart assembly state, forwarding-owned multipart
+Deduplication state, multipart assembly state, processor-owned multipart
 metadata, and secure replay/session/nonce state have explicit, deterministic,
 process-local TTL lifecycles. The Python reference state objects accept an
 optional deduplication `max_entries` capacity and optional assembly
@@ -730,8 +733,8 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP цели       |
 - Решения за дедупликация, атомарни за цялата multipart група: глобални в legacy
   режим и отделни за всеки `target_id` в routing режим.
 - Изрични, локални за процеса TTL жизнени цикли, проверени с тестове, за
-  дедупликацията, сглобяването, multipart метаданните, управлявани от слоя за
-  препращане, и състоянието на защитения вход.
+  дедупликацията, сглобяването, multipart метаданните, управлявани от процесора,
+  и състоянието на защитения вход.
 - Незадължителни ограничения, задавани чрез конструктора на обектите за локално
   състояние в референтната Python реализация, както и неизменяеми моментни
   снимки на статистиката за дедупликация, сглобяване и защитено състояние.
@@ -762,11 +765,14 @@ AISMixer разделя **слоя за данни** (`data plane`) и **сло�
 ### 📡 Слой за данни
 
 Вградените UDP и UDPSEC входове създават неизменяеми `IngressFrame` обекти, а
-`mixer_loop()` пренася елементите от опашката непроменени. На границата за
-препращане `forward_loop()` приема директните `IngressFrame` обекти със
-запазена идентичност на обекта и поддържа един адаптер за съвместимост с
-валидни legacy `IngressEvent` обекти; невалидните събития за съвместимост и
-неподдържаните елементи от опашката се пренебрегват преди маршрутизирането.
+един ingress fan-in пренася елементите от опашките непроменени към етапа за
+обработка. Този етап приема директните `IngressFrame` обекти със запазена
+идентичност на обекта и поддържа един адаптер за съвместимост с валидни legacy
+`IngressEvent` обекти; невалидните събития за съвместимост и неподдържаните
+елементи от опашката се пренебрегват преди маршрутизирането. След това всеки
+непразен пълен пакет от изходи на процесора се предава към един egress етап,
+който го изпраща последователно, преди етапът за обработка да приеме следващия
+елемент.
 
 За всеки приет `IngressFrame` слоят за данни взема една неизменяема моментна
 снимка на маршрутизацията и съпоставя `source_id` веднъж. Той сканира payload-а
@@ -778,7 +784,8 @@ AISMixer разделя **слоя за данни** (`data plane`) и **сло�
 съхранява съвпадналите изречения като низове.
 
 Тази граница на обработката подготвя услугата за бъдеща нативна реализация, но
-Campaign C нито дефинира, нито предоставя нативен API или ABI.
+Campaign D остава изцяло Python, локална за процеса, и не дефинира нативен API,
+ABI или IPC протокол.
 
 - **Legacy режим:** глобална дедупликация и broadcast към всички forwarder-и.
 - **Routing режим:** логическо съпоставяне на източника, дедупликация по цел и
@@ -798,7 +805,7 @@ Campaign C нито дефинира, нито предоставя нативе
 
 | Компонент | Роля |
 |---|---|
-| `aismixer.py` | Основен процес, задачи за входовете, цикли за смесване и препращане, жизнен цикъл на незадължителния слой за управление |
+| `aismixer.py` | Основен процес, задачи и fan-in за входовете, етапи за обработка и egress, жизнен цикъл на незадължителния слой за управление |
 | `core/routing.py` / `core/routing_state.py` | Логическа маршрутизация и неизменяеми моментни снимки, локални за процеса |
 | `core/routing_control*.py` | Версиониран протокол, услуга за управление и Unix-domain транспорт |
 | `aismixerctl.py` | Операторски CLI за управление на маршрутизацията по време на работа |
@@ -819,7 +826,7 @@ Campaign C нито дефинира, нито предоставя нативе
 бъдещо диференциално тестване на нативен процесор. Този README остава
 оперативен преглед, а не дублирана нормативна спецификация.
 
-Границата за препращане приема директно неизменяеми `IngressFrame` обекти и
+Етапът за обработка приема директно неизменяеми `IngressFrame` обекти и
 запазва един адаптер за legacy `IngressEvent` обекти, чийто `raw_line` е `str`,
 включително подкласове. Невалидните събития за съвместимост и неподдържаните
 елементи се пренебрегват преди маршрутизирането. За всеки приет `IngressFrame`
@@ -837,7 +844,7 @@ Multipart сглобяването поддържа фрагменти в нап
 цикъл на assembler-а.
 
 Състоянието за дедупликация, състоянието за multipart сглобяване, multipart
-метаданните, управлявани от слоя за препращане, и защитеното състояние за replay,
+метаданните, управлявани от процесора, и защитеното състояние за replay,
 сесии и nonce имат изрични, детерминирани TTL жизнени цикли, локални за процеса.
 Обектите за състояние на референтната Python реализация приемат незадължителен
 лимит `max_entries` за дедупликацията и незадължителни ограничения
@@ -1409,8 +1416,8 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | Destinații UDP |
 - Decizii de deduplicare atomice la nivelul întregului grup multipart: globale
   în modul legacy și separate pentru fiecare `target_id` în modul de rutare.
 - Cicluri de viață TTL locale procesului, explicite și verificate prin teste,
-  pentru deduplicare, asamblare, metadatele multipart gestionate de componenta
-  de forwarding și starea de ingress securizat.
+  pentru deduplicare, asamblare, metadatele multipart gestionate de procesor și
+  starea de ingress securizat.
 - Limite locale procesului, opționale la nivel de constructor, în obiectele de
   stare Python de referință, plus snapshot-uri statistice imuabile pentru
   deduplicare, asamblare și starea securizată.
@@ -1439,11 +1446,13 @@ AISMixer păstrează separate **planul de date** și **planul de control**.
 ### 📡 Planul de date
 
 Producătorii UDP și UDPSEC integrați creează obiecte `IngressFrame` imuabile,
-iar `mixer_loop()` transportă elementele cozii fără să le modifice. La limita
-de forwarding, `forward_loop()` acceptă direct cadrele păstrând identitatea
+iar un singur fan-in ingress transportă elementele cozilor nemodificate către
+etapa procesorului. Această etapă acceptă direct cadrele păstrând identitatea
 obiectului și menține un singur adaptor de compatibilitate pentru obiectele
 legacy `IngressEvent` valide; evenimentele de compatibilitate nevalide și
-elementele nesuportate sunt ignorate înainte de rutare.
+elementele nesuportate sunt ignorate înainte de rutare. Fiecare lot complet
+nevid de ieșiri ale procesorului ajunge apoi la o singură etapă egress, care îl
+expediază secvențial înainte ca etapa procesorului să consume următorul element.
 
 Pentru fiecare cadru acceptat, planul de date preia un singur snapshot imuabil
 de rutare și potrivește `source_id` o singură dată. Scanează payload-ul cadrului
@@ -1455,7 +1464,8 @@ egress. Implementarea Python de compatibilitate a assemblerului materializează
 și stochează momentan propozițiile potrivite ca șiruri.
 
 Această limită de procesare pregătește serviciul pentru o implementare nativă
-viitoare, dar Campaign C nu definește și nu oferă un API sau ABI nativ.
+viitoare, dar Campaign D rămâne exclusiv Python și locală procesului și nu
+definește un API sau ABI nativ ori un protocol IPC.
 
 - **Modul legacy:** deduplicare globală și broadcast către toate forwarderele.
 - **Modul de rutare:** potrivirea sursei logice, deduplicare pentru fiecare
@@ -1475,7 +1485,7 @@ imuabil nou și înlocuiește atomic starea de rutare locală procesului.
 
 | Componentă | Rol |
 |---|---|
-| `aismixer.py` | Runtime principal, task-uri ingress, bucla mixerului, bucla de forwarding și ciclul de viață opțional al controlului |
+| `aismixer.py` | Runtime principal, task-uri și fan-in ingress, etape de procesare și egress, plus ciclul de viață opțional al controlului |
 | `core/routing.py` / `core/routing_state.py` | Rutare logică și snapshot-uri imuabile locale procesului |
 | `core/routing_control*.py` | Protocol de control versionat, serviciu și transport prin socket din domeniul Unix |
 | `aismixerctl.py` | CLI pentru controlul rutării la runtime de către operator |
@@ -1496,7 +1506,7 @@ verificat prin teste, pentru implementarea Python de referință și baza pentru
 viitoarea testare diferențială a unui procesor nativ. Acest README rămâne o
 prezentare generală operațională, nu o copie a specificației normative.
 
-Limita de redirecționare acceptă direct obiecte `IngressFrame` imuabile și
+Etapa procesorului acceptă direct obiecte `IngressFrame` imuabile și
 păstrează un singur adaptor pentru obiectele legacy `IngressEvent` al căror
 `raw_line` este un `str`, inclusiv subclase. Evenimentele de compatibilitate
 nevalide și elementele nesuportate sunt ignorate înainte de rutare. Pentru
@@ -1514,7 +1524,7 @@ nivel de grup, iar starea TAG `s`, `c` și `g` urmează limitele ciclului de via
 al assemblerului.
 
 Starea de deduplicare, starea asamblării multipart, metadatele multipart
-gestionate de componenta de forwarding și starea securizată pentru replay,
+gestionate de procesor și starea securizată pentru replay,
 sesiuni și nonce-uri au cicluri de viață TTL explicite, deterministe și locale
 procesului. Obiectele de stare Python de referință acceptă pentru deduplicare
 capacitatea opțională `max_entries`, iar pentru asamblare limitele opționale

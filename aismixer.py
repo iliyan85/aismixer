@@ -3,8 +3,13 @@ import socket
 import yaml
 import os
 import time
+from dataclasses import dataclass
 from forwarder import Forwarder
-from core.data_plane import ProcessingSnapshot, RoutingDisposition
+from core.data_plane import (
+    ProcessingSnapshot,
+    ProcessorOutput,
+    RoutingDisposition,
+)
 from core.ingress_frame import (
     coerce_ingress_frame,
     frame_from_udp_datagram,
@@ -101,11 +106,22 @@ data_plane_processor = PythonDataPlaneProcessor(
 )
 
 
-async def mixer_loop(input_queues, output_queue):
+@dataclass(frozen=True, slots=True)
+class _EgressBatch:
+    """Private process-local handoff with a runtime-only ordering barrier."""
+
+    outputs: tuple[ProcessorOutput, ...]
+    completion: asyncio.Future
+
+
+async def ingress_fan_in_loop(input_queues, output_queue):
+    """Preserve queue-item identity and ordering through one ingress fan-in."""
+
     async def reader(q):
         while True:
             item = await q.get()
             await output_queue.put(item)
+
     tasks = [asyncio.create_task(reader(q)) for q in input_queues]
     await asyncio.gather(*tasks)
 
@@ -118,6 +134,13 @@ async def _cancel_and_await_tasks(tasks):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _cancel_or_retrieve_completion(completion):
+    if not completion.done():
+        completion.cancel()
+    elif not completion.cancelled():
+        completion.exception()
+
+
 def compile_input_policies(entries, kind):
     return tuple(
         compile_ingress_policy(entry, context=f"{kind}[{index}]")
@@ -125,8 +148,13 @@ def compile_input_policies(entries, kind):
     )
 
 
-async def forward_loop(queue, routing_state=None, processor=None):
-    """Coerce, snapshot, process, and sequentially dispatch ingress frames."""
+async def processor_stage_loop(
+    ingress_queue,
+    egress_queue,
+    routing_state=None,
+    processor=None,
+):
+    """Process one accepted frame and await its egress completion barrier."""
 
     active_processor = (
         data_plane_processor
@@ -134,7 +162,7 @@ async def forward_loop(queue, routing_state=None, processor=None):
         else processor
     )
     while True:
-        item = await queue.get()
+        item = await ingress_queue.get()
         frame = coerce_ingress_frame(item)
         if frame is None:
             continue
@@ -150,24 +178,98 @@ async def forward_loop(queue, routing_state=None, processor=None):
             )
 
         outputs = active_processor.process(frame, processing_snapshot)
-        for output in outputs:
-            if DEBUG:
-                message = output.message
-                if message.endswith("\r\n"):
-                    message = message[:-2]
-                print(f"{ts()} OUTPUT => {message}")
+        if not outputs:
+            continue
 
-            if output.disposition is RoutingDisposition.LEGACY_BROADCAST:
-                await forwarder.send(output.message)
-            elif output.disposition is RoutingDisposition.TARGETED:
-                await forwarder.send_to(
-                    output.target_ids,
-                    output.message,
-                )
-            else:
-                raise AssertionError(
-                    f"Unsupported routing disposition: {output.disposition!r}"
-                )
+        completion = asyncio.get_running_loop().create_future()
+        batch = _EgressBatch(
+            outputs=outputs,
+            completion=completion,
+        )
+        try:
+            await egress_queue.put(batch)
+            await completion
+        finally:
+            _cancel_or_retrieve_completion(completion)
+
+
+async def egress_stage_loop(
+    egress_queue,
+    output_forwarder,
+    *,
+    debug=False,
+    timestamp=None,
+):
+    """Dispatch complete processor batches sequentially in tuple order."""
+
+    active_timestamp = ts if timestamp is None else timestamp
+    while True:
+        batch = await egress_queue.get()
+        try:
+            for output in batch.outputs:
+                if debug:
+                    message = output.message
+                    if message.endswith("\r\n"):
+                        message = message[:-2]
+                    print(f"{active_timestamp()} OUTPUT => {message}")
+
+                if output.disposition is RoutingDisposition.LEGACY_BROADCAST:
+                    await output_forwarder.send(output.message)
+                elif output.disposition is RoutingDisposition.TARGETED:
+                    await output_forwarder.send_to(
+                        output.target_ids,
+                        output.message,
+                    )
+                else:
+                    raise AssertionError(
+                        "Unsupported routing disposition: "
+                        f"{output.disposition!r}"
+                    )
+        except asyncio.CancelledError:
+            if not batch.completion.done():
+                batch.completion.cancel()
+            raise
+        except BaseException as exc:
+            if not batch.completion.done():
+                batch.completion.set_exception(exc)
+            raise
+        else:
+            if not batch.completion.done():
+                batch.completion.set_result(None)
+
+
+async def _run_runtime_stages(
+    ingress_queue,
+    egress_queue,
+    *,
+    routing_state=None,
+    processor=None,
+    output_forwarder,
+    debug=False,
+    timestamp=None,
+):
+    """Run exactly one processor stage and one egress stage as one lifecycle."""
+
+    processor_task = asyncio.create_task(
+        processor_stage_loop(
+            ingress_queue,
+            egress_queue,
+            routing_state=routing_state,
+            processor=processor,
+        )
+    )
+    egress_task = asyncio.create_task(
+        egress_stage_loop(
+            egress_queue,
+            output_forwarder,
+            debug=debug,
+            timestamp=timestamp,
+        )
+    )
+    try:
+        await asyncio.gather(processor_task, egress_task)
+    finally:
+        await _cancel_and_await_tasks((processor_task, egress_task))
 
 
 async def handle_socket(
@@ -209,7 +311,8 @@ async def handle_socket(
 
 async def main():
     input_queues = []
-    mixer_queue = asyncio.Queue()
+    processor_queue = asyncio.Queue()
+    egress_queue = asyncio.Queue(maxsize=1)
     runtime_tasks = []
     udp_sockets = []
     sec_input_policies = compile_input_policies(SEC_INPUTS, "sec_inputs")
@@ -273,12 +376,20 @@ async def main():
                 )
             )
 
-        # Mixer + Forwarder
-        runtime_tasks.append(asyncio.create_task(mixer_loop(input_queues, mixer_queue)))
-        await forward_loop(
-            mixer_queue,
+        # Ingress fan-in + processor + egress
+        runtime_tasks.append(
+            asyncio.create_task(
+                ingress_fan_in_loop(input_queues, processor_queue)
+            )
+        )
+        await _run_runtime_stages(
+            processor_queue,
+            egress_queue,
             routing_state=routing_state,
             processor=data_plane_processor,
+            output_forwarder=forwarder,
+            debug=DEBUG,
+            timestamp=ts,
         )
     finally:
         await _cancel_and_await_tasks(runtime_tasks)

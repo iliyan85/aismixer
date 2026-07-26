@@ -298,7 +298,7 @@ async def run_aismixer_main(
     monkeypatch,
     *,
     control_server=None,
-    forward_exc=None,
+    stages_exc=None,
     observer=None,
 ):
     observer = observer if observer is not None else {}
@@ -314,34 +314,53 @@ async def run_aismixer_main(
 
     forwarder = FakeForwarder()
     builder_calls = []
-    mixer_cancelled = {"value": False}
-    forward_called = {
+    fan_in_cancelled = {"value": False}
+    stages_called = {
         "value": False,
+        "ingress_queue": None,
+        "egress_queue": None,
         "routing_state": None,
         "processor": None,
+        "output_forwarder": None,
+        "debug": None,
+        "timestamp": None,
     }
-    mixer_started = asyncio.Event()
+    fan_in_started = asyncio.Event()
 
     def fake_builder(config, state, available_target_ids):
         builder_calls.append((config, state, available_target_ids))
         return control_server
 
-    async def fake_mixer_loop(_input_queues, _output_queue):
-        mixer_started.set()
+    async def fake_ingress_fan_in_loop(_input_queues, _output_queue):
+        fan_in_started.set()
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
-            mixer_cancelled["value"] = True
+            fan_in_cancelled["value"] = True
             raise
 
-    async def fake_forward_loop(_queue, routing_state=None, processor=None):
-        observer["forward_called"] = True
-        forward_called["value"] = True
-        forward_called["routing_state"] = routing_state
-        forward_called["processor"] = processor
-        await mixer_started.wait()
-        if forward_exc is not None:
-            raise forward_exc
+    async def fake_run_runtime_stages(
+        ingress_queue,
+        egress_queue,
+        *,
+        routing_state=None,
+        processor=None,
+        output_forwarder,
+        debug=False,
+        timestamp=None,
+    ):
+        observer["stages_called"] = True
+        stages_called["value"] = True
+        stages_called["ingress_queue"] = ingress_queue
+        stages_called["egress_queue"] = egress_queue
+        stages_called["routing_state"] = routing_state
+        stages_called["processor"] = processor
+        stages_called["output_forwarder"] = output_forwarder
+        stages_called["debug"] = debug
+        stages_called["timestamp"] = timestamp
+        await fan_in_started.wait()
+        if stages_exc is not None:
+            raise stages_exc
 
     monkeypatch.setattr(aismixer, "SEC_INPUTS", [])
     monkeypatch.setattr(aismixer, "UDP_INPUTS", [])
@@ -349,16 +368,25 @@ async def run_aismixer_main(
     monkeypatch.setattr(aismixer, "routing_state", routing_state)
     monkeypatch.setattr(aismixer, "forwarder", forwarder)
     monkeypatch.setattr(aismixer, "build_optional_routing_control_server", fake_builder)
-    monkeypatch.setattr(aismixer, "mixer_loop", fake_mixer_loop)
-    monkeypatch.setattr(aismixer, "forward_loop", fake_forward_loop)
+    monkeypatch.setattr(
+        aismixer,
+        "ingress_fan_in_loop",
+        fake_ingress_fan_in_loop,
+    )
+    monkeypatch.setattr(
+        aismixer,
+        "_run_runtime_stages",
+        fake_run_runtime_stages,
+    )
 
     await aismixer.main()
 
     return {
         "builder_calls": builder_calls,
-        "mixer_cancelled": mixer_cancelled["value"],
-        "forward_called": forward_called,
+        "fan_in_cancelled": fan_in_cancelled["value"],
+        "stages_called": stages_called,
         "routing_state": routing_state,
+        "forwarder": forwarder,
         "forwarder_close_count": forwarder.close_count,
     }
 
@@ -369,10 +397,18 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
     assert result["builder_calls"] == [
         ({"control": None}, result["routing_state"], ("udp:a",))
     ]
-    assert result["forward_called"]["value"] is True
-    assert result["forward_called"]["routing_state"] is result["routing_state"]
-    assert result["forward_called"]["processor"] is aismixer.data_plane_processor
-    assert result["mixer_cancelled"] is True
+    assert result["stages_called"]["value"] is True
+    assert result["stages_called"]["routing_state"] is result["routing_state"]
+    assert result["stages_called"]["processor"] is aismixer.data_plane_processor
+    assert result["stages_called"]["output_forwarder"] is result["forwarder"]
+    assert result["stages_called"]["debug"] is aismixer.DEBUG
+    assert result["stages_called"]["timestamp"] is aismixer.ts
+    assert (
+        result["stages_called"]["ingress_queue"]
+        is not result["stages_called"]["egress_queue"]
+    )
+    assert result["stages_called"]["egress_queue"].maxsize == 1
+    assert result["fan_in_cancelled"] is True
     assert result["forwarder_close_count"] == 1
 
 
@@ -383,11 +419,11 @@ def test_enabled_control_starts_and_closes_server(monkeypatch):
 
     assert server.start_count == 1
     assert server.close_count == 1
-    assert result["mixer_cancelled"] is True
+    assert result["fan_in_cancelled"] is True
     assert result["forwarder_close_count"] == 1
 
 
-def test_server_closes_when_forward_loop_raises(monkeypatch):
+def test_server_closes_when_runtime_stages_raise(monkeypatch):
     server = FakeControlServer()
 
     with pytest.raises(RuntimeError, match="forward failed"):
@@ -395,7 +431,7 @@ def test_server_closes_when_forward_loop_raises(monkeypatch):
             run_aismixer_main(
                 monkeypatch,
                 control_server=server,
-                forward_exc=RuntimeError("forward failed"),
+                stages_exc=RuntimeError("forward failed"),
             )
         )
 
@@ -403,7 +439,7 @@ def test_server_closes_when_forward_loop_raises(monkeypatch):
     assert server.close_count == 1
 
 
-def test_server_closes_when_forward_loop_is_cancelled(monkeypatch):
+def test_server_closes_when_runtime_stages_are_cancelled(monkeypatch):
     server = FakeControlServer()
 
     with pytest.raises(asyncio.CancelledError):
@@ -411,7 +447,7 @@ def test_server_closes_when_forward_loop_is_cancelled(monkeypatch):
             run_aismixer_main(
                 monkeypatch,
                 control_server=server,
-                forward_exc=asyncio.CancelledError(),
+                stages_exc=asyncio.CancelledError(),
             )
         )
 
@@ -419,7 +455,7 @@ def test_server_closes_when_forward_loop_is_cancelled(monkeypatch):
     assert server.close_count == 1
 
 
-def test_server_start_failure_prevents_forward_loop_and_propagates(monkeypatch):
+def test_server_start_failure_prevents_runtime_stages_and_propagates(monkeypatch):
     server = FakeControlServer(start_exc=PermissionError("bind denied"))
     observer = {}
 
@@ -434,7 +470,7 @@ def test_server_start_failure_prevents_forward_loop_and_propagates(monkeypatch):
 
     assert server.start_count == 1
     assert server.close_count == 0
-    assert observer.get("forward_called") is None
+    assert observer.get("stages_called") is None
 
 
 def test_main_does_not_construct_a_second_routing_state(monkeypatch):
@@ -476,7 +512,7 @@ class IntegrationForwarder:
 
 
 @unix_socket_test
-def test_runtime_control_unix_stack_updates_forward_loop_routing(tmp_path, monkeypatch):
+def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
     async def scenario():
         path = tmp_path / "control.sock"
         routing_state = RoutingState()
@@ -489,8 +525,6 @@ def test_runtime_control_unix_stack_updates_forward_loop_routing(tmp_path, monke
         )
         assert isinstance(server, RoutingControlUnixServer)
 
-        monkeypatch.setattr(aismixer, "forwarder", fake_forwarder)
-        monkeypatch.setattr(aismixer, "DEBUG", False)
         processor = PythonDataPlaneProcessor(
             station_id="test_station",
             preserve_ingress_c=True,
@@ -502,12 +536,16 @@ def test_runtime_control_unix_stack_updates_forward_loop_routing(tmp_path, monke
 
         await server.start()
         client = RoutingControlUnixClient(path)
-        queue = asyncio.Queue()
-        forward_task = asyncio.create_task(
-            aismixer.forward_loop(
-                queue,
+        ingress_queue = asyncio.Queue()
+        egress_queue = asyncio.Queue()
+        runtime_task = asyncio.create_task(
+            aismixer._run_runtime_stages(
+                ingress_queue,
+                egress_queue,
                 routing_state=routing_state,
                 processor=processor,
+                output_forwarder=fake_forwarder,
+                debug=False,
             )
         )
         try:
@@ -538,7 +576,7 @@ def test_runtime_control_unix_stack_updates_forward_loop_routing(tmp_path, monke
                 }
             )
 
-            await queue.put(make_event(SENTENCE))
+            await ingress_queue.put(make_event(SENTENCE))
             await asyncio.wait_for(fake_forwarder.targeted_event.wait(), timeout=1)
 
             disable = await client.request(
@@ -550,11 +588,11 @@ def test_runtime_control_unix_stack_updates_forward_loop_routing(tmp_path, monke
                 }
             )
 
-            await queue.put(make_event(SECOND_SENTENCE))
+            await ingress_queue.put(make_event(SECOND_SENTENCE))
             await asyncio.wait_for(fake_forwarder.broadcast_event.wait(), timeout=1)
         finally:
-            forward_task.cancel()
-            await asyncio.gather(forward_task, return_exceptions=True)
+            runtime_task.cancel()
+            await asyncio.gather(runtime_task, return_exceptions=True)
             await server.close()
 
         assert status["result"]["generation"] == 0

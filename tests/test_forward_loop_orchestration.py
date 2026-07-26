@@ -125,6 +125,23 @@ class BoundaryObservingForwarder:
         raise AssertionError("boundary test expects legacy broadcast output")
 
 
+async def run_runtime_stages(
+    ingress_queue,
+    processor,
+    output_forwarder,
+    *,
+    routing_state=None,
+):
+    await aismixer._run_runtime_stages(
+        ingress_queue,
+        asyncio.Queue(),
+        routing_state=routing_state,
+        processor=processor,
+        output_forwarder=output_forwarder,
+        debug=False,
+    )
+
+
 def make_boundary_processor():
     touched_s_values = []
     clock_observations = []
@@ -163,23 +180,21 @@ def make_boundary_processor():
     )
 
 
-def test_invalid_item_is_ignored_before_snapshot_and_processing_then_loop_continues(
-    monkeypatch,
-):
+def test_invalid_item_is_ignored_before_snapshot_and_processing_then_loop_continues():
     frame = make_frame()
     state = RecordingRoutingState(
         RoutingSnapshot(generation=7, table=None)
     )
     processor = ScriptedProcessor(())
-    monkeypatch.setattr(aismixer, "forwarder", RecordingForwarder())
-    monkeypatch.setattr(aismixer, "DEBUG", False)
+    output_forwarder = RecordingForwarder()
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(
-            aismixer.forward_loop(
+            run_runtime_stages(
                 FiniteQueue(object(), frame),
-                routing_state=state,
                 processor=processor,
+                output_forwarder=output_forwarder,
+                routing_state=state,
             )
         )
 
@@ -191,9 +206,7 @@ def test_invalid_item_is_ignored_before_snapshot_and_processing_then_loop_contin
     assert snapshot.routing_table is None
 
 
-def test_processor_is_called_once_and_outputs_are_dispatched_sequentially(
-    monkeypatch,
-):
+def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
     frame = make_frame()
     state = RecordingRoutingState(
         RoutingSnapshot(generation=3, table=None)
@@ -212,15 +225,14 @@ def test_processor_is_called_once_and_outputs_are_dispatched_sequentially(
         )
     )
     forwarder = RecordingForwarder()
-    monkeypatch.setattr(aismixer, "forwarder", forwarder)
-    monkeypatch.setattr(aismixer, "DEBUG", False)
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(
-            aismixer.forward_loop(
+            run_runtime_stages(
                 FiniteQueue(frame),
-                routing_state=state,
                 processor=processor,
+                output_forwarder=forwarder,
+                routing_state=state,
             )
         )
 
@@ -236,7 +248,7 @@ def test_processor_is_called_once_and_outputs_are_dispatched_sequentially(
     ]
 
 
-def test_dispatch_failure_stops_before_later_output_dispatch(monkeypatch):
+def test_dispatch_failure_stops_before_later_output_dispatch():
     processor = ScriptedProcessor(
         (
             ProcessorOutput(
@@ -250,14 +262,13 @@ def test_dispatch_failure_stops_before_later_output_dispatch(monkeypatch):
         )
     )
     forwarder = RecordingForwarder(fail_at=1)
-    monkeypatch.setattr(aismixer, "forwarder", forwarder)
-    monkeypatch.setattr(aismixer, "DEBUG", False)
 
     with pytest.raises(RuntimeError, match="send failed"):
         asyncio.run(
-            aismixer.forward_loop(
+            run_runtime_stages(
                 FiniteQueue(make_frame()),
                 processor=processor,
+                output_forwarder=forwarder,
             )
         )
 
@@ -265,9 +276,7 @@ def test_dispatch_failure_stops_before_later_output_dispatch(monkeypatch):
     assert forwarder.events == [("broadcast", "first\r\n")]
 
 
-def test_whole_frame_processing_and_effects_complete_before_ordered_egress(
-    monkeypatch,
-):
+def test_whole_frame_processing_and_effects_complete_before_ordered_egress():
     (
         processor,
         deduplicator,
@@ -285,14 +294,13 @@ def test_whole_frame_processing_and_effects_complete_before_ordered_egress(
     frame = make_frame(
         (FIRST_SENTENCE + "\n" + SECOND_SENTENCE).encode("ascii")
     )
-    monkeypatch.setattr(aismixer, "forwarder", forwarder)
-    monkeypatch.setattr(aismixer, "DEBUG", False)
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(
-            aismixer.forward_loop(
+            run_runtime_stages(
                 FiniteQueue(frame),
                 processor=processor,
+                output_forwarder=forwarder,
             )
         )
 
@@ -321,9 +329,7 @@ def test_whole_frame_processing_and_effects_complete_before_ordered_egress(
     ]
 
 
-def test_first_send_failure_keeps_completed_effects_and_later_output(
-    monkeypatch,
-):
+def test_first_send_failure_keeps_completed_effects_and_later_output():
     (
         processor,
         deduplicator,
@@ -342,14 +348,13 @@ def test_first_send_failure_keeps_completed_effects_and_later_output(
     frame = make_frame(
         (FIRST_SENTENCE + "\n" + SECOND_SENTENCE).encode("ascii")
     )
-    monkeypatch.setattr(aismixer, "forwarder", forwarder)
-    monkeypatch.setattr(aismixer, "DEBUG", False)
 
     with pytest.raises(RuntimeError, match="send failed"):
         asyncio.run(
-            aismixer.forward_loop(
+            run_runtime_stages(
                 FiniteQueue(frame),
                 processor=processor,
+                output_forwarder=forwarder,
             )
         )
 
