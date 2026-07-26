@@ -591,3 +591,37 @@ This contract was consolidated at the end of Campaign A.
   native processor API or ABI.
 - This is a Campaign C closure snapshot, not a guarantee that future test
   counts will remain identical.
+
+## 19. Campaign D closure baseline
+
+- Closure snapshot date: 2026-07-26.
+- Branch: `main`.
+- Audited source commit:
+  `d35de4d84233b27e8541f0cc1b5c041ad464dbc2` (`d35de4d`).
+- Environment: Python 3.14.5 and pytest 9.0.3 on Windows 11
+  (`Windows-11-10.0.26200-SP0`, AMD64).
+- Focused results:
+  - Campaign D processor, runtime-stage, and supervision coverage:
+    `449 passed, 1 skipped` (450 collected);
+  - Campaign A-C semantic regression coverage: `473 passed` (473 collected);
+  - asyncio-debug and warnings-as-errors lifecycle coverage: `9 passed`
+    (9 collected).
+- Final full-suite result: `1248 passed, 18 skipped, 0 failed`
+  (1266 collected).
+- `git diff --check`: passed.
+- The closed processor boundary consists of immutable ingress, processing
+  snapshot, and processor-output values plus the synchronous
+  `DataPlaneProcessor` protocol. `PythonDataPlaneProcessor` is the sole
+  production processor and remains the behavioural reference implementation.
+- Runtime orchestration uses explicit process-local ingress fan-in, processor,
+  and ordered egress stages. A completion acknowledgement prevents processor
+  work on a later frame from running ahead of the current non-empty batch's
+  egress dispatch.
+- UDP, UDPSEC, fan-in, processor, and egress tasks share one process-local
+  fail-fast supervision lifecycle. This lifecycle supplies termination and
+  cleanup, not restart, rollback, replay, or transactional delivery.
+- Routing generations remain observational and do not reset processor state.
+- Campaign D introduced no native implementation, native API or ABI, bindings,
+  multiprocessing, coordinator/worker model, or IPC protocol.
+- This is a Campaign D closure snapshot, not a guarantee that future test
+  counts will remain identical.

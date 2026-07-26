@@ -460,6 +460,34 @@ def test_secure_server_closes_owned_socket_when_bind_fails(monkeypatch):
     assert fake_socket.close_count == 1
 
 
+def test_secure_server_closes_owned_socket_when_runtime_fails(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    runtime_failure = RuntimeError("receive loop failed")
+    fake_socket = _FakeSecureSocket()
+
+    async def fail_runtime(*_args, **_kwargs):
+        raise runtime_failure
+
+    monkeypatch.setattr(
+        secure,
+        "socket",
+        _FakeSocketModule(fake_socket, secure.socket),
+    )
+    monkeypatch.setattr(secure, "_secure_server_loop", fail_runtime)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(
+            secure.secure_server(
+                _FakeQueue(),
+                "127.0.0.1",
+                9999,
+            )
+        )
+
+    assert excinfo.value is runtime_failure
+    assert fake_socket.close_count == 1
+
+
 def _install_test_session(
     secure,
     state,

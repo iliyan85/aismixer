@@ -109,12 +109,12 @@ AISMixer keeps the **data plane** and **control plane** separate.
 
 Built-in UDP and UDPSEC producers create immutable `IngressFrame` objects, and
 a single ingress fan-in transports queue items unchanged to the processor
-stage. That stage accepts direct frames by object identity and retains one
-compatibility adapter for valid legacy `IngressEvent` objects; invalid
-compatibility events and unsupported queue items are ignored before routing.
-Each non-empty complete processor-output batch then passes to a single egress
-stage, which dispatches it sequentially before the processor stage consumes
-the next item.
+stage. That stage accepts direct frames by object identity, invokes the
+synchronous Python reference processor, and retains one compatibility adapter
+for valid legacy `IngressEvent` objects; invalid compatibility events and
+unsupported queue items are ignored before routing. Each non-empty complete
+processor-output batch then passes to a single egress stage, which dispatches
+it sequentially before the processor stage consumes the next item.
 
 All UDP and UDPSEC producer tasks, the ingress fan-in task, and the processor
 and egress tasks are supervised as one process-local lifecycle. Failure or
@@ -130,9 +130,9 @@ TAG metadata, and forwards accepted sentences to UDP egress destinations. The
 Python compatibility assembler currently materializes and stores matched
 sentence strings.
 
-This processing boundary prepares the service for a future native
-implementation, but Campaign D remains Python-only and process-local and
-defines no native API, ABI, or IPC protocol.
+Campaign D remains Python-only and process-local and defines no native API or
+ABI. Native processor implementations, coordinator/worker processes,
+multiprocessing, and IPC remain future work.
 
 - **Legacy mode:** global deduplication and broadcast to all forwarders.
 - **Routing mode:** logical source matching, per-target deduplication, and
@@ -773,12 +773,12 @@ AISMixer разделя **слоя за данни** (`data plane`) и **сло�
 Вградените UDP и UDPSEC входове създават неизменяеми `IngressFrame` обекти, а
 един ingress fan-in пренася елементите от опашките непроменени към етапа за
 обработка. Този етап приема директните `IngressFrame` обекти със запазена
-идентичност на обекта и поддържа един адаптер за съвместимост с валидни legacy
-`IngressEvent` обекти; невалидните събития за съвместимост и неподдържаните
-елементи от опашката се пренебрегват преди маршрутизирането. След това всеки
-непразен пълен пакет от изходи на процесора се предава към един egress етап,
-който го изпраща последователно, преди етапът за обработка да приеме следващия
-елемент.
+идентичност на обекта, извиква синхронния референтен Python процесор и поддържа
+един адаптер за съвместимост с валидни legacy `IngressEvent` обекти;
+невалидните събития за съвместимост и неподдържаните елементи от опашката се
+пренебрегват преди маршрутизирането. След това всеки непразен пълен пакет от
+изходи на процесора се предава към един egress етап, който го изпраща
+последователно, преди етапът за обработка да приеме следващия елемент.
 
 Всички задачи за UDP и UDPSEC входовете, ingress fan-in задачата и задачите на
 етапите за обработка и egress се наблюдават като един локален за процеса жизнен
@@ -795,9 +795,9 @@ runtime-а, след като останалите задачи бъдат от�
 реализацията на assembler-а за съвместимост в момента материализира и
 съхранява съвпадналите изречения като низове.
 
-Тази граница на обработката подготвя услугата за бъдеща нативна реализация, но
-Campaign D остава изцяло Python, локална за процеса, и не дефинира нативен API,
-ABI или IPC протокол.
+Campaign D остава изцяло Python и локална за процеса и не дефинира нативен API
+или ABI. Нативните реализации на процесора, coordinator/worker процесите,
+multiprocessing и IPC остават бъдеща работа.
 
 - **Legacy режим:** глобална дедупликация и broadcast към всички forwarder-и.
 - **Routing режим:** логическо съпоставяне на източника, дедупликация по цел и
@@ -1460,11 +1460,12 @@ AISMixer păstrează separate **planul de date** și **planul de control**.
 Producătorii UDP și UDPSEC integrați creează obiecte `IngressFrame` imuabile,
 iar un singur fan-in ingress transportă elementele cozilor nemodificate către
 etapa procesorului. Această etapă acceptă direct cadrele păstrând identitatea
-obiectului și menține un singur adaptor de compatibilitate pentru obiectele
-legacy `IngressEvent` valide; evenimentele de compatibilitate nevalide și
-elementele nesuportate sunt ignorate înainte de rutare. Fiecare lot complet
-nevid de ieșiri ale procesorului ajunge apoi la o singură etapă egress, care îl
-expediază secvențial înainte ca etapa procesorului să consume următorul element.
+obiectului, invocă procesorul sincron de referință implementat în Python și
+menține un singur adaptor de compatibilitate pentru obiectele legacy
+`IngressEvent` valide; evenimentele de compatibilitate nevalide și elementele
+nesuportate sunt ignorate înainte de rutare. Fiecare lot complet nevid de ieșiri
+ale procesorului ajunge apoi la o singură etapă egress, care îl expediază
+secvențial înainte ca etapa procesorului să consume următorul element.
 
 Toate task-urile producătorilor UDP și UDPSEC, ale fan-in-ului ingress și ale
 etapelor de procesare și egress sunt supravegheate ca un singur ciclu de viață
@@ -1481,9 +1482,9 @@ TAG de ieșire și redirecționează propozițiile acceptate spre destinațiile 
 egress. Implementarea Python de compatibilitate a assemblerului materializează
 și stochează momentan propozițiile potrivite ca șiruri.
 
-Această limită de procesare pregătește serviciul pentru o implementare nativă
-viitoare, dar Campaign D rămâne exclusiv Python și locală procesului și nu
-definește un API sau ABI nativ ori un protocol IPC.
+Campaign D rămâne exclusiv Python și locală procesului și nu definește un API
+sau ABI nativ. Implementările native ale procesorului, procesele
+coordinator/worker, multiprocessing și IPC rămân activități viitoare.
 
 - **Modul legacy:** deduplicare globală și broadcast către toate forwarderele.
 - **Modul de rutare:** potrivirea sursei logice, deduplicare pentru fiecare

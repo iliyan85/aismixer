@@ -32,6 +32,17 @@ The following capabilities are implemented in the current codebase:
 - Target-scoped deduplication in routing mode.
 - Immutable routing snapshots.
 - Process-local routing generations.
+- Immutable `IngressFrame` values and a bytes-native parsed ingress
+  representation.
+- An explicit synchronous `DataPlaneProcessor` boundary with immutable
+  snapshot and output values.
+- `PythonDataPlaneProcessor` as the current and sole Python reference
+  processor.
+- Explicit single-process ingress fan-in, processor, and egress stages.
+- An ordered completion barrier that prevents processor work on a later frame
+  from running ahead of the current non-empty batch's egress dispatch.
+- Process-local fail-fast supervision for UDP, UDPSEC, ingress fan-in,
+  processor, and egress tasks.
 - Runtime routing status, replacement, and disable operations.
 - Versioned JSON routing-control protocol.
 - Opt-in POSIX Unix-domain control server.
@@ -59,12 +70,23 @@ Remaining deployment hardening:
 - Define explicit service ownership and group access for the control socket.
 - Verify Linux and Raspberry Pi operational behavior for installer, service,
   UDPSEC, and control-socket deployments.
+- Aggregate resource-closer failures. A failing closer can currently mask the
+  primary runtime exception or prevent a later closer from running; correcting
+  that is cleanup hardening, not a Campaign D processor-boundary guarantee.
 
 ### 2. Process Architecture
 
+Already implemented:
+
+- Explicit stage boundaries and process-local lifecycle supervision within the
+  current single service process.
+
+Still future:
+
 - Introduce a coordinator process and dedicated ingress and egress workers.
-- Define process lifecycle supervision and failure handling.
-- Add IPC for routing snapshot distribution between processes.
+- Define cross-process lifecycle supervision and failure handling.
+- Add IPC and routing-snapshot distribution between processes.
+- Define worker restart and recovery policy.
 - Use explicit egress-worker terminology for forwarding workers.
 - Migrate in stages rather than as a single large rewrite.
 
