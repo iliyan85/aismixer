@@ -1,18 +1,19 @@
-"""Canonical transcript digests for the UDPSEC ECDHE handshake.
+"""Canonical transcript and key helpers for the UDPSEC ECDHE handshake.
 
 Every logical transcript field is framed as a four-byte unsigned big-endian
 length followed by the field bytes. Timestamps are first encoded as exactly
 eight unsigned big-endian bytes and are then framed like every other field.
 
 Binary inputs accept ``bytes``, ``bytearray``, and ``memoryview``. Mutable
-inputs are copied to immutable ``bytes`` before hashing. Public-key and
-signature fields remain opaque here; later handshake work is responsible for
-parsing and validating their cryptographic encodings.
+inputs are copied to immutable ``bytes``. UDPSEC ephemeral public points use
+only canonical 33-byte SEC1/X9.62 compressed-point encoding on P-256. The
+transcript helpers continue to treat their public-key and signature fields as
+opaque bytes.
 """
 
 from __future__ import annotations
 
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 
@@ -26,6 +27,13 @@ SESSION_TRANSCRIPT_LABEL = b"SESSION-TRANSCRIPT"
 
 _MAX_FRAMED_FIELD_LENGTH = (1 << 32) - 1
 _MAX_TIMESTAMP = (1 << 64) - 1
+_COMPRESSED_PUBLIC_KEY_LENGTH = 33
+_COMPRESSED_POINT_PREFIXES = (0x02, 0x03)
+_P256_SHARED_SECRET_LENGTH = ECDHE_CURVE.key_size // 8
+_INVALID_EPHEMERAL_PUBLIC_KEY = (
+    "encoded ephemeral public key is not a valid canonical compressed "
+    "P-256 point"
+)
 
 __all__ = (
     "CLIENT_AUTH_LABEL",
@@ -37,6 +45,10 @@ __all__ = (
     "build_client_auth_digest",
     "build_server_auth_digest",
     "build_session_transcript_hash",
+    "derive_ephemeral_shared_secret",
+    "generate_ephemeral_private_key",
+    "parse_ephemeral_public_key",
+    "serialize_ephemeral_public_key",
 )
 
 
@@ -69,6 +81,96 @@ def _required_bytes(name: str, value: object) -> bytes:
     if not normalized:
         raise ValueError(f"{name} must not be empty")
     return normalized
+
+
+def _require_p256_curve(name: str, curve: ec.EllipticCurve) -> None:
+    if not isinstance(curve, ec.SECP256R1):
+        raise ValueError(f"{name} must use SECP256R1/P-256")
+
+
+def generate_ephemeral_private_key() -> ec.EllipticCurvePrivateKey:
+    """Generate a fresh, in-memory P-256 private key for one handshake."""
+
+    return ec.generate_private_key(ECDHE_CURVE)
+
+
+def serialize_ephemeral_public_key(
+    public_key: ec.EllipticCurvePublicKey,
+) -> bytes:
+    """Serialize a P-256 public key as one canonical compressed SEC1 point."""
+
+    if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        raise TypeError("public_key must be an EllipticCurvePublicKey")
+    _require_p256_curve("public_key", public_key.curve)
+
+    encoded = public_key.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.CompressedPoint,
+    )
+    if (
+        not isinstance(encoded, bytes)
+        or len(encoded) != _COMPRESSED_PUBLIC_KEY_LENGTH
+        or encoded[0] not in _COMPRESSED_POINT_PREFIXES
+    ):
+        raise RuntimeError(
+            "public_key did not produce a canonical compressed P-256 point"
+        )
+    return encoded
+
+
+def parse_ephemeral_public_key(
+    encoded: bytes | bytearray | memoryview,
+) -> ec.EllipticCurvePublicKey:
+    """Parse one canonical compressed SEC1 P-256 public point."""
+
+    normalized = _required_bytes("encoded ephemeral public key", encoded)
+    if len(normalized) != _COMPRESSED_PUBLIC_KEY_LENGTH:
+        raise ValueError(
+            "encoded ephemeral public key must be exactly 33 bytes"
+        )
+    if normalized[0] not in _COMPRESSED_POINT_PREFIXES:
+        raise ValueError(
+            "encoded ephemeral public key must start with 0x02 or 0x03"
+        )
+
+    try:
+        public_key = ec.EllipticCurvePublicKey.from_encoded_point(
+            ECDHE_CURVE,
+            normalized,
+        )
+    except ValueError:
+        raise ValueError(_INVALID_EPHEMERAL_PUBLIC_KEY) from None
+
+    canonical = serialize_ephemeral_public_key(public_key)
+    if canonical != normalized:
+        raise ValueError(_INVALID_EPHEMERAL_PUBLIC_KEY)
+    return public_key
+
+
+def derive_ephemeral_shared_secret(
+    private_key: ec.EllipticCurvePrivateKey,
+    peer_public_key: ec.EllipticCurvePublicKey,
+) -> bytes:
+    """Return the raw 32-byte P-256 ECDHE shared secret without a KDF."""
+
+    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+        raise TypeError("private_key must be an EllipticCurvePrivateKey")
+    if not isinstance(peer_public_key, ec.EllipticCurvePublicKey):
+        raise TypeError(
+            "peer_public_key must be an EllipticCurvePublicKey"
+        )
+    _require_p256_curve("private_key", private_key.curve)
+    _require_p256_curve("peer_public_key", peer_public_key.curve)
+
+    shared_secret = private_key.exchange(ec.ECDH(), peer_public_key)
+    if (
+        not isinstance(shared_secret, bytes)
+        or len(shared_secret) != _P256_SHARED_SECRET_LENGTH
+    ):
+        raise RuntimeError(
+            "P-256 ECDHE exchange did not produce a 32-byte secret"
+        )
+    return shared_secret
 
 
 def _client_hello_fields(
