@@ -10,14 +10,20 @@ only canonical 33-byte SEC1/X9.62 compressed-point encoding on P-256.
 Transcript authentication uses P-256 ECDSA over a precomputed SHA-256 digest,
 with signatures encoded as strict canonical low-S ASN.1 DER. The transcript
 helpers continue to treat their public-key and signature fields as opaque
-bytes.
+bytes. Directional session keys use HKDF-SHA256 with the raw P-256 ECDHE
+secret as input keying material and the authenticated session transcript hash
+as salt, deriving separate AES-256-GCM keys for client-to-server and
+server-to-client traffic.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
 ECDHE_CURVE = ec.SECP256R1()
@@ -40,6 +46,11 @@ _P256_ORDER = int(
     16,
 )
 _P256_HALF_ORDER = _P256_ORDER // 2
+_SESSION_KEY_LENGTH = 32
+_SESSION_KEY_SCHEDULE_LABEL = b"SESSION-KEY-SCHEDULE"
+_CLIENT_TO_SERVER_LABEL = b"CLIENT-TO-SERVER"
+_SERVER_TO_CLIENT_LABEL = b"SERVER-TO-CLIENT"
+_AES_256_GCM_KEY_LABEL = b"AES-256-GCM-KEY"
 _INVALID_EPHEMERAL_PUBLIC_KEY = (
     "encoded ephemeral public key is not a valid canonical compressed "
     "P-256 point"
@@ -50,18 +61,39 @@ __all__ = (
     "DOMAIN_CONTEXT",
     "ECDHE_CURVE",
     "SERVER_AUTH_LABEL",
+    "SessionKeyMaterial",
     "SESSION_TRANSCRIPT_LABEL",
     "TRANSCRIPT_HASH",
     "build_client_auth_digest",
     "build_server_auth_digest",
     "build_session_transcript_hash",
     "derive_ephemeral_shared_secret",
+    "derive_session_key_material",
     "generate_ephemeral_private_key",
     "parse_ephemeral_public_key",
     "serialize_ephemeral_public_key",
     "sign_transcript_digest",
     "verify_transcript_signature",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class SessionKeyMaterial:
+    """Immutable directional AES-256-GCM keys with a secret-free repr."""
+
+    client_to_server_key: bytes = field(repr=False)
+    server_to_client_key: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "client_to_server_key",
+            "server_to_client_key",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(f"{name} must be bytes")
+            if len(value) != _SESSION_KEY_LENGTH:
+                raise ValueError(f"{name} must be exactly 32 bytes")
 
 
 def _station_id_bytes(station_id: object) -> bytes:
@@ -133,6 +165,57 @@ def _transcript_signature_algorithm() -> ec.ECDSA:
 
 def _valid_p256_scalar(value: int) -> bool:
     return 1 <= value < _P256_ORDER
+
+
+def _session_key_input_bytes(
+    name: str,
+    value: bytes | bytearray | memoryview,
+) -> bytes:
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError(f"{name} must be bytes, bytearray, or memoryview")
+    try:
+        normalized = bytes(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must reference readable bytes") from exc
+    if len(normalized) != _SESSION_KEY_LENGTH:
+        raise ValueError(f"{name} must be exactly 32 bytes")
+    return normalized
+
+
+def _framed_hkdf_info_field(value: bytes) -> bytes:
+    if len(value) > _MAX_FRAMED_FIELD_LENGTH:
+        raise ValueError("HKDF info field exceeds unsigned 32-bit framing")
+    return len(value).to_bytes(4, "big") + value
+
+
+def _session_key_info(direction_label: bytes) -> bytes:
+    return b"".join(
+        _framed_hkdf_info_field(value)
+        for value in (
+            DOMAIN_CONTEXT,
+            _SESSION_KEY_SCHEDULE_LABEL,
+            direction_label,
+            _AES_256_GCM_KEY_LABEL,
+        )
+    )
+
+
+def _derive_directional_session_key(
+    shared_secret: bytes,
+    session_transcript_hash: bytes,
+    direction_label: bytes,
+) -> bytes:
+    key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=_SESSION_KEY_LENGTH,
+        salt=session_transcript_hash,
+        info=_session_key_info(direction_label),
+    ).derive(shared_secret)
+    if not isinstance(key, bytes) or len(key) != _SESSION_KEY_LENGTH:
+        raise RuntimeError(
+            "HKDF-SHA256 did not produce a 32-byte session key"
+        )
+    return key
 
 
 def generate_ephemeral_private_key() -> ec.EllipticCurvePrivateKey:
@@ -298,6 +381,38 @@ def verify_transcript_signature(
     except InvalidSignature:
         return False
     return True
+
+
+def derive_session_key_material(
+    shared_secret: bytes | bytearray | memoryview,
+    session_transcript_hash: bytes | bytearray | memoryview,
+) -> SessionKeyMaterial:
+    """Derive independent client/server AES-256-GCM keys with HKDF-SHA256."""
+
+    normalized_secret = _session_key_input_bytes(
+        "shared_secret",
+        shared_secret,
+    )
+    normalized_transcript_hash = _session_key_input_bytes(
+        "session_transcript_hash",
+        session_transcript_hash,
+    )
+    client_to_server_key = _derive_directional_session_key(
+        normalized_secret,
+        normalized_transcript_hash,
+        _CLIENT_TO_SERVER_LABEL,
+    )
+    server_to_client_key = _derive_directional_session_key(
+        normalized_secret,
+        normalized_transcript_hash,
+        _SERVER_TO_CLIENT_LABEL,
+    )
+    if client_to_server_key == server_to_client_key:
+        raise RuntimeError("directional HKDF session keys must differ")
+    return SessionKeyMaterial(
+        client_to_server_key=client_to_server_key,
+        server_to_client_key=server_to_client_key,
+    )
 
 
 def _client_hello_fields(

@@ -1,3 +1,8 @@
+import hashlib
+import hmac
+import itertools
+from dataclasses import FrozenInstanceError, fields, is_dataclass
+
 import pytest
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -9,12 +14,14 @@ from core.udpsec_crypto import (
     DOMAIN_CONTEXT,
     ECDHE_CURVE,
     SERVER_AUTH_LABEL,
+    SessionKeyMaterial,
     SESSION_TRANSCRIPT_LABEL,
     TRANSCRIPT_HASH,
     build_client_auth_digest,
     build_server_auth_digest,
     build_session_transcript_hash,
     derive_ephemeral_shared_secret,
+    derive_session_key_material,
     generate_ephemeral_private_key,
     parse_ephemeral_public_key,
     serialize_ephemeral_public_key,
@@ -64,6 +71,26 @@ P256_ORDER = int(
     16,
 )
 TEST_TRANSCRIPT_DIGEST = bytes(range(32))
+EXPECTED_CLIENT_TO_SERVER_INFO = bytes.fromhex(
+    "000000154149534d495845522d5544505345432d4543444845"
+    "0000001453455353494f4e2d4b45592d5343484544554c45"
+    "00000010434c49454e542d544f2d534552564552"
+    "0000000f4145532d3235362d47434d2d4b4559"
+)
+EXPECTED_SERVER_TO_CLIENT_INFO = bytes.fromhex(
+    "000000154149534d495845522d5544505345432d4543444845"
+    "0000001453455353494f4e2d4b45592d5343484544554c45"
+    "000000105345525645522d544f2d434c49454e54"
+    "0000000f4145532d3235362d47434d2d4b4559"
+)
+EXPECTED_CLIENT_TO_SERVER_KEY = bytes.fromhex(
+    "df76ce2324cd1f051b79ffece9d776e9"
+    "e9d53326cfa807bfcd43b18605cd25ea"
+)
+EXPECTED_SERVER_TO_CLIENT_KEY = bytes.fromhex(
+    "a29be2b5bce14069ae3c189126bf48cf"
+    "8d101e2fd726e881c21c1f6fc7c0ba6d"
+)
 
 
 class _BytesConvertible:
@@ -111,6 +138,129 @@ def _p384_private_key(private_value=1):
 def _to_low_s(signature):
     r, s = utils.decode_dss_signature(signature)
     return utils.encode_dss_signature(r, min(s, P256_ORDER - s))
+
+
+def _reference_frame(value):
+    return len(value).to_bytes(4, "big") + value
+
+
+def _reference_session_key_info(direction_label):
+    return b"".join(
+        _reference_frame(value)
+        for value in (
+            b"AISMIXER-UDPSEC-ECDHE",
+            b"SESSION-KEY-SCHEDULE",
+            direction_label,
+            b"AES-256-GCM-KEY",
+        )
+    )
+
+
+def _reference_hkdf_sha256(ikm, salt, info, length=32):
+    digest_size = hashlib.sha256().digest_size
+    if length > 255 * digest_size:
+        raise ValueError("reference HKDF output is too long")
+
+    pseudorandom_key = hmac.new(
+        salt,
+        ikm,
+        hashlib.sha256,
+    ).digest()
+    output = bytearray()
+    previous = b""
+    for counter in range(1, (length + digest_size - 1) // digest_size + 1):
+        previous = hmac.new(
+            pseudorandom_key,
+            previous + info + bytes((counter,)),
+            hashlib.sha256,
+        ).digest()
+        output.extend(previous)
+    return bytes(output[:length])
+
+
+def _build_pure_handshake():
+    client_identity_private_key = _p256_private_key(101)
+    server_identity_private_key = _p256_private_key(202)
+    client_ephemeral_private_key = _p256_private_key(1)
+    server_ephemeral_private_key = _p256_private_key(2)
+
+    client_ephemeral_public_bytes = serialize_ephemeral_public_key(
+        client_ephemeral_private_key.public_key()
+    )
+    server_ephemeral_public_bytes = serialize_ephemeral_public_key(
+        server_ephemeral_private_key.public_key()
+    )
+    parsed_client_ephemeral_public_key = parse_ephemeral_public_key(
+        client_ephemeral_public_bytes
+    )
+    parsed_server_ephemeral_public_key = parse_ephemeral_public_key(
+        server_ephemeral_public_bytes
+    )
+
+    client_arguments = {
+        "station_id": "boat_001",
+        "timestamp": 0x0102030405060708,
+        "client_random": bytes(range(16)),
+        "client_ephemeral_public_key": client_ephemeral_public_bytes,
+    }
+    client_digest = build_client_auth_digest(**client_arguments)
+    client_signature = sign_transcript_digest(
+        client_identity_private_key,
+        client_digest,
+    )
+
+    server_arguments = {
+        **client_arguments,
+        "client_signature": client_signature,
+        "server_random": bytes(range(16, 32)),
+        "server_ephemeral_public_key": server_ephemeral_public_bytes,
+    }
+    server_digest = build_server_auth_digest(**server_arguments)
+    server_signature = sign_transcript_digest(
+        server_identity_private_key,
+        server_digest,
+    )
+
+    session_arguments = {
+        **server_arguments,
+        "server_signature": server_signature,
+    }
+    session_transcript_hash = build_session_transcript_hash(
+        **session_arguments
+    )
+    client_shared_secret = derive_ephemeral_shared_secret(
+        client_ephemeral_private_key,
+        parsed_server_ephemeral_public_key,
+    )
+    server_shared_secret = derive_ephemeral_shared_secret(
+        server_ephemeral_private_key,
+        parsed_client_ephemeral_public_key,
+    )
+
+    return {
+        "client_identity_private_key": client_identity_private_key,
+        "server_identity_private_key": server_identity_private_key,
+        "client_ephemeral_private_key": client_ephemeral_private_key,
+        "server_ephemeral_private_key": server_ephemeral_private_key,
+        "parsed_client_ephemeral_public_key": (
+            parsed_client_ephemeral_public_key
+        ),
+        "parsed_server_ephemeral_public_key": (
+            parsed_server_ephemeral_public_key
+        ),
+        "client_ephemeral_public_bytes": client_ephemeral_public_bytes,
+        "server_ephemeral_public_bytes": server_ephemeral_public_bytes,
+        "client_arguments": client_arguments,
+        "client_digest": client_digest,
+        "client_signature": client_signature,
+        "server_arguments": server_arguments,
+        "server_digest": server_digest,
+        "server_signature": server_signature,
+        "session_arguments": session_arguments,
+        "session_transcript_hash": session_transcript_hash,
+        "client_shared_secret": client_shared_secret,
+        "server_shared_secret": server_shared_secret,
+    }
 
 
 def test_protocol_constants_fix_curve_hash_domain_and_roles():
@@ -1387,3 +1537,716 @@ def test_helper_verification_uses_prehashed_sha256_without_rehashing():
         ordinary_signature,
         TEST_TRANSCRIPT_DIGEST,
     ) is False
+
+
+def test_session_key_api_is_public_frozen_slot_based_and_secret_safe():
+    assert "SessionKeyMaterial" in udpsec_crypto.__all__
+    assert "derive_session_key_material" in udpsec_crypto.__all__
+    assert is_dataclass(SessionKeyMaterial)
+    assert SessionKeyMaterial.__dataclass_params__.frozen is True
+    assert SessionKeyMaterial.__slots__ == (
+        "client_to_server_key",
+        "server_to_client_key",
+    )
+    assert tuple(item.name for item in fields(SessionKeyMaterial)) == (
+        "client_to_server_key",
+        "server_to_client_key",
+    )
+
+    material = SessionKeyMaterial(
+        client_to_server_key=b"\x01" * 32,
+        server_to_client_key=b"\x02" * 32,
+    )
+
+    assert isinstance(material.client_to_server_key, bytes)
+    assert isinstance(material.server_to_client_key, bytes)
+    assert len(material.client_to_server_key) == 32
+    assert len(material.server_to_client_key) == 32
+    assert not hasattr(material, "__dict__")
+    assert not hasattr(material, "shared_secret")
+    assert not hasattr(material, "session_transcript_hash")
+    assert repr(material) == "SessionKeyMaterial()"
+    assert material.client_to_server_key.hex() not in repr(material)
+    assert material.server_to_client_key.hex() not in repr(material)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("client_to_server_key", "server_to_client_key"),
+)
+def test_session_key_material_rejects_assignment(field_name):
+    material = SessionKeyMaterial(
+        client_to_server_key=b"\x01" * 32,
+        server_to_client_key=b"\x02" * 32,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        setattr(material, field_name, b"\x03" * 32)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("client_to_server_key", "server_to_client_key"),
+)
+@pytest.mark.parametrize(
+    "value",
+    (
+        pytest.param(bytearray(32), id="bytearray"),
+        pytest.param(memoryview(bytes(32)), id="memoryview"),
+        pytest.param(None, id="none"),
+        pytest.param("not-bytes", id="string"),
+    ),
+)
+def test_session_key_material_rejects_non_bytes_fields(
+    field_name,
+    value,
+):
+    arguments = {
+        "client_to_server_key": b"\x01" * 32,
+        "server_to_client_key": b"\x02" * 32,
+    }
+    arguments[field_name] = value
+
+    with pytest.raises(TypeError, match=f"{field_name} must be bytes"):
+        SessionKeyMaterial(**arguments)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("client_to_server_key", "server_to_client_key"),
+)
+@pytest.mark.parametrize("length", (0, 31, 33))
+def test_session_key_material_rejects_wrong_key_lengths(
+    field_name,
+    length,
+):
+    arguments = {
+        "client_to_server_key": b"\x01" * 32,
+        "server_to_client_key": b"\x02" * 32,
+    }
+    arguments[field_name] = b"\x03" * length
+
+    with pytest.raises(
+        ValueError,
+        match=f"{field_name} must be exactly 32 bytes",
+    ):
+        SessionKeyMaterial(**arguments)
+
+
+def test_session_key_derivation_matches_fixed_hkdf_sha256_vectors():
+    material = derive_session_key_material(
+        P256_SHARED_SECRET_SCALARS_1_AND_2,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+
+    assert material.client_to_server_key == EXPECTED_CLIENT_TO_SERVER_KEY
+    assert material.server_to_client_key == EXPECTED_SERVER_TO_CLIENT_KEY
+    assert material.client_to_server_key != material.server_to_client_key
+
+
+def test_session_key_vectors_match_independent_rfc5869_reference():
+    assert _reference_session_key_info(
+        b"CLIENT-TO-SERVER"
+    ) == EXPECTED_CLIENT_TO_SERVER_INFO
+    assert _reference_session_key_info(
+        b"SERVER-TO-CLIENT"
+    ) == EXPECTED_SERVER_TO_CLIENT_INFO
+    assert _reference_hkdf_sha256(
+        P256_SHARED_SECRET_SCALARS_1_AND_2,
+        TEST_TRANSCRIPT_DIGEST,
+        EXPECTED_CLIENT_TO_SERVER_INFO,
+    ) == EXPECTED_CLIENT_TO_SERVER_KEY
+    assert _reference_hkdf_sha256(
+        P256_SHARED_SECRET_SCALARS_1_AND_2,
+        TEST_TRANSCRIPT_DIGEST,
+        EXPECTED_SERVER_TO_CLIENT_INFO,
+    ) == EXPECTED_SERVER_TO_CLIENT_KEY
+
+
+def test_session_key_derivation_is_deterministic_and_direction_separated():
+    first = derive_session_key_material(
+        P256_SHARED_SECRET_SCALARS_1_AND_2,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+    second = derive_session_key_material(
+        P256_SHARED_SECRET_SCALARS_1_AND_2,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+
+    assert first == second
+    assert first.client_to_server_key != first.server_to_client_key
+
+
+def test_changing_each_hkdf_input_changes_both_directional_keys():
+    baseline = derive_session_key_material(
+        P256_SHARED_SECRET_SCALARS_1_AND_2,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+    changed_secret = bytearray(P256_SHARED_SECRET_SCALARS_1_AND_2)
+    changed_secret[0] ^= 0x01
+    changed_transcript_hash = bytearray(TEST_TRANSCRIPT_DIGEST)
+    changed_transcript_hash[-1] ^= 0x01
+
+    secret_changed = derive_session_key_material(
+        changed_secret,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+    transcript_changed = derive_session_key_material(
+        P256_SHARED_SECRET_SCALARS_1_AND_2,
+        changed_transcript_hash,
+    )
+
+    assert (
+        secret_changed.client_to_server_key
+        != baseline.client_to_server_key
+    )
+    assert (
+        secret_changed.server_to_client_key
+        != baseline.server_to_client_key
+    )
+    assert (
+        transcript_changed.client_to_server_key
+        != baseline.client_to_server_key
+    )
+    assert (
+        transcript_changed.server_to_client_key
+        != baseline.server_to_client_key
+    )
+
+
+@pytest.mark.parametrize(
+    "secret_container",
+    (bytes, bytearray, memoryview),
+)
+@pytest.mark.parametrize(
+    "transcript_container",
+    (bytes, bytearray, memoryview),
+)
+def test_session_key_derivation_accepts_supported_bytes_like_inputs(
+    secret_container,
+    transcript_container,
+):
+    material = derive_session_key_material(
+        secret_container(P256_SHARED_SECRET_SCALARS_1_AND_2),
+        transcript_container(TEST_TRANSCRIPT_DIGEST),
+    )
+
+    assert material.client_to_server_key == EXPECTED_CLIENT_TO_SERVER_KEY
+    assert material.server_to_client_key == EXPECTED_SERVER_TO_CLIENT_KEY
+    assert type(material.client_to_server_key) is bytes
+    assert type(material.server_to_client_key) is bytes
+
+
+def test_session_key_derivation_snapshots_mutable_inputs_without_retaining_them():
+    shared_secret = bytearray(P256_SHARED_SECRET_SCALARS_1_AND_2)
+    transcript_hash = bytearray(TEST_TRANSCRIPT_DIGEST)
+    material = derive_session_key_material(
+        memoryview(shared_secret),
+        transcript_hash,
+    )
+
+    shared_secret[0] ^= 0xFF
+    transcript_hash[0] ^= 0xFF
+
+    assert material == SessionKeyMaterial(
+        client_to_server_key=EXPECTED_CLIENT_TO_SERVER_KEY,
+        server_to_client_key=EXPECTED_SERVER_TO_CLIENT_KEY,
+    )
+    assert SessionKeyMaterial.__slots__ == (
+        "client_to_server_key",
+        "server_to_client_key",
+    )
+
+
+@pytest.mark.parametrize(
+    "argument_name",
+    ("shared_secret", "session_transcript_hash"),
+)
+@pytest.mark.parametrize(
+    "value",
+    (
+        pytest.param(None, id="none"),
+        pytest.param("not-bytes", id="string"),
+        pytest.param(32, id="integer"),
+        pytest.param(_BytesConvertible(), id="bytes-convertible"),
+    ),
+)
+def test_session_key_derivation_rejects_unsupported_input_types(
+    argument_name,
+    value,
+):
+    arguments = {
+        "shared_secret": P256_SHARED_SECRET_SCALARS_1_AND_2,
+        "session_transcript_hash": TEST_TRANSCRIPT_DIGEST,
+    }
+    arguments[argument_name] = value
+
+    with pytest.raises(
+        TypeError,
+        match=(
+            f"{argument_name} must be bytes, bytearray, or memoryview"
+        ),
+    ):
+        derive_session_key_material(**arguments)
+
+
+@pytest.mark.parametrize(
+    "argument_name",
+    ("shared_secret", "session_transcript_hash"),
+)
+@pytest.mark.parametrize("length", (0, 31, 33))
+def test_session_key_derivation_rejects_wrong_input_lengths(
+    argument_name,
+    length,
+):
+    arguments = {
+        "shared_secret": P256_SHARED_SECRET_SCALARS_1_AND_2,
+        "session_transcript_hash": TEST_TRANSCRIPT_DIGEST,
+    }
+    arguments[argument_name] = b"\x00" * length
+
+    with pytest.raises(
+        ValueError,
+        match=f"{argument_name} must be exactly 32 bytes",
+    ):
+        derive_session_key_material(**arguments)
+
+
+@pytest.mark.parametrize(
+    "argument_name",
+    ("shared_secret", "session_transcript_hash"),
+)
+def test_session_key_derivation_rejects_released_memoryviews(argument_name):
+    released_view = memoryview(bytearray(32))
+    released_view.release()
+    arguments = {
+        "shared_secret": P256_SHARED_SECRET_SCALARS_1_AND_2,
+        "session_transcript_hash": TEST_TRANSCRIPT_DIGEST,
+    }
+    arguments[argument_name] = released_view
+
+    with pytest.raises(
+        ValueError,
+        match=f"{argument_name} must reference readable bytes",
+    ):
+        derive_session_key_material(**arguments)
+
+
+def test_session_key_derivation_uses_two_independent_exact_hkdf_operations(
+    monkeypatch,
+):
+    instances = []
+
+    class _RecordingHKDF:
+        def __init__(self, *, algorithm, length, salt, info):
+            self.algorithm = algorithm
+            self.length = length
+            self.salt = salt
+            self.info = info
+            self.output_byte = len(instances) + 1
+            self.key_material = None
+            instances.append(self)
+
+        def derive(self, key_material):
+            self.key_material = key_material
+            return bytes((self.output_byte,)) * self.length
+
+    monkeypatch.setattr(udpsec_crypto, "HKDF", _RecordingHKDF)
+    shared_secret = bytearray(P256_SHARED_SECRET_SCALARS_1_AND_2)
+    transcript_hash = bytearray(TEST_TRANSCRIPT_DIGEST)
+
+    material = derive_session_key_material(
+        shared_secret,
+        memoryview(transcript_hash),
+    )
+
+    assert len(instances) == 2
+    assert instances[0] is not instances[1]
+    assert [item.algorithm.name for item in instances] == [
+        "sha256",
+        "sha256",
+    ]
+    assert [item.length for item in instances] == [32, 32]
+    assert [item.salt for item in instances] == [
+        TEST_TRANSCRIPT_DIGEST,
+        TEST_TRANSCRIPT_DIGEST,
+    ]
+    assert [item.info for item in instances] == [
+        EXPECTED_CLIENT_TO_SERVER_INFO,
+        EXPECTED_SERVER_TO_CLIENT_INFO,
+    ]
+    assert [item.key_material for item in instances] == [
+        P256_SHARED_SECRET_SCALARS_1_AND_2,
+        P256_SHARED_SECRET_SCALARS_1_AND_2,
+    ]
+    assert all(type(item.salt) is bytes for item in instances)
+    assert all(type(item.key_material) is bytes for item in instances)
+    assert material == SessionKeyMaterial(
+        client_to_server_key=b"\x01" * 32,
+        server_to_client_key=b"\x02" * 32,
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_output",
+    (
+        pytest.param(b"\x01" * 31, id="wrong-length"),
+        pytest.param(bytearray(b"\x01" * 32), id="mutable"),
+    ),
+)
+def test_session_key_derivation_rejects_invalid_backend_output(
+    monkeypatch,
+    backend_output,
+):
+    class _InvalidHKDF:
+        def __init__(self, **_arguments):
+            pass
+
+        def derive(self, _key_material):
+            return backend_output
+
+    monkeypatch.setattr(udpsec_crypto, "HKDF", _InvalidHKDF)
+
+    with pytest.raises(
+        RuntimeError,
+        match="HKDF-SHA256 did not produce a 32-byte session key",
+    ):
+        derive_session_key_material(
+            P256_SHARED_SECRET_SCALARS_1_AND_2,
+            TEST_TRANSCRIPT_DIGEST,
+        )
+
+
+def test_session_key_derivation_rejects_equal_directional_backend_outputs(
+    monkeypatch,
+):
+    class _EqualHKDF:
+        def __init__(self, **_arguments):
+            pass
+
+        def derive(self, _key_material):
+            return b"\x01" * 32
+
+    monkeypatch.setattr(udpsec_crypto, "HKDF", _EqualHKDF)
+
+    with pytest.raises(
+        RuntimeError,
+        match="directional HKDF session keys must differ",
+    ):
+        derive_session_key_material(
+            P256_SHARED_SECRET_SCALARS_1_AND_2,
+            TEST_TRANSCRIPT_DIGEST,
+        )
+
+
+def test_directional_hkdf_info_is_exactly_framed_and_separated():
+    assert len(EXPECTED_CLIENT_TO_SERVER_INFO) == 88
+    assert len(EXPECTED_SERVER_TO_CLIENT_INFO) == 88
+    assert (
+        EXPECTED_CLIENT_TO_SERVER_INFO
+        != EXPECTED_SERVER_TO_CLIENT_INFO
+    )
+    assert _reference_session_key_info(
+        b"CLIENT-TO-SERVER"
+    ) == EXPECTED_CLIENT_TO_SERVER_INFO
+    assert _reference_session_key_info(
+        b"SERVER-TO-CLIENT"
+    ) == EXPECTED_SERVER_TO_CLIENT_INFO
+
+
+@pytest.mark.parametrize(
+    ("direction_label", "expected_info", "expected_key"),
+    (
+        pytest.param(
+            b"CLIENT-TO-SERVER",
+            EXPECTED_CLIENT_TO_SERVER_INFO,
+            EXPECTED_CLIENT_TO_SERVER_KEY,
+            id="client-to-server",
+        ),
+        pytest.param(
+            b"SERVER-TO-CLIENT",
+            EXPECTED_SERVER_TO_CLIENT_INFO,
+            EXPECTED_SERVER_TO_CLIENT_KEY,
+            id="server-to-client",
+        ),
+    ),
+)
+def test_replacing_or_reordering_any_hkdf_info_field_changes_the_key(
+    direction_label,
+    expected_info,
+    expected_key,
+):
+    fields_in_order = (
+        b"AISMIXER-UDPSEC-ECDHE",
+        b"SESSION-KEY-SCHEDULE",
+        direction_label,
+        b"AES-256-GCM-KEY",
+    )
+    assert b"".join(
+        _reference_frame(value) for value in fields_in_order
+    ) == expected_info
+
+    for index in range(len(fields_in_order)):
+        changed_fields = list(fields_in_order)
+        changed_fields[index] += b"!"
+        changed_info = b"".join(
+            _reference_frame(value) for value in changed_fields
+        )
+        assert changed_info != expected_info
+        assert _reference_hkdf_sha256(
+            P256_SHARED_SECRET_SCALARS_1_AND_2,
+            TEST_TRANSCRIPT_DIGEST,
+            changed_info,
+        ) != expected_key
+
+    for reordered_fields in itertools.permutations(fields_in_order):
+        if reordered_fields == fields_in_order:
+            continue
+        reordered_info = b"".join(
+            _reference_frame(value) for value in reordered_fields
+        )
+        assert reordered_info != expected_info
+        assert _reference_hkdf_sha256(
+            P256_SHARED_SECRET_SCALARS_1_AND_2,
+            TEST_TRANSCRIPT_DIGEST,
+            reordered_info,
+        ) != expected_key
+
+
+def test_pure_full_handshake_composition_derives_matching_directional_keys():
+    handshake = _build_pure_handshake()
+
+    assert serialize_ephemeral_public_key(
+        handshake["parsed_client_ephemeral_public_key"]
+    ) == handshake["client_ephemeral_public_bytes"]
+    assert serialize_ephemeral_public_key(
+        handshake["parsed_server_ephemeral_public_key"]
+    ) == handshake["server_ephemeral_public_bytes"]
+    assert verify_transcript_signature(
+        handshake["client_identity_private_key"].public_key(),
+        handshake["client_signature"],
+        handshake["client_digest"],
+    ) is True
+    assert verify_transcript_signature(
+        handshake["server_identity_private_key"].public_key(),
+        handshake["server_signature"],
+        handshake["server_digest"],
+    ) is True
+    assert (
+        handshake["client_shared_secret"]
+        == handshake["server_shared_secret"]
+    )
+
+    client_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        handshake["session_transcript_hash"],
+    )
+    server_material = derive_session_key_material(
+        handshake["server_shared_secret"],
+        handshake["session_transcript_hash"],
+    )
+
+    assert client_material.client_to_server_key == (
+        server_material.client_to_server_key
+    )
+    assert client_material.server_to_client_key == (
+        server_material.server_to_client_key
+    )
+    assert (
+        client_material.client_to_server_key
+        != client_material.server_to_client_key
+    )
+
+
+def test_changing_authenticated_field_changes_composed_session_keys():
+    handshake = _build_pure_handshake()
+    baseline_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        handshake["session_transcript_hash"],
+    )
+    changed_client_arguments = {
+        **handshake["client_arguments"],
+        "timestamp": handshake["client_arguments"]["timestamp"] + 1,
+    }
+    changed_client_digest = build_client_auth_digest(
+        **changed_client_arguments
+    )
+    changed_session_arguments = {
+        **handshake["session_arguments"],
+        "timestamp": changed_client_arguments["timestamp"],
+    }
+    changed_transcript_hash = build_session_transcript_hash(
+        **changed_session_arguments
+    )
+    changed_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        changed_transcript_hash,
+    )
+
+    assert verify_transcript_signature(
+        handshake["client_identity_private_key"].public_key(),
+        handshake["client_signature"],
+        changed_client_digest,
+    ) is False
+    assert changed_transcript_hash != handshake["session_transcript_hash"]
+    assert (
+        changed_material.client_to_server_key
+        != baseline_material.client_to_server_key
+    )
+    assert (
+        changed_material.server_to_client_key
+        != baseline_material.server_to_client_key
+    )
+
+
+def test_changing_client_ephemeral_key_changes_composed_session_keys():
+    handshake = _build_pure_handshake()
+    baseline_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        handshake["session_transcript_hash"],
+    )
+    changed_client_private_key = _p256_private_key(3)
+    changed_client_public_bytes = serialize_ephemeral_public_key(
+        changed_client_private_key.public_key()
+    )
+    changed_client_public_key = parse_ephemeral_public_key(
+        changed_client_public_bytes
+    )
+    changed_client_secret = derive_ephemeral_shared_secret(
+        changed_client_private_key,
+        handshake["parsed_server_ephemeral_public_key"],
+    )
+    changed_server_secret = derive_ephemeral_shared_secret(
+        handshake["server_ephemeral_private_key"],
+        changed_client_public_key,
+    )
+    changed_client_arguments = {
+        **handshake["client_arguments"],
+        "client_ephemeral_public_key": changed_client_public_bytes,
+    }
+    changed_session_arguments = {
+        **handshake["session_arguments"],
+        "client_ephemeral_public_key": changed_client_public_bytes,
+    }
+    changed_transcript_hash = build_session_transcript_hash(
+        **changed_session_arguments
+    )
+    changed_client_material = derive_session_key_material(
+        changed_client_secret,
+        changed_transcript_hash,
+    )
+    changed_server_material = derive_session_key_material(
+        changed_server_secret,
+        changed_transcript_hash,
+    )
+
+    assert changed_client_secret == changed_server_secret
+    assert changed_client_secret != handshake["client_shared_secret"]
+    assert verify_transcript_signature(
+        handshake["client_identity_private_key"].public_key(),
+        handshake["client_signature"],
+        build_client_auth_digest(**changed_client_arguments),
+    ) is False
+    assert changed_client_material == changed_server_material
+    assert (
+        changed_client_material.client_to_server_key
+        != baseline_material.client_to_server_key
+    )
+    assert (
+        changed_client_material.server_to_client_key
+        != baseline_material.server_to_client_key
+    )
+
+
+def test_changing_server_ephemeral_key_changes_composed_session_keys():
+    handshake = _build_pure_handshake()
+    baseline_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        handshake["session_transcript_hash"],
+    )
+    changed_server_private_key = _p256_private_key(4)
+    changed_server_public_bytes = serialize_ephemeral_public_key(
+        changed_server_private_key.public_key()
+    )
+    changed_server_public_key = parse_ephemeral_public_key(
+        changed_server_public_bytes
+    )
+    changed_client_secret = derive_ephemeral_shared_secret(
+        handshake["client_ephemeral_private_key"],
+        changed_server_public_key,
+    )
+    changed_server_secret = derive_ephemeral_shared_secret(
+        changed_server_private_key,
+        handshake["parsed_client_ephemeral_public_key"],
+    )
+    changed_server_arguments = {
+        **handshake["server_arguments"],
+        "server_ephemeral_public_key": changed_server_public_bytes,
+    }
+    changed_session_arguments = {
+        **handshake["session_arguments"],
+        "server_ephemeral_public_key": changed_server_public_bytes,
+    }
+    changed_transcript_hash = build_session_transcript_hash(
+        **changed_session_arguments
+    )
+    changed_client_material = derive_session_key_material(
+        changed_client_secret,
+        changed_transcript_hash,
+    )
+    changed_server_material = derive_session_key_material(
+        changed_server_secret,
+        changed_transcript_hash,
+    )
+
+    assert changed_client_secret == changed_server_secret
+    assert changed_client_secret != handshake["client_shared_secret"]
+    assert verify_transcript_signature(
+        handshake["server_identity_private_key"].public_key(),
+        handshake["server_signature"],
+        build_server_auth_digest(**changed_server_arguments),
+    ) is False
+    assert changed_client_material == changed_server_material
+    assert (
+        changed_client_material.client_to_server_key
+        != baseline_material.client_to_server_key
+    )
+    assert (
+        changed_client_material.server_to_client_key
+        != baseline_material.server_to_client_key
+    )
+
+
+def test_changing_identity_signature_changes_composed_session_keys():
+    handshake = _build_pure_handshake()
+    baseline_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        handshake["session_transcript_hash"],
+    )
+    changed_server_signature = handshake["server_signature"] + b"\x00"
+    changed_session_arguments = {
+        **handshake["session_arguments"],
+        "server_signature": changed_server_signature,
+    }
+    changed_transcript_hash = build_session_transcript_hash(
+        **changed_session_arguments
+    )
+    changed_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        changed_transcript_hash,
+    )
+
+    assert verify_transcript_signature(
+        handshake["server_identity_private_key"].public_key(),
+        changed_server_signature,
+        handshake["server_digest"],
+    ) is False
+    assert changed_transcript_hash != handshake["session_transcript_hash"]
+    assert (
+        changed_material.client_to_server_key
+        != baseline_material.client_to_server_key
+    )
+    assert (
+        changed_material.server_to_client_key
+        != baseline_material.server_to_client_key
+    )
