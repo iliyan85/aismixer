@@ -52,6 +52,14 @@ def assert_no_direct_privileged_commands(script):
         assert " | sudo " not in line
 
 
+def assert_installs_shared_udpsec_modules(script):
+    for module in ("udpsec_crypto.py", "udpsec_protocol.py"):
+        assert (
+            f'run_as_root install -m 0644 "$REPO_ROOT/core/{module}" '
+            f'"$CORE_DIR/{module}"'
+        ) in script
+
+
 def test_systemd_units_select_singleton_and_instance_configs():
     singleton = read_proxy_file("nmea_sproxy.service")
     template = read_proxy_file("nmea_sproxy@.service")
@@ -84,6 +92,7 @@ def test_install_creates_layout_repairs_keys_and_only_enables_singleton():
         'run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" '
         '"$CORE_DIR/network_policy.py"'
     ) in install
+    assert_installs_shared_udpsec_modules(install)
     assert (
         'run_as_root install -m 0644 "$SCRIPT_DIR/input_adapters.py" '
         '"$INSTALL_DIR/input_adapters.py"'
@@ -208,6 +217,7 @@ def test_update_routes_runtime_and_unit_updates_through_helper():
         'run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" '
         '"$CORE_DIR/network_policy.py"'
     ) in update
+    assert_installs_shared_udpsec_modules(update)
     assert (
         'run_as_root install -m 0644 "$SCRIPT_DIR/nmea_sproxy.service" '
         '"$SYSTEMD_DIR/nmea_sproxy.service"'

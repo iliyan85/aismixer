@@ -423,7 +423,11 @@ def test_legacy_udp_mode_does_not_import_pyserial(monkeypatch):
 
 def test_serial_payload_is_encrypted_through_existing_udpsec_format(monkeypatch):
     proxy = load_proxy_module()
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    session_key_material = proxy.SessionKeyMaterial(
+        client_to_server_key=client_to_server_key,
+        server_to_client_key=b"\x02" * 32,
+    )
     remote_addr = ("192.0.2.10", 19999)
     timeouts = []
 
@@ -473,7 +477,7 @@ def test_serial_payload_is_encrypted_through_existing_udpsec_format(monkeypatch)
             "peer_timeout": 90,
             "session_refresh_interval": 0,
         },
-        key,
+        session_key_material,
         remote_addr,
     )
 
@@ -482,7 +486,10 @@ def test_serial_payload_is_encrypted_through_existing_udpsec_format(monkeypatch)
     assert len(out_sock.sent) == 1
     packet, destination = out_sock.sent[0]
     assert destination == remote_addr
-    assert proxy.decrypt_secure_json_message(packet, key) == {
+    assert proxy.decrypt_secure_json_message(
+        packet,
+        client_to_server_key,
+    ) == {
         "type": "nmea",
         "payload": "!AIVDM,1,1,,A,payload,0*00",
         "timestamp": 1000,

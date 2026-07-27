@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import builtins
+import hashlib
 import importlib.util
 import io
 import os
@@ -10,16 +11,27 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+import core.udpsec_crypto as udpsec_crypto
 from core.ingress_frame import (
     IngressFrame,
     PayloadTextMode,
     decode_frame_slice,
 )
 from core.network_policy import NetworkPolicy
+from core.udpsec_crypto import SessionKeyMaterial
+from core.udpsec_protocol import (
+    ClientHello,
+    ServerHello,
+    build_client_hello_packet,
+    build_server_hello_packet,
+    parse_client_hello_packet,
+    parse_server_hello_packet,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,171 +119,192 @@ def load_secure_module_with_fake_keys(
         return module
 
 
-def test_proxy_and_server_derive_session_key_are_compatible(monkeypatch):
+def test_authorized_station_identity_keys_are_validated_once(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    public_key = secure.AUTHORIZED_KEYS["boat_001"]
+
+    assert isinstance(public_key, ec.EllipticCurvePublicKey)
+    assert isinstance(public_key.curve, ec.SECP256R1)
+
+
+@pytest.mark.parametrize(
+    ("encoded", "message"),
+    (
+        pytest.param(None, "must be base64 text", id="non-text"),
+        pytest.param("", "must not be empty", id="empty"),
+        pytest.param("%%%%", "must be valid base64", id="alphabet"),
+        pytest.param(
+            "AB==",
+            "must use canonical base64",
+            id="noncanonical",
+        ),
+        pytest.param(
+            base64.b64encode(b"\x02" * 32).decode(),
+            "must be a 33-byte compressed",
+            id="length",
+        ),
+        pytest.param(
+            base64.b64encode(b"\x04" + b"\x01" * 32).decode(),
+            "must use compressed",
+            id="prefix",
+        ),
+        pytest.param(
+            base64.b64encode(b"\x02" + b"\xff" * 32).decode(),
+            "is not a valid P-256 point",
+            id="point",
+        ),
+    ),
+)
+def test_authorized_station_identity_loader_is_strict(
+    monkeypatch,
+    encoded,
+    message,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    expected_error = TypeError if encoded is None else ValueError
+    with pytest.raises(expected_error, match=message):
+        secure._load_authorized_identity_public_key(encoded)
+
+
+def test_obsolete_static_handshake_helpers_are_removed(monkeypatch):
     proxy = load_proxy_module()
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    shared_secret = b"fixed shared secret"
-    client_signature = b"client signature bytes"
-    server_signature = b"server signature bytes"
+    obsolete_server_names = (
+        "CONTEXT_STRING",
+        "build_current_handshake_payload",
+        "build_handshake_context_v1",
+        "build_session_transcript_v1",
+        "verify_signature",
+        "derive_session_key",
+        "server_pub_bytes",
+    )
+    obsolete_proxy_names = (
+        "sign_message",
+        "verify_signature",
+        "derive_session_key",
+        "compute_session_hash",
+    )
 
-    assert proxy.derive_session_key(
-        shared_secret, client_signature, server_signature
-    ) == secure.derive_session_key(shared_secret, client_signature + server_signature)
-
-
-def test_current_handshake_payload_matches_existing_signed_bytes(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    timestamp = 1234567890
-
-    assert secure.build_current_handshake_payload("boat_001", timestamp) == (
-        secure.HANDSHAKE_PREFIX + b"boat_001" + timestamp.to_bytes(8, "big")
+    assert all(
+        not hasattr(secure, name) for name in obsolete_server_names
+    )
+    assert all(
+        not hasattr(proxy, name) for name in obsolete_proxy_names
     )
 
 
-def test_context_string_is_not_part_of_current_handshake_payload(monkeypatch):
+def _reference_replay_key(domain_context, client_digest, client_signature):
+    digest = hashlib.sha256()
+    for value in (
+        domain_context,
+        b"HANDSHAKE-REPLAY",
+        client_digest,
+        client_signature,
+    ):
+        digest.update(len(value).to_bytes(4, "big"))
+        digest.update(value)
+    return digest.digest()
+
+
+def test_handshake_replay_key_matches_complete_framed_identity(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    client_digest = bytes(range(32))
+    client_signature = b"client signature"
 
-    payload = secure.build_current_handshake_payload("boat_001", 1234567890)
+    replay_key = secure.build_handshake_replay_key(
+        client_digest,
+        client_signature,
+    )
 
-    assert secure.CONTEXT_STRING == b"NMEA-AUTH-v1"
-    assert secure.CONTEXT_STRING not in payload
-
-
-def test_v1_handshake_context_is_deterministic_for_identical_inputs(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    args = ("boat_001", 1234567890, b"client pub", b"server pub")
-
-    assert secure.build_handshake_context_v1(*args) == secure.build_handshake_context_v1(*args)
-
-
-def test_v1_handshake_context_changes_when_context_string_changes(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    assert secure.build_handshake_context_v1(
-        "boat_001", 1234567890, b"client pub", b"server pub"
-    ) != secure.build_handshake_context_v1(
-        "boat_001",
-        1234567890,
-        b"client pub",
-        b"server pub",
-        context_string=b"OTHER-CONTEXT",
+    assert replay_key == _reference_replay_key(
+        secure.DOMAIN_CONTEXT,
+        client_digest,
+        client_signature,
+    )
+    assert replay_key == secure.build_handshake_replay_key(
+        client_digest,
+        client_signature,
     )
 
 
-def test_v1_handshake_context_changes_when_station_id_changes(monkeypatch):
+@pytest.mark.parametrize(
+    ("changed_digest", "changed_signature"),
+    (
+        pytest.param(b"\xff" + bytes(range(1, 32)), b"signature", id="digest"),
+        pytest.param(bytes(range(32)), b"other signature", id="signature"),
+    ),
+)
+def test_handshake_replay_key_changes_with_each_authenticated_input(
+    monkeypatch,
+    changed_digest,
+    changed_signature,
+):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    baseline = secure.build_handshake_replay_key(
+        bytes(range(32)),
+        b"signature",
+    )
 
-    assert secure.build_handshake_context_v1(
-        "boat_001", 1234567890, b"client pub", b"server pub"
-    ) != secure.build_handshake_context_v1(
-        "boat_002", 1234567890, b"client pub", b"server pub"
+    assert baseline != secure.build_handshake_replay_key(
+        changed_digest,
+        changed_signature,
     )
 
 
-def test_v1_handshake_context_changes_when_timestamp_changes(monkeypatch):
+def test_handshake_replay_key_binds_client_random_and_ephemeral_key(
+    monkeypatch,
+):
     secure = load_secure_module_with_fake_keys(monkeypatch)
+    base_arguments = {
+        "station_id": "boat_001",
+        "timestamp": 1234567890,
+        "client_random": b"\x01" * 32,
+        "client_ephemeral_public_key": b"\x02" + b"\x03" * 32,
+    }
+    baseline_digest = secure.build_client_auth_digest(**base_arguments)
+    changed_random_digest = secure.build_client_auth_digest(
+        **{**base_arguments, "client_random": b"\x02" * 32}
+    )
+    changed_ephemeral_digest = secure.build_client_auth_digest(
+        **{
+            **base_arguments,
+            "client_ephemeral_public_key": b"\x03" + b"\x04" * 32,
+        }
+    )
+    signature = b"signature"
 
-    assert secure.build_handshake_context_v1(
-        "boat_001", 1234567890, b"client pub", b"server pub"
-    ) != secure.build_handshake_context_v1(
-        "boat_001", 1234567891, b"client pub", b"server pub"
+    baseline = secure.build_handshake_replay_key(
+        baseline_digest,
+        signature,
+    )
+
+    assert baseline != secure.build_handshake_replay_key(
+        changed_random_digest,
+        signature,
+    )
+    assert baseline != secure.build_handshake_replay_key(
+        changed_ephemeral_digest,
+        signature,
     )
 
 
-def test_v1_handshake_context_changes_when_client_public_key_changes(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    assert secure.build_handshake_context_v1(
-        "boat_001", 1234567890, b"client pub", b"server pub"
-    ) != secure.build_handshake_context_v1(
-        "boat_001", 1234567890, b"other client pub", b"server pub"
-    )
-
-
-def test_v1_handshake_context_changes_when_server_public_key_changes(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    assert secure.build_handshake_context_v1(
-        "boat_001", 1234567890, b"client pub", b"server pub"
-    ) != secure.build_handshake_context_v1(
-        "boat_001", 1234567890, b"client pub", b"other server pub"
-    )
-
-
-def test_v1_session_transcript_is_deterministic_for_identical_inputs(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    context = secure.build_handshake_context_v1(
-        "boat_001", 1234567890, b"client pub", b"server pub"
-    )
-
-    assert secure.build_session_transcript_v1(
-        context, b"client sig", b"server sig"
-    ) == secure.build_session_transcript_v1(context, b"client sig", b"server sig")
-
-
-def test_v1_session_transcript_changes_when_client_signature_changes(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    context = secure.build_handshake_context_v1(
-        "boat_001", 1234567890, b"client pub", b"server pub"
-    )
-
-    assert secure.build_session_transcript_v1(
-        context, b"client sig", b"server sig"
-    ) != secure.build_session_transcript_v1(context, b"other client sig", b"server sig")
-
-
-def test_v1_session_transcript_changes_when_server_signature_changes(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    context = secure.build_handshake_context_v1(
-        "boat_001", 1234567890, b"client pub", b"server pub"
-    )
-
-    assert secure.build_session_transcript_v1(
-        context, b"client sig", b"server sig"
-    ) != secure.build_session_transcript_v1(context, b"client sig", b"other server sig")
-
-
-def test_handshake_replay_key_is_stable_for_same_inputs(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    assert secure.build_handshake_replay_key(
-        "boat_001", 1234567890, b"client sig"
-    ) == secure.build_handshake_replay_key("boat_001", 1234567890, b"client sig")
-
-
-def test_handshake_replay_key_changes_when_station_changes(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    assert secure.build_handshake_replay_key(
-        "boat_001", 1234567890, b"client sig"
-    ) != secure.build_handshake_replay_key("boat_002", 1234567890, b"client sig")
-
-
-def test_handshake_replay_key_changes_when_timestamp_changes(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    assert secure.build_handshake_replay_key(
-        "boat_001", 1234567890, b"client sig"
-    ) != secure.build_handshake_replay_key("boat_001", 1234567891, b"client sig")
-
-
-def test_handshake_replay_key_changes_when_signature_changes(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    assert secure.build_handshake_replay_key(
-        "boat_001", 1234567890, b"client sig"
-    ) != secure.build_handshake_replay_key("boat_001", 1234567890, b"other client sig")
-
-
-def test_handshake_replay_key_does_not_depend_on_addr(monkeypatch):
+def test_handshake_replay_key_does_not_depend_on_source_address(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     addr_a = ("192.0.2.10", 50000)
     addr_b = ("192.0.2.11", 50001)
+    client_digest = bytes(range(32))
+    client_signature = b"signature"
 
     assert addr_a != addr_b
     assert secure.build_handshake_replay_key(
-        "boat_001", 1234567890, b"client sig"
-    ) == secure.build_handshake_replay_key("boat_001", 1234567890, b"client sig")
+        client_digest,
+        client_signature,
+    ) == secure.build_handshake_replay_key(
+        client_digest,
+        client_signature,
+    )
 
 
 def test_handshake_replay_constants(monkeypatch):
@@ -349,26 +382,69 @@ class _FakeClock:
         return self.now
 
 
-def _signed_handshake_packet(secure, client_private_key, station_id, timestamp):
-    digest = secure.hashes.Hash(
-        secure.hashes.SHA256(), backend=secure.default_backend())
-    digest.update(secure.build_current_handshake_payload(station_id, timestamp))
-    to_sign = digest.finalize()
-    signature = client_private_key.sign(
-        to_sign,
-        secure.ec.ECDSA(secure.utils.Prehashed(secure.hashes.SHA256())),
+def _signed_client_hello(
+    secure,
+    client_identity_private_key,
+    station_id,
+    timestamp,
+    *,
+    client_random=None,
+    client_ephemeral_private_key=None,
+):
+    if client_random is None:
+        client_random = b"\x11" * 32
+    if client_ephemeral_private_key is None:
+        client_ephemeral_private_key = ec.derive_private_key(
+            2,
+            ec.SECP256R1(),
+        )
+    client_ephemeral_public_bytes = (
+        secure.serialize_ephemeral_public_key(
+            client_ephemeral_private_key.public_key()
+        )
     )
-    return b"|".join([
-        secure.HANDSHAKE_PREFIX,
-        station_id.encode(),
-        str(timestamp).encode(),
-        base64.b64encode(signature),
-    ])
+    client_auth_digest = secure.build_client_auth_digest(
+        station_id=station_id,
+        timestamp=timestamp,
+        client_random=client_random,
+        client_ephemeral_public_key=client_ephemeral_public_bytes,
+    )
+    client_signature = secure.sign_transcript_digest(
+        client_identity_private_key,
+        client_auth_digest,
+    )
+    client_hello = ClientHello(
+        station_id=station_id,
+        timestamp=timestamp,
+        client_random=client_random,
+        client_ephemeral_public_key=client_ephemeral_public_bytes,
+        client_signature=client_signature,
+    )
+    return (
+        build_client_hello_packet(client_hello),
+        client_hello,
+        client_ephemeral_private_key,
+    )
+
+
+def _signed_handshake_packet(
+    secure,
+    client_identity_private_key,
+    station_id,
+    timestamp,
+):
+    packet, _, _ = _signed_client_hello(
+        secure,
+        client_identity_private_key,
+        station_id,
+        timestamp,
+    )
+    return packet
 
 
 def _encrypted_data_packet(
     secure,
-    key,
+    client_to_server_key,
     nonce,
     source_id="boat_001",
     payload="!AIVDM,1,1,,A,payload,0*00",
@@ -379,13 +455,26 @@ def _encrypted_data_packet(
         "timestamp": 1000,
         "source_id": source_id,
     }).encode()
-    ciphertext = secure.AESGCM(key).encrypt(nonce, plaintext, b"NMEA")
+    ciphertext = secure.AESGCM(client_to_server_key).encrypt(
+        nonce,
+        plaintext,
+        b"NMEA",
+    )
     return secure.DATA_PREFIX + nonce + ciphertext
 
 
-def _encrypted_control_packet(secure, key, nonce, message):
+def _encrypted_control_packet(
+    secure,
+    client_to_server_key,
+    nonce,
+    message,
+):
     plaintext = secure.json.dumps(message).encode()
-    ciphertext = secure.AESGCM(key).encrypt(nonce, plaintext, secure.DATA_AAD)
+    ciphertext = secure.AESGCM(client_to_server_key).encrypt(
+        nonce,
+        plaintext,
+        secure.DATA_AAD,
+    )
     return secure.DATA_PREFIX + nonce + ciphertext
 
 
@@ -492,23 +581,41 @@ def _install_test_session(
     secure,
     state,
     addr,
-    key,
+    client_to_server_key,
+    server_to_client_key,
     now=1000.0,
     station_id="boat_001",
 ):
-    aesgcm = secure.AESGCM(key)
-    session = state.install_session(addr, station_id, aesgcm, now)
-    return session, aesgcm
+    client_to_server_aesgcm = secure.AESGCM(client_to_server_key)
+    server_to_client_aesgcm = secure.AESGCM(server_to_client_key)
+    session = state.install_session(
+        addr,
+        station_id,
+        client_to_server_aesgcm,
+        server_to_client_aesgcm,
+        now,
+    )
+    return (
+        session,
+        client_to_server_aesgcm,
+        server_to_client_aesgcm,
+    )
 
 
 def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
-    secure, client_private_key = load_secure_module_with_fake_keys(
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
         monkeypatch, with_client_private_key=True)
     timestamp = 1000
     station_id = "boat_001"
     addr = ("127.0.0.1", 50123)
-    packet = _signed_handshake_packet(
-        secure, client_private_key, station_id, timestamp)
+    packet, client_hello, client_ephemeral_private_key = (
+        _signed_client_hello(
+            secure,
+            client_identity_private_key,
+            station_id,
+            timestamp,
+        )
+    )
     state = secure.SecureState()
     wall_clock = _FakeClock(float(timestamp))
     monotonic_clock = _FakeClock(10.0)
@@ -524,20 +631,69 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
 
     stats = state.stats()
     assert len(fake_socket.sent) == 1
-    response_parts = fake_socket.sent[0][0].split(b"|")
-    assert response_parts[0] == b"OK"
-    assert len(response_parts) == 2
-    server_signature = base64.b64decode(response_parts[1], validate=True)
-    digest = secure.hashes.Hash(
-        secure.hashes.SHA256(), backend=secure.default_backend()
+    server_hello = parse_server_hello_packet(fake_socket.sent[0][0])
+    server_digest = secure.build_server_auth_digest(
+        station_id=client_hello.station_id,
+        timestamp=client_hello.timestamp,
+        client_random=client_hello.client_random,
+        client_ephemeral_public_key=(
+            client_hello.client_ephemeral_public_key
+        ),
+        client_signature=client_hello.client_signature,
+        server_random=server_hello.server_random,
+        server_ephemeral_public_key=(
+            server_hello.server_ephemeral_public_key
+        ),
     )
-    digest.update(
-        secure.build_current_handshake_payload(station_id, timestamp)
+    assert secure.verify_transcript_signature(
+        secure.server_priv.public_key(),
+        server_hello.server_signature,
+        server_digest,
     )
-    secure.verify_signature(
-        secure.server_pub_bytes,
-        server_signature,
-        digest.finalize(),
+    server_ephemeral_public_key = secure.parse_ephemeral_public_key(
+        server_hello.server_ephemeral_public_key
+    )
+    shared_secret = secure.derive_ephemeral_shared_secret(
+        client_ephemeral_private_key,
+        server_ephemeral_public_key,
+    )
+    transcript_hash = secure.build_session_transcript_hash(
+        station_id=client_hello.station_id,
+        timestamp=client_hello.timestamp,
+        client_random=client_hello.client_random,
+        client_ephemeral_public_key=(
+            client_hello.client_ephemeral_public_key
+        ),
+        client_signature=client_hello.client_signature,
+        server_random=server_hello.server_random,
+        server_ephemeral_public_key=(
+            server_hello.server_ephemeral_public_key
+        ),
+        server_signature=server_hello.server_signature,
+    )
+    client_key_material = secure.derive_session_key_material(
+        shared_secret,
+        transcript_hash,
+    )
+    session = state._sessions[addr]
+
+    nonce = b"\x01" * 12
+    plaintext = b"direction check"
+    ciphertext = secure.AESGCM(
+        client_key_material.client_to_server_key
+    ).encrypt(nonce, plaintext, secure.DATA_AAD)
+    assert session.client_to_server_aesgcm.decrypt(
+        nonce,
+        ciphertext,
+        secure.DATA_AAD,
+    ) == plaintext
+    assert (
+        session.client_to_server_aesgcm
+        is not session.server_to_client_aesgcm
+    )
+    assert (
+        client_key_material.client_to_server_key
+        != client_key_material.server_to_client_key
     )
     assert fake_socket.sent[0][1] == addr
     assert stats.handshake_replay_accepted == 1
@@ -547,6 +703,337 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
     assert stats.current_sessions == 1
     assert wall_clock.calls == 2
     assert monotonic_clock.calls == 2
+
+
+def test_secure_server_rejects_exact_replay_from_different_address(
+    monkeypatch,
+):
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    packet = _signed_handshake_packet(
+        secure,
+        client_identity_private_key,
+        "boat_001",
+        1000,
+    )
+    first_addr = ("127.0.0.1", 50123)
+    second_addr = ("127.0.0.2", 50124)
+    state = secure.SecureState()
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, first_addr), (packet, second_addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+    )
+
+    assert len(fake_socket.sent) == 1
+    assert fake_socket.sent[0][1] == first_addr
+    assert tuple(state._sessions) == (first_addr,)
+    assert state.stats().handshake_replay_accepted == 1
+    assert state.stats().handshake_replay_rejected == 1
+
+
+def test_invalid_hellos_do_not_consume_replay_or_generate_server_ephemeral(
+    monkeypatch,
+):
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    valid_packet, valid_hello, _ = _signed_client_hello(
+        secure,
+        client_identity_private_key,
+        "boat_001",
+        1000,
+    )
+    unknown_packet = _signed_handshake_packet(
+        secure,
+        client_identity_private_key,
+        "unknown_station",
+        1000,
+    )
+    wrong_signature_packet = build_client_hello_packet(
+        ClientHello(
+            station_id=valid_hello.station_id,
+            timestamp=valid_hello.timestamp,
+            client_random=valid_hello.client_random,
+            client_ephemeral_public_key=(
+                valid_hello.client_ephemeral_public_key
+            ),
+            client_signature=valid_hello.client_signature + b"\x00",
+        )
+    )
+    malformed_public_bytes = b"\x02" + b"\xff" * 32
+    malformed_digest = secure.build_client_auth_digest(
+        station_id="boat_001",
+        timestamp=1000,
+        client_random=b"\x22" * 32,
+        client_ephemeral_public_key=malformed_public_bytes,
+    )
+    malformed_signature = secure.sign_transcript_digest(
+        client_identity_private_key,
+        malformed_digest,
+    )
+    malformed_point_packet = build_client_hello_packet(
+        ClientHello(
+            station_id="boat_001",
+            timestamp=1000,
+            client_random=b"\x22" * 32,
+            client_ephemeral_public_key=malformed_public_bytes,
+            client_signature=malformed_signature,
+        )
+    )
+    old_packet = (
+        b"NMEA-H|boat_001|1000|"
+        + base64.b64encode(valid_hello.client_signature)
+    )
+    cases = (
+        (old_packet, 1000.0),
+        (unknown_packet, 1000.0),
+        (valid_packet, 1030.001),
+        (wrong_signature_packet, 1000.0),
+        (malformed_point_packet, 1000.0),
+    )
+    generation_calls = []
+
+    def fail_ephemeral_generation():
+        generation_calls.append(True)
+        raise AssertionError("server ephemeral generation must not run")
+
+    monkeypatch.setattr(
+        secure,
+        "generate_ephemeral_private_key",
+        fail_ephemeral_generation,
+    )
+
+    for packet, wall_time in cases:
+        state = secure.SecureState()
+        _, fake_socket = _run_secure_server_with_packets(
+            monkeypatch,
+            secure,
+            [(packet, ("127.0.0.1", 50123))],
+            state=state,
+            wall_clock=_FakeClock(wall_time),
+            monotonic_clock=_FakeClock(10.0),
+        )
+
+        assert fake_socket.sent == []
+        assert state.stats().current_handshake_replays == 0
+        assert state.stats().current_sessions == 0
+
+    assert generation_calls == []
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "station_id",
+        "timestamp",
+        "client_random",
+        "client_ephemeral_public_key",
+    ),
+)
+def test_server_rejects_clienthello_field_changed_after_signing(
+    monkeypatch,
+    field_name,
+):
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    _, client_hello, _ = _signed_client_hello(
+        secure,
+        client_identity_private_key,
+        "boat_001",
+        1000,
+    )
+    replacements = {
+        "station_id": "boat_002",
+        "timestamp": 1001,
+        "client_random": b"\x23" * 32,
+        "client_ephemeral_public_key": (
+            secure.serialize_ephemeral_public_key(
+                ec.derive_private_key(
+                    3,
+                    ec.SECP256R1(),
+                ).public_key()
+            )
+        ),
+    }
+    arguments = {
+        "station_id": client_hello.station_id,
+        "timestamp": client_hello.timestamp,
+        "client_random": client_hello.client_random,
+        "client_ephemeral_public_key": (
+            client_hello.client_ephemeral_public_key
+        ),
+        "client_signature": client_hello.client_signature,
+    }
+    arguments[field_name] = replacements[field_name]
+    changed_packet = build_client_hello_packet(ClientHello(**arguments))
+    secure.AUTHORIZED_KEYS["boat_002"] = (
+        client_identity_private_key.public_key()
+    )
+    state = secure.SecureState()
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(changed_packet, ("127.0.0.1", 50123))],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+    )
+
+    assert fake_socket.sent == []
+    assert state.stats().current_handshake_replays == 0
+    assert state.stats().current_sessions == 0
+
+
+def test_server_ecdhe_uses_only_one_validated_ephemeral_private_key(
+    monkeypatch,
+):
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    packet = _signed_handshake_packet(
+        secure,
+        client_identity_private_key,
+        "boat_001",
+        1000,
+    )
+    generated_server_private_key = ec.derive_private_key(
+        9,
+        ec.SECP256R1(),
+    )
+    parse_calls = []
+    derive_calls = []
+    original_parse = secure.parse_ephemeral_public_key
+    original_derive = secure.derive_ephemeral_shared_secret
+
+    def record_parse(encoded):
+        parse_calls.append(encoded)
+        return original_parse(encoded)
+
+    def record_derive(private_key, public_key):
+        derive_calls.append((private_key, public_key))
+        return original_derive(private_key, public_key)
+
+    monkeypatch.setattr(
+        secure,
+        "generate_ephemeral_private_key",
+        lambda: generated_server_private_key,
+    )
+    monkeypatch.setattr(
+        secure,
+        "parse_ephemeral_public_key",
+        record_parse,
+    )
+    monkeypatch.setattr(
+        secure,
+        "derive_ephemeral_shared_secret",
+        record_derive,
+    )
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, ("127.0.0.1", 50123))],
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+    )
+
+    assert len(fake_socket.sent) == 1
+    assert len(parse_calls) == 1
+    assert len(derive_calls) == 1
+    assert derive_calls[0][0] is generated_server_private_key
+    assert derive_calls[0][0] is not secure.server_priv
+
+
+def test_fresh_same_timestamp_hellos_get_fresh_server_state(monkeypatch):
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    first_packet, _, _ = _signed_client_hello(
+        secure,
+        client_identity_private_key,
+        "boat_001",
+        1000,
+        client_random=b"\x31" * 32,
+        client_ephemeral_private_key=ec.derive_private_key(
+            2,
+            ec.SECP256R1(),
+        ),
+    )
+    second_packet, _, _ = _signed_client_hello(
+        secure,
+        client_identity_private_key,
+        "boat_001",
+        1000,
+        client_random=b"\x32" * 32,
+        client_ephemeral_private_key=ec.derive_private_key(
+            3,
+            ec.SECP256R1(),
+        ),
+    )
+    random_values = iter((b"\x41" * 32, b"\x42" * 32))
+    ephemeral_keys = iter(
+        (
+            ec.derive_private_key(4, ec.SECP256R1()),
+            ec.derive_private_key(5, ec.SECP256R1()),
+        )
+    )
+    recorded_keys = []
+
+    class _RecordingAESGCM:
+        def __init__(self, key):
+            self.key = key
+            recorded_keys.append(key)
+
+    monkeypatch.setattr(secure.os, "urandom", lambda length: next(random_values))
+    monkeypatch.setattr(
+        secure,
+        "generate_ephemeral_private_key",
+        lambda: next(ephemeral_keys),
+    )
+    monkeypatch.setattr(secure, "AESGCM", _RecordingAESGCM)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 50123)
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(first_packet, addr), (second_packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+    )
+
+    first_server_hello = parse_server_hello_packet(
+        fake_socket.sent[0][0]
+    )
+    second_server_hello = parse_server_hello_packet(
+        fake_socket.sent[1][0]
+    )
+    assert first_server_hello.server_random != (
+        second_server_hello.server_random
+    )
+    assert first_server_hello.server_ephemeral_public_key != (
+        second_server_hello.server_ephemeral_public_key
+    )
+    assert len(recorded_keys) == 4
+    assert recorded_keys[0] != recorded_keys[1]
+    assert recorded_keys[0] != recorded_keys[2]
+    assert recorded_keys[1] != recorded_keys[3]
+    assert state.stats().handshake_replay_accepted == 2
+    assert state.stats().handshake_replay_rejected == 0
 
 
 def test_secure_server_sends_no_session_for_data_without_session(monkeypatch):
@@ -598,7 +1085,11 @@ def test_secure_server_valid_keepalive_touches_once_with_separate_clocks(
     state = secure.SecureState()
     addr = ("127.0.0.1", 50123)
     session = state.install_session(
-        addr, "boat_001", object(), now=1000.0
+        addr,
+        "boat_001",
+        object(),
+        object(),
+        now=1000.0,
     )
     wall_clock = _FakeClock(5000.0)
     monotonic_clock = _FakeClock(1010.0)
@@ -622,14 +1113,21 @@ def test_secure_server_valid_keepalive_touches_once_with_separate_clocks(
 
 def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    session, _ = _install_test_session(secure, state, addr, key)
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
     packet = _encrypted_control_packet(
         secure,
-        key,
+        client_to_server_key,
         nonce,
         {
             "type": "ping",
@@ -656,10 +1154,16 @@ def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
     response, response_addr = fake_socket.sent[0]
     response_nonce, ciphertext = secure.parse_secure_data_packet(response)
     pong = secure.json.loads(
-        secure.AESGCM(key).decrypt(
+        secure.AESGCM(server_to_client_key).decrypt(
             response_nonce, ciphertext, secure.DATA_AAD
         ).decode()
     )
+    with pytest.raises(InvalidTag):
+        secure.AESGCM(client_to_server_key).decrypt(
+            response_nonce,
+            ciphertext,
+            secure.DATA_AAD,
+        )
     assert response_addr == addr
     assert pong == {
         "type": "pong",
@@ -676,12 +1180,23 @@ def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
 
 def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    session, _ = _install_test_session(secure, state, addr, key)
-    packet = _encrypted_data_packet(secure, key, nonce)
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+    packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+    )
 
     fake_queue, _ = _run_secure_server_with_packets(
         monkeypatch, secure, [(packet, addr)], state=state)
@@ -709,7 +1224,8 @@ def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
 
 def test_secure_server_allowed_peer_preserves_data_behavior(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     policy = NetworkPolicy.from_entries(
@@ -717,8 +1233,18 @@ def test_secure_server_allowed_peer_preserves_data_behavior(monkeypatch):
         context="sec_inputs[0].allow_from",
     )
     state = secure.SecureState()
-    _install_test_session(secure, state, addr, key)
-    packet = _encrypted_data_packet(secure, key, nonce)
+    _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+    packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+    )
 
     fake_queue, _ = _run_secure_server_with_packets(
         monkeypatch,
@@ -741,7 +1267,13 @@ def test_secure_server_denied_data_peer_gets_no_no_session_response(monkeypatch)
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(session_ttl=1.0)
     retained_addr = ("198.51.100.20", 50000)
-    state.install_session(retained_addr, "retained", object(), now=0.0)
+    state.install_session(
+        retained_addr,
+        "retained",
+        object(),
+        object(),
+        now=0.0,
+    )
     addr = ("192.0.2.10", 50123)
     packet = secure.DATA_PREFIX + (b"\x00" * 28)
     policy = NetworkPolicy.from_entries(
@@ -786,7 +1318,11 @@ def test_secure_server_denied_handshake_peer_is_dropped_before_crypto(monkeypatc
     def fail_verify(*_args, **_kwargs):
         raise AssertionError("signature verification should not run")
 
-    monkeypatch.setattr(secure, "verify_signature", fail_verify)
+    monkeypatch.setattr(
+        secure,
+        "verify_transcript_signature",
+        fail_verify,
+    )
     state = secure.SecureState()
     wall_clock = _FakeClock(float(timestamp))
     monotonic_clock = _FakeClock(10.0)
@@ -810,12 +1346,23 @@ def test_secure_server_denied_handshake_peer_is_dropped_before_crypto(monkeypatc
 
 def test_secure_server_source_id_uses_station_not_sec_input_id(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    _install_test_session(secure, state, addr, key)
-    packet = _encrypted_data_packet(secure, key, nonce)
+    _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+    packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+    )
 
     fake_queue, _ = _run_secure_server_with_packets(
         monkeypatch,
@@ -834,15 +1381,22 @@ def test_secure_server_source_id_uses_station_not_sec_input_id(monkeypatch):
 
 def test_secure_server_preserves_unstripped_surrogate_payload(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     payload = " before\ud800after "
     state = secure.SecureState()
-    session, _ = _install_test_session(secure, state, addr, key)
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
     packet = _encrypted_data_packet(
         secure,
-        key,
+        client_to_server_key,
         nonce,
         payload=payload,
     )
@@ -895,21 +1449,28 @@ def test_secure_server_non_string_payload_retains_state_and_later_valid_works(
     payload,
 ):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     first_nonce = b"\x02" * 12
     second_nonce = b"\x03" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    session, _ = _install_test_session(secure, state, addr, key)
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
     first_packet = _encrypted_data_packet(
         secure,
-        key,
+        client_to_server_key,
         first_nonce,
         payload=payload,
     )
     second_packet = _encrypted_data_packet(
         secure,
-        key,
+        client_to_server_key,
         second_nonce,
         payload="later valid",
     )
@@ -959,12 +1520,23 @@ def test_secure_server_non_string_payload_retains_state_and_later_valid_works(
 
 def test_secure_server_rejects_duplicate_data_nonce_after_first_valid_packet(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    session, _ = _install_test_session(secure, state, addr, key)
-    packet = _encrypted_data_packet(secure, key, nonce)
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+    packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+    )
 
     fake_queue, _ = _run_secure_server_with_packets(
         monkeypatch,
@@ -983,11 +1555,18 @@ def test_secure_server_rejects_duplicate_data_nonce_after_first_valid_packet(mon
 
 def test_secure_server_failed_decrypt_does_not_record_data_nonce(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    session, _ = _install_test_session(secure, state, addr, key)
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
     packet = secure.DATA_PREFIX + nonce + (b"\x00" * 16)
 
     fake_queue, _ = _run_secure_server_with_packets(
@@ -1001,14 +1580,58 @@ def test_secure_server_failed_decrypt_does_not_record_data_nonce(monkeypatch):
     assert stats.data_nonces_accepted == 0
 
 
+def test_secure_server_rejects_data_encrypted_with_server_to_client_key(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
+    nonce = b"\x02" * 12
+    addr = ("127.0.0.1", 50123)
+    state = secure.SecureState()
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+    packet = _encrypted_data_packet(
+        secure,
+        server_to_client_key,
+        nonce,
+    )
+
+    fake_queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+    )
+
+    assert fake_queue.items == []
+    assert fake_socket.sent == []
+    assert session.last_seen == 1000.0
+    assert len(session.seen_data_nonces) == 0
+    assert state.stats().sessions_touched == 0
+    assert state.stats().data_nonces_accepted == 0
+
+
 def test_secure_server_malformed_framing_does_not_record_nonce_or_touch(
     monkeypatch,
 ):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    session, _ = _install_test_session(secure, state, addr, key)
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
     packet = secure.DATA_PREFIX + (b"\x02" * 12)
 
     fake_queue, fake_socket = _run_secure_server_with_packets(
@@ -1025,12 +1648,24 @@ def test_secure_server_malformed_framing_does_not_record_nonce_or_touch(
 
 def test_secure_server_source_mismatch_does_not_record_data_nonce_or_touch(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    session, _ = _install_test_session(secure, state, addr, key)
-    packet = _encrypted_data_packet(secure, key, nonce, source_id="other_station")
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+    packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+        source_id="other_station",
+    )
 
     fake_queue, _ = _run_secure_server_with_packets(
         monkeypatch, secure, [(packet, addr)], state=state)
@@ -1143,16 +1778,17 @@ def test_secure_server_keeps_replay_record_after_post_acceptance_failure(monkeyp
     )
     state = secure.SecureState()
 
-    class FailingServerPrivateKey:
-        def __init__(self):
-            self.sign_calls = 0
+    sign_calls = []
 
-        def sign(self, *_args, **_kwargs):
-            self.sign_calls += 1
-            raise RuntimeError("server signing failed")
+    def fail_server_signing(private_key, digest):
+        sign_calls.append((private_key, digest))
+        raise RuntimeError("server signing failed")
 
-    failing_key = FailingServerPrivateKey()
-    monkeypatch.setattr(secure, "server_priv", failing_key)
+    monkeypatch.setattr(
+        secure,
+        "sign_transcript_digest",
+        fail_server_signing,
+    )
 
     _, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
@@ -1164,7 +1800,8 @@ def test_secure_server_keeps_replay_record_after_post_acceptance_failure(monkeyp
     )
 
     assert fake_socket.sent == []
-    assert failing_key.sign_calls == 1
+    assert len(sign_calls) == 1
+    assert sign_calls[0][0] is secure.server_priv
     stats = state.stats()
     assert stats.handshake_replay_accepted == 1
     assert stats.handshake_replay_rejected == 1
@@ -1182,10 +1819,18 @@ def test_secure_server_successful_handshake_replaces_live_session_only(
     addr = ("127.0.0.1", 50123)
     other_addr = ("127.0.0.1", 50124)
     old = state.install_session(
-        addr, "boat_001", object(), now=0.0
+        addr,
+        "boat_001",
+        object(),
+        object(),
+        now=0.0,
     )
     other = state.install_session(
-        other_addr, "other", object(), now=1.0
+        other_addr,
+        "other",
+        object(),
+        object(),
+        now=1.0,
     )
     nonce = b"\x01" * 12
     assert state.accept_data_nonce(old, nonce, now=1.0)
@@ -1207,7 +1852,14 @@ def test_secure_server_successful_handshake_replaces_live_session_only(
     assert response_addr == addr
     assert response.startswith(b"OK|")
     assert replacement is not old
-    assert replacement.aesgcm is not old.aesgcm
+    assert (
+        replacement.client_to_server_aesgcm
+        is not old.client_to_server_aesgcm
+    )
+    assert (
+        replacement.server_to_client_aesgcm
+        is not old.server_to_client_aesgcm
+    )
     assert state._sessions[other_addr] is other
     assert tuple(state._sessions) == (other_addr, addr)
     assert not state.data_nonce_seen(replacement, nonce, now=2.0)
@@ -1229,12 +1881,24 @@ def test_secure_server_session_ttl_uses_exact_monotonic_boundary(
     accepted,
 ):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    _install_test_session(secure, state, addr, key, now=1000.0)
-    packet = _encrypted_data_packet(secure, key, nonce)
+    _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+        now=1000.0,
+    )
+    packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+    )
 
     fake_queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
@@ -1254,12 +1918,24 @@ def test_secure_server_session_ttl_uses_exact_monotonic_boundary(
 
 def test_secure_server_nonce_ttl_uses_monotonic_clock_and_exact_boundary(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState(session_ttl=1000.0, data_nonce_ttl=10.0)
-    _install_test_session(secure, state, addr, key, now=0.0)
-    packet = _encrypted_data_packet(secure, key, nonce)
+    _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+        now=0.0,
+    )
+    packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+    )
 
     first_queue, _ = _run_secure_server_with_packets(
         monkeypatch,
@@ -1298,23 +1974,34 @@ def test_secure_server_nonce_ttl_uses_monotonic_clock_and_exact_boundary(monkeyp
 
 def test_secure_server_rejects_repeated_nonce_before_second_decrypt(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
-    real_aesgcm = secure.AESGCM(key)
+    real_client_to_server_aesgcm = secure.AESGCM(client_to_server_key)
 
-    class CountingAESGCM:
+    class CountingClientToServerAESGCM:
         def __init__(self):
             self.decrypt_calls = 0
 
         def decrypt(self, *args):
             self.decrypt_calls += 1
-            return real_aesgcm.decrypt(*args)
+            return real_client_to_server_aesgcm.decrypt(*args)
 
-    aesgcm = CountingAESGCM()
+    client_to_server_aesgcm = CountingClientToServerAESGCM()
+    server_to_client_aesgcm = object()
     state = secure.SecureState()
-    state.install_session(addr, "boat_001", aesgcm, now=1000.0)
-    packet = _encrypted_data_packet(secure, key, nonce)
+    state.install_session(
+        addr,
+        "boat_001",
+        client_to_server_aesgcm,
+        server_to_client_aesgcm,
+        now=1000.0,
+    )
+    packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+    )
 
     fake_queue, _ = _run_secure_server_with_packets(
         monkeypatch,
@@ -1324,19 +2011,26 @@ def test_secure_server_rejects_repeated_nonce_before_second_decrypt(monkeypatch)
     )
 
     assert len(fake_queue.items) == 1
-    assert aesgcm.decrypt_calls == 1
+    assert client_to_server_aesgcm.decrypt_calls == 1
     assert state.stats().data_nonce_replays == 1
     assert state.stats().sessions_touched == 1
 
 
 def test_secure_server_invalid_json_does_not_record_nonce_or_touch(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    session, _ = _install_test_session(secure, state, addr, key)
-    ciphertext = secure.AESGCM(key).encrypt(
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+    ciphertext = secure.AESGCM(client_to_server_key).encrypt(
         nonce, b"not-json", secure.DATA_AAD
     )
     packet = secure.DATA_PREFIX + nonce + ciphertext
@@ -1365,12 +2059,24 @@ def test_secure_server_invalid_message_shape_does_not_record_nonce_or_touch(
     message,
 ):
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x03" * 32
     nonce = b"\x02" * 12
     addr = ("127.0.0.1", 50123)
     state = secure.SecureState()
-    session, _ = _install_test_session(secure, state, addr, key)
-    packet = _encrypted_control_packet(secure, key, nonce, message)
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+    packet = _encrypted_control_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+        message,
+    )
 
     fake_queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch, secure, [(packet, addr)], state=state
@@ -1388,7 +2094,13 @@ def test_allowed_peer_activity_proactively_cleans_silent_expired_session(monkeyp
     state = secure.SecureState(session_ttl=10.0)
     silent_addr = ("127.0.0.1", 50122)
     active_addr = ("127.0.0.1", 50123)
-    state.install_session(silent_addr, "silent", object(), now=0.0)
+    state.install_session(
+        silent_addr,
+        "silent",
+        object(),
+        object(),
+        now=0.0,
+    )
     packet = secure.DATA_PREFIX + (b"\x00" * 28)
 
     _, fake_socket = _run_secure_server_with_packets(
@@ -1411,7 +2123,13 @@ def test_allowed_handshake_proactively_cleans_silent_expired_session(monkeypatch
     state = secure.SecureState(session_ttl=10.0)
     silent_addr = ("127.0.0.1", 50122)
     handshake_addr = ("127.0.0.1", 50123)
-    state.install_session(silent_addr, "silent", object(), now=0.0)
+    state.install_session(
+        silent_addr,
+        "silent",
+        object(),
+        object(),
+        now=0.0,
+    )
     packet = _signed_handshake_packet(
         secure, client_private_key, "boat_001", 1000
     )
@@ -1435,7 +2153,13 @@ def test_unknown_allowed_packet_proactively_cleans_without_wall_clock(monkeypatc
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(session_ttl=10.0)
     silent_addr = ("127.0.0.1", 50122)
-    state.install_session(silent_addr, "silent", object(), now=0.0)
+    state.install_session(
+        silent_addr,
+        "silent",
+        object(),
+        object(),
+        now=0.0,
+    )
     wall_clock = _FakeClock(1000.0)
     monotonic_clock = _FakeClock(10.0)
 
@@ -1477,7 +2201,13 @@ def test_exactly_expired_address_receives_existing_no_session_format(
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(session_ttl=10.0)
     addr = ("127.0.0.1", 50123)
-    state.install_session(addr, "boat_001", object(), now=0.0)
+    state.install_session(
+        addr,
+        "boat_001",
+        object(),
+        object(),
+        now=0.0,
+    )
 
     _, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
@@ -1644,7 +2374,11 @@ def test_expiring_state_cleanup_and_capacity_do_not_scan_or_call_min(
             data_nonce_max_per_session=2,
         )
         session = state.install_session(
-            ("192.0.2.10", 50000), "boat_001", object(), now=0.0
+            ("192.0.2.10", 50000),
+            "boat_001",
+            object(),
+            object(),
+            now=0.0,
         )
         assert state.accept_data_nonce(session, b"\x01" * 12, now=0.0)
         assert state.accept_data_nonce(session, b"\x02" * 12, now=5.0)
@@ -1680,6 +2414,18 @@ def test_proxy_encrypt_message_aes_gcm_uses_12_byte_nonce_and_nmea_aad():
 
     assert len(nonce) == 12
     assert AESGCM(key).decrypt(nonce, ciphertext_and_tag, b"NMEA") == plaintext
+
+
+def _proxy_session_key_material(
+    proxy,
+    *,
+    client_to_server_key=b"\x01" * 32,
+    server_to_client_key=b"\x02" * 32,
+):
+    return proxy.SessionKeyMaterial(
+        client_to_server_key=client_to_server_key,
+        server_to_client_key=server_to_client_key,
+    )
 
 
 def test_proxy_treats_no_session_from_configured_remote_as_invalidation():
@@ -1774,7 +2520,11 @@ def test_proxy_empty_allow_from_denies_all():
 )
 def test_proxy_local_allow_from_allows_matching_senders(monkeypatch, entries, addr):
     proxy = load_proxy_module()
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    key_material = _proxy_session_key_material(
+        proxy,
+        client_to_server_key=client_to_server_key,
+    )
     remote_addr = ("192.0.2.10", 17777)
     policy = proxy.NetworkPolicy.from_entries(
         entries,
@@ -1815,7 +2565,7 @@ def test_proxy_local_allow_from_allows_matching_senders(monkeypatch, entries, ad
             "peer_timeout": 90,
             "session_refresh_interval": 0,
         },
-        key,
+        key_material,
         remote_addr,
         policy,
     )
@@ -1824,7 +2574,10 @@ def test_proxy_local_allow_from_allows_matching_senders(monkeypatch, entries, ad
     assert len(out_sock.sent) == 1
     packet, destination = out_sock.sent[0]
     assert destination == remote_addr
-    assert proxy.decrypt_secure_json_message(packet, key) == {
+    assert proxy.decrypt_secure_json_message(
+        packet,
+        client_to_server_key,
+    ) == {
         "type": "nmea",
         "payload": "!AIVDM,1,1,,A,payload,0*00",
         "timestamp": 1000,
@@ -1888,7 +2641,7 @@ def test_proxy_local_allow_from_drops_denied_packet_before_processing(
             "peer_timeout": 90,
             "session_refresh_interval": 0,
         },
-        b"\x01" * 32,
+        _proxy_session_key_material(proxy),
         remote_addr,
         policy,
     )
@@ -2097,7 +2850,8 @@ def test_proxy_source_ip_bind_error_names_configured_source(monkeypatch):
 
 def test_proxy_accepts_only_authenticated_matching_pong_as_liveness():
     proxy = load_proxy_module()
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x02" * 32
     remote_addr = ("192.0.2.10", 17777)
     packet = proxy.encrypt_secure_json_message(
         {
@@ -2106,25 +2860,48 @@ def test_proxy_accepts_only_authenticated_matching_pong_as_liveness():
             "timestamp": 1000,
             "source_id": "boat_001",
         },
-        key,
+        server_to_client_key,
     )
 
     assert proxy.handle_server_packet(
-        packet, remote_addr, remote_addr, key, "boat_001", 123
+        packet,
+        remote_addr,
+        remote_addr,
+        server_to_client_key,
+        "boat_001",
+        123,
     ) == proxy.SERVER_PACKET_AUTHENTICATED
     assert proxy.handle_server_packet(
         packet,
-        ("192.0.2.10", 17778),
         remote_addr,
-        key,
+        remote_addr,
+        client_to_server_key,
         "boat_001",
         123,
     ) == proxy.SERVER_PACKET_IGNORED
     assert proxy.handle_server_packet(
-        b"PONG|123", remote_addr, remote_addr, key, "boat_001", 123
+        packet,
+        ("192.0.2.10", 17778),
+        remote_addr,
+        server_to_client_key,
+        "boat_001",
+        123,
     ) == proxy.SERVER_PACKET_IGNORED
     assert proxy.handle_server_packet(
-        packet, remote_addr, remote_addr, key, "boat_001", 124
+        b"PONG|123",
+        remote_addr,
+        remote_addr,
+        server_to_client_key,
+        "boat_001",
+        123,
+    ) == proxy.SERVER_PACKET_IGNORED
+    assert proxy.handle_server_packet(
+        packet,
+        remote_addr,
+        remote_addr,
+        server_to_client_key,
+        "boat_001",
+        124,
     ) == proxy.SERVER_PACKET_IGNORED
 
 
@@ -2141,6 +2918,8 @@ class _FakeHandshakeSocket:
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
+        if callable(response):
+            return response(self.sent[-1][0])
         return response
 
     def gettimeout(self):
@@ -2150,39 +2929,184 @@ class _FakeHandshakeSocket:
         self.timeout = timeout
 
 
-def test_proxy_handshake_succeeds_after_stale_no_session_hint(monkeypatch):
+def _build_test_server_response(
+    client_packet,
+    server_identity_private_key,
+    *,
+    server_random=b"\x51" * 32,
+    server_ephemeral_private_key=None,
+    client_signature_binding=None,
+):
+    client_hello = parse_client_hello_packet(client_packet)
+    client_ephemeral_public_key = (
+        udpsec_crypto.parse_ephemeral_public_key(
+            client_hello.client_ephemeral_public_key
+        )
+    )
+    if server_ephemeral_private_key is None:
+        server_ephemeral_private_key = ec.derive_private_key(
+            7,
+            ec.SECP256R1(),
+        )
+    server_ephemeral_public_bytes = (
+        udpsec_crypto.serialize_ephemeral_public_key(
+            server_ephemeral_private_key.public_key()
+        )
+    )
+    bound_client_signature = (
+        client_hello.client_signature
+        if client_signature_binding is None
+        else client_signature_binding
+    )
+    server_digest = udpsec_crypto.build_server_auth_digest(
+        station_id=client_hello.station_id,
+        timestamp=client_hello.timestamp,
+        client_random=client_hello.client_random,
+        client_ephemeral_public_key=(
+            client_hello.client_ephemeral_public_key
+        ),
+        client_signature=bound_client_signature,
+        server_random=server_random,
+        server_ephemeral_public_key=server_ephemeral_public_bytes,
+    )
+    server_signature = udpsec_crypto.sign_transcript_digest(
+        server_identity_private_key,
+        server_digest,
+    )
+    server_hello = ServerHello(
+        server_random=server_random,
+        server_ephemeral_public_key=server_ephemeral_public_bytes,
+        server_signature=server_signature,
+    )
+    shared_secret = udpsec_crypto.derive_ephemeral_shared_secret(
+        server_ephemeral_private_key,
+        client_ephemeral_public_key,
+    )
+    transcript_hash = udpsec_crypto.build_session_transcript_hash(
+        station_id=client_hello.station_id,
+        timestamp=client_hello.timestamp,
+        client_random=client_hello.client_random,
+        client_ephemeral_public_key=(
+            client_hello.client_ephemeral_public_key
+        ),
+        client_signature=client_hello.client_signature,
+        server_random=server_hello.server_random,
+        server_ephemeral_public_key=(
+            server_hello.server_ephemeral_public_key
+        ),
+        server_signature=server_hello.server_signature,
+    )
+    key_material = udpsec_crypto.derive_session_key_material(
+        shared_secret,
+        transcript_hash,
+    )
+    return (
+        build_server_hello_packet(server_hello),
+        client_hello,
+        server_hello,
+        key_material,
+    )
+
+
+def test_proxy_handshake_succeeds_after_stale_no_session_hint(
+    monkeypatch,
+    capsys,
+):
     proxy = load_proxy_module()
     timestamp = 1000
     station_id = "boat_001"
     remote_addr = ("192.0.2.10", 17777)
-    client_private_key = ec.generate_private_key(ec.SECP256R1())
-    server_private_key = ec.generate_private_key(ec.SECP256R1())
-    server_public_key = server_private_key.public_key()
-    payload = (
-        proxy.HANDSHAKE_PREFIX
-        + station_id.encode()
-        + timestamp.to_bytes(8, "big")
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
     )
-    server_signature = proxy.sign_message(payload, server_private_key)
-    sock = _FakeHandshakeSocket([
-        (b"NOSESSION|boat_001", remote_addr),
-        (b"OK|" + base64.b64encode(server_signature), remote_addr),
-    ])
-    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    expected = {}
 
-    session_key = proxy.perform_handshake(
+    def valid_response(client_packet):
+        response, client_hello, server_hello, key_material = (
+            _build_test_server_response(
+                client_packet,
+                server_identity_private_key,
+            )
+        )
+        expected.update(
+            client_hello=client_hello,
+            server_hello=server_hello,
+            key_material=key_material,
+        )
+        return response, remote_addr
+
+    sock = _FakeHandshakeSocket((
+        (b"NOSESSION|boat_001", remote_addr),
+        valid_response,
+    ))
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+    parse_calls = []
+    derive_calls = []
+    original_parse = proxy.parse_ephemeral_public_key
+    original_derive = proxy.derive_ephemeral_shared_secret
+
+    def record_parse(encoded):
+        parse_calls.append(encoded)
+        return original_parse(encoded)
+
+    def record_derive(private_key, public_key):
+        derive_calls.append((private_key, public_key))
+        return original_derive(private_key, public_key)
+
+    monkeypatch.setattr(
+        proxy,
+        "parse_ephemeral_public_key",
+        record_parse,
+    )
+    monkeypatch.setattr(
+        proxy,
+        "derive_ephemeral_shared_secret",
+        record_derive,
+    )
+
+    key_material = proxy.perform_handshake(
         sock,
         {"station_id": station_id},
-        client_private_key,
-        server_public_key,
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
         remote_addr,
     )
 
-    client_signature = base64.b64decode(sock.sent[0][0].split(b"|")[3])
-    shared_secret = client_private_key.exchange(ec.ECDH(), server_public_key)
-    assert session_key == proxy.derive_session_key(
-        shared_secret, client_signature, server_signature
+    client_hello = parse_client_hello_packet(sock.sent[0][0])
+    client_digest = udpsec_crypto.build_client_auth_digest(
+        station_id=client_hello.station_id,
+        timestamp=client_hello.timestamp,
+        client_random=client_hello.client_random,
+        client_ephemeral_public_key=(
+            client_hello.client_ephemeral_public_key
+        ),
     )
+    assert udpsec_crypto.verify_transcript_signature(
+        station_identity_private_key.public_key(),
+        client_hello.client_signature,
+        client_digest,
+    )
+    assert key_material == expected["key_material"]
+    assert isinstance(key_material, SessionKeyMaterial)
+    assert (
+        key_material.client_to_server_key
+        != key_material.server_to_client_key
+    )
+    assert len(client_hello.client_random) == 32
+    assert len(client_hello.client_ephemeral_public_key) == 33
+    assert len(parse_calls) == 1
+    assert len(derive_calls) == 1
+    assert derive_calls[0][0] is not station_identity_private_key
+    output = capsys.readouterr().out
+    assert "Mutual ECDHE handshake established." in output
+    assert "Session hash" not in output
+    assert key_material.client_to_server_key.hex() not in output
+    assert key_material.server_to_client_key.hex() not in output
     assert sock.timeout == 5.0
 
 
@@ -2192,32 +3116,384 @@ def test_proxy_handshake_ignores_valid_reply_from_unexpected_remote(monkeypatch)
     station_id = "boat_001"
     remote_addr = ("192.0.2.10", 17777)
     other_addr = ("192.0.2.10", 17778)
-    client_private_key = ec.generate_private_key(ec.SECP256R1())
-    server_private_key = ec.generate_private_key(ec.SECP256R1())
-    server_public_key = server_private_key.public_key()
-    payload = (
-        proxy.HANDSHAKE_PREFIX
-        + station_id.encode()
-        + timestamp.to_bytes(8, "big")
-    )
-    server_signature = proxy.sign_message(payload, server_private_key)
-    response = b"OK|" + base64.b64encode(server_signature)
-    sock = _FakeHandshakeSocket([
-        (response, other_addr),
-        (response, remote_addr),
-    ])
+    client_private_key = ec.derive_private_key(11, ec.SECP256R1())
+    server_private_key = ec.derive_private_key(12, ec.SECP256R1())
+    response_packets = []
+
+    def response_from(address):
+        def build_response(client_packet):
+            response, _, _, _ = _build_test_server_response(
+                client_packet,
+                server_private_key,
+            )
+            response_packets.append(response)
+            return response, address
+
+        return build_response
+
+    sock = _FakeHandshakeSocket((
+        response_from(other_addr),
+        response_from(remote_addr),
+    ))
     monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
 
-    session_key = proxy.perform_handshake(
+    key_material = proxy.perform_handshake(
         sock,
         {"station_id": station_id},
         client_private_key,
-        server_public_key,
+        server_private_key.public_key(),
         remote_addr,
     )
 
-    assert session_key is not None
+    assert isinstance(key_material, SessionKeyMaterial)
+    assert len(response_packets) == 2
     assert len(sock.sent) == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "wrong-identity",
+        "server-random",
+        "server-ephemeral",
+        "client-signature-binding",
+        "malformed-server-point",
+        "old-response",
+    ),
+)
+def test_proxy_handshake_rejects_unauthenticated_or_old_server_response(
+    monkeypatch,
+    mutation,
+):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    remote_addr = ("192.0.2.10", 17777)
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
+    )
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    other_identity_private_key = ec.derive_private_key(
+        13,
+        ec.SECP256R1(),
+    )
+
+    def invalid_response(client_packet):
+        if mutation == "old-response":
+            return b"OK|b2xkLXNpZ25hdHVyZQ==", remote_addr
+        if mutation == "malformed-server-point":
+            client_hello = parse_client_hello_packet(client_packet)
+            malformed_public_bytes = b"\x02" + b"\xff" * 32
+            server_random = b"\x51" * 32
+            digest = udpsec_crypto.build_server_auth_digest(
+                station_id=client_hello.station_id,
+                timestamp=client_hello.timestamp,
+                client_random=client_hello.client_random,
+                client_ephemeral_public_key=(
+                    client_hello.client_ephemeral_public_key
+                ),
+                client_signature=client_hello.client_signature,
+                server_random=server_random,
+                server_ephemeral_public_key=malformed_public_bytes,
+            )
+            signature = udpsec_crypto.sign_transcript_digest(
+                server_identity_private_key,
+                digest,
+            )
+            return build_server_hello_packet(
+                ServerHello(
+                    server_random=server_random,
+                    server_ephemeral_public_key=malformed_public_bytes,
+                    server_signature=signature,
+                )
+            ), remote_addr
+
+        signing_key = (
+            other_identity_private_key
+            if mutation == "wrong-identity"
+            else server_identity_private_key
+        )
+        client_signature_binding = (
+            b"different-client-signature"
+            if mutation == "client-signature-binding"
+            else None
+        )
+        response, _, server_hello, _ = _build_test_server_response(
+            client_packet,
+            signing_key,
+            client_signature_binding=client_signature_binding,
+        )
+        if mutation == "server-random":
+            response = build_server_hello_packet(
+                ServerHello(
+                    server_random=b"\x52" * 32,
+                    server_ephemeral_public_key=(
+                        server_hello.server_ephemeral_public_key
+                    ),
+                    server_signature=server_hello.server_signature,
+                )
+            )
+        elif mutation == "server-ephemeral":
+            changed_public_bytes = (
+                udpsec_crypto.serialize_ephemeral_public_key(
+                    ec.derive_private_key(
+                        8,
+                        ec.SECP256R1(),
+                    ).public_key()
+                )
+            )
+            response = build_server_hello_packet(
+                ServerHello(
+                    server_random=server_hello.server_random,
+                    server_ephemeral_public_key=changed_public_bytes,
+                    server_signature=server_hello.server_signature,
+                )
+            )
+        return response, remote_addr
+
+    sock = _FakeHandshakeSocket(
+        (invalid_response, proxy.socket.timeout())
+    )
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+
+    key_material = proxy.perform_handshake(
+        sock,
+        {"station_id": "boat_001"},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+
+    assert key_material is None
+    assert len(sock.sent) == 1
+    assert sock.timeout == 5.0
+
+
+def test_separate_proxy_handshakes_use_fresh_random_ephemeral_and_keys(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    remote_addr = ("192.0.2.10", 17777)
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
+    )
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    random_lengths = []
+    random_values = iter((b"\x61" * 32, b"\x62" * 32))
+    client_ephemeral_keys = iter(
+        (
+            ec.derive_private_key(14, ec.SECP256R1()),
+            ec.derive_private_key(15, ec.SECP256R1()),
+        )
+    )
+
+    def next_random(length):
+        random_lengths.append(length)
+        return next(random_values)
+
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+    monkeypatch.setattr(proxy.os, "urandom", next_random)
+    monkeypatch.setattr(
+        proxy,
+        "generate_ephemeral_private_key",
+        lambda: next(client_ephemeral_keys),
+    )
+    sent_hellos = []
+
+    def new_socket():
+        def valid_response(client_packet):
+            sent_hellos.append(parse_client_hello_packet(client_packet))
+            response, _, _, _ = _build_test_server_response(
+                client_packet,
+                server_identity_private_key,
+            )
+            return response, remote_addr
+
+        return _FakeHandshakeSocket((valid_response,))
+
+    first_material = proxy.perform_handshake(
+        new_socket(),
+        {"station_id": "boat_001"},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+    second_material = proxy.perform_handshake(
+        new_socket(),
+        {"station_id": "boat_001"},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+
+    assert random_lengths == [32, 32]
+    assert sent_hellos[0].client_random != sent_hellos[1].client_random
+    assert sent_hellos[0].client_ephemeral_public_key != (
+        sent_hellos[1].client_ephemeral_public_key
+    )
+    assert first_material != second_material
+    assert first_material.client_to_server_key != (
+        second_material.client_to_server_key
+    )
+    assert first_material.server_to_client_key != (
+        second_material.server_to_client_key
+    )
+
+
+def test_runtime_end_to_end_ecdhe_and_directional_encryption(monkeypatch):
+    secure, station_identity_private_key = (
+        load_secure_module_with_fake_keys(
+            monkeypatch,
+            with_client_private_key=True,
+        )
+    )
+    proxy = load_proxy_module()
+    timestamp = 1000
+    remote_addr = ("192.0.2.10", 17777)
+    client_addr = ("192.0.2.20", 50123)
+    state = secure.SecureState()
+    recorded_server_keys = []
+
+    class _RecordingAESGCM:
+        def __init__(self, key):
+            self.key = key
+            self.delegate = AESGCM(key)
+            recorded_server_keys.append(key)
+
+        def encrypt(self, *args):
+            return self.delegate.encrypt(*args)
+
+        def decrypt(self, *args):
+            return self.delegate.decrypt(*args)
+
+    monkeypatch.setattr(secure, "AESGCM", _RecordingAESGCM)
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+
+    class _RuntimeBridgeSocket:
+        def __init__(self):
+            self.client_packet = None
+            self.timeout = 5.0
+
+        def sendto(self, packet, destination):
+            assert destination == remote_addr
+            self.client_packet = packet
+
+        def recvfrom(self, _size):
+            _, server_socket = _run_secure_server_with_packets(
+                monkeypatch,
+                secure,
+                [(self.client_packet, client_addr)],
+                state=state,
+                wall_clock=_FakeClock(float(timestamp)),
+                monotonic_clock=_FakeClock(10.0),
+            )
+            assert len(server_socket.sent) == 1
+            response, response_addr = server_socket.sent[0]
+            assert response_addr == client_addr
+            return response, remote_addr
+
+        def gettimeout(self):
+            return self.timeout
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+    bridge_socket = _RuntimeBridgeSocket()
+    client_key_material = proxy.perform_handshake(
+        bridge_socket,
+        {"station_id": "boat_001"},
+        station_identity_private_key,
+        secure.server_priv.public_key(),
+        remote_addr,
+    )
+
+    assert isinstance(client_key_material, SessionKeyMaterial)
+    assert recorded_server_keys == [
+        client_key_material.client_to_server_key,
+        client_key_material.server_to_client_key,
+    ]
+    assert (
+        client_key_material.client_to_server_key
+        != client_key_material.server_to_client_key
+    )
+    server_session = state._sessions[client_addr]
+    assert (
+        server_session.client_to_server_aesgcm
+        is not server_session.server_to_client_aesgcm
+    )
+
+    nmea_packet = proxy.encrypt_secure_json_message(
+        {
+            "type": "nmea",
+            "payload": "!AIVDM,1,1,,A,payload,0*00",
+            "timestamp": timestamp,
+            "source_id": "boat_001",
+        },
+        client_key_material.client_to_server_key,
+    )
+    nmea_queue, nmea_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(nmea_packet, client_addr)],
+        state=state,
+        wall_clock=_FakeClock(float(timestamp)),
+        monotonic_clock=_FakeClock(11.0),
+    )
+
+    assert len(nmea_queue.items) == 1
+    assert nmea_queue.items[0].payload == (
+        b"!AIVDM,1,1,,A,payload,0*00"
+    )
+    assert nmea_socket.sent == []
+
+    ping_packet = proxy.encrypt_secure_json_message(
+        {
+            "type": "ping",
+            "seq": 7,
+            "timestamp": timestamp,
+            "source_id": "boat_001",
+        },
+        client_key_material.client_to_server_key,
+    )
+    ping_queue, ping_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(ping_packet, client_addr)],
+        state=state,
+        wall_clock=_FakeClock(float(timestamp)),
+        monotonic_clock=_FakeClock(12.0),
+    )
+
+    assert ping_queue.items == []
+    assert len(ping_socket.sent) == 1
+    pong_packet, pong_addr = ping_socket.sent[0]
+    assert pong_addr == client_addr
+    assert proxy.handle_server_packet(
+        pong_packet,
+        remote_addr,
+        remote_addr,
+        client_key_material.server_to_client_key,
+        "boat_001",
+        7,
+    ) == proxy.SERVER_PACKET_AUTHENTICATED
+    assert proxy.handle_server_packet(
+        pong_packet,
+        remote_addr,
+        remote_addr,
+        client_key_material.client_to_server_key,
+        "boat_001",
+        7,
+    ) == proxy.SERVER_PACKET_IGNORED
+    assert len(ping_packet[len(proxy.DATA_PREFIX):][:12]) == 12
+    assert len(pong_packet[len(proxy.DATA_PREFIX):][:12]) == 12
 
 
 def test_proxy_handshake_timeout_returns_to_retry_loop(monkeypatch):
@@ -2347,7 +3623,7 @@ def _run_idle_proxy_session(monkeypatch, config):
         udp_sock,
         out_sock,
         config,
-        b"\x01" * 32,
+        _proxy_session_key_material(proxy),
         ("192.0.2.10", 17777),
     )
     return proxy, reason, out_sock
@@ -2409,7 +3685,7 @@ def test_proxy_forward_loop_exits_on_no_session(monkeypatch):
             "peer_timeout": 90,
             "session_refresh_interval": 0,
         },
-        b"\x01" * 32,
+        _proxy_session_key_material(proxy),
         remote_addr,
     )
 
@@ -2433,7 +3709,7 @@ def test_proxy_forward_loop_reports_socket_error(monkeypatch):
             "peer_timeout": 90,
             "session_refresh_interval": 0,
         },
-        b"\x01" * 32,
+        _proxy_session_key_material(proxy),
         ("192.0.2.10", 17777),
     )
 
@@ -2442,7 +3718,13 @@ def test_proxy_forward_loop_reports_socket_error(monkeypatch):
 
 def test_proxy_healthy_ping_pong_runs_past_old_refresh_interval(monkeypatch):
     proxy = load_proxy_module()
-    key = b"\x01" * 32
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x02" * 32
+    key_material = _proxy_session_key_material(
+        proxy,
+        client_to_server_key=client_to_server_key,
+        server_to_client_key=server_to_client_key,
+    )
     remote_addr = ("192.0.2.10", 17777)
     clock = [0.0]
 
@@ -2455,7 +3737,10 @@ def test_proxy_healthy_ping_pong_runs_past_old_refresh_interval(monkeypatch):
             self.pong_count = 0
 
         def sendto(self, data, addr):
-            ping = proxy.decrypt_secure_json_message(data, key)
+            ping = proxy.decrypt_secure_json_message(
+                data,
+                client_to_server_key,
+            )
             self.responses.append(
                 proxy.encrypt_secure_json_message(
                     {
@@ -2464,7 +3749,7 @@ def test_proxy_healthy_ping_pong_runs_past_old_refresh_interval(monkeypatch):
                         "timestamp": int(clock[0]),
                         "source_id": "boat_001",
                     },
-                    key,
+                    server_to_client_key,
                 )
             )
 
@@ -2495,7 +3780,7 @@ def test_proxy_healthy_ping_pong_runs_past_old_refresh_interval(monkeypatch):
             "peer_timeout": 90,
             "session_refresh_interval": 0,
         },
-        key,
+        key_material,
         remote_addr,
     )
 
@@ -2675,12 +3960,20 @@ def test_secure_session_stores_identity_crypto_and_monotonic_timestamps(monkeypa
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState()
     addr = ("192.0.2.10", 50000)
-    aesgcm = object()
+    client_to_server_aesgcm = object()
+    server_to_client_aesgcm = object()
 
-    session = state.install_session(addr, "boat_001", aesgcm, now=100.0)
+    session = state.install_session(
+        addr,
+        "boat_001",
+        client_to_server_aesgcm,
+        server_to_client_aesgcm,
+        now=100.0,
+    )
 
     assert session.station_id == "boat_001"
-    assert session.aesgcm is aesgcm
+    assert session.client_to_server_aesgcm is client_to_server_aesgcm
+    assert session.server_to_client_aesgcm is server_to_client_aesgcm
     assert session.created_at == 100.0
     assert session.last_seen == 100.0
     assert len(session.seen_data_nonces) == 0
@@ -2692,7 +3985,11 @@ def test_data_nonce_accepts_first_validated_nonce(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(data_nonce_ttl=60.0)
     session = state.install_session(
-        ("192.0.2.10", 50000), "boat_001", object(), now=100.0
+        ("192.0.2.10", 50000),
+        "boat_001",
+        object(),
+        object(),
+        now=100.0,
     )
     nonce = b"\x01" * 12
 
@@ -2709,7 +4006,11 @@ def test_data_nonce_replay_does_not_refresh_expiry(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(data_nonce_ttl=60.0)
     session = state.install_session(
-        ("192.0.2.10", 50000), "boat_001", object(), now=100.0
+        ("192.0.2.10", 50000),
+        "boat_001",
+        object(),
+        object(),
+        now=100.0,
     )
     nonce = b"\x01" * 12
 
@@ -2730,7 +4031,11 @@ def test_data_nonce_cleanup_removes_only_expired_front_prefix(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(data_nonce_ttl=30.0)
     session = state.install_session(
-        ("192.0.2.10", 50000), "boat_001", object(), now=0.0
+        ("192.0.2.10", 50000),
+        "boat_001",
+        object(),
+        object(),
+        now=0.0,
     )
     expired_nonce = b"\x01" * 12
     active_nonce = b"\x02" * 12
@@ -2752,7 +4057,11 @@ def test_data_nonce_capacity_evicts_oldest_live_nonce(monkeypatch):
         data_nonce_max_per_session=2,
     )
     session = state.install_session(
-        ("192.0.2.10", 50000), "boat_001", object(), now=100.0
+        ("192.0.2.10", 50000),
+        "boat_001",
+        object(),
+        object(),
+        now=100.0,
     )
     one = b"\x01" * 12
     two = b"\x02" * 12
@@ -2777,7 +4086,11 @@ def test_data_nonce_expiry_precedes_capacity_eviction(monkeypatch):
         data_nonce_max_per_session=2,
     )
     session = state.install_session(
-        ("192.0.2.10", 50000), "boat_001", object(), now=0.0
+        ("192.0.2.10", 50000),
+        "boat_001",
+        object(),
+        object(),
+        now=0.0,
     )
     expired = b"\x01" * 12
     live = b"\x02" * 12
@@ -2797,10 +4110,18 @@ def test_data_nonce_caches_are_independent_per_session(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(data_nonce_ttl=60.0)
     first = state.install_session(
-        ("192.0.2.10", 50000), "boat_001", object(), now=100.0
+        ("192.0.2.10", 50000),
+        "boat_001",
+        object(),
+        object(),
+        now=100.0,
     )
     second = state.install_session(
-        ("192.0.2.11", 50001), "boat_002", object(), now=100.0
+        ("192.0.2.11", 50001),
+        "boat_002",
+        object(),
+        object(),
+        now=100.0,
     )
     nonce = b"\x01" * 12
 
@@ -2815,7 +4136,13 @@ def test_get_active_session_uses_exact_ttl_boundary(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(session_ttl=30.0)
     addr = ("192.0.2.10", 50000)
-    session = state.install_session(addr, "boat_001", object(), now=100.0)
+    session = state.install_session(
+        addr,
+        "boat_001",
+        object(),
+        object(),
+        now=100.0,
+    )
 
     assert state.get_active_session(addr, now=129.999) is session
     assert state.get_active_session(addr, now=130.0) is None
@@ -2837,8 +4164,20 @@ def test_touch_session_updates_lru_order_without_changing_creation(monkeypatch):
     state = secure.SecureState()
     first_addr = ("192.0.2.10", 50000)
     second_addr = ("192.0.2.11", 50001)
-    first = state.install_session(first_addr, "first", object(), now=100.0)
-    state.install_session(second_addr, "second", object(), now=110.0)
+    first = state.install_session(
+        first_addr,
+        "first",
+        object(),
+        object(),
+        now=100.0,
+    )
+    state.install_session(
+        second_addr,
+        "second",
+        object(),
+        object(),
+        now=110.0,
+    )
 
     assert tuple(state._sessions) == (first_addr, second_addr)
     assert state.touch_session(first_addr, first, now=125.0)
@@ -2854,8 +4193,20 @@ def test_invalid_keepalive_does_not_touch_or_reorder_session(monkeypatch):
     state = secure.SecureState()
     first_addr = ("192.0.2.10", 50000)
     second_addr = ("192.0.2.11", 50001)
-    first = state.install_session(first_addr, "first", object(), now=100.0)
-    state.install_session(second_addr, "second", object(), now=110.0)
+    first = state.install_session(
+        first_addr,
+        "first",
+        object(),
+        object(),
+        now=100.0,
+    )
+    state.install_session(
+        second_addr,
+        "second",
+        object(),
+        object(),
+        now=110.0,
+    )
 
     assert not state.handle_keepalive(first_addr, "wrong", now=120.0)
 
@@ -2869,8 +4220,20 @@ def test_valid_keepalive_touches_and_reorders_session(monkeypatch):
     state = secure.SecureState()
     first_addr = ("192.0.2.10", 50000)
     second_addr = ("192.0.2.11", 50001)
-    first = state.install_session(first_addr, "first", object(), now=100.0)
-    state.install_session(second_addr, "second", object(), now=110.0)
+    first = state.install_session(
+        first_addr,
+        "first",
+        object(),
+        object(),
+        now=100.0,
+    )
+    state.install_session(
+        second_addr,
+        "second",
+        object(),
+        object(),
+        now=110.0,
+    )
 
     assert state.handle_keepalive(first_addr, "first", now=120.0)
 
@@ -2884,8 +4247,20 @@ def test_session_cleanup_removes_expired_lru_prefix_and_stops_at_live(monkeypatc
     state = secure.SecureState(session_ttl=30.0)
     expired_addr = ("192.0.2.10", 50000)
     active_addr = ("192.0.2.11", 50001)
-    state.install_session(expired_addr, "expired", object(), now=90.0)
-    state.install_session(active_addr, "active", object(), now=100.0)
+    state.install_session(
+        expired_addr,
+        "expired",
+        object(),
+        object(),
+        now=90.0,
+    )
+    state.install_session(
+        active_addr,
+        "active",
+        object(),
+        object(),
+        now=100.0,
+    )
 
     removed = state.cleanup_expired_sessions(now=120.0)
 
@@ -2900,11 +4275,29 @@ def test_session_capacity_evicts_least_recently_seen(monkeypatch):
     first_addr = ("192.0.2.10", 50000)
     second_addr = ("192.0.2.11", 50001)
     third_addr = ("192.0.2.12", 50002)
-    first = state.install_session(first_addr, "first", object(), now=100.0)
-    state.install_session(second_addr, "second", object(), now=110.0)
+    first = state.install_session(
+        first_addr,
+        "first",
+        object(),
+        object(),
+        now=100.0,
+    )
+    state.install_session(
+        second_addr,
+        "second",
+        object(),
+        object(),
+        now=110.0,
+    )
     assert state.touch_session(first_addr, first, now=120.0)
 
-    state.install_session(third_addr, "third", object(), now=130.0)
+    state.install_session(
+        third_addr,
+        "third",
+        object(),
+        object(),
+        now=130.0,
+    )
 
     assert tuple(state._sessions) == (first_addr, third_addr)
     stats = state.stats()
@@ -2920,10 +4313,28 @@ def test_equal_session_timestamps_use_deterministic_activity_order(monkeypatch):
     first_addr = ("192.0.2.10", 50000)
     second_addr = ("192.0.2.11", 50001)
     third_addr = ("192.0.2.12", 50002)
-    state.install_session(first_addr, "first", object(), now=100.0)
-    state.install_session(second_addr, "second", object(), now=100.0)
+    state.install_session(
+        first_addr,
+        "first",
+        object(),
+        object(),
+        now=100.0,
+    )
+    state.install_session(
+        second_addr,
+        "second",
+        object(),
+        object(),
+        now=100.0,
+    )
 
-    state.install_session(third_addr, "third", object(), now=100.0)
+    state.install_session(
+        third_addr,
+        "third",
+        object(),
+        object(),
+        now=100.0,
+    )
 
     assert tuple(state._sessions) == (second_addr, third_addr)
     assert state.stats().sessions_capacity_evicted == 1
@@ -2935,10 +4346,28 @@ def test_expired_sessions_are_removed_before_capacity_eviction(monkeypatch):
     expired_addr = ("192.0.2.10", 50000)
     active_addr = ("192.0.2.11", 50001)
     new_addr = ("192.0.2.12", 50002)
-    state.install_session(expired_addr, "expired", object(), now=90.0)
-    state.install_session(active_addr, "active", object(), now=100.0)
+    state.install_session(
+        expired_addr,
+        "expired",
+        object(),
+        object(),
+        now=90.0,
+    )
+    state.install_session(
+        active_addr,
+        "active",
+        object(),
+        object(),
+        now=100.0,
+    )
 
-    state.install_session(new_addr, "new", object(), now=120.0)
+    state.install_session(
+        new_addr,
+        "new",
+        object(),
+        object(),
+        now=120.0,
+    )
 
     assert tuple(state._sessions) == (active_addr, new_addr)
     stats = state.stats()
@@ -2953,20 +4382,45 @@ def test_live_session_replacement_discards_nonce_state_without_other_eviction(
     state = secure.SecureState(max_sessions=2)
     replaced_addr = ("192.0.2.10", 50000)
     other_addr = ("192.0.2.11", 50001)
-    old_aesgcm = object()
-    new_aesgcm = object()
-    old = state.install_session(replaced_addr, "old", old_aesgcm, now=100.0)
-    state.install_session(other_addr, "other", object(), now=110.0)
+    old_client_to_server_aesgcm = object()
+    old_server_to_client_aesgcm = object()
+    new_client_to_server_aesgcm = object()
+    new_server_to_client_aesgcm = object()
+    old = state.install_session(
+        replaced_addr,
+        "old",
+        old_client_to_server_aesgcm,
+        old_server_to_client_aesgcm,
+        now=100.0,
+    )
+    state.install_session(
+        other_addr,
+        "other",
+        object(),
+        object(),
+        now=110.0,
+    )
     nonce = b"\x01" * 12
     assert state.accept_data_nonce(old, nonce, now=115.0)
 
     new = state.install_session(
-        replaced_addr, "new", new_aesgcm, now=120.0
+        replaced_addr,
+        "new",
+        new_client_to_server_aesgcm,
+        new_server_to_client_aesgcm,
+        now=120.0,
     )
 
     assert new is state._sessions[replaced_addr]
     assert new is not old
-    assert new.aesgcm is new_aesgcm
+    assert (
+        new.client_to_server_aesgcm
+        is new_client_to_server_aesgcm
+    )
+    assert (
+        new.server_to_client_aesgcm
+        is new_server_to_client_aesgcm
+    )
     assert tuple(state._sessions) == (other_addr, replaced_addr)
     assert not state.data_nonce_seen(new, nonce, now=120.0)
     assert state.accept_data_nonce(new, nonce, now=120.0)
@@ -2981,10 +4435,22 @@ def test_expired_same_address_installation_is_not_live_replacement(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(session_ttl=30.0)
     addr = ("192.0.2.10", 50000)
-    old = state.install_session(addr, "old", object(), now=100.0)
+    old = state.install_session(
+        addr,
+        "old",
+        object(),
+        object(),
+        now=100.0,
+    )
     assert state.accept_data_nonce(old, b"\x01" * 12, now=100.0)
 
-    new = state.install_session(addr, "new", object(), now=130.0)
+    new = state.install_session(
+        addr,
+        "new",
+        object(),
+        object(),
+        now=130.0,
+    )
 
     assert new is state._sessions[addr]
     stats = state.stats()
@@ -2998,13 +4464,21 @@ def test_session_capacity_discard_counts_retained_nonces_once(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(max_sessions=1)
     first = state.install_session(
-        ("192.0.2.10", 50000), "first", object(), now=100.0
+        ("192.0.2.10", 50000),
+        "first",
+        object(),
+        object(),
+        now=100.0,
     )
     assert state.accept_data_nonce(first, b"\x01" * 12, now=100.0)
     assert state.accept_data_nonce(first, b"\x02" * 12, now=101.0)
 
     state.install_session(
-        ("192.0.2.11", 50001), "second", object(), now=102.0
+        ("192.0.2.11", 50001),
+        "second",
+        object(),
+        object(),
+        now=102.0,
     )
 
     stats = state.stats()
@@ -3023,12 +4497,20 @@ def test_removed_session_handle_cannot_mutate_nonce_state_or_statistics(
     state = secure.SecureState(max_sessions=1)
     old_addr = ("192.0.2.10", 50000)
     old = state.install_session(
-        old_addr, "old", object(), now=100.0
+        old_addr,
+        "old",
+        object(),
+        object(),
+        now=100.0,
     )
     assert state.accept_data_nonce(old, b"\x01" * 12, now=100.0)
 
     state.install_session(
-        ("192.0.2.11", 50001), "new", object(), now=101.0
+        ("192.0.2.11", 50001),
+        "new",
+        object(),
+        object(),
+        now=101.0,
     )
     before = state.stats()
 
@@ -3046,17 +4528,29 @@ def test_stale_nonce_check_does_not_cleanup_unrelated_expired_session(
     stale_addr = ("192.0.2.10", 50000)
     expiring_addr = ("192.0.2.11", 50001)
     stale = state.install_session(
-        stale_addr, "stale", object(), now=0.0
+        stale_addr,
+        "stale",
+        object(),
+        object(),
+        now=0.0,
     )
     expiring = state.install_session(
-        expiring_addr, "expiring", object(), now=2.0
+        expiring_addr,
+        "expiring",
+        object(),
+        object(),
+        now=2.0,
     )
     expiring_nonce = b"\x01" * 12
     assert state.accept_data_nonce(
         expiring, expiring_nonce, now=2.0
     )
     replacement = state.install_session(
-        stale_addr, "replacement", object(), now=3.0
+        stale_addr,
+        "replacement",
+        object(),
+        object(),
+        now=3.0,
     )
     assert replacement is not stale
 
@@ -3093,20 +4587,32 @@ def test_stale_nonce_accept_does_not_cleanup_unrelated_expired_session(
     expiring_addr = ("192.0.2.11", 50001)
     replacement_addr = ("192.0.2.12", 50002)
     stale = state.install_session(
-        stale_addr, "stale", object(), now=0.0
+        stale_addr,
+        "stale",
+        object(),
+        object(),
+        now=0.0,
     )
     assert state.accept_data_nonce(
         stale, b"\x01" * 12, now=0.0
     )
     expiring = state.install_session(
-        expiring_addr, "expiring", object(), now=2.0
+        expiring_addr,
+        "expiring",
+        object(),
+        object(),
+        now=2.0,
     )
     expiring_nonce = b"\x02" * 12
     assert state.accept_data_nonce(
         expiring, expiring_nonce, now=2.0
     )
     state.install_session(
-        replacement_addr, "replacement", object(), now=3.0
+        replacement_addr,
+        "replacement",
+        object(),
+        object(),
+        now=3.0,
     )
     assert stale_addr not in state._sessions
 
@@ -3142,13 +4648,25 @@ def test_stale_touch_does_not_cleanup_unrelated_expired_session(
     stale_addr = ("192.0.2.10", 50000)
     expiring_addr = ("192.0.2.11", 50001)
     stale = state.install_session(
-        stale_addr, "stale", object(), now=0.0
+        stale_addr,
+        "stale",
+        object(),
+        object(),
+        now=0.0,
     )
     expiring = state.install_session(
-        expiring_addr, "expiring", object(), now=2.0
+        expiring_addr,
+        "expiring",
+        object(),
+        object(),
+        now=2.0,
     )
     state.install_session(
-        stale_addr, "replacement", object(), now=3.0
+        stale_addr,
+        "replacement",
+        object(),
+        object(),
+        now=3.0,
     )
 
     before_stats = state.stats()
@@ -3172,10 +4690,18 @@ def test_touch_address_mismatch_is_side_effect_free_before_cleanup(
     expiring_addr = ("192.0.2.10", 50000)
     current_addr = ("192.0.2.11", 50001)
     expiring = state.install_session(
-        expiring_addr, "expiring", object(), now=2.0
+        expiring_addr,
+        "expiring",
+        object(),
+        object(),
+        now=2.0,
     )
     current = state.install_session(
-        current_addr, "current", object(), now=3.0
+        current_addr,
+        "current",
+        object(),
+        object(),
+        now=3.0,
     )
 
     before_stats = state.stats()
@@ -3196,7 +4722,11 @@ def test_expired_session_handle_cannot_accept_or_check_nonces(monkeypatch):
     state = secure.SecureState(session_ttl=10.0)
     addr = ("192.0.2.10", 50000)
     session = state.install_session(
-        addr, "old", object(), now=0.0
+        addr,
+        "old",
+        object(),
+        object(),
+        now=0.0,
     )
     assert state.accept_data_nonce(session, b"\x01" * 12, now=0.0)
 
@@ -3251,7 +4781,11 @@ def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
         initial.current_sessions = 1
 
     state.install_session(
-        ("192.0.2.10", 50000), "boat_001", object(), now=100.0
+        ("192.0.2.10", 50000),
+        "boat_001",
+        object(),
+        object(),
+        now=100.0,
     )
     current = state.stats()
     assert initial.current_sessions == 0
@@ -3264,7 +4798,13 @@ def test_secure_state_stats_do_not_read_clocks_or_cleanup(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(session_ttl=1.0)
     addr = ("192.0.2.10", 50000)
-    state.install_session(addr, "boat_001", object(), now=0.0)
+    state.install_session(
+        addr,
+        "boat_001",
+        object(),
+        object(),
+        now=0.0,
+    )
 
     def fail_clock():
         raise AssertionError("stats must not read a clock")
