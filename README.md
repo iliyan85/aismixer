@@ -443,16 +443,25 @@ routing-section update file.
 
 ## 🔐 `nmea_sproxy` Outputs
 
-UDPSEC is AISMixer's authenticated encrypted station-to-mixer UDP transport.
-It is not an external standardized protocol. Stations authenticate with ECDSA,
-and ECDH-derived session keys let the current `nmea_sproxy` protect AIS and
-ping/pong traffic with authenticated AES-GCM encryption. Authorized station
-public keys are configured through `authorized_keys.yaml`. Handshake-replay
-records, active sessions, and per-session data-nonce records use bounded,
-TTL-managed process-local state. Expiry cleanup is driven by allowed traffic
-rather than a background timer, and secure replay/session/nonce state is lost
-when the service restarts. UDPSEC protects packets in transit; it does not prove
-that the AIS payload itself is semantically true or physically accurate.
+UDPSEC is AISMixer's authenticated encrypted station-to-mixer UDP transport; it is not an
+external standardized protocol. For each handshake, each endpoint creates a fresh ephemeral
+P-256 keypair; the authenticated ECDHE exchange produces the shared secret. Out-of-band long-term P-256
+identity keys let the endpoints mutually authenticate the exchange with ECDSA signatures over
+transcript-bound SHA-256 digests; they are not key-agreement inputs. HKDF-SHA256 derives
+independent client-to-server and server-to-client AES-256-GCM traffic keys from the ephemeral
+shared secret and authenticated transcript. After sending its authenticated ServerHello, the
+server keeps a pending session until an encrypted sequence-zero client-to-server ping confirms
+key possession; it then promotes the session and sends an encrypted server-to-client pong,
+which the client authenticates. Forward secrecy against later identity-key compromise requires
+past ephemeral private keys and raw ECDHE shared secrets to be gone and neither endpoint to have
+been compromised while they were in memory. Endpoint compromise exposes current material; a
+currently compromised identity private key enables future impersonation. These properties are
+supported by engineering validation, not formal cryptographic verification. Authorized station
+public keys are configured through `authorized_keys.yaml`. Handshake replay plus pending and active
+sessions are bounded, TTL-managed, and process-local. Data packets use random 12-byte nonces with
+per-session replay detection. Allowed traffic drives expiry cleanup; secure replay/session/nonce
+state is lost on restart. UDPSEC protects packets in transit but does not prove AIS payloads
+semantically true or physically accurate.
 
 See the [`nmea_sproxy` guide](nmea_sproxy/README.md), [security
 policy](SECURITY.md), [behavioural contract](BEHAVIORAL_CONTRACT.md), and
@@ -1123,19 +1132,33 @@ sudo aismixerctl \
 
 ## 🔐 Изходи на `nmea_sproxy`
 
-UDPSEC е автентикираният и криптиран UDP транспорт между станцията и AISMixer.
-Това не е външен стандартизиран протокол. Станциите се автентикират с ECDSA, а
-ключовете за сесия, изведени чрез ECDH, позволяват на текущия `nmea_sproxy` да
-защитава AIS и ping/pong трафика с автентикирано AES-GCM криптиране.
-Разрешените публични ключове на станциите се конфигурират чрез
-`authorized_keys.yaml`.
-Записите за защита от повторение на handshake съобщения, записите за активни
-сесии и nonce стойностите за данни във всяка сесия са ограничени по брой,
-управляват се чрез TTL и са локални за процеса. Почистването на изтеклите записи
-се задейства от разрешен трафик, а не от фонов таймер; записите и nonce
-стойностите се губят при рестарт на услугата. UDPSEC защитава
-пакетите при пренос, но не доказва, че самото AIS съдържание е семантично вярно
-или физически точно.
+UDPSEC е автентикираният и криптиран UDP транспорт между станцията и AISMixer;
+това не е външен стандартизиран протокол. При всеки handshake всяка крайна точка
+създава нова ефемерна ключова двойка P-256; автентикираният ECDHE обмен
+създава споделената тайна. Дългосрочните P-256 ключове за идентичност са конфигурирани
+извън протокола като опорни точки на доверие; чрез тях двете крайни точки се
+удостоверяват взаимно с ECDSA подписи върху SHA-256 хешове, обвързани с
+транскрипта. Ключовете за идентичност не участват в договарянето на ключове. От
+ефемерната споделена тайна и автентикирания транскрипт HKDF-SHA256 извежда
+независими AES-256-GCM ключове за трафика от клиент към сървър и от сървър към
+клиент. След като изпрати удостоверения ServerHello, сървърът държи чакаща сесия,
+докато криптиран ping от клиента към сървъра със запазен пореден номер нула
+потвърди притежаването на ключовете; след това активира сесията и изпраща
+към клиента криптиран pong, който клиентът удостоверява. Защитата на миналите сесии
+(forward secrecy) при по-късно компрометиране на ключ за идентичност изисква
+предишните ефемерни частни ключове и ECDHE споделени тайни да не са налични и
+никоя от крайните точки да не е била компрометирана, докато те са били в паметта.
+Компрометирана крайна точка разкрива текущия материал, а компрометиран в момента
+частен ключ за идентичност позволява на нападател да се представя за съответната
+крайна точка в бъдещи сесии. Тези свойства са подкрепени от инженерна проверка,
+а не от формална криптографска верификация. Публичните ключове на разрешените
+станции се задават в `authorized_keys.yaml`. Записите за защита от повторение на
+handshake съобщения, както и чакащите и активните сесии, са ограничени по брой,
+управляват се чрез TTL и са локални за процеса. Пакетите с данни използват
+случайни 12-байтови nonce стойности с откриване на повторения във всяка сесия.
+Почистването на изтеклите записи се задейства от разрешен трафик, а не от фонов
+таймер; записите и nonce стойностите се губят при рестарт. UDPSEC защитава
+пакетите при пренос, но не доказва, че AIS съдържанието е семантично вярно или физически точно.
 
 За работата на протокола, обхвата на сигурността, точната семантика на
 състоянието и по-подробен контекст вижте [ръководството за
@@ -1811,19 +1834,34 @@ un fișier de actualizare care conține direct secțiunea de rutare.
 ## 🔐 Ieșirile `nmea_sproxy`
 
 UDPSEC este transportul UDP autentificat și criptat folosit de AISMixer între
-stație și mixer. Nu este un protocol extern standardizat. Stațiile se
-autentifică prin ECDSA, iar cheile de sesiune derivate prin ECDH permit
-versiunii actuale a `nmea_sproxy` să protejeze traficul AIS și ping/pong prin
-criptare AES-GCM autentificată. Cheile publice ale stațiilor autorizate sunt
-configurate prin `authorized_keys.yaml`. Înregistrările de replay ale
-handshake-ului, sesiunile active și înregistrările nonce-urilor de date pentru
-fiecare sesiune folosesc o stare locală procesului, limitată și gestionată prin
-TTL.
-Curățarea la expirare este declanșată de traficul permis, nu de un timer în
-fundal, iar starea securizată pentru replay, sesiuni și nonce-uri se pierde la
-repornirea serviciului. UDPSEC protejează pachetele în tranzit; nu dovedește că
-payload-ul AIS este veridic din punct de vedere semantic sau exact din punct de
-vedere fizic.
+stație și mixer; nu este un protocol extern standardizat. Pentru fiecare
+handshake, fiecare endpoint creează o pereche efemeră nouă P-256; schimbul ECDHE
+autentificat produce secretul comun. Cheile P-256 de identitate pe termen lung
+sunt ancore de încredere configurate în afara protocolului; prin ele, cele două
+endpoint-uri se autentifică reciproc cu semnături ECDSA peste digesturi SHA-256
+legate de transcript. Cheile de identitate nu participă la acordul de chei.
+HKDF-SHA256 derivă chei de trafic AES-256-GCM independente pentru direcțiile
+client-către-server și server-către-client din
+secretul efemer comun și transcriptul autentificat. După trimiterea mesajului
+ServerHello autentificat, serverul ține sesiunea în așteptare până când un ping
+criptat trimis de client către server, cu secvența zero, confirmă posesia
+cheilor; apoi o promovează și trimite un pong criptat de la server către client,
+autentificat de client. Forward secrecy la compromiterea ulterioară a cheii de
+identitate impune ca vechile chei private efemere și secretele ECDHE să nu mai
+existe și ca niciun endpoint să nu fi fost compromis cât timp erau în memorie.
+Compromiterea endpoint-ului expune materialul curent; o cheie privată de
+identitate compromisă în prezent permite uzurparea identității în sesiuni
+viitoare. Aceste proprietăți sunt susținute de validare inginerească, nu de
+verificare criptografică formală. Cheile publice ale stațiilor autorizate sunt
+configurate în `authorized_keys.yaml`. Înregistrările
+de replay ale handshake-ului și sesiunile în așteptare și active folosesc o
+stare locală a procesului, limitată și gestionată prin TTL. Pachetele de date
+folosesc nonce-uri aleatorii de 12 octeți, cu detectarea replay-urilor în fiecare
+sesiune. Curățarea la expirare este declanșată de traficul permis, nu de un timer
+în fundal, iar starea securizată pentru replay, sesiuni și nonce-uri se pierde la
+repornirea serviciului. UDPSEC protejează pachetele în tranzit, dar nu
+dovedește că payload-ul AIS este veridic din punct de vedere semantic sau exact
+din punct de vedere fizic.
 
 Pentru funcționarea protocolului, domeniul de securitate, semantica exactă a
 stării și context suplimentar, consultați [ghidul
