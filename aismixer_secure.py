@@ -1040,9 +1040,10 @@ async def _secure_server_loop(
 
                 message_type = msg.get("type")
                 if message_type == "ping":
+                    sequence = msg.get("seq")
                     if (
-                        "seq" not in msg
-                        or msg["seq"] == SESSION_CONFIRMATION_SEQUENCE
+                        type(sequence) is not int
+                        or sequence <= SESSION_CONFIRMATION_SEQUENCE
                     ):
                         print(f"[!] Invalid ping from {addr}")
                         continue

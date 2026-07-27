@@ -400,13 +400,7 @@ def handle_server_packet(
     if not isinstance(message, dict):
         return SERVER_PACKET_IGNORED
     message_sequence = message.get("seq")
-    if (
-        expected_ping_seq == SESSION_CONFIRMATION_SEQUENCE
-        and (
-            not isinstance(message_sequence, int)
-            or isinstance(message_sequence, bool)
-        )
-    ):
+    if type(message_sequence) is not int:
         return SERVER_PACKET_IGNORED
     if (
         message.get("type") == "pong"
