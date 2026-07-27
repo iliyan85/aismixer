@@ -74,6 +74,7 @@ from core.udpsec_crypto import (  # noqa: E402
 )
 from core.udpsec_protocol import (  # noqa: E402
     ClientHello,
+    SESSION_CONFIRMATION_SEQUENCE,
     build_client_hello_packet,
     parse_server_hello_packet,
 )
@@ -396,10 +397,21 @@ def handle_server_packet(
     except Exception:
         return SERVER_PACKET_IGNORED
 
+    if not isinstance(message, dict):
+        return SERVER_PACKET_IGNORED
+    message_sequence = message.get("seq")
+    if (
+        expected_ping_seq == SESSION_CONFIRMATION_SEQUENCE
+        and (
+            not isinstance(message_sequence, int)
+            or isinstance(message_sequence, bool)
+        )
+    ):
+        return SERVER_PACKET_IGNORED
     if (
         message.get("type") == "pong"
         and message.get("source_id") == station_id
-        and message.get("seq") == expected_ping_seq
+        and message_sequence == expected_ping_seq
     ):
         return SERVER_PACKET_AUTHENTICATED
     return SERVER_PACKET_IGNORED
@@ -625,8 +637,65 @@ def perform_handshake(
                 shared_secret,
                 session_transcript_hash,
             )
-            print("Mutual ECDHE handshake established.")
-            return session_key_material
+            try:
+                send_ping(
+                    sock,
+                    remote_addr,
+                    session_key_material.client_to_server_key,
+                    station_id,
+                    SESSION_CONFIRMATION_SEQUENCE,
+                )
+            except OSError as e:
+                print(f"❌ Session confirmation send error: {e}")
+                return None
+
+            confirmation_deadline = time.monotonic() + handshake_timeout
+            while True:
+                remaining = confirmation_deadline - time.monotonic()
+                if remaining <= 0:
+                    print("⚠️ No session confirmation from server.")
+                    return None
+                if settimeout:
+                    settimeout(remaining)
+
+                try:
+                    confirmation, confirmation_addr = sock.recvfrom(8192)
+                except socket.timeout:
+                    print("⚠️ No session confirmation from server.")
+                    return None
+                except ConnectionResetError as e:
+                    print(
+                        "❌ Connection reset during session confirmation: "
+                        f"{e}"
+                    )
+                    return None
+                except OSError as e:
+                    print(f"❌ Session confirmation receive error: {e}")
+                    return None
+
+                if not remote_addresses_match(
+                    confirmation_addr,
+                    remote_addr,
+                ):
+                    continue
+
+                confirmation_result = handle_server_packet(
+                    confirmation,
+                    confirmation_addr,
+                    remote_addr,
+                    session_key_material.server_to_client_key,
+                    station_id,
+                    SESSION_CONFIRMATION_SEQUENCE,
+                )
+                if confirmation_result == SERVER_PACKET_NO_SESSION:
+                    print("❌ Server rejected pending secure session.")
+                    return None
+                if confirmation_result != SERVER_PACKET_AUTHENTICATED:
+                    print("❌ Invalid secure session confirmation.")
+                    return None
+
+                print("Mutual ECDHE session confirmed.")
+                return session_key_material
     finally:
         if settimeout:
             settimeout(original_timeout)

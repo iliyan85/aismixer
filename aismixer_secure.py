@@ -8,6 +8,7 @@ import time
 import yaml
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -29,6 +30,7 @@ from core.udpsec_crypto import (
 )
 from core.udpsec_protocol import (
     CLIENT_HELLO_PREFIX,
+    SESSION_CONFIRMATION_SEQUENCE,
     ServerHello,
     build_server_hello_packet,
     parse_client_hello_packet,
@@ -36,11 +38,12 @@ from core.udpsec_protocol import (
 
 
 DATA_PREFIX = b"NMEA-D"
-KEEPALIVE_PREFIX = b"KEEPALIVE"
 NOSESSION_PREFIX = b"NOSESSION"
 DATA_AAD = b"NMEA"
 SESSION_TTL_SECONDS = 300
 SESSION_MAX = 100000
+PENDING_SESSION_TTL_SECONDS = 30
+PENDING_SESSION_MAX = SESSION_MAX
 HANDSHAKE_REPLAY_TTL_SECONDS = 60
 HANDSHAKE_REPLAY_MAX = 100000
 DATA_NONCE_TTL_SECONDS = SESSION_TTL_SECONDS
@@ -260,6 +263,16 @@ class _SecureSession:
     seen_data_nonces: _BoundedExpiringSet
 
 
+@dataclass
+class _PendingSecureSession:
+    _address: object
+    station_id: str
+    client_to_server_aesgcm: AESGCM
+    server_to_client_aesgcm: AESGCM
+    created_at: float
+    seen_data_nonces: _BoundedExpiringSet
+
+
 @dataclass(frozen=True)
 class SecureStateStats:
     handshake_replay_accepted: int
@@ -273,6 +286,12 @@ class SecureStateStats:
     sessions_expired: int
     sessions_capacity_evicted: int
 
+    pending_sessions_created: int
+    pending_sessions_replaced: int
+    pending_sessions_promoted: int
+    pending_sessions_expired: int
+    pending_sessions_capacity_evicted: int
+
     data_nonces_accepted: int
     data_nonce_replays: int
     data_nonces_expired: int
@@ -283,6 +302,8 @@ class SecureStateStats:
     peak_handshake_replays: int
     current_sessions: int
     peak_sessions: int
+    current_pending_sessions: int
+    peak_pending_sessions: int
     current_data_nonces: int
     peak_data_nonces: int
 
@@ -296,11 +317,17 @@ class SecureState:
         handshake_replay_max=HANDSHAKE_REPLAY_MAX,
         data_nonce_ttl=DATA_NONCE_TTL_SECONDS,
         data_nonce_max_per_session=DATA_NONCE_MAX_PER_SESSION,
+        pending_session_ttl=PENDING_SESSION_TTL_SECONDS,
+        max_pending_sessions=PENDING_SESSION_MAX,
     ):
         self._session_ttl = _validate_positive_ttl(
             "session_ttl", session_ttl)
         self._max_sessions = _validate_positive_int(
             "max_sessions", max_sessions)
+        self._pending_session_ttl = _validate_positive_ttl(
+            "pending_session_ttl", pending_session_ttl)
+        self._max_pending_sessions = _validate_positive_int(
+            "max_pending_sessions", max_pending_sessions)
         self._handshake_replay_ttl = _validate_positive_ttl(
             "handshake_replay_ttl", handshake_replay_ttl)
         self._handshake_replay_max = _validate_positive_int(
@@ -315,6 +342,7 @@ class SecureState:
             self._handshake_replay_max,
         )
         self._sessions = OrderedDict()
+        self._pending_sessions = OrderedDict()
 
         self._handshake_replay_accepted = 0
         self._handshake_replay_rejected = 0
@@ -327,6 +355,12 @@ class SecureState:
         self._sessions_expired = 0
         self._sessions_capacity_evicted = 0
 
+        self._pending_sessions_created = 0
+        self._pending_sessions_replaced = 0
+        self._pending_sessions_promoted = 0
+        self._pending_sessions_expired = 0
+        self._pending_sessions_capacity_evicted = 0
+
         self._data_nonces_accepted = 0
         self._data_nonce_replays = 0
         self._data_nonces_expired = 0
@@ -336,6 +370,7 @@ class SecureState:
         self._current_data_nonces = 0
         self._peak_handshake_replays = 0
         self._peak_sessions = 0
+        self._peak_pending_sessions = 0
         self._peak_data_nonces = 0
 
     def stats(self) -> SecureStateStats:
@@ -351,6 +386,13 @@ class SecureState:
             sessions_touched=self._sessions_touched,
             sessions_expired=self._sessions_expired,
             sessions_capacity_evicted=self._sessions_capacity_evicted,
+            pending_sessions_created=self._pending_sessions_created,
+            pending_sessions_replaced=self._pending_sessions_replaced,
+            pending_sessions_promoted=self._pending_sessions_promoted,
+            pending_sessions_expired=self._pending_sessions_expired,
+            pending_sessions_capacity_evicted=(
+                self._pending_sessions_capacity_evicted
+            ),
             data_nonces_accepted=self._data_nonces_accepted,
             data_nonce_replays=self._data_nonce_replays,
             data_nonces_expired=self._data_nonces_expired,
@@ -364,6 +406,8 @@ class SecureState:
             peak_handshake_replays=self._peak_handshake_replays,
             current_sessions=len(self._sessions),
             peak_sessions=self._peak_sessions,
+            current_pending_sessions=len(self._pending_sessions),
+            peak_pending_sessions=self._peak_pending_sessions,
             current_data_nonces=self._current_data_nonces,
             peak_data_nonces=self._peak_data_nonces,
         )
@@ -385,11 +429,14 @@ class SecureState:
         )
         return True
 
-    def _remove_session(self, addr, reason):
-        session = self._sessions.pop(addr)
+    def _discard_session_nonces(self, session):
         discarded_nonces = session.seen_data_nonces.discard_all()
         self._current_data_nonces -= discarded_nonces
         self._data_nonces_session_discarded += discarded_nonces
+
+    def _remove_session(self, addr, reason):
+        session = self._sessions.pop(addr)
+        self._discard_session_nonces(session)
 
         if reason == "expired":
             self._sessions_expired += 1
@@ -401,6 +448,22 @@ class SecureState:
             raise ValueError(f"Unknown session removal reason: {reason}")
         return session
 
+    def _remove_pending_session(self, addr, reason):
+        pending = self._pending_sessions.pop(addr)
+        self._discard_session_nonces(pending)
+
+        if reason == "expired":
+            self._pending_sessions_expired += 1
+        elif reason == "capacity":
+            self._pending_sessions_capacity_evicted += 1
+        elif reason == "replaced":
+            self._pending_sessions_replaced += 1
+        else:
+            raise ValueError(
+                f"Unknown pending-session removal reason: {reason}"
+            )
+        return pending
+
     def cleanup_expired_sessions(self, now):
         expired = []
         while self._sessions:
@@ -408,6 +471,16 @@ class SecureState:
             if now - session.last_seen < self._session_ttl:
                 break
             self._remove_session(addr, "expired")
+            expired.append(addr)
+        return expired
+
+    def cleanup_expired_pending_sessions(self, now):
+        expired = []
+        while self._pending_sessions:
+            addr, pending = next(iter(self._pending_sessions.items()))
+            if now < pending.created_at + self._pending_session_ttl:
+                break
+            self._remove_pending_session(addr, "expired")
             expired.append(addr)
         return expired
 
@@ -447,9 +520,48 @@ class SecureState:
         )
         return session
 
+    def install_pending_session(
+        self,
+        addr,
+        station_id,
+        client_to_server_aesgcm,
+        server_to_client_aesgcm,
+        now,
+    ):
+        self.cleanup_expired_pending_sessions(now)
+
+        if addr in self._pending_sessions:
+            self._remove_pending_session(addr, "replaced")
+        elif len(self._pending_sessions) >= self._max_pending_sessions:
+            oldest_addr = next(iter(self._pending_sessions))
+            self._remove_pending_session(oldest_addr, "capacity")
+
+        pending = _PendingSecureSession(
+            _address=addr,
+            station_id=station_id,
+            client_to_server_aesgcm=client_to_server_aesgcm,
+            server_to_client_aesgcm=server_to_client_aesgcm,
+            created_at=now,
+            seen_data_nonces=_BoundedExpiringSet(
+                self._data_nonce_ttl,
+                self._data_nonce_max_per_session,
+            ),
+        )
+        self._pending_sessions[addr] = pending
+        self._pending_sessions_created += 1
+        self._peak_pending_sessions = max(
+            self._peak_pending_sessions,
+            len(self._pending_sessions),
+        )
+        return pending
+
     def get_active_session(self, addr, now):
         self.cleanup_expired_sessions(now)
         return self._sessions.get(addr)
+
+    def get_pending_session(self, addr, now):
+        self.cleanup_expired_pending_sessions(now)
+        return self._pending_sessions.get(addr)
 
     def _get_live_session_handle(self, addr, session, now):
         if self._sessions.get(addr) is not session:
@@ -460,6 +572,16 @@ class SecureState:
             return None
 
         return session
+
+    def _get_live_pending_session_handle(self, addr, pending, now):
+        if self._pending_sessions.get(addr) is not pending:
+            return None
+
+        self.cleanup_expired_pending_sessions(now)
+        if self._pending_sessions.get(addr) is not pending:
+            return None
+
+        return pending
 
     def _touch_active_session(self, addr, session, now):
         session.last_seen = now
@@ -472,12 +594,42 @@ class SecureState:
         self._touch_active_session(addr, session, now)
         return True
 
-    def handle_keepalive(self, addr, station_id, now):
-        session = self.get_active_session(addr, now)
-        if session is None or session.station_id != station_id:
-            return False
-        self._touch_active_session(addr, session, now)
-        return True
+    def promote_pending_session(self, addr, pending, now):
+        if self._get_live_pending_session_handle(
+            addr, pending, now
+        ) is None:
+            return None
+
+        self.cleanup_expired_sessions(now)
+        self._pending_sessions.pop(addr)
+        self._pending_sessions_promoted += 1
+
+        if addr in self._sessions:
+            self._remove_session(addr, "replaced")
+        elif len(self._sessions) >= self._max_sessions:
+            oldest_addr = next(iter(self._sessions))
+            self._remove_session(oldest_addr, "capacity")
+
+        session = _SecureSession(
+            _address=addr,
+            station_id=pending.station_id,
+            client_to_server_aesgcm=(
+                pending.client_to_server_aesgcm
+            ),
+            server_to_client_aesgcm=(
+                pending.server_to_client_aesgcm
+            ),
+            created_at=now,
+            last_seen=now,
+            seen_data_nonces=pending.seen_data_nonces,
+        )
+        self._sessions[addr] = session
+        self._sessions_created += 1
+        self._peak_sessions = max(
+            self._peak_sessions,
+            len(self._sessions),
+        )
+        return session
 
     def _account_expired_data_nonces(self, expired):
         self._data_nonces_expired += expired
@@ -494,12 +646,43 @@ class SecureState:
             self._data_nonce_replays += 1
         return seen
 
+    def pending_data_nonce_seen(self, pending, nonce, now):
+        if self._get_live_pending_session_handle(
+            pending._address, pending, now
+        ) is None:
+            return False
+        seen, expired = pending.seen_data_nonces.contains(nonce, now)
+        self._account_expired_data_nonces(expired)
+        return seen
+
     def accept_data_nonce(self, session, nonce, now):
         if self._get_live_session_handle(
             session._address, session, now
         ) is None:
             return False
         admission = session.seen_data_nonces.accept(nonce, now)
+        self._account_expired_data_nonces(admission.expired)
+        self._data_nonces_capacity_evicted += admission.capacity_evicted
+        self._current_data_nonces -= admission.capacity_evicted
+
+        if not admission.accepted:
+            self._data_nonce_replays += 1
+            return False
+
+        self._data_nonces_accepted += 1
+        self._current_data_nonces += 1
+        self._peak_data_nonces = max(
+            self._peak_data_nonces,
+            self._current_data_nonces,
+        )
+        return True
+
+    def accept_pending_data_nonce(self, pending, nonce, now):
+        if self._get_live_pending_session_handle(
+            pending._address, pending, now
+        ) is None:
+            return False
+        admission = pending.seen_data_nonces.accept(nonce, now)
         self._account_expired_data_nonces(admission.expired)
         self._data_nonces_capacity_evicted += admission.capacity_evicted
         self._current_data_nonces -= admission.capacity_evicted
@@ -566,31 +749,6 @@ def parse_secure_data_packet(data):
     return nonce, ciphertext
 
 
-def parse_keepalive_packet(data):
-    parts = data.split(b"|")
-    if len(parts) != 3 or parts[0] != KEEPALIVE_PREFIX:
-        raise ValueError("Invalid keepalive packet format")
-    if not parts[1]:
-        raise ValueError("Missing keepalive station_id")
-    if not parts[2]:
-        raise ValueError("Missing keepalive timestamp")
-    try:
-        timestamp = int(parts[2].decode())
-    except ValueError as e:
-        raise ValueError("Invalid keepalive timestamp") from e
-    return parts[1].decode(), timestamp
-
-
-def parse_keepalive_station_id(data):
-    parts = data.split(b"|", 2)
-    if len(parts) < 2 or parts[0] != KEEPALIVE_PREFIX or not parts[1]:
-        return None
-    try:
-        return parts[1].decode()
-    except UnicodeDecodeError:
-        return None
-
-
 def build_no_session_hint(station_id=None):
     if station_id:
         return NOSESSION_PREFIX + b"|" + station_id.encode()
@@ -601,6 +759,22 @@ def encrypt_secure_json_message(aesgcm, message):
     nonce = os.urandom(12)
     plaintext = json.dumps(message, separators=(",", ":")).encode()
     return DATA_PREFIX + nonce + aesgcm.encrypt(nonce, plaintext, DATA_AAD)
+
+
+def _is_session_confirmation_ping(message, station_id):
+    if not isinstance(message, dict):
+        return False
+    sequence = message.get("seq")
+    timestamp = message.get("timestamp")
+    return (
+        message.get("type") == "ping"
+        and isinstance(sequence, int)
+        and not isinstance(sequence, bool)
+        and sequence == SESSION_CONFIRMATION_SEQUENCE
+        and isinstance(timestamp, int)
+        and not isinstance(timestamp, bool)
+        and message.get("source_id") == station_id
+    )
 
 
 def _build_server_handshake(client_hello, client_ephemeral_public_key):
@@ -688,6 +862,7 @@ async def _secure_server_loop(
             continue
         local_now = monotonic_now()
         state_owner.cleanup_expired_sessions(local_now)
+        state_owner.cleanup_expired_pending_sessions(local_now)
 
         if data.startswith(CLIENT_HELLO_PREFIX):
             try:
@@ -742,7 +917,7 @@ async def _secure_server_loop(
                     client_hello,
                     client_ephemeral_public_key,
                 )
-                state_owner.install_session(
+                state_owner.install_pending_session(
                     addr,
                     station_id,
                     client_to_server_aesgcm,
@@ -751,45 +926,103 @@ async def _secure_server_loop(
                 )
 
                 sock.sendto(response_packet, addr)
-                print(f"[+] Accepted handshake from {station_id} @ {addr}")
+                print(
+                    f"[+] Sent authenticated ServerHello "
+                    f"to {station_id} @ {addr}"
+                )
 
             except Exception as e:
                 print(
                     f"[!] Handshake error from {addr}: {type(e).__name__}: {e}")
 
-        elif data == KEEPALIVE_PREFIX or data.startswith(KEEPALIVE_PREFIX + b"|"):
-            station_id = parse_keepalive_station_id(data)
-            try:
-                station_id, _ = parse_keepalive_packet(data)
-                if state_owner.handle_keepalive(
-                    addr, station_id, local_now
-                ):
-                    if DEBUG:
-                        print(
-                            f"{wall_now()} [SECURE] Keepalive "
-                            f"from {station_id} @ {addr}"
-                        )
-                else:
-                    print(f"[!] Ignored keepalive from {addr}")
-                    sock.sendto(build_no_session_hint(station_id), addr)
-            except Exception as e:
-                print(
-                    f"[!] Keepalive error from {addr}: {type(e).__name__}: {e}")
-                sock.sendto(build_no_session_hint(station_id), addr)
-
         elif data.startswith(DATA_PREFIX):
             try:
+                pending = state_owner.get_pending_session(
+                    addr, local_now
+                )
                 session = state_owner.get_active_session(addr, local_now)
-                if session is None:
+                if pending is None and session is None:
                     print(f"[!] No session for {addr}")
                     sock.sendto(build_no_session_hint(), addr)
                     continue
+
+                nonce, ciphertext = parse_secure_data_packet(data)
+
+                if pending is not None and not (
+                    state_owner.pending_data_nonce_seen(
+                        pending, nonce, local_now
+                    )
+                ):
+                    try:
+                        pending_plaintext = (
+                            pending.client_to_server_aesgcm.decrypt(
+                                nonce,
+                                ciphertext,
+                                DATA_AAD,
+                            )
+                        )
+                    except InvalidTag:
+                        pass
+                    else:
+                        pending_message = json.loads(
+                            pending_plaintext.decode()
+                        )
+                        if not _is_session_confirmation_ping(
+                            pending_message,
+                            pending.station_id,
+                        ):
+                            print(
+                                f"[!] Invalid session confirmation "
+                                f"from {addr}"
+                            )
+                            continue
+                        if not state_owner.accept_pending_data_nonce(
+                            pending, nonce, local_now
+                        ):
+                            print(
+                                f"[!] Duplicate secure data nonce "
+                                f"from {addr}"
+                            )
+                            continue
+
+                        session = state_owner.promote_pending_session(
+                            addr,
+                            pending,
+                            local_now,
+                        )
+                        if session is None:
+                            continue
+                        if not state_owner.touch_session(
+                            addr, session, local_now
+                        ):
+                            continue
+
+                        response = {
+                            "type": "pong",
+                            "seq": SESSION_CONFIRMATION_SEQUENCE,
+                            "timestamp": int(wall_now()),
+                            "source_id": session.station_id,
+                        }
+                        sock.sendto(
+                            encrypt_secure_json_message(
+                                session.server_to_client_aesgcm,
+                                response,
+                            ),
+                            addr,
+                        )
+                        print(
+                            f"[+] Confirmed secure session for "
+                            f"{session.station_id} @ {addr}"
+                        )
+                        continue
+
+                if session is None:
+                    continue
+
                 station_id = session.station_id
                 client_to_server_aesgcm = (
                     session.client_to_server_aesgcm
                 )
-
-                nonce, ciphertext = parse_secure_data_packet(data)
                 if state_owner.data_nonce_seen(session, nonce, local_now):
                     print(f"[!] Duplicate secure data nonce from {addr}")
                     continue
@@ -807,7 +1040,10 @@ async def _secure_server_loop(
 
                 message_type = msg.get("type")
                 if message_type == "ping":
-                    if "seq" not in msg:
+                    if (
+                        "seq" not in msg
+                        or msg["seq"] == SESSION_CONFIRMATION_SEQUENCE
+                    ):
                         print(f"[!] Invalid ping from {addr}")
                         continue
                 elif message_type == "nmea":

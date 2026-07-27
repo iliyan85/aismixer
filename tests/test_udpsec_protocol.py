@@ -7,6 +7,7 @@ import core.udpsec_protocol as udpsec_protocol
 from core.udpsec_protocol import (
     CLIENT_HELLO_PREFIX,
     ClientHello,
+    SESSION_CONFIRMATION_SEQUENCE,
     SERVER_HELLO_PREFIX,
     ServerHello,
     build_client_hello_packet,
@@ -173,6 +174,7 @@ def test_protocol_api_and_wire_prefixes_are_public():
     assert {
         "CLIENT_HELLO_PREFIX",
         "ClientHello",
+        "SESSION_CONFIRMATION_SEQUENCE",
         "SERVER_HELLO_PREFIX",
         "ServerHello",
         "build_client_hello_packet",
@@ -181,6 +183,7 @@ def test_protocol_api_and_wire_prefixes_are_public():
         "parse_server_hello_packet",
     } <= set(udpsec_protocol.__all__)
     assert CLIENT_HELLO_PREFIX == b"NMEA-H"
+    assert SESSION_CONFIRMATION_SEQUENCE == 0
     assert SERVER_HELLO_PREFIX == b"OK"
 
 

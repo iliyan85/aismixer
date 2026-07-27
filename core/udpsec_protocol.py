@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 CLIENT_HELLO_PREFIX = b"NMEA-H"
 SERVER_HELLO_PREFIX = b"OK"
+SESSION_CONFIRMATION_SEQUENCE = 0
 
 _MAX_TIMESTAMP = (1 << 64) - 1
 _MAX_TIMESTAMP_ASCII = str(_MAX_TIMESTAMP).encode("ascii")
@@ -27,6 +28,7 @@ __all__ = (
     "CLIENT_HELLO_PREFIX",
     "ClientHello",
     "SERVER_HELLO_PREFIX",
+    "SESSION_CONFIRMATION_SEQUENCE",
     "ServerHello",
     "build_client_hello_packet",
     "build_server_hello_packet",

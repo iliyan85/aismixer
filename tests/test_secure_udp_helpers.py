@@ -195,6 +195,15 @@ def test_obsolete_static_handshake_helpers_are_removed(monkeypatch):
     )
 
 
+def test_obsolete_plaintext_keepalive_symbols_are_removed(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert not hasattr(secure, "KEEPALIVE_PREFIX")
+    assert not hasattr(secure, "parse_keepalive_packet")
+    assert not hasattr(secure, "parse_keepalive_station_id")
+    assert not hasattr(secure.SecureState, "handle_keepalive")
+
+
 def _reference_replay_key(domain_context, client_digest, client_signature):
     digest = hashlib.sha256()
     for value in (
@@ -675,21 +684,21 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
         shared_secret,
         transcript_hash,
     )
-    session = state._sessions[addr]
+    pending = state._pending_sessions[addr]
 
     nonce = b"\x01" * 12
     plaintext = b"direction check"
     ciphertext = secure.AESGCM(
         client_key_material.client_to_server_key
     ).encrypt(nonce, plaintext, secure.DATA_AAD)
-    assert session.client_to_server_aesgcm.decrypt(
+    assert pending.client_to_server_aesgcm.decrypt(
         nonce,
         ciphertext,
         secure.DATA_AAD,
     ) == plaintext
     assert (
-        session.client_to_server_aesgcm
-        is not session.server_to_client_aesgcm
+        pending.client_to_server_aesgcm
+        is not pending.server_to_client_aesgcm
     )
     assert (
         client_key_material.client_to_server_key
@@ -698,9 +707,11 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
     assert fake_socket.sent[0][1] == addr
     assert stats.handshake_replay_accepted == 1
     assert stats.handshake_replay_rejected == 1
-    assert stats.sessions_created == 1
+    assert stats.sessions_created == 0
+    assert stats.pending_sessions_created == 1
     assert stats.current_handshake_replays == 1
-    assert stats.current_sessions == 1
+    assert stats.current_sessions == 0
+    assert stats.current_pending_sessions == 1
     assert wall_clock.calls == 2
     assert monotonic_clock.calls == 2
 
@@ -733,9 +744,11 @@ def test_secure_server_rejects_exact_replay_from_different_address(
 
     assert len(fake_socket.sent) == 1
     assert fake_socket.sent[0][1] == first_addr
-    assert tuple(state._sessions) == (first_addr,)
+    assert tuple(state._sessions) == ()
+    assert tuple(state._pending_sessions) == (first_addr,)
     assert state.stats().handshake_replay_accepted == 1
     assert state.stats().handshake_replay_rejected == 1
+    assert state.stats().pending_sessions_created == 1
 
 
 def test_invalid_hellos_do_not_consume_replay_or_generate_server_ephemeral(
@@ -825,6 +838,7 @@ def test_invalid_hellos_do_not_consume_replay_or_generate_server_ephemeral(
         assert fake_socket.sent == []
         assert state.stats().current_handshake_replays == 0
         assert state.stats().current_sessions == 0
+        assert state.stats().current_pending_sessions == 0
 
     assert generation_calls == []
 
@@ -893,6 +907,7 @@ def test_server_rejects_clienthello_field_changed_after_signing(
     assert fake_socket.sent == []
     assert state.stats().current_handshake_replays == 0
     assert state.stats().current_sessions == 0
+    assert state.stats().current_pending_sessions == 0
 
 
 def test_server_ecdhe_uses_only_one_validated_ephemeral_private_key(
@@ -1034,6 +1049,11 @@ def test_fresh_same_timestamp_hellos_get_fresh_server_state(monkeypatch):
     assert recorded_keys[1] != recorded_keys[3]
     assert state.stats().handshake_replay_accepted == 2
     assert state.stats().handshake_replay_rejected == 0
+    assert tuple(state._sessions) == ()
+    assert tuple(state._pending_sessions) == (addr,)
+    assert state.stats().pending_sessions_created == 2
+    assert state.stats().pending_sessions_replaced == 1
+    assert state.stats().current_pending_sessions == 1
 
 
 def test_secure_server_sends_no_session_for_data_without_session(monkeypatch):
@@ -1049,47 +1069,33 @@ def test_secure_server_sends_no_session_for_data_without_session(monkeypatch):
     assert fake_socket.sent == [(secure.NOSESSION_PREFIX, addr)]
 
 
-def test_secure_server_sends_station_no_session_for_keepalive_without_session(
+@pytest.mark.parametrize(
+    "packet",
+    (
+        b"KEEPALIVE",
+        b"KEEPALIVE|boat_001|1000",
+    ),
+)
+def test_plaintext_keepalive_is_silently_ignored_without_touch_or_promotion(
     monkeypatch,
+    packet,
 ):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState()
     addr = ("127.0.0.1", 50123)
-    packet = b"KEEPALIVE|boat_001|1000"
-
-    fake_queue, fake_socket = _run_secure_server_with_packets(
-        monkeypatch, secure, [(packet, addr)], state=state
-    )
-
-    assert fake_queue.items == []
-    assert fake_socket.sent == [(b"NOSESSION|boat_001", addr)]
-    assert state.stats().current_sessions == 0
-
-
-def test_secure_server_sends_bare_no_session_for_unparseable_keepalive(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    addr = ("127.0.0.1", 50123)
-
-    fake_queue, fake_socket = _run_secure_server_with_packets(
-        monkeypatch, secure, [(b"KEEPALIVE", addr)]
-    )
-
-    assert fake_queue.items == []
-    assert fake_socket.sent == [(secure.NOSESSION_PREFIX, addr)]
-
-
-def test_secure_server_valid_keepalive_touches_once_with_separate_clocks(
-    monkeypatch,
-):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    state = secure.SecureState()
-    addr = ("127.0.0.1", 50123)
-    session = state.install_session(
+    active = state.install_session(
         addr,
         "boat_001",
         object(),
         object(),
         now=1000.0,
+    )
+    pending = state.install_pending_session(
+        addr,
+        "boat_001",
+        object(),
+        object(),
+        now=1005.0,
     )
     wall_clock = _FakeClock(5000.0)
     monotonic_clock = _FakeClock(1010.0)
@@ -1097,7 +1103,7 @@ def test_secure_server_valid_keepalive_touches_once_with_separate_clocks(
     fake_queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
         secure,
-        [(b"KEEPALIVE|boat_001|1000", addr)],
+        [(packet, addr)],
         state=state,
         wall_clock=wall_clock,
         monotonic_clock=monotonic_clock,
@@ -1105,9 +1111,12 @@ def test_secure_server_valid_keepalive_touches_once_with_separate_clocks(
 
     assert fake_queue.items == []
     assert fake_socket.sent == []
-    assert session.last_seen == 1010.0
-    assert state.stats().sessions_touched == 1
-    assert wall_clock.calls == int(secure.DEBUG)
+    assert state._sessions[addr] is active
+    assert state._pending_sessions[addr] is pending
+    assert active.last_seen == 1000.0
+    assert state.stats().sessions_touched == 0
+    assert state.stats().pending_sessions_promoted == 0
+    assert wall_clock.calls == 0
     assert monotonic_clock.calls == 1
 
 
@@ -1714,7 +1723,10 @@ def test_secure_server_handshake_freshness_uses_wall_clock_boundary(
     )
 
     assert bool(fake_socket.sent) is accepted
-    assert state.stats().sessions_created == int(accepted)
+    assert state.stats().sessions_created == 0
+    assert state.stats().pending_sessions_created == int(accepted)
+    assert state.stats().current_sessions == 0
+    assert state.stats().current_pending_sessions == int(accepted)
     assert state.stats().handshake_replay_accepted == int(accepted)
     assert wall_clock.calls == 1
     assert monotonic_clock.calls == 1
@@ -1763,8 +1775,13 @@ def test_secure_server_handshake_replay_ttl_uses_monotonic_clock(monkeypatch):
     assert stats.handshake_replay_accepted == 2
     assert stats.handshake_replay_rejected == 1
     assert stats.handshake_replay_expired == 1
-    assert stats.sessions_created == 2
-    assert stats.sessions_replaced == 1
+    assert stats.sessions_created == 0
+    assert stats.sessions_replaced == 0
+    assert stats.pending_sessions_created == 2
+    assert stats.pending_sessions_replaced == 0
+    assert stats.pending_sessions_expired == 1
+    assert stats.current_sessions == 0
+    assert stats.current_pending_sessions == 1
 
 
 def test_secure_server_keeps_replay_record_after_post_acceptance_failure(monkeypatch):
@@ -1807,9 +1824,11 @@ def test_secure_server_keeps_replay_record_after_post_acceptance_failure(monkeyp
     assert stats.handshake_replay_rejected == 1
     assert stats.current_handshake_replays == 1
     assert stats.sessions_created == 0
+    assert stats.pending_sessions_created == 0
+    assert stats.current_pending_sessions == 0
 
 
-def test_secure_server_successful_handshake_replaces_live_session_only(
+def test_authenticated_hello_preserves_active_and_installs_pending_candidate(
     monkeypatch,
 ):
     secure, client_private_key = load_secure_module_with_fake_keys(
@@ -1847,28 +1866,34 @@ def test_secure_server_successful_handshake_replaces_live_session_only(
         monotonic_clock=_FakeClock(2.0),
     )
 
-    replacement = state._sessions[addr]
+    pending = state._pending_sessions[addr]
     response, response_addr = fake_socket.sent[0]
     assert response_addr == addr
     assert response.startswith(b"OK|")
-    assert replacement is not old
+    assert state._sessions[addr] is old
+    assert pending is not old
     assert (
-        replacement.client_to_server_aesgcm
+        pending.client_to_server_aesgcm
         is not old.client_to_server_aesgcm
     )
     assert (
-        replacement.server_to_client_aesgcm
+        pending.server_to_client_aesgcm
         is not old.server_to_client_aesgcm
     )
     assert state._sessions[other_addr] is other
-    assert tuple(state._sessions) == (other_addr, addr)
-    assert not state.data_nonce_seen(replacement, nonce, now=2.0)
+    assert tuple(state._sessions) == (addr, other_addr)
+    assert tuple(state._pending_sessions) == (addr,)
+    assert state.data_nonce_seen(old, nonce, now=2.0)
+    assert not state.pending_data_nonce_seen(pending, nonce, now=2.0)
 
     stats = state.stats()
-    assert stats.sessions_created == 3
-    assert stats.sessions_replaced == 1
+    assert stats.sessions_created == 2
+    assert stats.sessions_replaced == 0
     assert stats.sessions_capacity_evicted == 0
-    assert stats.data_nonces_session_discarded == 1
+    assert stats.pending_sessions_created == 1
+    assert stats.current_sessions == 2
+    assert stats.current_pending_sessions == 1
+    assert stats.data_nonces_session_discarded == 0
 
 
 @pytest.mark.parametrize(
@@ -2143,8 +2168,10 @@ def test_allowed_handshake_proactively_cleans_silent_expired_session(monkeypatch
         monotonic_clock=_FakeClock(10.0),
     )
 
-    assert tuple(state._sessions) == (handshake_addr,)
+    assert tuple(state._sessions) == ()
+    assert tuple(state._pending_sessions) == (handshake_addr,)
     assert state.stats().sessions_expired == 1
+    assert state.stats().pending_sessions_created == 1
     assert len(fake_socket.sent) == 1
     assert fake_socket.sent[0][0].startswith(b"OK|")
 
@@ -2180,24 +2207,7 @@ def test_unknown_allowed_packet_proactively_cleans_without_wall_clock(monkeypatc
     assert monotonic_clock.calls == 1
 
 
-@pytest.mark.parametrize(
-    ("packet_factory", "expected_response"),
-    [
-        (
-            lambda secure: secure.DATA_PREFIX + (b"\x00" * 28),
-            lambda secure, addr: (secure.NOSESSION_PREFIX, addr),
-        ),
-        (
-            lambda _secure: b"KEEPALIVE|boat_001|1000",
-            lambda _secure, addr: (b"NOSESSION|boat_001", addr),
-        ),
-    ],
-)
-def test_exactly_expired_address_receives_existing_no_session_format(
-    monkeypatch,
-    packet_factory,
-    expected_response,
-):
+def test_exactly_expired_address_receives_no_session_for_data(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(session_ttl=10.0)
     addr = ("127.0.0.1", 50123)
@@ -2212,12 +2222,12 @@ def test_exactly_expired_address_receives_existing_no_session_format(
     _, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
         secure,
-        [(packet_factory(secure), addr)],
+        [(secure.DATA_PREFIX + (b"\x00" * 28), addr)],
         state=state,
         monotonic_clock=_FakeClock(10.0),
     )
 
-    assert fake_socket.sent == [expected_response(secure, addr)]
+    assert fake_socket.sent == [(secure.NOSESSION_PREFIX, addr)]
     assert state.stats().sessions_expired == 1
 
 
@@ -2910,6 +2920,7 @@ class _FakeHandshakeSocket:
         self.responses = list(responses)
         self.sent = []
         self.timeout = 5.0
+        self.timeouts = []
 
     def sendto(self, data, addr):
         self.sent.append((data, addr))
@@ -2926,6 +2937,7 @@ class _FakeHandshakeSocket:
         return self.timeout
 
     def settimeout(self, timeout):
+        self.timeouts.append(timeout)
         self.timeout = timeout
 
 
@@ -3008,6 +3020,94 @@ def _build_test_server_response(
     )
 
 
+class _TestConfirmingServer:
+    def __init__(
+        self,
+        proxy,
+        server_identity_private_key,
+        remote_addr,
+        *,
+        pong_nonce=b"\x91" * 12,
+    ):
+        self.proxy = proxy
+        self.server_identity_private_key = server_identity_private_key
+        self.remote_addr = remote_addr
+        self.pong_nonce = pong_nonce
+        self.client_hello = None
+        self.server_hello = None
+        self.key_material = None
+        self.confirmation_packet = None
+        self.confirmation_message = None
+        self.confirmation_nonce = None
+        self.pong_packet = None
+
+    def server_hello_response(self, client_packet):
+        response, client_hello, server_hello, key_material = (
+            _build_test_server_response(
+                client_packet,
+                self.server_identity_private_key,
+            )
+        )
+        self.client_hello = client_hello
+        self.server_hello = server_hello
+        self.key_material = key_material
+        return response, self.remote_addr
+
+    def read_confirmation_ping(self, confirmation_packet):
+        assert self.key_material is not None
+        message = self.proxy.decrypt_secure_json_message(
+            confirmation_packet,
+            self.key_material.client_to_server_key,
+        )
+        with pytest.raises(InvalidTag):
+            self.proxy.decrypt_secure_json_message(
+                confirmation_packet,
+                self.key_material.server_to_client_key,
+            )
+        assert isinstance(message, dict)
+        assert message.get("type") == "ping"
+        assert message.get("seq") == (
+            self.proxy.SESSION_CONFIRMATION_SEQUENCE
+        )
+        assert message.get("source_id") == self.client_hello.station_id
+        assert isinstance(message.get("timestamp"), int)
+        self.confirmation_packet = confirmation_packet
+        self.confirmation_message = message
+        self.confirmation_nonce = confirmation_packet[
+            len(self.proxy.DATA_PREFIX):
+            len(self.proxy.DATA_PREFIX) + 12
+        ]
+        return message
+
+    def encrypt_server_packet(
+        self,
+        message,
+        *,
+        key=None,
+        nonce=None,
+    ):
+        if key is None:
+            key = self.key_material.server_to_client_key
+        if nonce is None:
+            nonce = self.pong_nonce
+        return _encrypted_control_packet(
+            self.proxy,
+            key,
+            nonce,
+            message,
+        )
+
+    def confirmation_pong_response(self, confirmation_packet):
+        message = self.read_confirmation_ping(confirmation_packet)
+        self.pong_packet = self.encrypt_server_packet({
+            "type": "pong",
+            "seq": self.proxy.SESSION_CONFIRMATION_SEQUENCE,
+            "timestamp": message["timestamp"],
+            "source_id": self.client_hello.station_id,
+        })
+        return self.pong_packet, self.remote_addr
+
+
 def test_proxy_handshake_succeeds_after_stale_no_session_hint(
     monkeypatch,
     capsys,
@@ -3024,25 +3124,23 @@ def test_proxy_handshake_succeeds_after_stale_no_session_hint(
         12,
         ec.SECP256R1(),
     )
-    expected = {}
+    confirming_server = _TestConfirmingServer(
+        proxy,
+        server_identity_private_key,
+        remote_addr,
+    )
+    output_before_confirmation = []
 
-    def valid_response(client_packet):
-        response, client_hello, server_hello, key_material = (
-            _build_test_server_response(
-                client_packet,
-                server_identity_private_key,
-            )
+    def confirmation_response(confirmation_packet):
+        output_before_confirmation.append(capsys.readouterr().out)
+        return confirming_server.confirmation_pong_response(
+            confirmation_packet
         )
-        expected.update(
-            client_hello=client_hello,
-            server_hello=server_hello,
-            key_material=key_material,
-        )
-        return response, remote_addr
 
     sock = _FakeHandshakeSocket((
         (b"NOSESSION|boat_001", remote_addr),
-        valid_response,
+        confirming_server.server_hello_response,
+        confirmation_response,
     ))
     monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
     parse_calls = []
@@ -3091,7 +3189,7 @@ def test_proxy_handshake_succeeds_after_stale_no_session_hint(
         client_hello.client_signature,
         client_digest,
     )
-    assert key_material == expected["key_material"]
+    assert key_material == confirming_server.key_material
     assert isinstance(key_material, SessionKeyMaterial)
     assert (
         key_material.client_to_server_key
@@ -3102,11 +3200,31 @@ def test_proxy_handshake_succeeds_after_stale_no_session_hint(
     assert len(parse_calls) == 1
     assert len(derive_calls) == 1
     assert derive_calls[0][0] is not station_identity_private_key
-    output = capsys.readouterr().out
-    assert "Mutual ECDHE handshake established." in output
+    assert len(sock.sent) == 2
+    confirmation_packet, confirmation_addr = sock.sent[1]
+    assert confirmation_addr == remote_addr
+    assert confirmation_packet.startswith(proxy.DATA_PREFIX)
+    assert confirming_server.confirmation_message == {
+        "type": "ping",
+        "seq": proxy.SESSION_CONFIRMATION_SEQUENCE,
+        "timestamp": timestamp,
+        "source_id": station_id,
+    }
+    assert len(confirming_server.confirmation_nonce) == 12
+    assert "Mutual ECDHE session confirmed." not in (
+        output_before_confirmation[0]
+    )
+    output = output_before_confirmation[0] + capsys.readouterr().out
+    assert "Mutual ECDHE session confirmed." in output
+    assert "Mutual ECDHE handshake established." not in output
     assert "Session hash" not in output
     assert key_material.client_to_server_key.hex() not in output
     assert key_material.server_to_client_key.hex() not in output
+    with pytest.raises(InvalidTag):
+        proxy.decrypt_secure_json_message(
+            confirming_server.pong_packet,
+            key_material.client_to_server_key,
+        )
     assert sock.timeout == 5.0
 
 
@@ -3119,12 +3237,16 @@ def test_proxy_handshake_ignores_valid_reply_from_unexpected_remote(monkeypatch)
     client_private_key = ec.derive_private_key(11, ec.SECP256R1())
     server_private_key = ec.derive_private_key(12, ec.SECP256R1())
     response_packets = []
+    confirming_server = _TestConfirmingServer(
+        proxy,
+        server_private_key,
+        remote_addr,
+    )
 
     def response_from(address):
         def build_response(client_packet):
-            response, _, _, _ = _build_test_server_response(
-                client_packet,
-                server_private_key,
+            response, _ = confirming_server.server_hello_response(
+                client_packet
             )
             response_packets.append(response)
             return response, address
@@ -3134,6 +3256,7 @@ def test_proxy_handshake_ignores_valid_reply_from_unexpected_remote(monkeypatch)
     sock = _FakeHandshakeSocket((
         response_from(other_addr),
         response_from(remote_addr),
+        confirming_server.confirmation_pong_response,
     ))
     monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
 
@@ -3147,7 +3270,7 @@ def test_proxy_handshake_ignores_valid_reply_from_unexpected_remote(monkeypatch)
 
     assert isinstance(key_material, SessionKeyMaterial)
     assert len(response_packets) == 2
-    assert len(sock.sent) == 1
+    assert len(sock.sent) == 2
 
 
 @pytest.mark.parametrize(
@@ -3287,7 +3410,12 @@ def test_separate_proxy_handshakes_use_fresh_random_ephemeral_and_keys(
         ec.SECP256R1(),
     )
     random_lengths = []
-    random_values = iter((b"\x61" * 32, b"\x62" * 32))
+    random_values = iter((
+        b"\x61" * 32,
+        b"\x71" * 12,
+        b"\x62" * 32,
+        b"\x72" * 12,
+    ))
     client_ephemeral_keys = iter(
         (
             ec.derive_private_key(14, ec.SECP256R1()),
@@ -3307,17 +3435,34 @@ def test_separate_proxy_handshakes_use_fresh_random_ephemeral_and_keys(
         lambda: next(client_ephemeral_keys),
     )
     sent_hellos = []
+    confirmation_nonces = []
 
     def new_socket():
-        def valid_response(client_packet):
-            sent_hellos.append(parse_client_hello_packet(client_packet))
-            response, _, _, _ = _build_test_server_response(
-                client_packet,
-                server_identity_private_key,
-            )
-            return response, remote_addr
+        confirming_server = _TestConfirmingServer(
+            proxy,
+            server_identity_private_key,
+            remote_addr,
+        )
 
-        return _FakeHandshakeSocket((valid_response,))
+        def server_hello_response(client_packet):
+            sent_hellos.append(parse_client_hello_packet(client_packet))
+            return confirming_server.server_hello_response(
+                client_packet
+            )
+
+        def confirmation_response(confirmation_packet):
+            response = confirming_server.confirmation_pong_response(
+                confirmation_packet
+            )
+            confirmation_nonces.append(
+                confirming_server.confirmation_nonce
+            )
+            return response
+
+        return _FakeHandshakeSocket((
+            server_hello_response,
+            confirmation_response,
+        ))
 
     first_material = proxy.perform_handshake(
         new_socket(),
@@ -3334,7 +3479,7 @@ def test_separate_proxy_handshakes_use_fresh_random_ephemeral_and_keys(
         remote_addr,
     )
 
-    assert random_lengths == [32, 32]
+    assert random_lengths == [32, 12, 32, 12]
     assert sent_hellos[0].client_random != sent_hellos[1].client_random
     assert sent_hellos[0].client_ephemeral_public_key != (
         sent_hellos[1].client_ephemeral_public_key
@@ -3346,6 +3491,7 @@ def test_separate_proxy_handshakes_use_fresh_random_ephemeral_and_keys(
     assert first_material.server_to_client_key != (
         second_material.server_to_client_key
     )
+    assert confirmation_nonces == [b"\x71" * 12, b"\x72" * 12]
 
 
 def test_runtime_end_to_end_ecdhe_and_directional_encryption(monkeypatch):
@@ -3379,18 +3525,19 @@ def test_runtime_end_to_end_ecdhe_and_directional_encryption(monkeypatch):
 
     class _RuntimeBridgeSocket:
         def __init__(self):
-            self.client_packet = None
+            self.client_packets = []
             self.timeout = 5.0
 
         def sendto(self, packet, destination):
             assert destination == remote_addr
-            self.client_packet = packet
+            self.client_packets.append(packet)
 
         def recvfrom(self, _size):
+            client_packet = self.client_packets.pop(0)
             _, server_socket = _run_secure_server_with_packets(
                 monkeypatch,
                 secure,
-                [(self.client_packet, client_addr)],
+                [(client_packet, client_addr)],
                 state=state,
                 wall_clock=_FakeClock(float(timestamp)),
                 monotonic_clock=_FakeClock(10.0),
@@ -3494,6 +3641,347 @@ def test_runtime_end_to_end_ecdhe_and_directional_encryption(monkeypatch):
     ) == proxy.SERVER_PACKET_IGNORED
     assert len(ping_packet[len(proxy.DATA_PREFIX):][:12]) == 12
     assert len(pong_packet[len(proxy.DATA_PREFIX):][:12]) == 12
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "reverse-direction-key",
+        "wrong-sequence",
+        "bool-sequence",
+        "wrong-source",
+        "wrong-type",
+        "malformed-json",
+        "non-dict-json",
+    ),
+)
+def test_proxy_handshake_rejects_invalid_session_confirmation(
+    monkeypatch,
+    mutation,
+    capsys,
+):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    station_id = "boat_001"
+    remote_addr = ("192.0.2.10", 17777)
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
+    )
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    confirming_server = _TestConfirmingServer(
+        proxy,
+        server_identity_private_key,
+        remote_addr,
+    )
+
+    def invalid_confirmation(confirmation_packet):
+        message = confirming_server.read_confirmation_ping(
+            confirmation_packet
+        )
+        pong = {
+            "type": "pong",
+            "seq": proxy.SESSION_CONFIRMATION_SEQUENCE,
+            "timestamp": message["timestamp"],
+            "source_id": station_id,
+        }
+        key = confirming_server.key_material.server_to_client_key
+        if mutation == "reverse-direction-key":
+            key = confirming_server.key_material.client_to_server_key
+        elif mutation == "wrong-sequence":
+            pong["seq"] = 1
+        elif mutation == "bool-sequence":
+            pong["seq"] = False
+        elif mutation == "wrong-source":
+            pong["source_id"] = "other_station"
+        elif mutation == "wrong-type":
+            pong["type"] = "status"
+
+        if mutation == "malformed-json":
+            nonce = b"\xa1" * 12
+            encrypted = AESGCM(key).encrypt(
+                nonce,
+                b"not-json",
+                proxy.DATA_AAD,
+            )
+            packet = proxy.DATA_PREFIX + nonce + encrypted
+        elif mutation == "non-dict-json":
+            packet = confirming_server.encrypt_server_packet(
+                ["pong", proxy.SESSION_CONFIRMATION_SEQUENCE],
+                key=key,
+                nonce=b"\xa2" * 12,
+            )
+        else:
+            packet = confirming_server.encrypt_server_packet(
+                pong,
+                key=key,
+                nonce=b"\xa3" * 12,
+            )
+        return packet, remote_addr
+
+    sock = _FakeHandshakeSocket((
+        confirming_server.server_hello_response,
+        invalid_confirmation,
+    ))
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+
+    key_material = proxy.perform_handshake(
+        sock,
+        {"station_id": station_id},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+
+    output = capsys.readouterr().out
+    assert key_material is None
+    assert len(sock.sent) == 2
+    assert "Mutual ECDHE session confirmed." not in output
+    assert confirming_server.key_material.client_to_server_key.hex() not in (
+        output
+    )
+    assert confirming_server.key_material.server_to_client_key.hex() not in (
+        output
+    )
+    assert sock.timeout == 5.0
+
+
+def test_proxy_handshake_ignores_confirmation_from_unexpected_remote(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    station_id = "boat_001"
+    remote_addr = ("192.0.2.10", 17777)
+    other_addr = ("192.0.2.10", 17778)
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
+    )
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    confirming_server = _TestConfirmingServer(
+        proxy,
+        server_identity_private_key,
+        remote_addr,
+    )
+
+    def confirmation_from_other_addr(confirmation_packet):
+        packet, _ = confirming_server.confirmation_pong_response(
+            confirmation_packet
+        )
+        return packet, other_addr
+
+    def confirmation_from_expected_addr(_confirmation_packet):
+        return confirming_server.pong_packet, remote_addr
+
+    sock = _FakeHandshakeSocket((
+        confirming_server.server_hello_response,
+        confirmation_from_other_addr,
+        confirmation_from_expected_addr,
+    ))
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+
+    key_material = proxy.perform_handshake(
+        sock,
+        {"station_id": station_id},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+
+    assert key_material == confirming_server.key_material
+    assert len(sock.sent) == 2
+    assert sock.timeout == 5.0
+
+
+def test_proxy_handshake_fails_on_no_session_during_confirmation(
+    monkeypatch,
+    capsys,
+):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    station_id = "boat_001"
+    remote_addr = ("192.0.2.10", 17777)
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
+    )
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    confirming_server = _TestConfirmingServer(
+        proxy,
+        server_identity_private_key,
+        remote_addr,
+    )
+    sock = _FakeHandshakeSocket((
+        confirming_server.server_hello_response,
+        (b"NOSESSION|boat_001", remote_addr),
+    ))
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+
+    key_material = proxy.perform_handshake(
+        sock,
+        {"station_id": station_id},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+
+    assert key_material is None
+    assert len(sock.sent) == 2
+    assert "Mutual ECDHE session confirmed." not in (
+        capsys.readouterr().out
+    )
+    assert sock.timeout == 5.0
+
+
+@pytest.mark.parametrize(
+    "confirmation_failure",
+    ("timeout", "socket-error"),
+)
+def test_proxy_handshake_confirmation_failure_returns_to_retry_loop(
+    monkeypatch,
+    confirmation_failure,
+    capsys,
+):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    remote_addr = ("192.0.2.10", 17777)
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
+    )
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    confirming_server = _TestConfirmingServer(
+        proxy,
+        server_identity_private_key,
+        remote_addr,
+    )
+    failure = (
+        proxy.socket.timeout()
+        if confirmation_failure == "timeout"
+        else OSError("confirmation receive failed")
+    )
+    sock = _FakeHandshakeSocket((
+        confirming_server.server_hello_response,
+        failure,
+    ))
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+
+    key_material = proxy.perform_handshake(
+        sock,
+        {"station_id": "boat_001"},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+
+    assert key_material is None
+    assert len(sock.sent) == 2
+    assert "Mutual ECDHE session confirmed." not in (
+        capsys.readouterr().out
+    )
+    assert sock.timeout == 5.0
+
+
+def test_proxy_handshake_confirmation_send_error_returns_to_retry_loop(
+    monkeypatch,
+    capsys,
+):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    remote_addr = ("192.0.2.10", 17777)
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
+    )
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    confirming_server = _TestConfirmingServer(
+        proxy,
+        server_identity_private_key,
+        remote_addr,
+    )
+
+    class ConfirmationSendFailingSocket(_FakeHandshakeSocket):
+        def sendto(self, data, addr):
+            if self.sent:
+                raise OSError("confirmation send failed")
+            super().sendto(data, addr)
+
+    sock = ConfirmationSendFailingSocket((
+        confirming_server.server_hello_response,
+    ))
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+
+    key_material = proxy.perform_handshake(
+        sock,
+        {"station_id": "boat_001"},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+
+    assert key_material is None
+    assert len(sock.sent) == 1
+    assert "Mutual ECDHE session confirmed." not in (
+        capsys.readouterr().out
+    )
+    assert sock.timeout == 5.0
+
+
+def test_proxy_handshake_uses_fresh_confirmation_deadline(monkeypatch):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    remote_addr = ("192.0.2.10", 17777)
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
+    )
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    confirming_server = _TestConfirmingServer(
+        proxy,
+        server_identity_private_key,
+        remote_addr,
+    )
+    sock = _FakeHandshakeSocket((
+        confirming_server.server_hello_response,
+        confirming_server.confirmation_pong_response,
+    ))
+    monotonic_values = iter((100.0, 101.0, 200.0, 201.0))
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+    monkeypatch.setattr(
+        proxy.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    key_material = proxy.perform_handshake(
+        sock,
+        {"station_id": "boat_001"},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+
+    assert key_material == confirming_server.key_material
+    assert sock.timeouts == [4.0, 4.0, 5.0]
 
 
 def test_proxy_handshake_timeout_returns_to_retry_loop(monkeypatch):
@@ -3842,48 +4330,13 @@ def test_secure_data_packet_parser_output_decrypts_valid_proxy_packet(monkeypatc
     assert AESGCM(key).decrypt(nonce, ciphertext, b"NMEA") == plaintext
 
 
-def test_parse_keepalive_packet_accepts_valid_packet(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    assert secure.parse_keepalive_packet(b"KEEPALIVE|boat_001|1234567890") == (
-        "boat_001",
-        1234567890,
-    )
-
-
-def test_parse_keepalive_packet_rejects_wrong_prefix(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    with pytest.raises(ValueError):
-        secure.parse_keepalive_packet(b"NOTKEEPALIVE|boat_001|1234567890")
-
-
-def test_parse_keepalive_packet_rejects_missing_station_id(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    with pytest.raises(ValueError):
-        secure.parse_keepalive_packet(b"KEEPALIVE||1234567890")
-
-
-def test_parse_keepalive_packet_rejects_missing_timestamp(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    with pytest.raises(ValueError):
-        secure.parse_keepalive_packet(b"KEEPALIVE|boat_001|")
-
-
-def test_parse_keepalive_packet_rejects_non_numeric_timestamp(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    with pytest.raises(ValueError):
-        secure.parse_keepalive_packet(b"KEEPALIVE|boat_001|not-a-timestamp")
-
-
 def test_session_ttl_seconds_is_300(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
 
     assert secure.SESSION_TTL_SECONDS == 300
     assert secure.SESSION_MAX == 100000
+    assert secure.PENDING_SESSION_TTL_SECONDS == 30
+    assert secure.PENDING_SESSION_MAX == secure.SESSION_MAX
 
 
 def test_data_nonce_constants(monkeypatch):
@@ -3895,7 +4348,12 @@ def test_data_nonce_constants(monkeypatch):
 
 @pytest.mark.parametrize(
     "field",
-    ["max_sessions", "handshake_replay_max", "data_nonce_max_per_session"],
+    [
+        "max_sessions",
+        "max_pending_sessions",
+        "handshake_replay_max",
+        "data_nonce_max_per_session",
+    ],
 )
 @pytest.mark.parametrize("value", [True, 1.0, 1.5, "2", None])
 def test_secure_state_rejects_non_integer_maximums(monkeypatch, field, value):
@@ -3907,7 +4365,12 @@ def test_secure_state_rejects_non_integer_maximums(monkeypatch, field, value):
 
 @pytest.mark.parametrize(
     "field",
-    ["max_sessions", "handshake_replay_max", "data_nonce_max_per_session"],
+    [
+        "max_sessions",
+        "max_pending_sessions",
+        "handshake_replay_max",
+        "data_nonce_max_per_session",
+    ],
 )
 @pytest.mark.parametrize("value", [0, -1])
 def test_secure_state_rejects_non_positive_maximums(monkeypatch, field, value):
@@ -3919,7 +4382,12 @@ def test_secure_state_rejects_non_positive_maximums(monkeypatch, field, value):
 
 @pytest.mark.parametrize(
     "field",
-    ["session_ttl", "handshake_replay_ttl", "data_nonce_ttl"],
+    [
+        "session_ttl",
+        "pending_session_ttl",
+        "handshake_replay_ttl",
+        "data_nonce_ttl",
+    ],
 )
 @pytest.mark.parametrize("value", [True, "1", None])
 def test_secure_state_rejects_non_numeric_ttls(monkeypatch, field, value):
@@ -3931,7 +4399,12 @@ def test_secure_state_rejects_non_numeric_ttls(monkeypatch, field, value):
 
 @pytest.mark.parametrize(
     "field",
-    ["session_ttl", "handshake_replay_ttl", "data_nonce_ttl"],
+    [
+        "session_ttl",
+        "pending_session_ttl",
+        "handshake_replay_ttl",
+        "data_nonce_ttl",
+    ],
 )
 @pytest.mark.parametrize("value", [0, 0.0, -1, -0.5])
 def test_secure_state_rejects_non_positive_ttls(monkeypatch, field, value):
@@ -3947,6 +4420,8 @@ def test_secure_state_accepts_positive_integer_and_float_limits(monkeypatch):
     state = secure.SecureState(
         session_ttl=1,
         max_sessions=1,
+        pending_session_ttl=1.25,
+        max_pending_sessions=2,
         handshake_replay_ttl=1.5,
         handshake_replay_max=2,
         data_nonce_ttl=2.5,
@@ -4184,60 +4659,6 @@ def test_touch_session_updates_lru_order_without_changing_creation(monkeypatch):
 
     assert first.created_at == 100.0
     assert first.last_seen == 125.0
-    assert tuple(state._sessions) == (second_addr, first_addr)
-    assert state.stats().sessions_touched == 1
-
-
-def test_invalid_keepalive_does_not_touch_or_reorder_session(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    state = secure.SecureState()
-    first_addr = ("192.0.2.10", 50000)
-    second_addr = ("192.0.2.11", 50001)
-    first = state.install_session(
-        first_addr,
-        "first",
-        object(),
-        object(),
-        now=100.0,
-    )
-    state.install_session(
-        second_addr,
-        "second",
-        object(),
-        object(),
-        now=110.0,
-    )
-
-    assert not state.handle_keepalive(first_addr, "wrong", now=120.0)
-
-    assert first.last_seen == 100.0
-    assert tuple(state._sessions) == (first_addr, second_addr)
-    assert state.stats().sessions_touched == 0
-
-
-def test_valid_keepalive_touches_and_reorders_session(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-    state = secure.SecureState()
-    first_addr = ("192.0.2.10", 50000)
-    second_addr = ("192.0.2.11", 50001)
-    first = state.install_session(
-        first_addr,
-        "first",
-        object(),
-        object(),
-        now=100.0,
-    )
-    state.install_session(
-        second_addr,
-        "second",
-        object(),
-        object(),
-        now=110.0,
-    )
-
-    assert state.handle_keepalive(first_addr, "first", now=120.0)
-
-    assert first.last_seen == 120.0
     assert tuple(state._sessions) == (second_addr, first_addr)
     assert state.stats().sessions_touched == 1
 
@@ -4764,6 +5185,11 @@ def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
         "sessions_touched",
         "sessions_expired",
         "sessions_capacity_evicted",
+        "pending_sessions_created",
+        "pending_sessions_replaced",
+        "pending_sessions_promoted",
+        "pending_sessions_expired",
+        "pending_sessions_capacity_evicted",
         "data_nonces_accepted",
         "data_nonce_replays",
         "data_nonces_expired",
@@ -4773,6 +5199,8 @@ def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
         "peak_handshake_replays",
         "current_sessions",
         "peak_sessions",
+        "current_pending_sessions",
+        "peak_pending_sessions",
         "current_data_nonces",
         "peak_data_nonces",
     }
@@ -5164,3 +5592,1268 @@ def test_current_secure_udp_key_filename_expectations():
     assert proxy.CANONICAL_REMOTE_PUBLIC_KEY_PATH == REMOTE_CANONICAL_PUBLIC_KEY_PATH
     assert proxy.DEFAULT_CONFIG["remote_public_key"] == REMOTE_CANONICAL_PUBLIC_KEY_PATH
     assert proxy.DEFAULT_CONFIG["station_private_key"] == STATION_CANONICAL_PRIVATE_KEY_PATH
+
+
+# D.6.6 server pending-session lifecycle and dispatch coverage.
+
+
+def _d66_keys(marker):
+    return bytes((marker,)) * 32, bytes((marker + 1,)) * 32
+
+
+def _d66_install_pending(
+    secure,
+    state,
+    addr,
+    *,
+    marker=40,
+    now=0.0,
+    station_id="boat_001",
+):
+    client_to_server_key, server_to_client_key = _d66_keys(marker)
+    pending = state.install_pending_session(
+        addr,
+        station_id,
+        secure.AESGCM(client_to_server_key),
+        secure.AESGCM(server_to_client_key),
+        now,
+    )
+    return pending, client_to_server_key, server_to_client_key
+
+
+def _d66_confirmation_packet(
+    secure,
+    client_to_server_key,
+    nonce,
+    *,
+    station_id="boat_001",
+    seq=0,
+    timestamp=1000,
+):
+    return _encrypted_control_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+        {
+            "type": "ping",
+            "seq": seq,
+            "timestamp": timestamp,
+            "source_id": station_id,
+        },
+    )
+
+
+def _d66_decrypt_json(secure, packet, key):
+    nonce, ciphertext = secure.parse_secure_data_packet(packet)
+    plaintext = secure.AESGCM(key).decrypt(
+        nonce,
+        ciphertext,
+        secure.DATA_AAD,
+    )
+    return secure.json.loads(plaintext.decode())
+
+
+def _d66_derive_client_material(
+    secure,
+    client_hello,
+    client_ephemeral_private_key,
+    server_packet,
+):
+    server_hello = parse_server_hello_packet(server_packet)
+    server_ephemeral_public_key = secure.parse_ephemeral_public_key(
+        server_hello.server_ephemeral_public_key
+    )
+    shared_secret = secure.derive_ephemeral_shared_secret(
+        client_ephemeral_private_key,
+        server_ephemeral_public_key,
+    )
+    transcript_hash = secure.build_session_transcript_hash(
+        station_id=client_hello.station_id,
+        timestamp=client_hello.timestamp,
+        client_random=client_hello.client_random,
+        client_ephemeral_public_key=(
+            client_hello.client_ephemeral_public_key
+        ),
+        client_signature=client_hello.client_signature,
+        server_random=server_hello.server_random,
+        server_ephemeral_public_key=(
+            server_hello.server_ephemeral_public_key
+        ),
+        server_signature=server_hello.server_signature,
+    )
+    return secure.derive_session_key_material(
+        shared_secret,
+        transcript_hash,
+    )
+
+
+def _d66_run_authenticated_handshake(
+    monkeypatch,
+    secure,
+    client_identity_private_key,
+    state,
+    addr,
+    *,
+    timestamp,
+    monotonic_time,
+    random_marker,
+    ephemeral_scalar,
+):
+    packet, client_hello, client_ephemeral_private_key = (
+        _signed_client_hello(
+            secure,
+            client_identity_private_key,
+            "boat_001",
+            timestamp,
+            client_random=bytes((random_marker,)) * 32,
+            client_ephemeral_private_key=ec.derive_private_key(
+                ephemeral_scalar,
+                ec.SECP256R1(),
+            ),
+        )
+    )
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(float(timestamp)),
+        monotonic_clock=_FakeClock(monotonic_time),
+    )
+    assert queue.items == []
+    assert len(fake_socket.sent) == 1
+    assert fake_socket.sent[0][1] == addr
+    server_packet = fake_socket.sent[0][0]
+    server_hello = parse_server_hello_packet(server_packet)
+    assert build_server_hello_packet(server_hello) == server_packet
+    key_material = _d66_derive_client_material(
+        secure,
+        client_hello,
+        client_ephemeral_private_key,
+        server_packet,
+    )
+    return key_material, fake_socket
+
+
+def test_d66_pending_representation_and_creation_stats(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51001)
+
+    pending, _, _ = _d66_install_pending(
+        secure,
+        state,
+        addr,
+        now=12.5,
+    )
+
+    assert isinstance(pending, secure._PendingSecureSession)
+    assert set(vars(pending)) == {
+        "_address",
+        "station_id",
+        "client_to_server_aesgcm",
+        "server_to_client_aesgcm",
+        "created_at",
+        "seen_data_nonces",
+    }
+    assert pending._address == addr
+    assert pending.station_id == "boat_001"
+    assert pending.created_at == 12.5
+    assert (
+        pending.client_to_server_aesgcm
+        is not pending.server_to_client_aesgcm
+    )
+    for forbidden_name in (
+        "ephemeral_private_key",
+        "shared_secret",
+        "session_transcript_hash",
+        "client_to_server_key",
+        "server_to_client_key",
+    ):
+        assert not hasattr(pending, forbidden_name)
+
+    stats = state.stats()
+    assert state.get_active_session(addr, 12.5) is None
+    assert state.get_pending_session(addr, 12.5) is pending
+    assert stats.pending_sessions_created == 1
+    assert stats.current_pending_sessions == 1
+    assert stats.peak_pending_sessions == 1
+    assert stats.sessions_created == 0
+    assert stats.current_sessions == 0
+
+
+def test_d66_pending_exact_ttl_prefix_cleanup_without_min(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(
+        pending_session_ttl=10.0,
+        max_pending_sessions=3,
+    )
+    addresses = [
+        ("127.0.0.1", 51010),
+        ("127.0.0.1", 51011),
+        ("127.0.0.1", 51012),
+    ]
+    for index, addr in enumerate(addresses):
+        _d66_install_pending(
+            secure,
+            state,
+            addr,
+            marker=10 + (index * 2),
+            now=float(index),
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            builtins,
+            "min",
+            lambda *args, **kwargs: pytest.fail(
+                "pending cleanup must not scan with min()"
+            ),
+        )
+        expired = state.cleanup_expired_pending_sessions(11.0)
+
+    assert expired == addresses[:2]
+    assert tuple(state._pending_sessions) == (addresses[2],)
+    assert state.cleanup_expired_pending_sessions(11.999) == []
+    assert state.cleanup_expired_pending_sessions(12.0) == [
+        addresses[2]
+    ]
+    stats = state.stats()
+    assert stats.pending_sessions_expired == 3
+    assert stats.pending_sessions_capacity_evicted == 0
+    assert stats.current_pending_sessions == 0
+    assert stats.peak_pending_sessions == 3
+    assert stats.sessions_expired == 0
+
+
+def test_d66_pending_capacity_is_independent_and_cleans_expired_first(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(
+        session_ttl=100.0,
+        max_sessions=1,
+        pending_session_ttl=10.0,
+        max_pending_sessions=2,
+    )
+    active_addr = ("127.0.0.1", 51020)
+    active_keys = _d66_keys(2)
+    active, _, _ = _install_test_session(
+        secure,
+        state,
+        active_addr,
+        *active_keys,
+        now=0.0,
+    )
+    pending_addresses = [
+        ("127.0.0.1", 51021),
+        ("127.0.0.1", 51022),
+        ("127.0.0.1", 51023),
+        ("127.0.0.1", 51024),
+    ]
+    _d66_install_pending(
+        secure, state, pending_addresses[0], marker=10, now=0.0
+    )
+    _d66_install_pending(
+        secure, state, pending_addresses[1], marker=12, now=1.0
+    )
+
+    _d66_install_pending(
+        secure, state, pending_addresses[2], marker=14, now=10.0
+    )
+    assert tuple(state._pending_sessions) == (
+        pending_addresses[1],
+        pending_addresses[2],
+    )
+    assert state.stats().pending_sessions_expired == 1
+    assert state.stats().pending_sessions_capacity_evicted == 0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            builtins,
+            "min",
+            lambda *args, **kwargs: pytest.fail(
+                "pending capacity eviction must use OrderedDict order"
+            ),
+        )
+        _d66_install_pending(
+            secure,
+            state,
+            pending_addresses[3],
+            marker=16,
+            now=10.5,
+        )
+
+    assert tuple(state._pending_sessions) == (
+        pending_addresses[2],
+        pending_addresses[3],
+    )
+    assert state._sessions == {active_addr: active}
+    stats = state.stats()
+    assert stats.pending_sessions_created == 4
+    assert stats.pending_sessions_expired == 1
+    assert stats.pending_sessions_capacity_evicted == 1
+    assert stats.current_pending_sessions == 2
+    assert stats.peak_pending_sessions == 2
+    assert stats.sessions_capacity_evicted == 0
+    assert stats.current_sessions == 1
+
+
+def test_d66_pending_replacement_preserves_active_and_accounts_cache(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51030)
+    active_keys = _d66_keys(2)
+    active, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        *active_keys,
+        now=0.0,
+    )
+    active_nonce = b"\x01" * 12
+    assert state.accept_data_nonce(active, active_nonce, 0.1)
+    first_pending, _, _ = _d66_install_pending(
+        secure,
+        state,
+        addr,
+        marker=20,
+        now=1.0,
+    )
+    pending_nonce = b"\x02" * 12
+    assert state.accept_pending_data_nonce(
+        first_pending,
+        pending_nonce,
+        1.1,
+    )
+
+    second_pending, _, _ = _d66_install_pending(
+        secure,
+        state,
+        addr,
+        marker=30,
+        now=2.0,
+    )
+
+    assert state._sessions[addr] is active
+    assert state._pending_sessions[addr] is second_pending
+    assert len(first_pending.seen_data_nonces) == 0
+    assert active.seen_data_nonces.contains(active_nonce, 2.0)[0]
+    stats = state.stats()
+    assert stats.pending_sessions_created == 2
+    assert stats.pending_sessions_replaced == 1
+    assert stats.current_pending_sessions == 1
+    assert stats.sessions_created == 1
+    assert stats.sessions_replaced == 0
+    assert stats.current_sessions == 1
+    assert stats.current_data_nonces == 1
+    assert stats.data_nonces_session_discarded == 1
+
+    assert state.cleanup_expired_pending_sessions(31.999) == []
+    assert state.cleanup_expired_pending_sessions(32.0) == [addr]
+    assert state._sessions[addr] is active
+    stats = state.stats()
+    assert stats.pending_sessions_expired == 1
+    assert stats.current_pending_sessions == 0
+    assert stats.sessions_expired == 0
+    assert stats.sessions_replaced == 0
+    assert stats.current_sessions == 1
+    assert stats.current_data_nonces == 1
+
+
+def test_d66_stale_pending_handle_cannot_promote_or_replace_active(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51040)
+    active_keys = _d66_keys(2)
+    active, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        *active_keys,
+        now=0.0,
+    )
+    stale, _, _ = _d66_install_pending(
+        secure, state, addr, marker=20, now=1.0
+    )
+    current, _, _ = _d66_install_pending(
+        secure, state, addr, marker=30, now=2.0
+    )
+
+    assert state.promote_pending_session(addr, stale, 3.0) is None
+    assert state._sessions[addr] is active
+    assert state._pending_sessions[addr] is current
+    stats = state.stats()
+    assert stats.pending_sessions_promoted == 0
+    assert stats.sessions_replaced == 0
+    assert stats.current_sessions == 1
+    assert stats.current_pending_sessions == 1
+
+
+def test_d66_promotion_transfers_nonce_cache_and_discards_old_once(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51050)
+    active_keys = _d66_keys(2)
+    old_active, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        *active_keys,
+        now=0.0,
+    )
+    old_nonce = b"\x11" * 12
+    assert state.accept_data_nonce(old_active, old_nonce, 0.1)
+    pending, _, _ = _d66_install_pending(
+        secure, state, addr, marker=20, now=1.0
+    )
+    confirmation_nonce = b"\x22" * 12
+    assert state.accept_pending_data_nonce(
+        pending,
+        confirmation_nonce,
+        1.1,
+    )
+    transferred_cache = pending.seen_data_nonces
+
+    promoted = state.promote_pending_session(addr, pending, 2.0)
+
+    assert promoted is state._sessions[addr]
+    assert addr not in state._pending_sessions
+    assert promoted.seen_data_nonces is transferred_cache
+    assert promoted.seen_data_nonces.contains(
+        confirmation_nonce,
+        2.0,
+    )[0]
+    assert len(old_active.seen_data_nonces) == 0
+    stats = state.stats()
+    assert stats.pending_sessions_promoted == 1
+    assert stats.current_pending_sessions == 0
+    assert stats.sessions_created == 2
+    assert stats.sessions_replaced == 1
+    assert stats.current_sessions == 1
+    assert stats.current_data_nonces == 1
+    assert stats.data_nonces_session_discarded == 1
+
+
+def test_d66_authenticated_hello_is_pending_until_exact_expiry(
+    monkeypatch,
+):
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    state = secure.SecureState(pending_session_ttl=30.0)
+    addr = ("127.0.0.1", 51060)
+
+    key_material, _ = _d66_run_authenticated_handshake(
+        monkeypatch,
+        secure,
+        client_identity_private_key,
+        state,
+        addr,
+        timestamp=1000,
+        monotonic_time=100.0,
+        random_marker=61,
+        ephemeral_scalar=11,
+    )
+
+    pending = state._pending_sessions[addr]
+    assert state.get_active_session(addr, 100.0) is None
+    assert (
+        pending.client_to_server_aesgcm
+        is not pending.server_to_client_aesgcm
+    )
+    nonce = b"\x31" * 12
+    plaintext = b"directional pending key check"
+    ciphertext = secure.AESGCM(
+        key_material.client_to_server_key
+    ).encrypt(nonce, plaintext, secure.DATA_AAD)
+    assert pending.client_to_server_aesgcm.decrypt(
+        nonce,
+        ciphertext,
+        secure.DATA_AAD,
+    ) == plaintext
+    with pytest.raises(InvalidTag):
+        pending.server_to_client_aesgcm.decrypt(
+            nonce,
+            ciphertext,
+            secure.DATA_AAD,
+        )
+    for forbidden_name in (
+        "ephemeral_private_key",
+        "shared_secret",
+        "session_transcript_hash",
+    ):
+        assert not hasattr(pending, forbidden_name)
+
+    assert state.cleanup_expired_pending_sessions(129.999) == []
+    assert state.cleanup_expired_pending_sessions(130.0) == [addr]
+    stats = state.stats()
+    assert stats.pending_sessions_created == 1
+    assert stats.pending_sessions_expired == 1
+    assert stats.current_pending_sessions == 0
+    assert stats.sessions_created == 0
+    assert stats.current_sessions == 0
+
+
+def test_d66_valid_confirmation_promotes_and_sends_directional_pong(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51070)
+    pending, client_to_server_key, server_to_client_key = (
+        _d66_install_pending(
+            secure,
+            state,
+            addr,
+            marker=40,
+            now=0.0,
+        )
+    )
+    nonce = b"\x41" * 12
+    packet = _d66_confirmation_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+        timestamp=1000,
+    )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(1001.0),
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert queue.items == []
+    assert addr not in state._pending_sessions
+    active = state._sessions[addr]
+    assert active.seen_data_nonces is pending.seen_data_nonces
+    assert active.seen_data_nonces.contains(nonce, 1.0)[0]
+    assert active.last_seen == 1.0
+    assert len(fake_socket.sent) == 1
+    response_packet, response_addr = fake_socket.sent[0]
+    assert response_addr == addr
+    assert _d66_decrypt_json(
+        secure,
+        response_packet,
+        server_to_client_key,
+    ) == {
+        "type": "pong",
+        "seq": secure.SESSION_CONFIRMATION_SEQUENCE,
+        "timestamp": 1001,
+        "source_id": "boat_001",
+    }
+    with pytest.raises(InvalidTag):
+        _d66_decrypt_json(
+            secure,
+            response_packet,
+            client_to_server_key,
+        )
+
+    stats = state.stats()
+    assert stats.pending_sessions_promoted == 1
+    assert stats.current_pending_sessions == 0
+    assert stats.sessions_created == 1
+    assert stats.sessions_touched == 1
+    assert stats.current_sessions == 1
+    assert stats.data_nonces_accepted == 1
+    assert stats.current_data_nonces == 1
+
+
+def test_d66_duplicate_confirmation_nonce_promotes_and_responds_once(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51071)
+    _, client_to_server_key, _ = _d66_install_pending(
+        secure,
+        state,
+        addr,
+        marker=40,
+        now=0.0,
+    )
+    nonce = b"\x42" * 12
+    packet = _d66_confirmation_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+    )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr), (packet, addr)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert queue.items == []
+    assert len(fake_socket.sent) == 1
+    assert state.stats().pending_sessions_promoted == 1
+    assert state.stats().sessions_created == 1
+    assert state.stats().data_nonces_accepted == 1
+    assert state.stats().data_nonce_replays == 1
+    assert state.stats().current_data_nonces == 1
+
+
+def test_d66_active_session_rejects_fresh_reserved_sequence_zero(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51073)
+    client_to_server_key, server_to_client_key = _d66_keys(2)
+    active, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+        now=0.0,
+    )
+    nonce = b"\x4f" * 12
+    packet = _d66_confirmation_packet(
+        secure,
+        client_to_server_key,
+        nonce,
+    )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert queue.items == []
+    assert fake_socket.sent == []
+    assert state._sessions[addr] is active
+    assert active.last_seen == 0.0
+    assert not active.seen_data_nonces.contains(nonce, 1.0)[0]
+    assert state.stats().sessions_touched == 0
+    assert state.stats().data_nonces_accepted == 0
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "wrong-key",
+        "malformed-json",
+        "non-dict-json",
+        "wrong-station",
+        "wrong-seq",
+        "false-seq",
+        "missing-timestamp",
+        "nmea",
+        "unknown-type",
+    ),
+)
+def test_d66_invalid_pending_packets_do_not_promote_or_consume_nonce(
+    monkeypatch,
+    case,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51072)
+    pending, client_to_server_key, _ = _d66_install_pending(
+        secure,
+        state,
+        addr,
+        marker=40,
+        now=0.0,
+    )
+    nonce = b"\x43" * 12
+
+    if case == "wrong-key":
+        packet = _d66_confirmation_packet(
+            secure,
+            bytes((99,)) * 32,
+            nonce,
+        )
+    elif case == "malformed-json":
+        ciphertext = secure.AESGCM(client_to_server_key).encrypt(
+            nonce,
+            b"{not-json",
+            secure.DATA_AAD,
+        )
+        packet = secure.DATA_PREFIX + nonce + ciphertext
+    elif case == "non-dict-json":
+        packet = _encrypted_control_packet(
+            secure,
+            client_to_server_key,
+            nonce,
+            ["ping", secure.SESSION_CONFIRMATION_SEQUENCE],
+        )
+    elif case == "wrong-station":
+        packet = _d66_confirmation_packet(
+            secure,
+            client_to_server_key,
+            nonce,
+            station_id="other_station",
+        )
+    elif case == "wrong-seq":
+        packet = _d66_confirmation_packet(
+            secure,
+            client_to_server_key,
+            nonce,
+            seq=1,
+        )
+    elif case == "false-seq":
+        packet = _d66_confirmation_packet(
+            secure,
+            client_to_server_key,
+            nonce,
+            seq=False,
+        )
+    elif case == "missing-timestamp":
+        packet = _encrypted_control_packet(
+            secure,
+            client_to_server_key,
+            nonce,
+            {
+                "type": "ping",
+                "seq": secure.SESSION_CONFIRMATION_SEQUENCE,
+                "source_id": "boat_001",
+            },
+        )
+    elif case == "nmea":
+        packet = _encrypted_data_packet(
+            secure,
+            client_to_server_key,
+            nonce,
+        )
+    else:
+        packet = _encrypted_control_packet(
+            secure,
+            client_to_server_key,
+            nonce,
+            {
+                "type": "status",
+                "seq": secure.SESSION_CONFIRMATION_SEQUENCE,
+                "timestamp": 1000,
+                "source_id": "boat_001",
+            },
+        )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert queue.items == []
+    assert fake_socket.sent == []
+    assert state._pending_sessions[addr] is pending
+    assert state.get_active_session(addr, 1.0) is None
+    assert not pending.seen_data_nonces.contains(nonce, 1.0)[0]
+    stats = state.stats()
+    assert stats.pending_sessions_promoted == 0
+    assert stats.current_pending_sessions == 1
+    assert stats.sessions_created == 0
+    assert stats.current_sessions == 0
+    assert stats.data_nonces_accepted == 0
+    assert stats.current_data_nonces == 0
+
+
+def test_d66_pending_auth_failure_and_seen_nonce_fall_back_to_active(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51080)
+    active_client_key, active_server_key = _d66_keys(2)
+    active, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        active_client_key,
+        active_server_key,
+        now=0.0,
+    )
+    pending, _, _ = _d66_install_pending(
+        secure,
+        state,
+        addr,
+        marker=40,
+        now=0.5,
+    )
+    shared_nonce = b"\x51" * 12
+    assert state.accept_pending_data_nonce(
+        pending,
+        shared_nonce,
+        0.5,
+    )
+    first_nonce = b"\x50" * 12
+    ping_nonce = b"\x52" * 12
+    packets = [
+        (
+            _encrypted_data_packet(
+                secure,
+                active_client_key,
+                first_nonce,
+                payload="!AIVDM,1,1,,A,first,0*00",
+            ),
+            addr,
+        ),
+        (
+            _encrypted_data_packet(
+                secure,
+                active_client_key,
+                shared_nonce,
+                payload="!AIVDM,1,1,,A,second,0*00",
+            ),
+            addr,
+        ),
+        (
+            _encrypted_control_packet(
+                secure,
+                active_client_key,
+                ping_nonce,
+                {
+                    "type": "ping",
+                    "seq": 1,
+                    "timestamp": 1000,
+                    "source_id": "boat_001",
+                },
+            ),
+            addr,
+        ),
+    ]
+    parse_calls = []
+    original_parse_secure_data_packet = secure.parse_secure_data_packet
+
+    def record_parse_secure_data_packet(data):
+        parse_calls.append(data)
+        return original_parse_secure_data_packet(data)
+
+    monkeypatch.setattr(
+        secure,
+        "parse_secure_data_packet",
+        record_parse_secure_data_packet,
+    )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        packets,
+        state=state,
+        wall_clock=_FakeClock(1001.0),
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert parse_calls == [packet for packet, _ in packets]
+    assert len(queue.items) == 2
+    assert state._sessions[addr] is active
+    assert state._pending_sessions[addr] is pending
+    assert active.last_seen == 1.0
+    assert pending.seen_data_nonces.contains(shared_nonce, 1.0)[0]
+    assert active.seen_data_nonces.contains(shared_nonce, 1.0)[0]
+    assert len(fake_socket.sent) == 1
+    assert _d66_decrypt_json(
+        secure,
+        fake_socket.sent[0][0],
+        active_server_key,
+    ) == {
+        "type": "pong",
+        "seq": 1,
+        "timestamp": 1001,
+        "source_id": "boat_001",
+    }
+    assert state.stats().current_sessions == 1
+    assert state.stats().current_pending_sessions == 1
+    assert state.stats().data_nonce_replays == 0
+
+
+def test_d66_authenticated_invalid_pending_plaintext_is_exclusive(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51081)
+    shared_client_key, active_server_key = _d66_keys(2)
+    active, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        shared_client_key,
+        active_server_key,
+        now=0.0,
+    )
+    pending_server_key = bytes((30,)) * 32
+    pending = state.install_pending_session(
+        addr,
+        "boat_001",
+        secure.AESGCM(shared_client_key),
+        secure.AESGCM(pending_server_key),
+        0.5,
+    )
+    nonce = b"\x53" * 12
+    packet = _encrypted_data_packet(
+        secure,
+        shared_client_key,
+        nonce,
+        payload="!AIVDM,1,1,,A,must-not-queue,0*00",
+    )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert queue.items == []
+    assert fake_socket.sent == []
+    assert state._sessions[addr] is active
+    assert state._pending_sessions[addr] is pending
+    assert active.last_seen == 0.0
+    assert not active.seen_data_nonces.contains(nonce, 1.0)[0]
+    assert not pending.seen_data_nonces.contains(nonce, 1.0)[0]
+    assert state.stats().sessions_touched == 0
+    assert state.stats().data_nonces_accepted == 0
+
+
+def test_d66_only_invalid_tag_selects_active_key_fallback(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51083)
+    active_client_key, active_server_key = _d66_keys(2)
+    active, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        active_client_key,
+        active_server_key,
+        now=0.0,
+    )
+
+    class UnexpectedDecryptFailure:
+        def decrypt(self, nonce, ciphertext, aad):
+            raise RuntimeError("unexpected pending decrypt failure")
+
+    pending = state.install_pending_session(
+        addr,
+        "boat_001",
+        UnexpectedDecryptFailure(),
+        secure.AESGCM(bytes((30,)) * 32),
+        0.5,
+    )
+    nonce = b"\x54" * 12
+    packet = _encrypted_data_packet(
+        secure,
+        active_client_key,
+        nonce,
+        payload="!AIVDM,1,1,,A,must-not-fallback,0*00",
+    )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert queue.items == []
+    assert fake_socket.sent == []
+    assert state._sessions[addr] is active
+    assert state._pending_sessions[addr] is pending
+    assert active.last_seen == 0.0
+    assert not active.seen_data_nonces.contains(nonce, 1.0)[0]
+    assert not pending.seen_data_nonces.contains(nonce, 1.0)[0]
+    assert state.stats().sessions_touched == 0
+    assert state.stats().data_nonces_accepted == 0
+
+
+def test_d66_plaintext_keepalive_is_absent_and_silent(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("127.0.0.1", 51082)
+    active_keys = _d66_keys(2)
+    active, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        *active_keys,
+        now=0.0,
+    )
+    pending, _, _ = _d66_install_pending(
+        secure,
+        state,
+        addr,
+        marker=40,
+        now=0.5,
+    )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(b"KEEPALIVE|boat_001|1000", addr)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert not hasattr(secure, "KEEPALIVE_PREFIX")
+    assert not hasattr(secure, "parse_keepalive_packet")
+    assert not hasattr(secure, "parse_keepalive_station_id")
+    assert not hasattr(state, "handle_keepalive")
+    assert queue.items == []
+    assert fake_socket.sent == []
+    assert state._sessions[addr] is active
+    assert state._pending_sessions[addr] is pending
+    assert active.last_seen == 0.0
+    assert state.stats().sessions_touched == 0
+    assert state.stats().pending_sessions_promoted == 0
+
+
+def test_d66_same_address_confirmed_rekey_preserves_then_replaces_active(
+    monkeypatch,
+):
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    state = secure.SecureState(
+        session_ttl=500.0,
+        pending_session_ttl=30.0,
+    )
+    addr = ("127.0.0.1", 51090)
+
+    first_keys, _ = _d66_run_authenticated_handshake(
+        monkeypatch,
+        secure,
+        client_identity_private_key,
+        state,
+        addr,
+        timestamp=1000,
+        monotonic_time=0.0,
+        random_marker=71,
+        ephemeral_scalar=21,
+    )
+    first_confirmation_nonce = b"\x61" * 12
+    first_confirmation = _d66_confirmation_packet(
+        secure,
+        first_keys.client_to_server_key,
+        first_confirmation_nonce,
+        timestamp=1000,
+    )
+    first_queue, first_confirmation_socket = (
+        _run_secure_server_with_packets(
+            monkeypatch,
+            secure,
+            [(first_confirmation, addr)],
+            state=state,
+            wall_clock=_FakeClock(1001.0),
+            monotonic_clock=_FakeClock(1.0),
+        )
+    )
+    assert first_queue.items == []
+    assert _d66_decrypt_json(
+        secure,
+        first_confirmation_socket.sent[0][0],
+        first_keys.server_to_client_key,
+    )["seq"] == secure.SESSION_CONFIRMATION_SEQUENCE
+    first_active = state._sessions[addr]
+    first_cache = first_active.seen_data_nonces
+
+    # Treat the first pong as lost: the server is active, and a later fresh
+    # handshake must retain it while installing the next pending candidate.
+    second_keys, _ = _d66_run_authenticated_handshake(
+        monkeypatch,
+        secure,
+        client_identity_private_key,
+        state,
+        addr,
+        timestamp=1002,
+        monotonic_time=2.0,
+        random_marker=72,
+        ephemeral_scalar=22,
+    )
+    assert second_keys.client_to_server_key != (
+        first_keys.client_to_server_key
+    )
+    assert second_keys.server_to_client_key != (
+        first_keys.server_to_client_key
+    )
+    assert state._sessions[addr] is first_active
+    second_pending = state._pending_sessions[addr]
+
+    old_data_nonce = b"\x62" * 12
+    old_ping_nonce = b"\x63" * 12
+    old_packets = [
+        (
+            _encrypted_data_packet(
+                secure,
+                first_keys.client_to_server_key,
+                old_data_nonce,
+                payload="!AIVDM,1,1,,A,old-active,0*00",
+            ),
+            addr,
+        ),
+        (
+            _encrypted_control_packet(
+                secure,
+                first_keys.client_to_server_key,
+                old_ping_nonce,
+                {
+                    "type": "ping",
+                    "seq": 1,
+                    "timestamp": 1003,
+                    "source_id": "boat_001",
+                },
+            ),
+            addr,
+        ),
+    ]
+    old_queue, old_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        old_packets,
+        state=state,
+        wall_clock=_FakeClock(1003.0),
+        monotonic_clock=_FakeClock(3.0),
+    )
+    assert len(old_queue.items) == 1
+    assert len(old_socket.sent) == 1
+    assert _d66_decrypt_json(
+        secure,
+        old_socket.sent[0][0],
+        first_keys.server_to_client_key,
+    )["seq"] == 1
+    assert state._sessions[addr] is first_active
+    assert state._pending_sessions[addr] is second_pending
+    assert len(first_cache) == 3
+
+    second_confirmation_nonce = b"\x64" * 12
+    second_confirmation = _d66_confirmation_packet(
+        secure,
+        second_keys.client_to_server_key,
+        second_confirmation_nonce,
+        timestamp=1004,
+    )
+    second_queue, second_confirmation_socket = (
+        _run_secure_server_with_packets(
+            monkeypatch,
+            secure,
+            [(second_confirmation, addr)],
+            state=state,
+            wall_clock=_FakeClock(1004.0),
+            monotonic_clock=_FakeClock(4.0),
+        )
+    )
+    assert second_queue.items == []
+    assert _d66_decrypt_json(
+        secure,
+        second_confirmation_socket.sent[0][0],
+        second_keys.server_to_client_key,
+    )["seq"] == secure.SESSION_CONFIRMATION_SEQUENCE
+    second_active = state._sessions[addr]
+    assert second_active is not first_active
+    assert addr not in state._pending_sessions
+    assert second_active.seen_data_nonces is (
+        second_pending.seen_data_nonces
+    )
+    assert second_active.seen_data_nonces.contains(
+        second_confirmation_nonce,
+        4.0,
+    )[0]
+    assert len(first_cache) == 0
+
+    late_old_nonce = b"\x65" * 12
+    new_data_nonce = b"\x66" * 12
+    new_ping_nonce = b"\x67" * 12
+    post_promotion_packets = [
+        (
+            _encrypted_data_packet(
+                secure,
+                first_keys.client_to_server_key,
+                late_old_nonce,
+                payload="!AIVDM,1,1,,A,late-old,0*00",
+            ),
+            addr,
+        ),
+        (
+            _encrypted_data_packet(
+                secure,
+                second_keys.client_to_server_key,
+                new_data_nonce,
+                payload="!AIVDM,1,1,,A,new-active,0*00",
+            ),
+            addr,
+        ),
+        (
+            _encrypted_control_packet(
+                secure,
+                second_keys.client_to_server_key,
+                new_ping_nonce,
+                {
+                    "type": "ping",
+                    "seq": 1,
+                    "timestamp": 1005,
+                    "source_id": "boat_001",
+                },
+            ),
+            addr,
+        ),
+    ]
+    new_queue, new_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        post_promotion_packets,
+        state=state,
+        wall_clock=_FakeClock(1005.0),
+        monotonic_clock=_FakeClock(5.0),
+    )
+
+    assert len(new_queue.items) == 1
+    assert len(new_socket.sent) == 1
+    assert _d66_decrypt_json(
+        secure,
+        new_socket.sent[0][0],
+        second_keys.server_to_client_key,
+    )["seq"] == 1
+    with pytest.raises(InvalidTag):
+        _d66_decrypt_json(
+            secure,
+            new_socket.sent[0][0],
+            first_keys.server_to_client_key,
+        )
+    assert not second_active.seen_data_nonces.contains(
+        late_old_nonce,
+        5.0,
+    )[0]
+    assert second_active.seen_data_nonces.contains(
+        new_data_nonce,
+        5.0,
+    )[0]
+    assert second_active.seen_data_nonces.contains(
+        new_ping_nonce,
+        5.0,
+    )[0]
+
+    stats = state.stats()
+    assert stats.pending_sessions_created == 2
+    assert stats.pending_sessions_promoted == 2
+    assert stats.current_pending_sessions == 0
+    assert stats.sessions_created == 2
+    assert stats.sessions_replaced == 1
+    assert stats.current_sessions == 1
+    assert stats.data_nonces_session_discarded == 3
+    assert stats.current_data_nonces == 3
