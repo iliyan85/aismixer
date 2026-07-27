@@ -1,6 +1,7 @@
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, utils
 
 import core.udpsec_crypto as udpsec_crypto
 from core.udpsec_crypto import (
@@ -17,6 +18,8 @@ from core.udpsec_crypto import (
     generate_ephemeral_private_key,
     parse_ephemeral_public_key,
     serialize_ephemeral_public_key,
+    sign_transcript_digest,
+    verify_transcript_signature,
 )
 
 
@@ -55,6 +58,12 @@ P256_SHARED_SECRET_SCALARS_1_AND_379 = bytes.fromhex(
     "005543894af3d00ed7d740abdbd75c96"
     "b06877b787db5f70eea78b90a8d7c00a"
 )
+P256_ORDER = int(
+    "FFFFFFFF00000000FFFFFFFFFFFFFFFF"
+    "BCE6FAADA7179E84F3B9CAC2FC632551",
+    16,
+)
+TEST_TRANSCRIPT_DIGEST = bytes(range(32))
 
 
 class _BytesConvertible:
@@ -97,6 +106,11 @@ def _p256_private_key(private_value):
 
 def _p384_private_key(private_value=1):
     return ec.derive_private_key(private_value, ec.SECP384R1())
+
+
+def _to_low_s(signature):
+    r, s = utils.decode_dss_signature(signature)
+    return utils.encode_dss_signature(r, min(s, P256_ORDER - s))
 
 
 def test_protocol_constants_fix_curve_hash_domain_and_roles():
@@ -787,3 +801,589 @@ def test_ephemeral_shared_secret_rejects_wrong_public_curve():
             _p256_private_key(1),
             _p384_private_key().public_key(),
         )
+
+
+def test_transcript_signature_helpers_are_public_exports():
+    assert {
+        "sign_transcript_digest",
+        "verify_transcript_signature",
+    } <= set(udpsec_crypto.__all__)
+
+
+def test_transcript_signing_returns_strict_low_s_der_bytes():
+    private_key = _p256_private_key(7)
+    signature = sign_transcript_digest(
+        private_key,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+    r, s = utils.decode_dss_signature(signature)
+
+    assert type(signature) is bytes
+    assert signature
+    assert 1 <= r < P256_ORDER
+    assert 1 <= s < P256_ORDER
+    assert s <= P256_ORDER // 2
+    assert utils.encode_dss_signature(r, s) == signature
+
+
+def test_repeated_transcript_signatures_are_low_s_and_verify():
+    private_key = _p256_private_key(7)
+    public_key = private_key.public_key()
+
+    for _ in range(12):
+        signature = sign_transcript_digest(
+            private_key,
+            TEST_TRANSCRIPT_DIGEST,
+        )
+        _, s = utils.decode_dss_signature(signature)
+
+        assert s <= P256_ORDER // 2
+        assert verify_transcript_signature(
+            public_key,
+            signature,
+            TEST_TRANSCRIPT_DIGEST,
+        ) is True
+
+
+@pytest.mark.parametrize("container", (bytearray, memoryview))
+def test_transcript_signing_accepts_mutable_digest_types(container):
+    private_key = _p256_private_key(7)
+    signature = sign_transcript_digest(
+        private_key,
+        container(TEST_TRANSCRIPT_DIGEST),
+    )
+
+    assert verify_transcript_signature(
+        private_key.public_key(),
+        signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "digest",
+    (
+        None,
+        "digest",
+        32,
+        list(TEST_TRANSCRIPT_DIGEST),
+        _BytesConvertible(),
+    ),
+)
+def test_transcript_signing_rejects_wrong_digest_types(digest):
+    with pytest.raises(
+        TypeError,
+        match="digest must be bytes, bytearray, or memoryview",
+    ):
+        sign_transcript_digest(_p256_private_key(7), digest)
+
+
+@pytest.mark.parametrize(
+    "digest",
+    (
+        pytest.param(b"", id="zero"),
+        pytest.param(b"x" * 31, id="31"),
+        pytest.param(b"x" * 33, id="33"),
+    ),
+)
+def test_transcript_signing_rejects_wrong_digest_lengths(digest):
+    with pytest.raises(
+        ValueError,
+        match="digest must be exactly 32 bytes",
+    ):
+        sign_transcript_digest(_p256_private_key(7), digest)
+
+
+@pytest.mark.parametrize("private_key", (None, b"key", object()))
+def test_transcript_signing_rejects_wrong_private_key_types(private_key):
+    with pytest.raises(
+        TypeError,
+        match="private_key must be an EllipticCurvePrivateKey",
+    ):
+        sign_transcript_digest(private_key, TEST_TRANSCRIPT_DIGEST)
+
+
+def test_transcript_signing_does_not_accept_public_keys():
+    private_key = _p256_private_key(7)
+
+    with pytest.raises(
+        TypeError,
+        match="private_key must be an EllipticCurvePrivateKey",
+    ):
+        sign_transcript_digest(
+            private_key.public_key(),
+            TEST_TRANSCRIPT_DIGEST,
+        )
+
+
+def test_transcript_signing_rejects_other_private_key_curves():
+    with pytest.raises(
+        ValueError,
+        match="private_key must use SECP256R1/P-256",
+    ):
+        sign_transcript_digest(
+            _p384_private_key(),
+            TEST_TRANSCRIPT_DIGEST,
+        )
+
+
+def test_transcript_signature_verification_returns_exact_bool():
+    private_key = _p256_private_key(7)
+    signature = sign_transcript_digest(
+        private_key,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+    changed_digest = bytearray(TEST_TRANSCRIPT_DIGEST)
+    changed_digest[-1] ^= 0x01
+
+    assert verify_transcript_signature(
+        private_key.public_key(),
+        signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is True
+    assert verify_transcript_signature(
+        private_key.public_key(),
+        signature,
+        changed_digest,
+    ) is False
+    assert verify_transcript_signature(
+        _p256_private_key(8).public_key(),
+        signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is False
+
+
+def test_client_signature_does_not_verify_for_server_or_session_digest():
+    identity_key = _p256_private_key(7)
+    client_digest = build_client_auth_digest(**CLIENT_ARGS)
+    client_signature = sign_transcript_digest(
+        identity_key,
+        client_digest,
+    )
+    server_arguments = {
+        **SERVER_ARGS,
+        "client_signature": client_signature,
+    }
+    server_digest = build_server_auth_digest(**server_arguments)
+    server_signature = sign_transcript_digest(
+        identity_key,
+        server_digest,
+    )
+    session_digest = build_session_transcript_hash(
+        **server_arguments,
+        server_signature=server_signature,
+    )
+
+    assert verify_transcript_signature(
+        identity_key.public_key(),
+        client_signature,
+        server_digest,
+    ) is False
+    assert verify_transcript_signature(
+        identity_key.public_key(),
+        client_signature,
+        session_digest,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("builder", "arguments", "field", "replacement"),
+    _field_cases(
+        lambda field: {
+            "station_id": "boat_002",
+            "timestamp": 1234567891,
+            "client_random": b"Client-random",
+            "client_ephemeral_public_key": b"Client-ephemeral",
+            "client_signature": b"Client-signature",
+            "server_random": b"Server-random",
+            "server_ephemeral_public_key": b"Server-ephemeral",
+            "server_signature": b"Server-signature",
+        }[field]
+    ),
+)
+def test_signature_fails_when_each_authenticated_field_changes(
+    builder,
+    arguments,
+    field,
+    replacement,
+):
+    identity_key = _p256_private_key(7)
+    digest = builder(**arguments)
+    signature = sign_transcript_digest(identity_key, digest)
+    changed = {**arguments, field: replacement}
+
+    assert verify_transcript_signature(
+        identity_key.public_key(),
+        signature,
+        builder(**changed),
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "signature_container",
+    (bytes, bytearray, memoryview),
+)
+@pytest.mark.parametrize(
+    "digest_container",
+    (bytes, bytearray, memoryview),
+)
+def test_signature_verification_accepts_supported_bytes_like_types(
+    signature_container,
+    digest_container,
+):
+    private_key = _p256_private_key(7)
+    signature = sign_transcript_digest(
+        private_key,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+
+    assert verify_transcript_signature(
+        private_key.public_key(),
+        signature_container(signature),
+        digest_container(TEST_TRANSCRIPT_DIGEST),
+    ) is True
+
+
+def test_transcript_signing_snapshots_mutable_digest_input():
+    private_key = _p256_private_key(7)
+    digest_storage = bytearray(TEST_TRANSCRIPT_DIGEST)
+    signature = sign_transcript_digest(
+        private_key,
+        memoryview(digest_storage),
+    )
+    original_digest = bytes(digest_storage)
+
+    digest_storage[0] ^= 0xFF
+
+    assert verify_transcript_signature(
+        private_key.public_key(),
+        signature,
+        original_digest,
+    ) is True
+    assert verify_transcript_signature(
+        private_key.public_key(),
+        signature,
+        digest_storage,
+    ) is False
+
+
+def test_signature_verification_snapshots_mutable_inputs():
+    private_key = _p256_private_key(7)
+    signature_storage = bytearray(
+        sign_transcript_digest(private_key, TEST_TRANSCRIPT_DIGEST)
+    )
+    digest_storage = bytearray(TEST_TRANSCRIPT_DIGEST)
+
+    result = verify_transcript_signature(
+        private_key.public_key(),
+        memoryview(signature_storage),
+        memoryview(digest_storage),
+    )
+    signature_storage[-1] ^= 0x01
+    digest_storage[0] ^= 0xFF
+
+    assert result is True
+    assert verify_transcript_signature(
+        private_key.public_key(),
+        signature_storage,
+        digest_storage,
+    ) is False
+
+
+@pytest.mark.parametrize("public_key", (None, b"key", object()))
+def test_signature_verification_rejects_wrong_public_key_types(public_key):
+    with pytest.raises(
+        TypeError,
+        match="public_key must be an EllipticCurvePublicKey",
+    ):
+        verify_transcript_signature(
+            public_key,
+            b"signature",
+            TEST_TRANSCRIPT_DIGEST,
+        )
+
+
+def test_signature_verification_does_not_accept_private_keys():
+    private_key = _p256_private_key(7)
+
+    with pytest.raises(
+        TypeError,
+        match="public_key must be an EllipticCurvePublicKey",
+    ):
+        verify_transcript_signature(
+            private_key,
+            b"signature",
+            TEST_TRANSCRIPT_DIGEST,
+        )
+
+
+def test_signature_verification_rejects_other_public_key_curves():
+    with pytest.raises(
+        ValueError,
+        match="public_key must use SECP256R1/P-256",
+    ):
+        verify_transcript_signature(
+            _p384_private_key().public_key(),
+            b"signature",
+            TEST_TRANSCRIPT_DIGEST,
+        )
+
+
+@pytest.mark.parametrize(
+    "signature",
+    (
+        None,
+        "signature",
+        70,
+        [0x30, 0x00],
+        _BytesConvertible(),
+    ),
+)
+def test_signature_verification_rejects_unsupported_signature_types(
+    signature,
+):
+    with pytest.raises(
+        TypeError,
+        match="signature must be bytes, bytearray, or memoryview",
+    ):
+        verify_transcript_signature(
+            _p256_private_key(7).public_key(),
+            signature,
+            TEST_TRANSCRIPT_DIGEST,
+        )
+
+
+@pytest.mark.parametrize(
+    "signature",
+    (b"", bytearray(), memoryview(b"")),
+)
+def test_signature_verification_rejects_empty_signatures(signature):
+    assert verify_transcript_signature(
+        _p256_private_key(7).public_key(),
+        signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "digest",
+    (
+        None,
+        "digest",
+        32,
+        list(TEST_TRANSCRIPT_DIGEST),
+        _BytesConvertible(),
+    ),
+)
+def test_signature_verification_rejects_wrong_digest_types(digest):
+    with pytest.raises(
+        TypeError,
+        match="digest must be bytes, bytearray, or memoryview",
+    ):
+        verify_transcript_signature(
+            _p256_private_key(7).public_key(),
+            b"signature",
+            digest,
+        )
+
+
+@pytest.mark.parametrize(
+    "digest",
+    (
+        pytest.param(b"", id="zero"),
+        pytest.param(b"x" * 31, id="31"),
+        pytest.param(b"x" * 33, id="33"),
+    ),
+)
+def test_signature_verification_rejects_wrong_digest_lengths(digest):
+    with pytest.raises(
+        ValueError,
+        match="digest must be exactly 32 bytes",
+    ):
+        verify_transcript_signature(
+            _p256_private_key(7).public_key(),
+            b"signature",
+            digest,
+        )
+
+
+@pytest.mark.parametrize(
+    "signature",
+    (
+        pytest.param(
+            bytes.fromhex("30060201010201"),
+            id="truncated",
+        ),
+        pytest.param(
+            bytes.fromhex("3106020101020101"),
+            id="wrong-sequence-tag",
+        ),
+        pytest.param(
+            bytes.fromhex("300702020001020101"),
+            id="non-minimal-integer",
+        ),
+        pytest.param(
+            bytes.fromhex("308106020101020101"),
+            id="non-minimal-length",
+        ),
+    ),
+)
+def test_signature_verification_rejects_malformed_or_noncanonical_der(
+    signature,
+):
+    assert verify_transcript_signature(
+        _p256_private_key(7).public_key(),
+        signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is False
+
+
+def test_signature_verification_rejects_der_with_trailing_bytes():
+    private_key = _p256_private_key(7)
+    signature = sign_transcript_digest(
+        private_key,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+
+    assert verify_transcript_signature(
+        private_key.public_key(),
+        signature + b"\x00",
+        TEST_TRANSCRIPT_DIGEST,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("r", "s"),
+    (
+        pytest.param(0, 1, id="zero-r"),
+        pytest.param(1, 0, id="zero-s"),
+        pytest.param(P256_ORDER, 1, id="order-r"),
+        pytest.param(1, P256_ORDER, id="order-s"),
+        pytest.param(P256_ORDER + 1, 1, id="above-order-r"),
+        pytest.param(1, P256_ORDER + 1, id="above-order-s"),
+    ),
+)
+def test_signature_verification_rejects_out_of_range_scalars(r, s):
+    signature = utils.encode_dss_signature(r, s)
+
+    assert verify_transcript_signature(
+        _p256_private_key(7).public_key(),
+        signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "signature",
+    (
+        pytest.param(
+            bytes.fromhex("30060201ff020101"),
+            id="negative-r",
+        ),
+        pytest.param(
+            bytes.fromhex("30060201010201ff"),
+            id="negative-s",
+        ),
+    ),
+)
+def test_signature_verification_rejects_negative_der_scalars(signature):
+    assert verify_transcript_signature(
+        _p256_private_key(7).public_key(),
+        signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is False
+
+
+def test_signature_verification_rejects_in_range_invalid_signature():
+    signature = utils.encode_dss_signature(1, 1)
+
+    assert verify_transcript_signature(
+        _p256_private_key(7).public_key(),
+        signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is False
+
+
+def test_signature_verification_rejects_high_s_twin():
+    private_key = _p256_private_key(7)
+    public_key = private_key.public_key()
+    low_signature = sign_transcript_digest(
+        private_key,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+    r, low_s = utils.decode_dss_signature(low_signature)
+    high_s = P256_ORDER - low_s
+    high_signature = utils.encode_dss_signature(r, high_s)
+
+    assert low_s <= P256_ORDER // 2
+    assert high_s > P256_ORDER // 2
+    assert utils.encode_dss_signature(r, high_s) == high_signature
+
+    try:
+        public_key.verify(
+            high_signature,
+            TEST_TRANSCRIPT_DIGEST,
+            ec.ECDSA(utils.Prehashed(hashes.SHA256())),
+        )
+    except InvalidSignature:
+        pass
+
+    assert verify_transcript_signature(
+        public_key,
+        low_signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is True
+    assert verify_transcript_signature(
+        public_key,
+        high_signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is False
+
+
+def test_helper_signature_uses_prehashed_sha256_without_rehashing():
+    private_key = _p256_private_key(7)
+    public_key = private_key.public_key()
+    signature = sign_transcript_digest(
+        private_key,
+        TEST_TRANSCRIPT_DIGEST,
+    )
+
+    public_key.verify(
+        signature,
+        TEST_TRANSCRIPT_DIGEST,
+        ec.ECDSA(utils.Prehashed(hashes.SHA256())),
+    )
+    with pytest.raises(InvalidSignature):
+        public_key.verify(
+            signature,
+            TEST_TRANSCRIPT_DIGEST,
+            ec.ECDSA(hashes.SHA256()),
+        )
+
+
+def test_helper_verification_uses_prehashed_sha256_without_rehashing():
+    private_key = _p256_private_key(7)
+    public_key = private_key.public_key()
+    prehashed_signature = _to_low_s(
+        private_key.sign(
+            TEST_TRANSCRIPT_DIGEST,
+            ec.ECDSA(utils.Prehashed(hashes.SHA256())),
+        )
+    )
+    ordinary_signature = _to_low_s(
+        private_key.sign(
+            TEST_TRANSCRIPT_DIGEST,
+            ec.ECDSA(hashes.SHA256()),
+        )
+    )
+
+    assert verify_transcript_signature(
+        public_key,
+        prehashed_signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is True
+    assert verify_transcript_signature(
+        public_key,
+        ordinary_signature,
+        TEST_TRANSCRIPT_DIGEST,
+    ) is False

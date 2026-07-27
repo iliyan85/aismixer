@@ -6,15 +6,18 @@ eight unsigned big-endian bytes and are then framed like every other field.
 
 Binary inputs accept ``bytes``, ``bytearray``, and ``memoryview``. Mutable
 inputs are copied to immutable ``bytes``. UDPSEC ephemeral public points use
-only canonical 33-byte SEC1/X9.62 compressed-point encoding on P-256. The
-transcript helpers continue to treat their public-key and signature fields as
-opaque bytes.
+only canonical 33-byte SEC1/X9.62 compressed-point encoding on P-256.
+Transcript authentication uses P-256 ECDSA over a precomputed SHA-256 digest,
+with signatures encoded as strict canonical low-S ASN.1 DER. The transcript
+helpers continue to treat their public-key and signature fields as opaque
+bytes.
 """
 
 from __future__ import annotations
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, utils
 
 
 ECDHE_CURVE = ec.SECP256R1()
@@ -30,6 +33,13 @@ _MAX_TIMESTAMP = (1 << 64) - 1
 _COMPRESSED_PUBLIC_KEY_LENGTH = 33
 _COMPRESSED_POINT_PREFIXES = (0x02, 0x03)
 _P256_SHARED_SECRET_LENGTH = ECDHE_CURVE.key_size // 8
+_TRANSCRIPT_DIGEST_LENGTH = TRANSCRIPT_HASH.digest_size
+_P256_ORDER = int(
+    "FFFFFFFF00000000FFFFFFFFFFFFFFFF"
+    "BCE6FAADA7179E84F3B9CAC2FC632551",
+    16,
+)
+_P256_HALF_ORDER = _P256_ORDER // 2
 _INVALID_EPHEMERAL_PUBLIC_KEY = (
     "encoded ephemeral public key is not a valid canonical compressed "
     "P-256 point"
@@ -49,6 +59,8 @@ __all__ = (
     "generate_ephemeral_private_key",
     "parse_ephemeral_public_key",
     "serialize_ephemeral_public_key",
+    "sign_transcript_digest",
+    "verify_transcript_signature",
 )
 
 
@@ -86,6 +98,41 @@ def _required_bytes(name: str, value: object) -> bytes:
 def _require_p256_curve(name: str, curve: ec.EllipticCurve) -> None:
     if not isinstance(curve, ec.SECP256R1):
         raise ValueError(f"{name} must use SECP256R1/P-256")
+
+
+def _transcript_digest_bytes(
+    digest: bytes | bytearray | memoryview,
+) -> bytes:
+    if not isinstance(digest, (bytes, bytearray, memoryview)):
+        raise TypeError("digest must be bytes, bytearray, or memoryview")
+    try:
+        normalized = bytes(digest)
+    except ValueError as exc:
+        raise ValueError("digest must reference readable bytes") from exc
+    if len(normalized) != _TRANSCRIPT_DIGEST_LENGTH:
+        raise ValueError("digest must be exactly 32 bytes")
+    return normalized
+
+
+def _signature_bytes(
+    signature: bytes | bytearray | memoryview,
+) -> bytes | None:
+    if not isinstance(signature, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            "signature must be bytes, bytearray, or memoryview"
+        )
+    try:
+        return bytes(signature)
+    except ValueError:
+        return None
+
+
+def _transcript_signature_algorithm() -> ec.ECDSA:
+    return ec.ECDSA(utils.Prehashed(hashes.SHA256()))
+
+
+def _valid_p256_scalar(value: int) -> bool:
+    return 1 <= value < _P256_ORDER
 
 
 def generate_ephemeral_private_key() -> ec.EllipticCurvePrivateKey:
@@ -171,6 +218,86 @@ def derive_ephemeral_shared_secret(
             "P-256 ECDHE exchange did not produce a 32-byte secret"
         )
     return shared_secret
+
+
+def sign_transcript_digest(
+    private_key: ec.EllipticCurvePrivateKey,
+    digest: bytes | bytearray | memoryview,
+) -> bytes:
+    """Sign one precomputed SHA-256 transcript digest as low-S ECDSA DER."""
+
+    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+        raise TypeError("private_key must be an EllipticCurvePrivateKey")
+    _require_p256_curve("private_key", private_key.curve)
+    normalized_digest = _transcript_digest_bytes(digest)
+
+    signature = private_key.sign(
+        normalized_digest,
+        _transcript_signature_algorithm(),
+    )
+    if not isinstance(signature, bytes) or not signature:
+        raise RuntimeError("ECDSA backend did not produce a DER signature")
+
+    try:
+        r, s = utils.decode_dss_signature(signature)
+    except ValueError as exc:
+        raise RuntimeError(
+            "ECDSA backend produced an invalid DER signature"
+        ) from exc
+    if not _valid_p256_scalar(r) or not _valid_p256_scalar(s):
+        raise RuntimeError(
+            "ECDSA backend produced signature scalars outside P-256"
+        )
+    if utils.encode_dss_signature(r, s) != signature:
+        raise RuntimeError(
+            "ECDSA backend produced a non-canonical DER signature"
+        )
+
+    if s > _P256_HALF_ORDER:
+        s = _P256_ORDER - s
+    canonical = utils.encode_dss_signature(r, s)
+    if not isinstance(canonical, bytes) or not canonical:
+        raise RuntimeError(
+            "ECDSA signature canonicalization did not produce DER bytes"
+        )
+    return canonical
+
+
+def verify_transcript_signature(
+    public_key: ec.EllipticCurvePublicKey,
+    signature: bytes | bytearray | memoryview,
+    digest: bytes | bytearray | memoryview,
+) -> bool:
+    """Verify strict canonical low-S DER over a precomputed SHA-256 digest."""
+
+    if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        raise TypeError("public_key must be an EllipticCurvePublicKey")
+    _require_p256_curve("public_key", public_key.curve)
+    normalized_digest = _transcript_digest_bytes(digest)
+    normalized_signature = _signature_bytes(signature)
+    if not normalized_signature:
+        return False
+
+    try:
+        r, s = utils.decode_dss_signature(normalized_signature)
+    except ValueError:
+        return False
+    if not _valid_p256_scalar(r) or not _valid_p256_scalar(s):
+        return False
+    if s > _P256_HALF_ORDER:
+        return False
+    if utils.encode_dss_signature(r, s) != normalized_signature:
+        return False
+
+    try:
+        public_key.verify(
+            normalized_signature,
+            normalized_digest,
+            _transcript_signature_algorithm(),
+        )
+    except InvalidSignature:
+        return False
+    return True
 
 
 def _client_hello_fields(
