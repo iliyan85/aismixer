@@ -293,85 +293,122 @@ durable or distributed deduplication.
 ## 11. Secure local state
 
 Secure ingress has one explicit `SecureState` owner for handshake replay
-records, active sessions, per-session accepted data nonces, and their
-statistics. The production default is module-wide, while an isolated state
-owner and clocks may be injected into a secure listener. This state is
-in-memory and process-local; it is neither durable nor shared across processes.
+records, pending sessions, active sessions, the accepted data nonces privately
+owned by each pending or active session, and their statistics. The production
+default is module-wide, while an isolated state owner and clocks may be
+injected into a secure listener. This state is in-memory and process-local; it
+is neither durable nor shared across processes.
 
 Wall time and monotonic time have separate ownership. Wall time is used only
 for externally meaningful protocol or diagnostic timestamps: the transmitted
-handshake timestamp check, the pong timestamp, and existing timestamped debug
-output. Handshake freshness remains inclusive at the boundary:
+handshake timestamp check, pong timestamps, and timestamped debug output.
+Handshake freshness remains inclusive at the boundary:
 `abs(wall_now - transmitted_timestamp) <= 30`. Monotonic time owns handshake
-replay TTL, session creation and last-seen times, session TTL, data-nonce TTL,
-and local capacity ordering. Each allowed received packet uses one monotonic
-observation for all of that packet's local-state decisions. Network policy is
-applied first; a denied packet performs no cryptographic work, state mutation,
-session cleanup, or secure-state clock read.
+replay TTL, pending-session creation and TTL, active-session creation and
+last-seen times, active-session TTL, data-nonce TTL, and local capacity
+ordering. Each allowed received packet uses one monotonic observation for all
+of that packet's local-state decisions. Network policy is applied first; a
+denied packet performs no cryptographic work, state mutation, cleanup, or
+secure-state clock read.
 
 Every process-local TTL uses the same exact boundary: state is live while
 `age < ttl` and expires when `age >= ttl`. A duplicate handshake replay key or
 data nonce does not refresh its expiry. Wall-clock changes do not expire,
-revive, or extend replay, session, or nonce state.
+revive, or extend replay, pending-session, active-session, or nonce state.
 
 Handshake replay identity is exactly the value produced by
-`build_handshake_replay_key(station_id, timestamp, signature)`; the network
-address is not part of that identity. A verified handshake consumes a newly
-accepted replay key after timestamp, authorization, and signature validation
-but before session installation. A later server-side failure does not remove
-that key. The replay set retains at most `HANDSHAKE_REPLAY_MAX` records, expires
-only its ordered front prefix during admission, and evicts the oldest live
-record deterministically when capacity remains full.
+`build_handshake_replay_key(client_auth_digest, client_signature)`. The digest
+is the authenticated ClientHello digest built from the parsed ClientHello, and
+the signature is the exact client identity signature verified over that
+digest. The peer network address is not part of replay identity. Replay
+admission occurs after freshness, station authorization, identity-signature
+verification, and ephemeral-point validation, but before pending-session
+installation. A later server-side failure does not remove an admitted key. The
+replay set retains at most `HANDSHAKE_REPLAY_MAX` records, expires only its
+ordered front prefix during admission, and evicts the oldest live record
+deterministically when capacity remains full.
+
+A pending session is identified by the exact peer socket address and retains
+the authenticated station ID, separate client-to-server and server-to-client
+AES-GCM owners, its monotonic creation time, and a private data-nonce set.
+Pending sessions have their own TTL, capacity, and creation order, independent
+of active-session TTL, capacity, and activity order. Pending lifetime is not
+refreshed by traffic. Expiry removes only the expired ordered front prefix. A
+new pending address is installed at the newest end; when capacity remains
+full, the oldest live pending entry is evicted deterministically. A newer live
+pending session at the same address replaces only the older pending entry and
+occupies the newest position. Equal creation times follow deterministic
+installation order. At most `PENDING_SESSION_MAX` pending sessions are retained.
+
+Installing or replacing a pending session does not remove, replace, or touch
+an active session at the same address. While the candidate remains pending,
+confirmation failure or client timeout leaves any existing active session
+intact; it does not promote the pending entry and does not itself delete
+server-side pending state. Pending expiry, same-address replacement, or capacity
+eviction discards only that pending entry and its nonce state and does not itself
+alter an active session at that address.
 
 An active session is identified by the exact peer socket address and retains
-its authenticated station ID, AES-GCM owner, monotonic creation and last-seen
-times, and a private data-nonce set. Sessions are ordered from least to most
-recently seen. Installation and valid activity place a session at the
-most-recent end; only a valid matching keepalive or a fully validated secure
-data or ping packet counts as activity. Invalid, malformed, mismatched,
-expired, or replayed traffic does not touch the session.
+its authenticated station ID, separate client-to-server and server-to-client
+AES-GCM owners, monotonic creation and last-seen times, and a private
+data-nonce set. Active sessions are ordered from least to most recently seen.
+Installation and valid activity place a session at the most-recent end. Only
+promotion or a fully validated active secure NMEA or ping packet counts as
+activity; invalid, malformed, mismatched, expired, or replayed traffic does not
+touch the active session.
 
-After network policy accepts any packet, including a handshake or an unknown
-packet type, the expired least-recent session prefix is removed before
-packet-type-specific state handling. The process may physically retain silent
-expired sessions until later allowed traffic, but an expired directly
-addressed session is never treated as active. At most `SESSION_MAX` sessions
-are retained. A successful same-address handshake replaces the live session
-and discards its nonce state without evicting an unrelated session. For a new
-address, expired sessions are removed before capacity is considered; if still
-full, exactly the least-recently-seen live session is evicted. Equal timestamps
-are resolved by the deterministic activity order.
+After network policy accepts any packet, including a handshake or unknown
+packet type, the expired ordered prefixes of both pending and active session
+stores are removed before packet-type-specific handling. Expired state may
+therefore remain physically present until later allowed traffic, but an
+expired directly addressed session is never treated as live. State operations
+receiving an active or pending handle first require exact retained-object
+identity at its address. A replaced, capacity-evicted, promoted, expired, or
+otherwise stale handle cannot mutate state or trigger unrelated cleanup.
 
-State operations that receive a session object first require exact retained
-object identity at the supplied or stored address before performing lifecycle
-cleanup. An already replaced, capacity-evicted, or otherwise removed handle is
-rejected without cleanup, ordering changes, nonce access, or statistics
-changes. A handle that is current when the operation begins still undergoes
-normal exact-boundary expiry and is removed and accounted once if expired.
+A pending session is promoted only when a DATA packet decrypts under its
+client-to-server AES-GCM owner and decodes to a confirmation ping. Confirmation
+requires type `"ping"`, reserved sequence `0` as a built-in integer and not a
+boolean, an integer timestamp that is not a boolean, and a source identity equal
+to the pending station ID. The packet nonce is admitted to the pending session
+before promotion. Promotion removes the pending entry and, as one state-model
+transition, replaces any live active session at the same address.
+The station identity, both directional AES-GCM owners, and the pending nonce
+set become the new active state; active creation and last-seen time begin at
+promotion. The server then returns an encrypted sequence-zero pong using the
+promoted server-to-client owner. Ordinary active-session ping sequences must
+be exact built-in integers strictly greater than zero.
 
-Secure-data nonce identity is the exact 12-byte nonce within its owning
-session. Identical bytes in different sessions are independent. A live replay
-is rejected before decryption and does not touch the session. A new nonce is
-retained only after decryption, JSON decoding, source-ID matching, and message
-type and required-field validation; it is recorded before the session is
-touched and before the ping or NMEA action. Each nonce set retains at most
+For promotion at a new address, expired active sessions are removed before
+active capacity is considered; if capacity remains full, the
+least-recently-seen live active session is evicted. Equal active timestamps are
+resolved by deterministic activity order. At most `SESSION_MAX` active
+sessions are retained. Replacing, expiring, or capacity-evicting an active
+session discards its nonce state.
+
+Secure-data nonce identity is the exact 12-byte nonce within its owning pending
+or active session. Identical bytes in different session states are independent.
+A live nonce replay for an owner is rejected before decryption under that owner
+and does not refresh nonce expiry. A new pending nonce is retained only after
+decryption and complete confirmation validation; a new active nonce is retained
+only after decryption, JSON decoding, source matching, and message-type and
+required-field validation. Admission occurs before promotion, session touch,
+pong generation, or NMEA action. Each nonce set retains at most
 `DATA_NONCE_MAX_PER_SESSION` records, expires only its ordered front prefix,
 and evicts the oldest live nonce deterministically when capacity remains full.
-Replacing, expiring, or capacity-evicting a session discards all nonce state
-owned by that session.
+Promotion transfers the pending nonce set without discarding it; other removal
+of its owning session discards it.
 
 An NMEA message that contains the required `payload` key but whose value is not
-a string retains that accepted nonce and touches its session before frame
-construction is attempted. It produces no frame or queue item and is not
+a string retains that accepted nonce and touches its active session before
+frame construction is attempted. It produces no frame or queue item and is not
 promoted to a protocol exception; later packets continue to be processed.
 
 `stats()` returns an immutable point-in-time `SecureStateStats` snapshot. It
-reports accepted, rejected or replayed, expired, capacity-evicted, created,
-replaced, touched, and owning-session-discarded lifecycle counts as applicable,
-plus current and peak handshake-replay, session, and data-nonce counts. Every
-removed record has exactly one removal reason. Reading statistics invokes
-neither clock, performs no cleanup, exposes no mutable state, and does not
-change an earlier snapshot.
+reports replay, pending-session, active-session, and data-nonce lifecycle
+counts, plus current and peak sizes. Every removed record has exactly one
+removal reason. Reading statistics invokes neither clock, performs no cleanup,
+exposes no mutable state, and does not change an earlier snapshot.
 
 This section governs only process-local secure state. It does not redefine
 secure packet formats, cryptographic algorithms, the signed handshake
