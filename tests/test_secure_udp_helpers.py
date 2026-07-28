@@ -3643,6 +3643,84 @@ def test_runtime_end_to_end_ecdhe_and_directional_encryption(monkeypatch):
     assert len(pong_packet[len(proxy.DATA_PREFIX):][:12]) == 12
 
 
+def test_proxy_handshake_ignores_stale_active_pong_before_confirmation(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    station_id = "boat_001"
+    remote_addr = ("192.0.2.10", 17777)
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
+    )
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    old_active_keys = _proxy_session_key_material(
+        proxy,
+        client_to_server_key=b"\x31" * 32,
+        server_to_client_key=b"\x32" * 32,
+    )
+    confirming_server = _TestConfirmingServer(
+        proxy,
+        server_identity_private_key,
+        remote_addr,
+    )
+    stale_packets = []
+
+    def stale_active_pong(confirmation_packet):
+        message = confirming_server.read_confirmation_ping(
+            confirmation_packet
+        )
+        packet = confirming_server.encrypt_server_packet(
+            {
+                "type": "pong",
+                "seq": proxy.SESSION_CONFIRMATION_SEQUENCE,
+                "timestamp": message["timestamp"],
+                "source_id": station_id,
+            },
+            key=old_active_keys.server_to_client_key,
+            nonce=b"\xb1" * 12,
+        )
+        stale_packets.append(packet)
+        return packet, remote_addr
+
+    sock = _FakeHandshakeSocket((
+        confirming_server.server_hello_response,
+        stale_active_pong,
+        confirming_server.confirmation_pong_response,
+    ))
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+
+    key_material = proxy.perform_handshake(
+        sock,
+        {"station_id": station_id},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+
+    assert key_material == confirming_server.key_material
+    assert (
+        key_material.server_to_client_key
+        != old_active_keys.server_to_client_key
+    )
+    assert proxy.decrypt_secure_json_message(
+        stale_packets[0],
+        old_active_keys.server_to_client_key,
+    )["seq"] == proxy.SESSION_CONFIRMATION_SEQUENCE
+    with pytest.raises(InvalidTag):
+        proxy.decrypt_secure_json_message(
+            stale_packets[0],
+            key_material.server_to_client_key,
+        )
+    assert len(sock.sent) == 2
+    assert sock.responses == []
+    assert sock.timeout == 5.0
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -3655,7 +3733,7 @@ def test_runtime_end_to_end_ecdhe_and_directional_encryption(monkeypatch):
         "non-dict-json",
     ),
 )
-def test_proxy_handshake_rejects_invalid_session_confirmation(
+def test_proxy_handshake_ignores_invalid_confirmation_before_valid(
     monkeypatch,
     mutation,
     capsys,
@@ -3725,6 +3803,7 @@ def test_proxy_handshake_rejects_invalid_session_confirmation(
     sock = _FakeHandshakeSocket((
         confirming_server.server_hello_response,
         invalid_confirmation,
+        confirming_server.confirmation_pong_response,
     ))
     monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
 
@@ -3737,9 +3816,11 @@ def test_proxy_handshake_rejects_invalid_session_confirmation(
     )
 
     output = capsys.readouterr().out
-    assert key_material is None
+    assert key_material == confirming_server.key_material
     assert len(sock.sent) == 2
-    assert "Mutual ECDHE session confirmed." not in output
+    assert sock.responses == []
+    assert "Mutual ECDHE session confirmed." in output
+    assert "Invalid secure session confirmation." not in output
     assert confirming_server.key_material.client_to_server_key.hex() not in (
         output
     )
@@ -3824,6 +3905,7 @@ def test_proxy_handshake_fails_on_no_session_during_confirmation(
     sock = _FakeHandshakeSocket((
         confirming_server.server_hello_response,
         (b"NOSESSION|boat_001", remote_addr),
+        confirming_server.confirmation_pong_response,
     ))
     monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
 
@@ -3837,6 +3919,7 @@ def test_proxy_handshake_fails_on_no_session_during_confirmation(
 
     assert key_material is None
     assert len(sock.sent) == 2
+    assert len(sock.responses) == 1
     assert "Mutual ECDHE session confirmed." not in (
         capsys.readouterr().out
     )
@@ -3982,6 +4065,55 @@ def test_proxy_handshake_uses_fresh_confirmation_deadline(monkeypatch):
 
     assert key_material == confirming_server.key_material
     assert sock.timeouts == [4.0, 4.0, 5.0]
+
+
+def test_proxy_ignored_datagrams_do_not_extend_confirmation_deadline(
+    monkeypatch,
+    capsys,
+):
+    proxy = load_proxy_module()
+    timestamp = 1000
+    remote_addr = ("192.0.2.10", 17777)
+    station_identity_private_key = ec.derive_private_key(
+        11,
+        ec.SECP256R1(),
+    )
+    server_identity_private_key = ec.derive_private_key(
+        12,
+        ec.SECP256R1(),
+    )
+    confirming_server = _TestConfirmingServer(
+        proxy,
+        server_identity_private_key,
+        remote_addr,
+    )
+    sock = _FakeHandshakeSocket((
+        confirming_server.server_hello_response,
+        (b"malformed-confirmation", remote_addr),
+        (b"unrelated-same-address-datagram", remote_addr),
+    ))
+    monotonic_values = iter((100.0, 101.0, 200.0, 201.0, 204.0, 205.0))
+    monkeypatch.setattr(proxy.time, "time", lambda: timestamp)
+    monkeypatch.setattr(
+        proxy.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    key_material = proxy.perform_handshake(
+        sock,
+        {"station_id": "boat_001"},
+        station_identity_private_key,
+        server_identity_private_key.public_key(),
+        remote_addr,
+    )
+
+    output = capsys.readouterr().out
+    assert key_material is None
+    assert sock.responses == []
+    assert sock.timeouts == [4.0, 4.0, 1.0, 5.0]
+    assert "No session confirmation from server." in output
+    assert "Mutual ECDHE session confirmed." not in output
 
 
 def test_proxy_handshake_timeout_returns_to_retry_loop(monkeypatch):

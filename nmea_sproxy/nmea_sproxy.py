@@ -684,6 +684,8 @@ def perform_handshake(
                 if confirmation_result == SERVER_PACKET_NO_SESSION:
                     print("❌ Server rejected pending secure session.")
                     return None
+                if confirmation_result == SERVER_PACKET_IGNORED:
+                    continue
                 if confirmation_result != SERVER_PACKET_AUTHENTICATED:
                     print("❌ Invalid secure session confirmation.")
                     return None
