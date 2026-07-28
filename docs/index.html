@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | AIS Stream Processing and Routing Platform</title>
   <link rel="canonical" href="https://aismixer.net/">
-  <meta name="description" content="AISMixer processes and routes AIS NMEA 0183 streams with deterministic multipart, deduplication, TAG, and bounded UDPSEC state lifecycles.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183, AIS stream processing, logical routing, UDPSEC, nmea_sproxy, AIVDM, AIVDO, aismixerctl, maritime data">
+  <meta name="description" content="AISMixer processes and routes AIS NMEA 0183 streams with deterministic state, logical routing, and authenticated ECDHE UDPSEC session establishment.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, AIS stream processing, logical routing, UDPSEC, authenticated ECDHE, nmea_sproxy, AIVDM, AIVDO, aismixerctl, maritime data">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | AIS Stream Processing and Routing Platform">
-  <meta property="og:description" content="Deterministic AIS NMEA 0183 processing, logical routing, explicit local state, and authenticated UDPSEC transport.">
+  <meta property="og:description" content="Deterministic AIS processing, logical routing, and authenticated ECDHE UDPSEC with bounded pending and active session state.">
   <meta property="og:url" content="https://aismixer.net/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,7 +28,7 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | AIS Stream Processing and Routing Platform">
-  <meta name="twitter:description" content="Deterministic AIS processing · Explicit state · Logical routing · Authenticated UDPSEC">
+  <meta name="twitter:description" content="Deterministic AIS processing · Logical routing · Authenticated ECDHE UDPSEC">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="AISMixer AIS stream processing and routing platform overview">
 
@@ -48,7 +48,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
-    "description": "Open-source platform for deterministic AIS NMEA 0183 processing, logical routing, explicit local state, and authenticated UDPSEC transport.",
+    "description": "Open-source platform for deterministic AIS processing, logical routing, and authenticated ECDHE UDPSEC with bounded pending and active session state.",
     "url": "https://aismixer.net/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -68,7 +68,7 @@
     ],
     "inLanguage": "en",
     "isAccessibleForFree": true,
-    "keywords": ["AIS NMEA 0183", "stream processing", "logical routing", "UDPSEC", "nmea_sproxy", "AIVDM", "AIVDO"]
+    "keywords": ["AIS NMEA 0183", "stream processing", "logical routing", "UDPSEC", "authenticated ECDHE", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -268,8 +268,8 @@
         <article class="card state-card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Secure replay and sessions</h3>
-          <p>Handshake replay records, active sessions, and per-session nonce records are hard-bounded. Monotonic time owns local lifetime; expired state is removed before deterministic live eviction.</p>
-          <p>Sessions are ordered by recent valid activity. A successful same-address handshake replaces only that session and its nonce state. All secure state is process-local and is lost at restart.</p>
+          <p>Handshake replay records, pending sessions, active sessions, and the private nonce state owned by each pending or active session are hard-bounded. Monotonic local time governs TTL, and expired state is removed before deterministic live-state eviction.</p>
+          <p>Installing a same-address pending candidate preserves the current active session and replaces only an older pending candidate. The active session changes only after authenticated encrypted confirmation and pending-to-active promotion; a failed confirmation, or pending expiry, replacement, or capacity eviction, leaves it intact. All secure state is in-memory, process-local, and lost at restart.</p>
         </article>
         <article class="card state-card">
           <div class="icons" aria-hidden="true">📊</div>
@@ -414,27 +414,57 @@
       <div class="section-heading">
         <p class="eyebrow">UDPSEC lifecycle</p>
         <h2>Authenticated transport with bounded local state</h2>
-        <p class="section-intro">The current <span class="kbd">nmea_sproxy</span> and AISMixer UDPSEC path combines authenticated key agreement and encrypted traffic with explicit replay, session, and nonce ownership.</p>
+        <p class="section-intro">The current <span class="kbd">nmea_sproxy</span> and AISMixer UDPSEC path uses authenticated ephemeral ECDHE and independent directional keys, with encrypted sequence-zero confirmation before the client treats a new session as established.</p>
+      </div>
+      <div class="pipeline reference-pipeline" role="group" aria-label="UDPSEC authenticated ECDHE session-establishment flow">
+        <div class="pipeline-node">
+          <strong>Authenticated ClientHello</strong>
+          <span>Identity-signed, fresh P-256 ephemeral key</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Ephemeral P-256 ECDHE</strong>
+          <span>Fresh shared secret for this handshake</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>HKDF-SHA256</strong>
+          <span>Independent C2S and S2C keys</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Encrypted sequence-zero confirmation</strong>
+          <span>C2S ping, then S2C pong</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Active session</strong>
+          <span>Authenticated ping promotes; authenticated pong completes</span>
+        </div>
       </div>
       <div class="grid feature-row">
         <article class="card">
           <div class="icons" aria-hidden="true">🔑</div>
-          <h3>Authenticated session setup</h3>
-          <p>Stations authenticate with ECDSA. ECDH-derived session keys let the current proxy protect AIS and ping/pong traffic with authenticated AES-GCM encryption.</p>
+          <h3>Authenticated ephemeral key agreement</h3>
+          <p>For every session handshake, each endpoint creates a fresh ephemeral P-256 ECDHE keypair. Long-term P-256 identity keys only authenticate canonical, role-separated SHA-256 transcript digests with ECDSA; they are not ECDHE key-agreement inputs.</p>
+          <p>HKDF-SHA256 derives independent C2S and S2C keys from the shared secret and authenticated transcript. AES-256-GCM protects encrypted data and control traffic.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🛡️</div>
-          <h3>Bounded replay protection</h3>
-          <p>Handshake replay records, active sessions, and each session’s accepted data nonces are hard-bounded. Monotonic time governs local TTL and ordering, and expiry precedes live-state eviction.</p>
+          <h3>Encrypted mutual confirmation</h3>
+          <p>The client sends an encrypted sequence-zero ping for the pending session. The server promotes only after authenticating it and returns an encrypted sequence-zero pong under the promoted S2C key; the client treats the session as established only after authenticating that pong.</p>
+          <p>Unrelated, malformed, stale-key, wrong-sequence, and wrong-source datagrams neither confirm the candidate nor extend its fixed confirmation deadline.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">♻️</div>
-          <h3>Traffic-driven cleanup</h3>
-          <p>Allowed traffic drives expiry cleanup rather than a background timer. Replay, session, and nonce state is process-local, non-durable, and lost when the service restarts.</p>
+          <h3>Coordinated update and local state</h3>
+          <p>Both endpoints must be updated together; there is no legacy fallback, mixed mode, negotiation switch, certificate system, or algorithm negotiation.</p>
+          <p>Allowed traffic drives expiry cleanup rather than a background timer. Replay, pending-session, active-session, and nonce state is in-memory, process-local, non-durable, and lost when the service restarts.</p>
         </article>
       </div>
       <div class="callout">
-        <p><strong>Security boundary:</strong> UDPSEC protects transport authenticity, confidentiality, and replay handling within its implemented scope; it does not prove that an AIS payload is physically or semantically truthful. AISMixer does not currently implement an AIS spoofing or anomaly detector.</p>
+        <p><strong>Forward-secrecy boundary:</strong> Later compromise of a long-term identity key does not by itself reconstruct keys for completed sessions when old ephemeral private keys and raw shared secrets are gone and neither endpoint was compromised while they were in memory. An identity key compromised in the present enables future impersonation. This implemented property is supported by engineering validation, not formal cryptographic verification.</p>
+        <p><strong>Transport boundary:</strong> UDPSEC authenticates and encrypts data and control packets within its scope, but does not prove AIS truthfulness or detect spoofing, guarantee UDP delivery or ordering, protect compromised endpoints, or provide complete denial-of-service resistance. It does not hide peer IP addresses, packet timing or lengths, or the cleartext ClientHello station identifier; NOSESSION hints are unauthenticated.</p>
         <p>Read the <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">security policy</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">behavioural contract</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>, and <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a> for the detailed boundaries.</p>
       </div>
     </section>
@@ -540,7 +570,7 @@
             <li>Logical routing, zones, and target-scoped deduplication.</li>
             <li>Runtime routing control with <span class="kbd">aismixerctl</span>.</li>
             <li>Deterministic deduplication, assembly, and multipart TAG lifecycles.</li>
-            <li>Hard-bounded secure replay, session, and per-session nonce state.</li>
+            <li>Hard-bounded handshake replay, pending-session, active-session, and private per-session nonce state.</li>
             <li>Immutable state statistics and a tested Python behavioural reference.</li>
             <li>Endpoint controls, physical receiver input through nmea_sproxy, and trusted plain-UDP proxy mode.</li>
             <li>systemd <span class="kbd">RuntimeDirectory</span>, lifecycle scripts, and the global routing CLI.</li>

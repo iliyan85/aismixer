@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | Platformă de procesare și rutare a fluxurilor AIS</title>
   <link rel="canonical" href="https://aismixer.net/ro/">
-  <meta name="description" content="AISMixer procesează și rutează fluxuri AIS NMEA 0183 cu cicluri de viață deterministe pentru multipart, deduplicare, TAG și starea UDPSEC limitată explicit.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183, procesarea fluxurilor AIS, rutare logică, UDPSEC, nmea_sproxy, AIVDM, AIVDO, aismixerctl, date maritime">
+  <meta name="description" content="AISMixer procesează și rutează fluxuri AIS NMEA 0183 cu cicluri deterministe și UDPSEC cu ECDHE autentificat, chei direcționale și stare locală limitată.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, procesarea fluxurilor AIS, rutare logică, UDPSEC, ECDHE autentificat, nmea_sproxy, AIVDM, AIVDO, aismixerctl, date maritime">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | Platformă de procesare și rutare a fluxurilor AIS">
-  <meta property="og:description" content="Procesare deterministă AIS NMEA 0183, rutare logică, stare locală explicită și transport UDPSEC autentificat.">
+  <meta property="og:description" content="Procesare deterministă AIS NMEA 0183, rutare logică și UDPSEC cu ECDHE autentificat și stare locală limitată.">
   <meta property="og:url" content="https://aismixer.net/ro/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,7 +28,7 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | Platformă de procesare și rutare a fluxurilor AIS">
-  <meta name="twitter:description" content="Procesare AIS deterministă · Stare explicită · Rutare logică · UDPSEC autentificat">
+  <meta name="twitter:description" content="Procesare AIS deterministă · Rutare logică · UDPSEC cu ECDHE autentificat">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="Prezentare generală a platformei AISMixer pentru procesarea și rutarea fluxurilor AIS">
 
@@ -48,7 +48,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
-    "description": "Platformă open-source pentru procesare deterministă AIS NMEA 0183, rutare logică, stare locală explicită și transport UDPSEC autentificat.",
+    "description": "Platformă open-source pentru procesare deterministă AIS NMEA 0183, rutare logică și transport UDPSEC cu ECDHE autentificat și stare locală limitată.",
     "url": "https://aismixer.net/ro/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -68,7 +68,7 @@
     ],
     "inLanguage": "ro",
     "isAccessibleForFree": true,
-    "keywords": ["AIS NMEA 0183", "procesarea fluxurilor", "rutare logică", "UDPSEC", "nmea_sproxy", "AIVDM", "AIVDO"]
+    "keywords": ["AIS NMEA 0183", "procesarea fluxurilor", "rutare logică", "UDPSEC", "ECDHE autentificat", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -269,8 +269,8 @@
         <article class="card state-card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Protecție anti-replay și sesiuni securizate</h3>
-          <p>Înregistrările anti-replay pentru handshake, sesiunile active și înregistrările nonce pentru fiecare sesiune au limite stricte de capacitate. Timpul monoton guvernează durata de viață locală; starea expirată este eliminată înaintea evacuării deterministe a stării active.</p>
-          <p>Sesiunile sunt ordonate după activitatea validă recentă. Un handshake reușit de la aceeași adresă înlocuiește numai sesiunea respectivă și starea nonce asociată. Toată starea securizată este locală procesului și se pierde la repornire.</p>
+          <p>Înregistrările anti-replay pentru handshake, sesiunile în așteptare, sesiunile active și starea privată a nonce-urilor, deținută separat de fiecare sesiune în așteptare sau activă, au limite stricte de capacitate. Timpul monoton local guvernează TTL-ul; starea expirată este eliminată înaintea evacuării deterministe impuse de capacitate.</p>
+          <p>Instalarea unui candidat în așteptare la aceeași adresă păstrează sesiunea activă existentă și înlocuiește numai candidatul în așteptare mai vechi de la acea adresă. Sesiunea activă este înlocuită numai după confirmarea criptată autentificată și promovarea candidatului; dacă confirmarea eșuează ori candidatul expiră, este înlocuit sau evacuat din cauza capacității, sesiunea activă rămâne intactă. Toată starea securizată rămâne numai în memorie, este locală procesului și se pierde la repornire.</p>
         </article>
         <article class="card state-card">
           <div class="icons" aria-hidden="true">📊</div>
@@ -415,27 +415,57 @@
       <div class="section-heading">
         <p class="eyebrow">Ciclul de viață UDPSEC</p>
         <h2>Transport autentificat cu stare locală limitată</h2>
-        <p class="section-intro">Traseul UDPSEC actual dintre <span class="kbd">nmea_sproxy</span> și AISMixer combină stabilirea autentificată a cheilor și traficul criptat cu responsabilitate explicită pentru starea anti-replay, sesiuni și nonce-uri.</p>
+        <p class="section-intro">Traseul UDPSEC actual dintre <span class="kbd">nmea_sproxy</span> și AISMixer folosește un schimb ECDHE efemer autentificat și chei direcționale independente, cu o confirmare criptată cu secvența zero înainte ca clientul să considere stabilită o sesiune nouă.</p>
+      </div>
+      <div class="pipeline reference-pipeline" role="group" aria-label="Fluxul de stabilire a unei sesiuni UDPSEC autentificate">
+        <div class="pipeline-node">
+          <strong>ClientHello autentificat</strong>
+          <span>Semnat cu cheia de identitate, cu o cheie efemeră P-256 nouă</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>ECDHE efemer P-256</strong>
+          <span>Secret comun nou pentru acest handshake</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>HKDF-SHA256</strong>
+          <span>Chei C2S și S2C independente</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Confirmare criptată cu secvența zero</strong>
+          <span>Ping C2S, apoi pong S2C</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Sesiune activă</strong>
+          <span>Ping-ul autentificat promovează; pong-ul autentificat finalizează</span>
+        </div>
       </div>
       <div class="grid feature-row">
         <article class="card">
           <div class="icons" aria-hidden="true">🔑</div>
-          <h3>Inițializare autentificată a sesiunii</h3>
-          <p>Stațiile se autentifică prin ECDSA. Cheile de sesiune derivate prin ECDH permit proxy-ului actual să protejeze traficul AIS și ping/pong prin criptare autentificată AES-GCM.</p>
+          <h3>Acord efemer autentificat al cheilor</h3>
+          <p>La fiecare stabilire a unei sesiuni, fiecare endpoint generează o pereche nouă de chei efemere P-256 pentru ECDHE. Cheile P-256 de identitate pe termen lung autentifică numai schimbul, prin semnături ECDSA peste digesturi SHA-256 canonice ale transcriptului, distincte pentru fiecare rol; ele nu participă la acordul de chei ECDHE.</p>
+          <p>HKDF-SHA256 derivă chei C2S și S2C independente din secretul comun și transcriptul autentificat. AES-256-GCM protejează datele și traficul de control criptat.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🛡️</div>
-          <h3>Protecție anti-replay cu limite stricte</h3>
-          <p>Înregistrările anti-replay pentru handshake, sesiunile active și nonce-urile de date acceptate în fiecare sesiune au limite stricte de capacitate. Timpul monoton guvernează TTL-ul local și ordonarea, iar expirarea precedă evacuarea stării active.</p>
+          <h3>Confirmare reciprocă criptată</h3>
+          <p>Clientul confirmă sesiunea în așteptare printr-un ping C2S criptat cu secvența zero. Serverul o promovează numai după autentificarea ping-ului și răspunde cu un pong criptat cu secvența zero folosind cheia S2C a sesiunii promovate; clientul consideră sesiunea stabilită numai după autentificarea acelui pong.</p>
+          <p>Datagramele fără legătură, malformate, criptate cu o cheie veche sau care au secvența ori sursa greșită nu confirmă candidatul și nici nu prelungesc termenul-limită fix de confirmare.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">♻️</div>
-          <h3>Curățare declanșată de trafic</h3>
-          <p>Traficul permis declanșează curățarea stării expirate, nu un timer de fundal. Starea anti-replay, a sesiunilor și nonce-urilor este locală procesului, nepersistentă și se pierde când serviciul repornește.</p>
+          <h3>Actualizare coordonată și stare locală</h3>
+          <p>Ambele endpoint-uri trebuie actualizate împreună. Nu există fallback legacy, mod mixt, comutator pentru negociere, sistem de certificate sau negociere a algoritmilor.</p>
+          <p>Traficul permis declanșează curățarea stării expirate, nu un timer de fundal. Starea anti-replay, a sesiunilor în așteptare și active și a nonce-urilor rămâne numai în memorie, este locală procesului, nepersistentă și se pierde când serviciul repornește.</p>
         </article>
       </div>
       <div class="callout">
-        <p><strong>Limita de securitate:</strong> UDPSEC protejează autenticitatea și confidențialitatea transportului și tratează reluările în limitele implementate; nu dovedește că un payload AIS este adevărat fizic sau semantic. AISMixer nu implementează în prezent un detector de spoofing sau anomalii AIS.</p>
+        <p><strong>Forward secrecy, în limitele implementate:</strong> compromiterea ulterioară a unei chei de identitate pe termen lung nu permite, prin ea însăși, reconstruirea cheilor sesiunilor deja încheiate, dacă vechile chei private efemere și secretele ECDHE brute nu mai există și niciun endpoint nu a fost compromis cât timp acestea se aflau în memorie. Compromiterea actuală a unei chei de identitate permite uzurparea identității în sesiuni viitoare. Această proprietate implementată este susținută de validare inginerească, nu de verificare criptografică formală.</p>
+        <p><strong>Limita transportului:</strong> UDPSEC autentifică și criptează pachetele de date și de control în domeniul său, dar nu dovedește veridicitatea AIS și nu detectează spoofing-ul, nu garantează livrarea sau ordinea UDP, nu protejează endpoint-uri compromise și nu oferă rezistență completă la atacuri de refuz al serviciului. Nu ascunde adresele IP ale participanților, temporizarea sau lungimile pachetelor și nici identificatorul stației din ClientHello, transmis în clar; mesajele NOSESSION nu sunt autentificate.</p>
         <p>Citiți <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">politica de securitate</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">contractul comportamental</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> și <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki-ul</a> pentru limitele detaliate.</p>
       </div>
     </section>
@@ -541,7 +571,7 @@
             <li>Rutare logică, zone și deduplicare separată pentru fiecare destinație.</li>
             <li>Controlul rutării la runtime prin <span class="kbd">aismixerctl</span>.</li>
             <li>Cicluri de viață deterministe pentru deduplicare, asamblare și TAG multipart.</li>
-            <li>Stare cu limite stricte pentru replay securizat, sesiuni și nonce-urile fiecărei sesiuni.</li>
+            <li>Stare cu limite stricte pentru înregistrările anti-replay ale handshake-ului, sesiunile în așteptare și active și nonce-urile private ale fiecărei sesiuni.</li>
             <li>Statistici imuabile ale stării și o referință comportamentală Python testată.</li>
             <li>Controlul punctelor terminale și intrare de la receptoare fizice prin nmea_sproxy, inclusiv modul UDP simplu pe o rețea de încredere.</li>
             <li><span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață și CLI-ul global de rutare.</li>

@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | Обработка и маршрутизиране на AIS потоци</title>
   <link rel="canonical" href="https://aismixer.net/bg/">
-  <meta name="description" content="AISMixer обработва и маршрутизира AIS NMEA 0183 потоци с детерминирани жизнени цикли за multipart съобщения, дедупликация, TAG метаданни и ограничено UDPSEC състояние.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183, детерминирана обработка на AIS потоци, логическо маршрутизиране, UDPSEC, nmea_sproxy, AIVDM, AIVDO, aismixerctl, морски данни">
+  <meta name="description" content="AISMixer обработва и маршрутизира AIS NMEA 0183 потоци с детерминирани жизнени цикли, логическа маршрутизация и автентикиран ECDHE UDPSEC транспорт с ограничено локално състояние.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, детерминирана обработка на AIS потоци, логическо маршрутизиране, UDPSEC, ECDHE, nmea_sproxy, AIVDM, AIVDO, aismixerctl, морски данни">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
-  <meta property="og:description" content="Детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, изрично локално състояние и автентикиран UDPSEC транспорт.">
+  <meta property="og:description" content="Детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, изрично локално състояние и автентикиран ECDHE UDPSEC транспорт.">
   <meta property="og:url" content="https://aismixer.net/bg/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,7 +28,7 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
-  <meta name="twitter:description" content="Детерминирана AIS обработка · Изрично състояние · Логическо маршрутизиране · Автентикиран UDPSEC">
+  <meta name="twitter:description" content="Детерминирана AIS обработка · Изрично състояние · Логическо маршрутизиране · Автентикиран ECDHE UDPSEC">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="Преглед на платформата AISMixer за обработка и маршрутизиране на AIS потоци">
 
@@ -48,7 +48,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
-    "description": "Платформа с отворен код за детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, изрично локално състояние и автентикиран UDPSEC транспорт.",
+    "description": "Платформа с отворен код за детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, изрично локално състояние и автентикиран ECDHE UDPSEC транспорт.",
     "url": "https://aismixer.net/bg/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -68,7 +68,7 @@
     ],
     "inLanguage": "bg",
     "isAccessibleForFree": true,
-    "keywords": ["AIS NMEA 0183", "детерминирана обработка на потоци", "логическо маршрутизиране", "UDPSEC", "nmea_sproxy", "AIVDM", "AIVDO"]
+    "keywords": ["AIS NMEA 0183", "детерминирана обработка на потоци", "логическо маршрутизиране", "UDPSEC", "ECDHE", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -268,8 +268,8 @@
         <article class="card state-card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Защита от повторения и сесии</h3>
-          <p>Записите за защита от повторение при handshake, активните сесии и записите с nonce стойности за всяка сесия са твърдо ограничени. Монотонното време управлява локалния жизнен цикъл; изтеклото състояние се премахва преди детерминираното премахване на живо състояние.</p>
-          <p>Сесиите се подреждат според скорошната валидна активност. Успешен handshake от същия адрес заменя само тази сесия и нейното nonce състояние. Цялото състояние за сигурност е локално за процеса и се губи при рестарт.</p>
+          <p>Записите за защита от повторение при handshake, чакащите и активните сесии и частното nonce състояние, притежавано от всяка чакаща или активна сесия, са твърдо ограничени. Монотонното локално време управлява TTL, а изтеклото състояние се премахва преди детерминираното премахване на живо състояние поради капацитет.</p>
+          <p>Инсталирането на нова чакаща сесия от същия адрес заменя само по-старата чакаща сесия и запазва съществуващата активна. Активната сесия се заменя едва след автентикирано криптирано потвърждение и повишаване на чакащата сесия. Неуспешното потвърждение не я засяга; същото важи при изтичане, замяна или премахване на чакащата сесия поради капацитет. Цялото състояние е в паметта, локално за процеса и се губи при рестарт.</p>
         </article>
         <article class="card state-card">
           <div class="icons" aria-hidden="true">📊</div>
@@ -414,27 +414,57 @@
       <div class="section-heading">
         <p class="eyebrow">Жизнен цикъл на UDPSEC</p>
         <h2>Автентикиран транспорт с ограничено локално състояние</h2>
-        <p class="section-intro">Текущият UDPSEC път през <span class="kbd">nmea_sproxy</span> и AISMixer съчетава автентикирано договаряне на ключове и криптиран трафик с изрична отговорност за защитата от повторения, сесиите и nonce стойностите.</p>
+        <p class="section-intro">Текущият UDPSEC път през <span class="kbd">nmea_sproxy</span> и AISMixer използва автентикиран ефемерен ECDHE обмен и независими ключове за двете посоки, с криптирано потвърждение с пореден номер нула, преди клиентът да приеме новата сесия за установена.</p>
+      </div>
+      <div class="pipeline reference-pipeline" role="group" aria-label="Поток за установяване на UDPSEC сесия чрез автентикиран ECDHE">
+        <div class="pipeline-node">
+          <strong>Автентикиран ClientHello</strong>
+          <span>Подпис с ключ за идентичност и нов ефемерен P-256 ключ</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Ефемерен P-256 ECDHE</strong>
+          <span>Нова споделена тайна за този handshake</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>HKDF-SHA256</strong>
+          <span>Независими C2S и S2C ключове</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Криптирано потвърждение с пореден номер нула</strong>
+          <span>C2S ping, следван от S2C pong</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Активна сесия</strong>
+          <span>Автентикираният ping повишава сесията; автентикираният pong завършва установяването</span>
+        </div>
       </div>
       <div class="grid feature-row">
         <article class="card">
           <div class="icons" aria-hidden="true">🔑</div>
-          <h3>Автентикирано установяване на сесия</h3>
-          <p>Станциите се автентикират с ECDSA. Сесийните ключове, получени чрез ECDH, позволяват на текущото прокси да защитава AIS и ping/pong трафика с автентикирано AES-GCM криптиране.</p>
+          <h3>Автентикиран ефемерен обмен на ключове</h3>
+          <p>При всеки handshake всяка крайна точка създава нова ефемерна ключова двойка P-256 за ECDHE. Дългосрочните P-256 ключове за идентичност служат единствено за взаимна автентикация чрез ECDSA подписи върху канонични SHA-256 хешове на транскрипта, разделени според ролята; те не участват в ECDHE договарянето на ключове.</p>
+          <p>HKDF-SHA256 извежда независими C2S и S2C ключове от споделената тайна и автентикирания транскрипт. AES-256-GCM защитава криптираните данни и управляващия трафик.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🛡️</div>
-          <h3>Ограничена защита от повторения</h3>
-          <p>Записите за защита от повторение при handshake, активните сесии и приетите nonce стойности за данни на всяка сесия са твърдо ограничени. Монотонното време управлява локалните TTL и подреждането, а изтичането предхожда премахването на живо състояние.</p>
+          <h3>Криптирано взаимно потвърждение</h3>
+          <p>Клиентът потвърждава чакащата сесия с криптиран ping по C2S с пореден номер нула. Сървърът я повишава в активна само след като удостовери ping, след което връща криптиран pong с пореден номер нула чрез S2C ключа на вече активната сесия; клиентът приема сесията за установена едва след като удостовери този pong.</p>
+          <p>Несвързани и неправилно форматирани дейтаграми, както и такива с остарял ключ, грешен пореден номер или грешен източник, нито потвърждават чакащата сесия, нито удължават фиксирания срок за потвърждение.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">♻️</div>
-          <h3>Почистване, задвижвано от трафика</h3>
-          <p>Разрешеният трафик задвижва почистването на изтеклите записи вместо фонов таймер. Състоянието за защита от повторения, сесиите и nonce стойностите е локално за процеса, не се запазва трайно и се губи при рестарт на услугата.</p>
+          <h3>Съгласувано обновяване и локално състояние</h3>
+          <p>Двете крайни точки трябва да бъдат обновени заедно. Няма автоматично връщане към предишния режим, смесен режим, превключвател за договаряне, система от сертификати или договаряне на алгоритми.</p>
+          <p>Разрешеният трафик задвижва почистването на изтеклите записи вместо фонов таймер. Състоянието за защита от повторения, чакащите и активните сесии и nonce стойностите е в паметта, локално за процеса, не се запазва трайно и се губи при рестарт на услугата.</p>
         </article>
       </div>
       <div class="callout">
-        <p><strong>Граница на сигурността:</strong> в рамките на реализирания си обхват UDPSEC защитава автентичността и поверителността на транспорта и обработва повторенията; той не доказва, че AIS съдържанието е физически или семантично достоверно. AISMixer в момента няма реализиран детектор за подправяне или аномалии в AIS.</p>
+        <p><strong>Граница на защитата на миналите сесии (forward secrecy):</strong> по-късното компрометиране на дългосрочен ключ за идентичност само по себе си не възстановява ключовете на вече приключили сесии, ако старите ефемерни частни ключове и споделените ECDHE тайни вече не са налични и никоя крайна точка не е била компрометирана, докато те са били в паметта. Компрометиран в момента ключ за идентичност позволява представяне за съответната страна в бъдещи сесии. Това реализирано свойство е подкрепено от инженерна проверка, а не от формална криптографска верификация.</p>
+        <p><strong>Граница на транспорта:</strong> UDPSEC автентикира и криптира пакетите с данни и управляващия трафик в своя обхват, но не доказва достоверността на AIS съдържанието и не открива подправяне, не гарантира доставка или ред на UDP дейтаграмите, не защитава компрометирани крайни точки и не осигурява пълна устойчивост срещу отказ на услуга. Той не скрива IP адресите на страните, моментите или размерите на пакетите, нито идентификатора на станцията, предаван като открит текст в ClientHello; NOSESSION подсказките не са автентикирани.</p>
         <p>Прочетете <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">политиката за сигурност</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">договора за поведение</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ръководството за <span class="kbd">nmea_sproxy</span></a> и <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a> за подробните граници.</p>
       </div>
     </section>
@@ -540,7 +570,7 @@
             <li>Логическа маршрутизация, зони и дедупликация по цели.</li>
             <li>Управление на маршрутизирането по време на работа чрез <span class="kbd">aismixerctl</span>.</li>
             <li>Детерминирани жизнени цикли за дедупликация, сглобяване и multipart TAG метаданни.</li>
-            <li>Твърдо ограничено състояние за защитата от повторения, сесиите и nonce стойностите за всяка сесия.</li>
+            <li>Твърдо ограничени записи за защита от повторение при handshake, чакащи и активни сесии и частно nonce състояние за всяка сесия.</li>
             <li>Неизменяеми статистики на състоянието и тествана Python референция за поведението.</li>
             <li>Контрол на крайните точки, вход от физически приемници през nmea_sproxy и доверен режим с некриптиран UDP.</li>
             <li>systemd <span class="kbd">RuntimeDirectory</span>, скриптове за жизнения цикъл и глобален CLI за маршрутизиране.</li>
