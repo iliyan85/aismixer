@@ -3,15 +3,12 @@ import socket
 import yaml
 import os
 import time
-import base64
 import sys
 import json
 import select
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.exceptions import InvalidSignature
 from input_adapters import (
     InputConfigError,
     LEGACY_UDP_INPUT_TYPE,
@@ -36,11 +33,20 @@ from output_adapters import (
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+_SHARED_CORE_MODULES = (
+    "network_policy.py",
+    "udpsec_crypto.py",
+    "udpsec_protocol.py",
+)
 
 
 def add_shared_module_path():
     for base in (SCRIPT_DIR, REPO_ROOT):
-        if os.path.exists(os.path.join(base, "core", "network_policy.py")):
+        core_dir = os.path.join(base, "core")
+        if all(
+            os.path.exists(os.path.join(core_dir, module))
+            for module in _SHARED_CORE_MODULES
+        ):
             if base not in sys.path:
                 sys.path.insert(0, base)
             return
@@ -53,10 +59,28 @@ from core.network_policy import (  # noqa: E402
     NetworkPolicyConfigError,
     compile_ingress_policy,
 )
+from core.udpsec_crypto import (  # noqa: E402
+    SessionKeyMaterial,
+    build_client_auth_digest,
+    build_server_auth_digest,
+    build_session_transcript_hash,
+    derive_ephemeral_shared_secret,
+    derive_session_key_material,
+    generate_ephemeral_private_key,
+    parse_ephemeral_public_key,
+    serialize_ephemeral_public_key,
+    sign_transcript_digest,
+    verify_transcript_signature,
+)
+from core.udpsec_protocol import (  # noqa: E402
+    ClientHello,
+    SESSION_CONFIRMATION_SEQUENCE,
+    build_client_hello_packet,
+    parse_server_hello_packet,
+)
 
 
 # Константи
-HANDSHAKE_PREFIX = b"NMEA-H"
 DATA_PREFIX = b"NMEA-D"
 NOSESSION_PREFIX = b"NOSESSION"
 DATA_AAD = b"NMEA"
@@ -247,41 +271,6 @@ def load_public_key(path):
         return serialization.load_pem_public_key(f.read())
 
 
-def sign_message(message, private_key):
-    return private_key.sign(message, ec.ECDSA(hashes.SHA256()))
-
-
-def verify_signature(message, signature, public_key):
-    try:
-        public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
-        return True
-    except InvalidSignature:
-        return False
-
-# Нов метод: derive_session_key
-
-
-def derive_session_key(shared_secret, client_signature, server_signature):
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(b"NMEA-SESSION")
-    digest.update(shared_secret)
-    digest.update(client_signature)
-    digest.update(server_signature)
-    return digest.finalize()
-
-# Стар метод за съвместимост (не се използва)
-
-
-def compute_session_hash(station_id, timestamp, signature, server_signature):
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(HANDSHAKE_PREFIX)
-    digest.update(station_id.encode())
-    digest.update(str(timestamp).encode())
-    digest.update(signature)
-    digest.update(server_signature)
-    return digest.finalize()
-
-
 def encrypt_message_aes_gcm(plaintext, key):
     iv = os.urandom(12)
     encryptor = Cipher(
@@ -393,7 +382,7 @@ def handle_server_packet(
     data,
     addr,
     remote_addr,
-    session_key,
+    server_to_client_key,
     station_id,
     expected_ping_seq,
 ):
@@ -404,14 +393,19 @@ def handle_server_packet(
         return SERVER_PACKET_NO_SESSION
 
     try:
-        message = decrypt_secure_json_message(data, session_key)
+        message = decrypt_secure_json_message(data, server_to_client_key)
     except Exception:
         return SERVER_PACKET_IGNORED
 
+    if not isinstance(message, dict):
+        return SERVER_PACKET_IGNORED
+    message_sequence = message.get("seq")
+    if type(message_sequence) is not int:
+        return SERVER_PACKET_IGNORED
     if (
         message.get("type") == "pong"
         and message.get("source_id") == station_id
-        and message.get("seq") == expected_ping_seq
+        and message_sequence == expected_ping_seq
     ):
         return SERVER_PACKET_AUTHENTICATED
     return SERVER_PACKET_IGNORED
@@ -470,7 +464,13 @@ def iter_forwardable_nmea_sentences(data):
     return extract_nmea_sentences(data.decode(errors="replace").strip())
 
 
-def send_udpsec_nmea_sentence(clean_line, out_sock, config, session_key, remote_addr):
+def send_udpsec_nmea_sentence(
+    clean_line,
+    out_sock,
+    config,
+    client_to_server_key,
+    remote_addr,
+):
     json_obj = {
         "type": "nmea",
         "payload": clean_line,
@@ -478,7 +478,7 @@ def send_udpsec_nmea_sentence(clean_line, out_sock, config, session_key, remote_
         "source_id": config["station_id"],
     }
     out_sock.sendto(
-        encrypt_secure_json_message(json_obj, session_key),
+        encrypt_secure_json_message(json_obj, client_to_server_key),
         remote_addr,
     )
 
@@ -496,27 +496,51 @@ def forward_pending_input(input_adapter, send_sentence):
         forward_input_payload(data, send_sentence)
 
 
-def send_ping(sock, remote_addr, session_key, station_id, seq):
+def send_ping(sock, remote_addr, client_to_server_key, station_id, seq):
     message = {
         "type": "ping",
         "seq": seq,
         "timestamp": int(time.time()),
         "source_id": station_id,
     }
-    sock.sendto(encrypt_secure_json_message(message, session_key), remote_addr)
+    sock.sendto(
+        encrypt_secure_json_message(message, client_to_server_key),
+        remote_addr,
+    )
 
 
-def perform_handshake(sock, config, private_key, server_pubkey, remote_addr):
+def perform_handshake(
+    sock,
+    config,
+    station_identity_private_key,
+    server_identity_public_key,
+    remote_addr,
+):
+    station_id = config["station_id"]
     timestamp = int(time.time())
-    payload = HANDSHAKE_PREFIX + \
-        config["station_id"].encode() + timestamp.to_bytes(8, "big")
-    signature = sign_message(payload, private_key)
-    packet = b"|".join([
-        HANDSHAKE_PREFIX,
-        config["station_id"].encode(),
-        str(timestamp).encode(),
-        base64.b64encode(signature),
-    ])
+    client_random = os.urandom(32)
+    client_ephemeral_private_key = generate_ephemeral_private_key()
+    client_ephemeral_public_key = serialize_ephemeral_public_key(
+        client_ephemeral_private_key.public_key()
+    )
+    client_digest = build_client_auth_digest(
+        station_id=station_id,
+        timestamp=timestamp,
+        client_random=client_random,
+        client_ephemeral_public_key=client_ephemeral_public_key,
+    )
+    client_signature = sign_transcript_digest(
+        station_identity_private_key,
+        client_digest,
+    )
+    client_hello = ClientHello(
+        station_id=station_id,
+        timestamp=timestamp,
+        client_random=client_random,
+        client_ephemeral_public_key=client_ephemeral_public_key,
+        client_signature=client_signature,
+    )
+    packet = build_client_hello_packet(client_hello)
     try:
         sock.sendto(packet, remote_addr)
     except OSError as e:
@@ -554,32 +578,120 @@ def perform_handshake(sock, config, private_key, server_pubkey, remote_addr):
 
             if not remote_addresses_match(addr, remote_addr):
                 continue
-            if not response.startswith(b"OK|"):
-                print(
-                    f"⚠️ Ignored handshake response: "
-                    f"{response.decode(errors='ignore')}"
-                )
-                continue
 
             try:
-                _, server_sig_b64 = response.split(b"|", 1)
-                server_signature = base64.b64decode(server_sig_b64)
-            except Exception as e:
+                server_hello = parse_server_hello_packet(response)
+                server_ephemeral_public_key = parse_ephemeral_public_key(
+                    server_hello.server_ephemeral_public_key
+                )
+            except (TypeError, ValueError) as e:
                 print(f"⚠️ Invalid handshake response format: {e}")
                 continue
 
-            if not verify_signature(payload, server_signature, server_pubkey):
+            server_digest = build_server_auth_digest(
+                station_id=client_hello.station_id,
+                timestamp=client_hello.timestamp,
+                client_random=client_hello.client_random,
+                client_ephemeral_public_key=(
+                    client_hello.client_ephemeral_public_key
+                ),
+                client_signature=client_hello.client_signature,
+                server_random=server_hello.server_random,
+                server_ephemeral_public_key=(
+                    server_hello.server_ephemeral_public_key
+                ),
+            )
+            if not verify_transcript_signature(
+                server_identity_public_key,
+                server_hello.server_signature,
+                server_digest,
+            ):
                 print("❌ Server signature verification failed.")
                 continue
 
-            shared_secret = private_key.exchange(ec.ECDH(), server_pubkey)
-            session_key = derive_session_key(
-                shared_secret, signature, server_signature)
-            print(
-                f"✅ Mutual handshake OK. "
-                f"Session hash: {session_key.hex()[:16]}..."
+            shared_secret = derive_ephemeral_shared_secret(
+                client_ephemeral_private_key,
+                server_ephemeral_public_key,
             )
-            return session_key
+            session_transcript_hash = build_session_transcript_hash(
+                station_id=client_hello.station_id,
+                timestamp=client_hello.timestamp,
+                client_random=client_hello.client_random,
+                client_ephemeral_public_key=(
+                    client_hello.client_ephemeral_public_key
+                ),
+                client_signature=client_hello.client_signature,
+                server_random=server_hello.server_random,
+                server_ephemeral_public_key=(
+                    server_hello.server_ephemeral_public_key
+                ),
+                server_signature=server_hello.server_signature,
+            )
+            session_key_material = derive_session_key_material(
+                shared_secret,
+                session_transcript_hash,
+            )
+            try:
+                send_ping(
+                    sock,
+                    remote_addr,
+                    session_key_material.client_to_server_key,
+                    station_id,
+                    SESSION_CONFIRMATION_SEQUENCE,
+                )
+            except OSError as e:
+                print(f"❌ Session confirmation send error: {e}")
+                return None
+
+            confirmation_deadline = time.monotonic() + handshake_timeout
+            while True:
+                remaining = confirmation_deadline - time.monotonic()
+                if remaining <= 0:
+                    print("⚠️ No session confirmation from server.")
+                    return None
+                if settimeout:
+                    settimeout(remaining)
+
+                try:
+                    confirmation, confirmation_addr = sock.recvfrom(8192)
+                except socket.timeout:
+                    print("⚠️ No session confirmation from server.")
+                    return None
+                except ConnectionResetError as e:
+                    print(
+                        "❌ Connection reset during session confirmation: "
+                        f"{e}"
+                    )
+                    return None
+                except OSError as e:
+                    print(f"❌ Session confirmation receive error: {e}")
+                    return None
+
+                if not remote_addresses_match(
+                    confirmation_addr,
+                    remote_addr,
+                ):
+                    continue
+
+                confirmation_result = handle_server_packet(
+                    confirmation,
+                    confirmation_addr,
+                    remote_addr,
+                    session_key_material.server_to_client_key,
+                    station_id,
+                    SESSION_CONFIRMATION_SEQUENCE,
+                )
+                if confirmation_result == SERVER_PACKET_NO_SESSION:
+                    print("❌ Server rejected pending secure session.")
+                    return None
+                if confirmation_result == SERVER_PACKET_IGNORED:
+                    continue
+                if confirmation_result != SERVER_PACKET_AUTHENTICATED:
+                    print("❌ Invalid secure session confirmation.")
+                    return None
+
+                print("Mutual ECDHE session confirmed.")
+                return session_key_material
     finally:
         if settimeout:
             settimeout(original_timeout)
@@ -589,11 +701,13 @@ def forward_loop(
     local_input,
     out_sock,
     config,
-    session_key,
+    session_key_material,
     remote_addr,
     ingress_policy=None,
 ):
     input_adapter = _coerce_input_adapter(local_input, ingress_policy)
+    client_to_server_key = session_key_material.client_to_server_key
+    server_to_client_key = session_key_material.server_to_client_key
     session_started_at = time.monotonic()
     last_authenticated_peer = session_started_at
     last_ping_at = session_started_at
@@ -603,7 +717,7 @@ def forward_loop(
         clean_line,
         out_sock,
         config,
-        session_key,
+        client_to_server_key,
         remote_addr,
     )
 
@@ -662,7 +776,7 @@ def forward_loop(
                 response,
                 addr,
                 remote_addr,
-                session_key,
+                server_to_client_key,
                 config["station_id"],
                 expected_ping_seq,
             )
@@ -692,7 +806,7 @@ def forward_loop(
                 send_ping(
                     out_sock,
                     remote_addr,
-                    session_key,
+                    client_to_server_key,
                     config["station_id"],
                     next_ping_seq,
                 )
@@ -832,8 +946,12 @@ def main(argv=None):
             print(f"Configuration error: {e}", file=sys.stderr)
             return 1
 
-        private_key = load_private_key(config["station_private_key"])
-        server_pubkey = load_public_key(config["remote_public_key"])
+        station_identity_private_key = load_private_key(
+            config["station_private_key"]
+        )
+        server_identity_public_key = load_public_key(
+            config["remote_public_key"]
+        )
         try:
             out_sock = create_output_socket(output_config, out_family)
         except OutputConfigError as e:
@@ -888,14 +1006,19 @@ def main(argv=None):
             )
 
         while True:
-            session_key = perform_handshake(
-                out_sock, config, private_key, server_pubkey, remote_addr)
-            if session_key:
+            session_key_material = perform_handshake(
+                out_sock,
+                config,
+                station_identity_private_key,
+                server_identity_public_key,
+                remote_addr,
+            )
+            if session_key_material:
                 reason = forward_loop(
                     local_input,
                     out_sock,
                     config,
-                    session_key,
+                    session_key_material,
                     remote_addr,
                     ingress_policy,
                 )

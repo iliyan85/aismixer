@@ -1,33 +1,55 @@
 import os
 import asyncio
 import base64
+import binascii
 import json
 import socket
 import time
 import yaml
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, utils
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.backends import default_backend
 from core.ingress_frame import frame_from_text_payload
 from core.network_policy import NetworkPolicy
 from core.source_identity import build_udpsec_source_id
+from core.udpsec_crypto import (
+    DOMAIN_CONTEXT,
+    build_client_auth_digest,
+    build_server_auth_digest,
+    build_session_transcript_hash,
+    derive_ephemeral_shared_secret,
+    derive_session_key_material,
+    generate_ephemeral_private_key,
+    parse_ephemeral_public_key,
+    serialize_ephemeral_public_key,
+    sign_transcript_digest,
+    verify_transcript_signature,
+)
+from core.udpsec_protocol import (
+    CLIENT_HELLO_PREFIX,
+    SESSION_CONFIRMATION_SEQUENCE,
+    ServerHello,
+    build_server_hello_packet,
+    parse_client_hello_packet,
+)
 
 
-HANDSHAKE_PREFIX = b"NMEA-H"
 DATA_PREFIX = b"NMEA-D"
-KEEPALIVE_PREFIX = b"KEEPALIVE"
 NOSESSION_PREFIX = b"NOSESSION"
 DATA_AAD = b"NMEA"
-CONTEXT_STRING = b"NMEA-AUTH-v1"
 SESSION_TTL_SECONDS = 300
 SESSION_MAX = 100000
+PENDING_SESSION_TTL_SECONDS = 30
+PENDING_SESSION_MAX = SESSION_MAX
 HANDSHAKE_REPLAY_TTL_SECONDS = 60
 HANDSHAKE_REPLAY_MAX = 100000
 DATA_NONCE_TTL_SECONDS = SESSION_TTL_SECONDS
 DATA_NONCE_MAX_PER_SESSION = 100000
+
+_HANDSHAKE_REPLAY_LABEL = b"HANDSHAKE-REPLAY"
 
 DEBUG = True  # Set to False in production
 
@@ -53,6 +75,63 @@ def resolve_local_path(path):
     return os.path.join(base_dir, path)
 
 
+def _load_authorized_identity_public_key(encoded_public_key):
+    if not isinstance(encoded_public_key, str):
+        raise TypeError(
+            "authorized station public key must be base64 text"
+        )
+    if not encoded_public_key:
+        raise ValueError("authorized station public key must not be empty")
+    try:
+        encoded_ascii = encoded_public_key.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            "authorized station public key must be ASCII base64"
+        ) from exc
+    try:
+        public_key_bytes = base64.b64decode(
+            encoded_ascii,
+            validate=True,
+        )
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(
+            "authorized station public key must be valid base64"
+        ) from exc
+    if base64.b64encode(public_key_bytes) != encoded_ascii:
+        raise ValueError(
+            "authorized station public key must use canonical base64"
+        )
+    if len(public_key_bytes) != 33:
+        raise ValueError(
+            "authorized station public key must be a 33-byte "
+            "compressed P-256 point"
+        )
+    if public_key_bytes[0] not in (0x02, 0x03):
+        raise ValueError(
+            "authorized station public key must use compressed "
+            "P-256 point encoding"
+        )
+
+    try:
+        public_key = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(),
+            public_key_bytes,
+        )
+    except ValueError:
+        raise ValueError(
+            "authorized station public key is not a valid P-256 point"
+        ) from None
+    canonical = public_key.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.CompressedPoint,
+    )
+    if canonical != public_key_bytes:
+        raise ValueError(
+            "authorized station public key is not canonically encoded"
+        )
+    return public_key
+
+
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
 auth_keys_path = resolve_existing_path(
@@ -70,19 +149,19 @@ with open(auth_keys_path, 'r') as f:
     authorized_db = yaml.safe_load(f)
 
 AUTHORIZED_KEYS = {
-    entry["name"]: base64.b64decode(entry["pubkey"])
+    entry["name"]: _load_authorized_identity_public_key(entry["pubkey"])
     for entry in authorized_db["authorized_clients"]
 }
 
 with open(priv_key_path, 'rb') as f:
     server_priv = serialization.load_pem_private_key(
-        f.read(), password=None, backend=default_backend())
-
-server_pub = server_priv.public_key()
-server_pub_bytes = server_pub.public_bytes(
-    encoding=serialization.Encoding.X962,
-    format=serialization.PublicFormat.CompressedPoint
-)
+        f.read(),
+        password=None,
+    )
+if not isinstance(server_priv, ec.EllipticCurvePrivateKey):
+    raise TypeError("server identity private key must be an EC private key")
+if not isinstance(server_priv.curve, ec.SECP256R1):
+    raise ValueError("server identity private key must use P-256")
 
 
 def _validate_positive_int(name, value):
@@ -177,9 +256,20 @@ class _BoundedExpiringSet:
 class _SecureSession:
     _address: object
     station_id: str
-    aesgcm: AESGCM
+    client_to_server_aesgcm: AESGCM
+    server_to_client_aesgcm: AESGCM
     created_at: float
     last_seen: float
+    seen_data_nonces: _BoundedExpiringSet
+
+
+@dataclass
+class _PendingSecureSession:
+    _address: object
+    station_id: str
+    client_to_server_aesgcm: AESGCM
+    server_to_client_aesgcm: AESGCM
+    created_at: float
     seen_data_nonces: _BoundedExpiringSet
 
 
@@ -196,6 +286,12 @@ class SecureStateStats:
     sessions_expired: int
     sessions_capacity_evicted: int
 
+    pending_sessions_created: int
+    pending_sessions_replaced: int
+    pending_sessions_promoted: int
+    pending_sessions_expired: int
+    pending_sessions_capacity_evicted: int
+
     data_nonces_accepted: int
     data_nonce_replays: int
     data_nonces_expired: int
@@ -206,6 +302,8 @@ class SecureStateStats:
     peak_handshake_replays: int
     current_sessions: int
     peak_sessions: int
+    current_pending_sessions: int
+    peak_pending_sessions: int
     current_data_nonces: int
     peak_data_nonces: int
 
@@ -219,11 +317,17 @@ class SecureState:
         handshake_replay_max=HANDSHAKE_REPLAY_MAX,
         data_nonce_ttl=DATA_NONCE_TTL_SECONDS,
         data_nonce_max_per_session=DATA_NONCE_MAX_PER_SESSION,
+        pending_session_ttl=PENDING_SESSION_TTL_SECONDS,
+        max_pending_sessions=PENDING_SESSION_MAX,
     ):
         self._session_ttl = _validate_positive_ttl(
             "session_ttl", session_ttl)
         self._max_sessions = _validate_positive_int(
             "max_sessions", max_sessions)
+        self._pending_session_ttl = _validate_positive_ttl(
+            "pending_session_ttl", pending_session_ttl)
+        self._max_pending_sessions = _validate_positive_int(
+            "max_pending_sessions", max_pending_sessions)
         self._handshake_replay_ttl = _validate_positive_ttl(
             "handshake_replay_ttl", handshake_replay_ttl)
         self._handshake_replay_max = _validate_positive_int(
@@ -238,6 +342,7 @@ class SecureState:
             self._handshake_replay_max,
         )
         self._sessions = OrderedDict()
+        self._pending_sessions = OrderedDict()
 
         self._handshake_replay_accepted = 0
         self._handshake_replay_rejected = 0
@@ -250,6 +355,12 @@ class SecureState:
         self._sessions_expired = 0
         self._sessions_capacity_evicted = 0
 
+        self._pending_sessions_created = 0
+        self._pending_sessions_replaced = 0
+        self._pending_sessions_promoted = 0
+        self._pending_sessions_expired = 0
+        self._pending_sessions_capacity_evicted = 0
+
         self._data_nonces_accepted = 0
         self._data_nonce_replays = 0
         self._data_nonces_expired = 0
@@ -259,6 +370,7 @@ class SecureState:
         self._current_data_nonces = 0
         self._peak_handshake_replays = 0
         self._peak_sessions = 0
+        self._peak_pending_sessions = 0
         self._peak_data_nonces = 0
 
     def stats(self) -> SecureStateStats:
@@ -274,6 +386,13 @@ class SecureState:
             sessions_touched=self._sessions_touched,
             sessions_expired=self._sessions_expired,
             sessions_capacity_evicted=self._sessions_capacity_evicted,
+            pending_sessions_created=self._pending_sessions_created,
+            pending_sessions_replaced=self._pending_sessions_replaced,
+            pending_sessions_promoted=self._pending_sessions_promoted,
+            pending_sessions_expired=self._pending_sessions_expired,
+            pending_sessions_capacity_evicted=(
+                self._pending_sessions_capacity_evicted
+            ),
             data_nonces_accepted=self._data_nonces_accepted,
             data_nonce_replays=self._data_nonce_replays,
             data_nonces_expired=self._data_nonces_expired,
@@ -287,6 +406,8 @@ class SecureState:
             peak_handshake_replays=self._peak_handshake_replays,
             current_sessions=len(self._sessions),
             peak_sessions=self._peak_sessions,
+            current_pending_sessions=len(self._pending_sessions),
+            peak_pending_sessions=self._peak_pending_sessions,
             current_data_nonces=self._current_data_nonces,
             peak_data_nonces=self._peak_data_nonces,
         )
@@ -308,11 +429,14 @@ class SecureState:
         )
         return True
 
-    def _remove_session(self, addr, reason):
-        session = self._sessions.pop(addr)
+    def _discard_session_nonces(self, session):
         discarded_nonces = session.seen_data_nonces.discard_all()
         self._current_data_nonces -= discarded_nonces
         self._data_nonces_session_discarded += discarded_nonces
+
+    def _remove_session(self, addr, reason):
+        session = self._sessions.pop(addr)
+        self._discard_session_nonces(session)
 
         if reason == "expired":
             self._sessions_expired += 1
@@ -324,6 +448,22 @@ class SecureState:
             raise ValueError(f"Unknown session removal reason: {reason}")
         return session
 
+    def _remove_pending_session(self, addr, reason):
+        pending = self._pending_sessions.pop(addr)
+        self._discard_session_nonces(pending)
+
+        if reason == "expired":
+            self._pending_sessions_expired += 1
+        elif reason == "capacity":
+            self._pending_sessions_capacity_evicted += 1
+        elif reason == "replaced":
+            self._pending_sessions_replaced += 1
+        else:
+            raise ValueError(
+                f"Unknown pending-session removal reason: {reason}"
+            )
+        return pending
+
     def cleanup_expired_sessions(self, now):
         expired = []
         while self._sessions:
@@ -334,7 +474,24 @@ class SecureState:
             expired.append(addr)
         return expired
 
-    def install_session(self, addr, station_id, aesgcm, now):
+    def cleanup_expired_pending_sessions(self, now):
+        expired = []
+        while self._pending_sessions:
+            addr, pending = next(iter(self._pending_sessions.items()))
+            if now < pending.created_at + self._pending_session_ttl:
+                break
+            self._remove_pending_session(addr, "expired")
+            expired.append(addr)
+        return expired
+
+    def install_session(
+        self,
+        addr,
+        station_id,
+        client_to_server_aesgcm,
+        server_to_client_aesgcm,
+        now,
+    ):
         self.cleanup_expired_sessions(now)
 
         if addr in self._sessions:
@@ -346,7 +503,8 @@ class SecureState:
         session = _SecureSession(
             _address=addr,
             station_id=station_id,
-            aesgcm=aesgcm,
+            client_to_server_aesgcm=client_to_server_aesgcm,
+            server_to_client_aesgcm=server_to_client_aesgcm,
             created_at=now,
             last_seen=now,
             seen_data_nonces=_BoundedExpiringSet(
@@ -362,9 +520,48 @@ class SecureState:
         )
         return session
 
+    def install_pending_session(
+        self,
+        addr,
+        station_id,
+        client_to_server_aesgcm,
+        server_to_client_aesgcm,
+        now,
+    ):
+        self.cleanup_expired_pending_sessions(now)
+
+        if addr in self._pending_sessions:
+            self._remove_pending_session(addr, "replaced")
+        elif len(self._pending_sessions) >= self._max_pending_sessions:
+            oldest_addr = next(iter(self._pending_sessions))
+            self._remove_pending_session(oldest_addr, "capacity")
+
+        pending = _PendingSecureSession(
+            _address=addr,
+            station_id=station_id,
+            client_to_server_aesgcm=client_to_server_aesgcm,
+            server_to_client_aesgcm=server_to_client_aesgcm,
+            created_at=now,
+            seen_data_nonces=_BoundedExpiringSet(
+                self._data_nonce_ttl,
+                self._data_nonce_max_per_session,
+            ),
+        )
+        self._pending_sessions[addr] = pending
+        self._pending_sessions_created += 1
+        self._peak_pending_sessions = max(
+            self._peak_pending_sessions,
+            len(self._pending_sessions),
+        )
+        return pending
+
     def get_active_session(self, addr, now):
         self.cleanup_expired_sessions(now)
         return self._sessions.get(addr)
+
+    def get_pending_session(self, addr, now):
+        self.cleanup_expired_pending_sessions(now)
+        return self._pending_sessions.get(addr)
 
     def _get_live_session_handle(self, addr, session, now):
         if self._sessions.get(addr) is not session:
@@ -375,6 +572,16 @@ class SecureState:
             return None
 
         return session
+
+    def _get_live_pending_session_handle(self, addr, pending, now):
+        if self._pending_sessions.get(addr) is not pending:
+            return None
+
+        self.cleanup_expired_pending_sessions(now)
+        if self._pending_sessions.get(addr) is not pending:
+            return None
+
+        return pending
 
     def _touch_active_session(self, addr, session, now):
         session.last_seen = now
@@ -387,12 +594,42 @@ class SecureState:
         self._touch_active_session(addr, session, now)
         return True
 
-    def handle_keepalive(self, addr, station_id, now):
-        session = self.get_active_session(addr, now)
-        if session is None or session.station_id != station_id:
-            return False
-        self._touch_active_session(addr, session, now)
-        return True
+    def promote_pending_session(self, addr, pending, now):
+        if self._get_live_pending_session_handle(
+            addr, pending, now
+        ) is None:
+            return None
+
+        self.cleanup_expired_sessions(now)
+        self._pending_sessions.pop(addr)
+        self._pending_sessions_promoted += 1
+
+        if addr in self._sessions:
+            self._remove_session(addr, "replaced")
+        elif len(self._sessions) >= self._max_sessions:
+            oldest_addr = next(iter(self._sessions))
+            self._remove_session(oldest_addr, "capacity")
+
+        session = _SecureSession(
+            _address=addr,
+            station_id=pending.station_id,
+            client_to_server_aesgcm=(
+                pending.client_to_server_aesgcm
+            ),
+            server_to_client_aesgcm=(
+                pending.server_to_client_aesgcm
+            ),
+            created_at=now,
+            last_seen=now,
+            seen_data_nonces=pending.seen_data_nonces,
+        )
+        self._sessions[addr] = session
+        self._sessions_created += 1
+        self._peak_sessions = max(
+            self._peak_sessions,
+            len(self._sessions),
+        )
+        return session
 
     def _account_expired_data_nonces(self, expired):
         self._data_nonces_expired += expired
@@ -407,6 +644,15 @@ class SecureState:
         self._account_expired_data_nonces(expired)
         if seen:
             self._data_nonce_replays += 1
+        return seen
+
+    def pending_data_nonce_seen(self, pending, nonce, now):
+        if self._get_live_pending_session_handle(
+            pending._address, pending, now
+        ) is None:
+            return False
+        seen, expired = pending.seen_data_nonces.contains(nonce, now)
+        self._account_expired_data_nonces(expired)
         return seen
 
     def accept_data_nonce(self, session, nonce, now):
@@ -431,61 +677,64 @@ class SecureState:
         )
         return True
 
+    def accept_pending_data_nonce(self, pending, nonce, now):
+        if self._get_live_pending_session_handle(
+            pending._address, pending, now
+        ) is None:
+            return False
+        admission = pending.seen_data_nonces.accept(nonce, now)
+        self._account_expired_data_nonces(admission.expired)
+        self._data_nonces_capacity_evicted += admission.capacity_evicted
+        self._current_data_nonces -= admission.capacity_evicted
+
+        if not admission.accepted:
+            self._data_nonce_replays += 1
+            return False
+
+        self._data_nonces_accepted += 1
+        self._current_data_nonces += 1
+        self._peak_data_nonces = max(
+            self._peak_data_nonces,
+            self._current_data_nonces,
+        )
+        return True
+
 
 secure_state = SecureState()
 
 
-def _field_bytes(value):
-    if isinstance(value, str):
-        return value.encode()
-    return value
+def _update_replay_digest(digest, field):
+    if not isinstance(field, bytes):
+        raise TypeError("handshake replay fields must be bytes")
+    if len(field) > (1 << 32) - 1:
+        raise ValueError(
+            "handshake replay field exceeds unsigned 32-bit framing"
+        )
+    digest.update(len(field).to_bytes(4, "big"))
+    digest.update(field)
 
 
-def _update_framed(digest, value):
-    data = _field_bytes(value)
-    digest.update(len(data).to_bytes(4, "big"))
-    digest.update(data)
-
-
-def build_current_handshake_payload(station_id, timestamp):
-    return HANDSHAKE_PREFIX + station_id.encode() + timestamp.to_bytes(8, "big")
-
-
-def build_handshake_context_v1(
-    station_id,
-    timestamp,
-    client_pub_bytes,
-    server_pub_bytes,
-    context_string=CONTEXT_STRING,
+def build_handshake_replay_key(
+    client_auth_digest,
+    client_signature,
 ):
-    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
-    for value in (
-        context_string,
-        station_id,
-        timestamp.to_bytes(8, "big"),
-        client_pub_bytes,
-        server_pub_bytes,
+    if not isinstance(client_auth_digest, bytes):
+        raise TypeError("client_auth_digest must be bytes")
+    if len(client_auth_digest) != 32:
+        raise ValueError("client_auth_digest must be exactly 32 bytes")
+    if not isinstance(client_signature, bytes):
+        raise TypeError("client_signature must be bytes")
+    if not client_signature:
+        raise ValueError("client_signature must not be empty")
+
+    digest = hashes.Hash(hashes.SHA256())
+    for field in (
+        DOMAIN_CONTEXT,
+        _HANDSHAKE_REPLAY_LABEL,
+        client_auth_digest,
+        client_signature,
     ):
-        _update_framed(digest, value)
-    return digest.finalize()
-
-
-def build_session_transcript_v1(handshake_context, client_signature, server_signature):
-    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
-    for value in (handshake_context, client_signature, server_signature):
-        _update_framed(digest, value)
-    return digest.finalize()
-
-
-def build_handshake_replay_key(station_id, timestamp, signature):
-    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
-    for value in (
-        b"NMEA-H-REPLAY",
-        station_id,
-        timestamp.to_bytes(8, "big"),
-        signature,
-    ):
-        _update_framed(digest, value)
+        _update_replay_digest(digest, field)
     return digest.finalize()
 
 
@@ -500,31 +749,6 @@ def parse_secure_data_packet(data):
     return nonce, ciphertext
 
 
-def parse_keepalive_packet(data):
-    parts = data.split(b"|")
-    if len(parts) != 3 or parts[0] != KEEPALIVE_PREFIX:
-        raise ValueError("Invalid keepalive packet format")
-    if not parts[1]:
-        raise ValueError("Missing keepalive station_id")
-    if not parts[2]:
-        raise ValueError("Missing keepalive timestamp")
-    try:
-        timestamp = int(parts[2].decode())
-    except ValueError as e:
-        raise ValueError("Invalid keepalive timestamp") from e
-    return parts[1].decode(), timestamp
-
-
-def parse_keepalive_station_id(data):
-    parts = data.split(b"|", 2)
-    if len(parts) < 2 or parts[0] != KEEPALIVE_PREFIX or not parts[1]:
-        return None
-    try:
-        return parts[1].decode()
-    except UnicodeDecodeError:
-        return None
-
-
 def build_no_session_hint(station_id=None):
     if station_id:
         return NOSESSION_PREFIX + b"|" + station_id.encode()
@@ -537,20 +761,76 @@ def encrypt_secure_json_message(aesgcm, message):
     return DATA_PREFIX + nonce + aesgcm.encrypt(nonce, plaintext, DATA_AAD)
 
 
-def verify_signature(pub_bytes, signature, message_digest):
-    pubkey = ec.EllipticCurvePublicKey.from_encoded_point(
-        ec.SECP256R1(), pub_bytes)
-    try:
-        pubkey.verify(signature, message_digest, ec.ECDSA(
-            utils.Prehashed(hashes.SHA256())))
-    except Exception as e:
-        raise ValueError(f"Signature verification failed: {e}")
+def _is_session_confirmation_ping(message, station_id):
+    if not isinstance(message, dict):
+        return False
+    sequence = message.get("seq")
+    timestamp = message.get("timestamp")
+    return (
+        message.get("type") == "ping"
+        and isinstance(sequence, int)
+        and not isinstance(sequence, bool)
+        and sequence == SESSION_CONFIRMATION_SEQUENCE
+        and isinstance(timestamp, int)
+        and not isinstance(timestamp, bool)
+        and message.get("source_id") == station_id
+    )
 
 
-def derive_session_key(shared_secret, combined_sig):
-    h = hashes.Hash(hashes.SHA256(), backend=default_backend())
-    h.update(b"NMEA-SESSION" + shared_secret + combined_sig)
-    return h.finalize()
+def _build_server_handshake(client_hello, client_ephemeral_public_key):
+    """Build one authenticated ServerHello and directional session ciphers."""
+
+    server_random = os.urandom(32)
+    server_ephemeral_private_key = generate_ephemeral_private_key()
+    server_ephemeral_public_bytes = serialize_ephemeral_public_key(
+        server_ephemeral_private_key.public_key()
+    )
+    server_auth_digest = build_server_auth_digest(
+        station_id=client_hello.station_id,
+        timestamp=client_hello.timestamp,
+        client_random=client_hello.client_random,
+        client_ephemeral_public_key=(
+            client_hello.client_ephemeral_public_key
+        ),
+        client_signature=client_hello.client_signature,
+        server_random=server_random,
+        server_ephemeral_public_key=server_ephemeral_public_bytes,
+    )
+    server_signature = sign_transcript_digest(
+        server_priv,
+        server_auth_digest,
+    )
+    shared_secret = derive_ephemeral_shared_secret(
+        server_ephemeral_private_key,
+        client_ephemeral_public_key,
+    )
+    session_transcript_hash = build_session_transcript_hash(
+        station_id=client_hello.station_id,
+        timestamp=client_hello.timestamp,
+        client_random=client_hello.client_random,
+        client_ephemeral_public_key=(
+            client_hello.client_ephemeral_public_key
+        ),
+        client_signature=client_hello.client_signature,
+        server_random=server_random,
+        server_ephemeral_public_key=server_ephemeral_public_bytes,
+        server_signature=server_signature,
+    )
+    key_material = derive_session_key_material(
+        shared_secret,
+        session_transcript_hash,
+    )
+    server_hello = ServerHello(
+        server_random=server_random,
+        server_ephemeral_public_key=server_ephemeral_public_bytes,
+        server_signature=server_signature,
+    )
+    response_packet = build_server_hello_packet(server_hello)
+    return (
+        response_packet,
+        AESGCM(key_material.client_to_server_key),
+        AESGCM(key_material.server_to_client_key),
+    )
 
 
 async def _secure_server_loop(
@@ -582,105 +862,176 @@ async def _secure_server_loop(
             continue
         local_now = monotonic_now()
         state_owner.cleanup_expired_sessions(local_now)
+        state_owner.cleanup_expired_pending_sessions(local_now)
 
-        if data.startswith(HANDSHAKE_PREFIX):
+        if data.startswith(CLIENT_HELLO_PREFIX):
             try:
-                # Parse text-based handshake: NMEA-H|station_id|timestamp|base64(signature)
-                parts = data[len(HANDSHAKE_PREFIX):].lstrip(b"|").split(b"|")
-                if len(parts) != 3:
-                    raise ValueError("Invalid handshake format")
-
-                station_id = parts[0].decode()
-                timestamp = int(parts[1].decode())
-                signature = base64.b64decode(parts[2])
+                client_hello = parse_client_hello_packet(data)
+                station_id = client_hello.station_id
+                timestamp = client_hello.timestamp
 
                 if abs(wall_now() - timestamp) > 30:
                     print(
                         f"[!] Rejected {station_id}: timestamp out of window")
                     continue
 
-                client_pub_bytes = AUTHORIZED_KEYS.get(station_id)
-                if not client_pub_bytes:
+                client_identity_public_key = AUTHORIZED_KEYS.get(station_id)
+                if client_identity_public_key is None:
                     print(f"[!] Rejected {station_id}: unknown client")
                     continue
 
-                digest = hashes.Hash(
-                    hashes.SHA256(), backend=default_backend())
-                digest.update(build_current_handshake_payload(station_id, timestamp))
-                to_verify = digest.finalize()
-
-                verify_signature(client_pub_bytes, signature, to_verify)
-
+                client_auth_digest = build_client_auth_digest(
+                    station_id=station_id,
+                    timestamp=timestamp,
+                    client_random=client_hello.client_random,
+                    client_ephemeral_public_key=(
+                        client_hello.client_ephemeral_public_key
+                    ),
+                )
+                if not verify_transcript_signature(
+                    client_identity_public_key,
+                    client_hello.client_signature,
+                    client_auth_digest,
+                ):
+                    raise ValueError(
+                        "ClientHello identity signature verification failed"
+                    )
+                client_ephemeral_public_key = parse_ephemeral_public_key(
+                    client_hello.client_ephemeral_public_key
+                )
                 replay_key = build_handshake_replay_key(
-                    station_id, timestamp, signature)
+                    client_auth_digest,
+                    client_hello.client_signature,
+                )
                 if not state_owner.accept_handshake_replay(
                     replay_key, local_now
                 ):
                     print(f"[!] Rejected {station_id}: handshake replay")
                     continue
 
-                # build response
-                digest_s = hashes.Hash(
-                    hashes.SHA256(), backend=default_backend())
-                digest_s.update(build_current_handshake_payload(station_id, timestamp))
-                to_sign = digest_s.finalize()
-                sig_server = server_priv.sign(
-                    to_sign, ec.ECDSA(utils.Prehashed(hashes.SHA256())))
+                (
+                    response_packet,
+                    client_to_server_aesgcm,
+                    server_to_client_aesgcm,
+                ) = _build_server_handshake(
+                    client_hello,
+                    client_ephemeral_public_key,
+                )
+                state_owner.install_pending_session(
+                    addr,
+                    station_id,
+                    client_to_server_aesgcm,
+                    server_to_client_aesgcm,
+                    local_now,
+                )
 
-                # build session key
-                client_pubkey = ec.EllipticCurvePublicKey.from_encoded_point(
-                    ec.SECP256R1(), client_pub_bytes)
-                shared_secret = server_priv.exchange(ec.ECDH(), client_pubkey)
-                session_key = derive_session_key(
-                    shared_secret, signature + sig_server)
-                aesgcm = AESGCM(session_key)
-                state_owner.install_session(
-                    addr, station_id, aesgcm, local_now)
-
-                response = b"OK|" + base64.b64encode(sig_server)
-                sock.sendto(response, addr)
-                print(f"[+] Accepted handshake from {station_id} @ {addr}")
+                sock.sendto(response_packet, addr)
+                print(
+                    f"[+] Sent authenticated ServerHello "
+                    f"to {station_id} @ {addr}"
+                )
 
             except Exception as e:
                 print(
                     f"[!] Handshake error from {addr}: {type(e).__name__}: {e}")
 
-        elif data == KEEPALIVE_PREFIX or data.startswith(KEEPALIVE_PREFIX + b"|"):
-            station_id = parse_keepalive_station_id(data)
-            try:
-                station_id, _ = parse_keepalive_packet(data)
-                if state_owner.handle_keepalive(
-                    addr, station_id, local_now
-                ):
-                    if DEBUG:
-                        print(
-                            f"{wall_now()} [SECURE] Keepalive "
-                            f"from {station_id} @ {addr}"
-                        )
-                else:
-                    print(f"[!] Ignored keepalive from {addr}")
-                    sock.sendto(build_no_session_hint(station_id), addr)
-            except Exception as e:
-                print(
-                    f"[!] Keepalive error from {addr}: {type(e).__name__}: {e}")
-                sock.sendto(build_no_session_hint(station_id), addr)
-
         elif data.startswith(DATA_PREFIX):
             try:
+                pending = state_owner.get_pending_session(
+                    addr, local_now
+                )
                 session = state_owner.get_active_session(addr, local_now)
-                if session is None:
+                if pending is None and session is None:
                     print(f"[!] No session for {addr}")
                     sock.sendto(build_no_session_hint(), addr)
                     continue
-                station_id = session.station_id
-                aesgcm = session.aesgcm
 
                 nonce, ciphertext = parse_secure_data_packet(data)
+
+                if pending is not None and not (
+                    state_owner.pending_data_nonce_seen(
+                        pending, nonce, local_now
+                    )
+                ):
+                    try:
+                        pending_plaintext = (
+                            pending.client_to_server_aesgcm.decrypt(
+                                nonce,
+                                ciphertext,
+                                DATA_AAD,
+                            )
+                        )
+                    except InvalidTag:
+                        pass
+                    else:
+                        pending_message = json.loads(
+                            pending_plaintext.decode()
+                        )
+                        if not _is_session_confirmation_ping(
+                            pending_message,
+                            pending.station_id,
+                        ):
+                            print(
+                                f"[!] Invalid session confirmation "
+                                f"from {addr}"
+                            )
+                            continue
+                        if not state_owner.accept_pending_data_nonce(
+                            pending, nonce, local_now
+                        ):
+                            print(
+                                f"[!] Duplicate secure data nonce "
+                                f"from {addr}"
+                            )
+                            continue
+
+                        session = state_owner.promote_pending_session(
+                            addr,
+                            pending,
+                            local_now,
+                        )
+                        if session is None:
+                            continue
+                        if not state_owner.touch_session(
+                            addr, session, local_now
+                        ):
+                            continue
+
+                        response = {
+                            "type": "pong",
+                            "seq": SESSION_CONFIRMATION_SEQUENCE,
+                            "timestamp": int(wall_now()),
+                            "source_id": session.station_id,
+                        }
+                        sock.sendto(
+                            encrypt_secure_json_message(
+                                session.server_to_client_aesgcm,
+                                response,
+                            ),
+                            addr,
+                        )
+                        print(
+                            f"[+] Confirmed secure session for "
+                            f"{session.station_id} @ {addr}"
+                        )
+                        continue
+
+                if session is None:
+                    continue
+
+                station_id = session.station_id
+                client_to_server_aesgcm = (
+                    session.client_to_server_aesgcm
+                )
                 if state_owner.data_nonce_seen(session, nonce, local_now):
                     print(f"[!] Duplicate secure data nonce from {addr}")
                     continue
 
-                plaintext = aesgcm.decrypt(nonce, ciphertext, DATA_AAD)
+                plaintext = client_to_server_aesgcm.decrypt(
+                    nonce,
+                    ciphertext,
+                    DATA_AAD,
+                )
 
                 msg = json.loads(plaintext.decode())
                 if msg.get("source_id") != station_id:
@@ -689,7 +1040,11 @@ async def _secure_server_loop(
 
                 message_type = msg.get("type")
                 if message_type == "ping":
-                    if "seq" not in msg:
+                    sequence = msg.get("seq")
+                    if (
+                        type(sequence) is not int
+                        or sequence <= SESSION_CONFIRMATION_SEQUENCE
+                    ):
                         print(f"[!] Invalid ping from {addr}")
                         continue
                 elif message_type == "nmea":
@@ -715,7 +1070,13 @@ async def _secure_server_loop(
                         "timestamp": int(wall_now()),
                         "source_id": station_id,
                     }
-                    sock.sendto(encrypt_secure_json_message(aesgcm, response), addr)
+                    sock.sendto(
+                        encrypt_secure_json_message(
+                            session.server_to_client_aesgcm,
+                            response,
+                        ),
+                        addr,
+                    )
                     continue
 
                 src_for_queue = sec_input_id or station_id or "ANONYMOUS"
