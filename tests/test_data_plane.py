@@ -5,26 +5,12 @@ import pytest
 
 from core.data_plane import (
     DataPlaneProcessor,
+    DeduplicationMode,
     ProcessingSnapshot,
     ProcessorOutput,
     RoutingDisposition,
 )
 from core.ingress_frame import IngressFrame
-from core.routing import RoutingTable
-from core.routing_state import RoutingSnapshot
-
-
-def make_table() -> RoutingTable:
-    return RoutingTable.from_definitions(
-        {"source": {"include": ["udp:source"]}},
-        [
-            {
-                "name": "source_to_targets",
-                "from_zone": "source",
-                "to": ["udp:first", "udp:second"],
-            }
-        ],
-    )
 
 
 def make_frame() -> IngressFrame:
@@ -38,97 +24,146 @@ def make_frame() -> IngressFrame:
     )
 
 
-def test_processing_snapshot_is_frozen_slotted_and_has_only_boundary_values():
-    snapshot = ProcessingSnapshot(
-        routing_generation=0,
-        routing_table=None,
+def test_deduplication_mode_has_exact_public_values():
+    assert tuple(DeduplicationMode) == (
+        DeduplicationMode.GLOBAL,
+        DeduplicationMode.PER_TARGET,
     )
-
-    with pytest.raises(FrozenInstanceError):
-        snapshot.routing_generation = 1
-
-    assert not hasattr(snapshot, "__dict__")
-    assert tuple(field.name for field in fields(snapshot)) == (
-        "routing_generation",
-        "routing_table",
-    )
+    assert DeduplicationMode.GLOBAL.value == "global"
+    assert DeduplicationMode.PER_TARGET.value == "per-target"
 
 
-def test_processing_snapshot_preserves_generation_and_routing_table_identity():
-    table = make_table()
-
+def test_processing_snapshot_is_frozen_slotted_and_target_only():
+    mutable_target_ids = [2, 0, 1]
     snapshot = ProcessingSnapshot(
         routing_generation=7,
-        routing_table=table,
+        deduplication_mode=DeduplicationMode.PER_TARGET,
+        target_ids=mutable_target_ids,
     )
+    mutable_target_ids.append(3)
 
+    with pytest.raises(FrozenInstanceError):
+        snapshot.routing_generation = 8
+
+    assert not hasattr(snapshot, "__dict__")
+    assert not hasattr(snapshot, "routing_table")
+    assert tuple(field.name for field in fields(snapshot)) == (
+        "routing_generation",
+        "deduplication_mode",
+        "target_ids",
+    )
     assert snapshot.routing_generation == 7
-    assert snapshot.routing_table is table
+    assert snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
+    assert snapshot.target_ids == (2, 0, 1)
+    assert isinstance(snapshot.target_ids, tuple)
 
 
-def test_processing_snapshot_none_table_explicitly_represents_legacy_mode():
+def test_processing_snapshot_copies_a_non_string_iterable():
     snapshot = ProcessingSnapshot(
+        routing_generation=0,
+        deduplication_mode=DeduplicationMode.PER_TARGET,
+        target_ids=(target_id for target_id in (4, 1, 3)),
+    )
+
+    assert snapshot.target_ids == (4, 1, 3)
+
+
+def test_processing_snapshot_distinguishes_empty_global_and_per_target_modes():
+    global_snapshot = ProcessingSnapshot(
         routing_generation=3,
-        routing_table=None,
+        deduplication_mode=DeduplicationMode.GLOBAL,
+        target_ids=(),
+    )
+    routed_snapshot = ProcessingSnapshot(
+        routing_generation=3,
+        deduplication_mode=DeduplicationMode.PER_TARGET,
+        target_ids=(),
     )
 
-    assert snapshot.routing_generation == 3
-    assert snapshot.routing_table is None
-
-
-def test_processing_snapshot_adapts_immutable_routing_snapshot():
-    table = make_table()
-    routing_snapshot = RoutingSnapshot(generation=11, table=table)
-
-    snapshot = ProcessingSnapshot.from_routing_snapshot(routing_snapshot)
-
-    assert snapshot == ProcessingSnapshot(
-        routing_generation=11,
-        routing_table=table,
-    )
-    assert snapshot.routing_table is table
+    assert global_snapshot.target_ids == routed_snapshot.target_ids == ()
+    assert global_snapshot != routed_snapshot
+    assert global_snapshot.deduplication_mode is DeduplicationMode.GLOBAL
+    assert routed_snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
 
 
 @pytest.mark.parametrize(
-    ("routing_generation", "routing_table", "exception"),
+    ("routing_generation", "exception"),
     [
-        (True, None, TypeError),
-        (1.0, None, TypeError),
-        ("1", None, TypeError),
-        (-1, None, ValueError),
-        (0, object(), TypeError),
+        (True, TypeError),
+        (1.0, TypeError),
+        ("1", TypeError),
+        (-1, ValueError),
     ],
 )
-def test_processing_snapshot_rejects_invalid_values(
+def test_processing_snapshot_rejects_invalid_generation(
     routing_generation,
-    routing_table,
     exception,
 ):
     with pytest.raises(exception):
         ProcessingSnapshot(
             routing_generation=routing_generation,
-            routing_table=routing_table,
+            deduplication_mode=DeduplicationMode.GLOBAL,
+            target_ids=(),
         )
 
 
-def test_processing_snapshot_adapter_rejects_non_snapshot():
-    with pytest.raises(TypeError, match="RoutingSnapshot"):
-        ProcessingSnapshot.from_routing_snapshot(object())
+@pytest.mark.parametrize("mode", ["global", None, object()])
+def test_processing_snapshot_rejects_invalid_deduplication_mode(mode):
+    with pytest.raises(TypeError, match="DeduplicationMode"):
+        ProcessingSnapshot(
+            routing_generation=0,
+            deduplication_mode=mode,
+            target_ids=(),
+        )
 
 
 @pytest.mark.parametrize(
-    ("routing_snapshot", "exception"),
+    "target_ids",
     [
-        (RoutingSnapshot(generation=-1, table=None), ValueError),
-        (RoutingSnapshot(generation=0, table=object()), TypeError),
+        None,
+        1,
+        "1",
+        b"\x01",
     ],
 )
-def test_processing_snapshot_adapter_revalidates_snapshot_values(
-    routing_snapshot,
+def test_processing_snapshot_rejects_invalid_target_collection(target_ids):
+    with pytest.raises(TypeError, match="iterable"):
+        ProcessingSnapshot(
+            routing_generation=0,
+            deduplication_mode=DeduplicationMode.PER_TARGET,
+            target_ids=target_ids,
+        )
+
+
+@pytest.mark.parametrize(
+    ("target_id", "exception"),
+    [
+        (True, TypeError),
+        ("1", TypeError),
+        (1.0, TypeError),
+        (object(), TypeError),
+        (-1, ValueError),
+    ],
+)
+def test_processing_snapshot_rejects_invalid_numeric_target_ids(
+    target_id,
     exception,
 ):
     with pytest.raises(exception):
-        ProcessingSnapshot.from_routing_snapshot(routing_snapshot)
+        ProcessingSnapshot(
+            routing_generation=0,
+            deduplication_mode=DeduplicationMode.PER_TARGET,
+            target_ids=(target_id,),
+        )
+
+
+def test_processing_snapshot_rejects_duplicate_target_ids():
+    with pytest.raises(ValueError, match="unique"):
+        ProcessingSnapshot(
+            routing_generation=0,
+            deduplication_mode=DeduplicationMode.PER_TARGET,
+            target_ids=(2, 1, 2),
+        )
 
 
 def test_processor_output_is_frozen_slotted_and_has_no_runtime_objects():
@@ -148,22 +183,18 @@ def test_processor_output_is_frozen_slotted_and_has_no_runtime_objects():
     )
 
 
-def test_targeted_processor_output_preserves_order_and_copies_mutable_input():
-    target_ids = ["udp:second", "udp:first", "udp:second"]
+def test_targeted_processor_output_preserves_order_repeats_and_copies_input():
+    target_ids = [2, 0, 2]
 
     output = ProcessorOutput(
         message="formatted message\r\n",
         disposition=RoutingDisposition.TARGETED,
         target_ids=target_ids,
     )
-    target_ids.append("udp:later")
+    target_ids.append(1)
 
     assert output.disposition is RoutingDisposition.TARGETED
-    assert output.target_ids == (
-        "udp:second",
-        "udp:first",
-        "udp:second",
-    )
+    assert output.target_ids == (2, 0, 2)
     assert isinstance(output.target_ids, tuple)
 
 
@@ -183,14 +214,25 @@ def test_legacy_processor_output_has_explicit_disposition_and_no_targets():
         (
             "message\r\n",
             RoutingDisposition.LEGACY_BROADCAST,
-            ("udp:first",),
+            (0,),
             ValueError,
         ),
         ("message\r\n", RoutingDisposition.TARGETED, (), ValueError),
-        ("message\r\n", "targeted", ("udp:first",), TypeError),
-        (b"message\r\n", RoutingDisposition.TARGETED, ("udp:first",), TypeError),
-        ("message\r\n", RoutingDisposition.TARGETED, "udp:first", TypeError),
-        ("message\r\n", RoutingDisposition.TARGETED, ("udp:first", object()), TypeError),
+        ("message\r\n", "targeted", (0,), TypeError),
+        (b"message\r\n", RoutingDisposition.TARGETED, (0,), TypeError),
+        ("message\r\n", RoutingDisposition.TARGETED, "0", TypeError),
+        ("message\r\n", RoutingDisposition.TARGETED, b"\x00", TypeError),
+        (
+            "message\r\n",
+            RoutingDisposition.TARGETED,
+            (target_id for target_id in (0,)),
+            TypeError,
+        ),
+        ("message\r\n", RoutingDisposition.TARGETED, (True,), TypeError),
+        ("message\r\n", RoutingDisposition.TARGETED, ("0",), TypeError),
+        ("message\r\n", RoutingDisposition.TARGETED, (0.0,), TypeError),
+        ("message\r\n", RoutingDisposition.TARGETED, (object(),), TypeError),
+        ("message\r\n", RoutingDisposition.TARGETED, (-1,), ValueError),
     ],
 )
 def test_processor_output_rejects_invalid_values(
@@ -222,7 +264,8 @@ def test_minimal_synchronous_fake_satisfies_processor_protocol():
     expected_frame = make_frame()
     expected_snapshot = ProcessingSnapshot(
         routing_generation=0,
-        routing_table=None,
+        deduplication_mode=DeduplicationMode.GLOBAL,
+        target_ids=(),
     )
     processor: DataPlaneProcessor = FakeProcessor()
 

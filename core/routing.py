@@ -7,9 +7,11 @@ their namespaces.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence, TypeAlias
+
+from core.target_identity import EgressTargetId, freeze_target_id_by_name
 
 
 SourceId: TypeAlias = str
@@ -79,11 +81,24 @@ ResolvedZones: TypeAlias = dict[ZoneName, frozenset[SourceId]]
 
 
 @dataclass(frozen=True, slots=True)
+class _CompiledTargetRoute:
+    """Immutable target-only route used by the runtime matching path."""
+
+    source_ids: frozenset[SourceId]
+    target_ids: tuple[EgressTargetId, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RoutingTable:
     """A compiled, reusable snapshot of zones and ordered routes."""
 
     resolved_zones: Mapping[ZoneName, frozenset[SourceId]]
     route_definitions: tuple[RouteDefinition, ...]
+    _compiled_target_routes: tuple[_CompiledTargetRoute, ...] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         resolved_zones = {
@@ -94,6 +109,7 @@ class RoutingTable:
         _validate_route_zone_references(resolved_zones, route_definitions)
         object.__setattr__(self, "resolved_zones", MappingProxyType(resolved_zones))
         object.__setattr__(self, "route_definitions", route_definitions)
+        object.__setattr__(self, "_compiled_target_routes", None)
 
     @classmethod
     def from_definitions(
@@ -127,6 +143,71 @@ class RoutingTable:
         """Match a source against the compiled zones and routes."""
 
         return match_routes(source_id, self.resolved_zones, self.route_definitions)
+
+    def compile_target_ids(
+        self,
+        target_id_by_name: Mapping[str, EgressTargetId],
+    ) -> RoutingTable:
+        """Return a new table with route target names resolved to numeric IDs."""
+
+        frozen_target_ids = freeze_target_id_by_name(target_id_by_name)
+        unknown = sorted({
+            target_name
+            for route in self.route_definitions
+            for target_name in route.to
+            if target_name not in frozen_target_ids
+        })
+        if unknown:
+            raise ValueError(
+                "Routing target name(s) are unavailable or unsupported: "
+                f"{', '.join(unknown)}."
+            )
+
+        compiled_target_routes = tuple(
+            _CompiledTargetRoute(
+                source_ids=self.resolved_zones[route.from_zone],
+                target_ids=tuple(
+                    frozen_target_ids[target_name]
+                    for target_name in route.to
+                ),
+            )
+            for route in self.route_definitions
+        )
+        compiled_table = RoutingTable(
+            resolved_zones=self.resolved_zones,
+            route_definitions=self.route_definitions,
+        )
+        object.__setattr__(
+            compiled_table,
+            "_compiled_target_routes",
+            compiled_target_routes,
+        )
+        return compiled_table
+
+    def match_target_ids(
+        self,
+        source_id: SourceId,
+    ) -> tuple[EgressTargetId, ...]:
+        """Return ordered unique numeric targets without descriptive results."""
+
+        compiled_target_routes = self._compiled_target_routes
+        if compiled_target_routes is None:
+            raise RuntimeError(
+                "RoutingTable has no compiled numeric target plan; "
+                "call compile_target_ids() first."
+            )
+
+        target_ids: list[EgressTargetId] = []
+        seen_target_ids: set[EgressTargetId] = set()
+        for route in compiled_target_routes:
+            if source_id not in route.source_ids:
+                continue
+            for target_id in route.target_ids:
+                if target_id in seen_target_ids:
+                    continue
+                seen_target_ids.add(target_id)
+                target_ids.append(target_id)
+        return tuple(target_ids)
 
 
 def load_zone_definitions(config: Mapping[str, object]) -> dict[str, ZoneDefinition]:

@@ -264,10 +264,11 @@ emitted in full when otherwise eligible.
 
 A dedup entry is live while `age < ttl` and expires at `age >= ttl`. A rejected
 duplicate does not refresh the insertion time. Legacy/no-table forwarding uses
-one global deduplication scope. Routed forwarding uses each target ID as an
-independent logical-key scope, so a group already seen by one target may still
-be new to another target. Ingress source identity does not create an additional
-dedup scope for that target.
+one global deduplication scope. Routed forwarding uses each process-local
+numeric `EgressTargetId` as an independent logical-key scope, so a group already
+seen by one target may still be new to another target. Ingress source identity
+does not create an additional dedup scope for that target. Routing-generation
+changes do not reset global or per-target deduplication state.
 
 By default, `max_entries=None` leaves the retained entry count unbounded. A
 positive `max_entries` applies one instance-wide, process-local cap shared by
@@ -416,37 +417,89 @@ transcript, session-key derivation, or `nmea_sproxy` protocol compatibility.
 
 ## 12. Routing snapshot boundary
 
-When routing state is present, the processor stage must acquire one
-immutable routing snapshot per accepted or successfully coerced frame. If that
-snapshot contains a table, `frame.source_id` must be matched once. Unsupported
-queue items and invalid compatibility events acquire no snapshot and perform
-no match.
+Routing configuration, `RouteDefinition.to`, route errors, status, control
+responses and CLI-visible target identifiers use canonical external strings
+such as `udp:aishub`. Initial and dynamically replaced routing candidates
+resolve every such name once through the immutable
+`Forwarder.target_id_by_name` mapping before installation. A candidate is
+installed only after every name has resolved and the complete immutable numeric
+route program has been built. Failed compilation leaves the active routing
+snapshot unchanged.
 
-All accepted sentences extracted from one frame must use the same match result.
-A routing-table replacement during processing affects the next accepted frame,
-not the frame already in progress. A missing table, including a snapshot whose
-table is `None`, selects legacy forwarding and global deduplication mode.
+The descriptive `RoutingTable.match(source_id)` API remains string-facing and
+returns ordered route names and ordered unique external target strings.
+Production frame processing instead uses `match_target_ids(source_id)`, whose
+immutable compiled route program contains resolved source sets and ordered
+numeric targets but no route names. Matching performs no external-name lookup.
+Route declaration order and target declaration order are retained, and a
+target matched more than once appears only at its first occurrence.
+
+Numeric egress IDs are dense zero-based positions in the immutable forwarder
+destination tuple. They are process-local implementation values, are never
+written to routing configuration or control JSON, and may change after a
+restart when destination declaration order changes. Unnamed legacy
+destinations have numeric IDs even though they have no external routing name.
+
+When routing state is present, the processor stage acquires exactly one
+immutable routing snapshot per accepted or successfully coerced frame. If that
+snapshot contains a table, orchestration calls the numeric target-only matcher
+exactly once with `frame.source_id`. Unsupported queue items and invalid
+compatibility events acquire no snapshot and perform no match. All accepted
+sentences extracted from one frame use the same resolved numeric tuple. A
+routing-table replacement during processing affects the next accepted frame,
+not the frame already in progress.
+
+The frozen, slotted processor view contains exactly:
+
+```text
+ProcessingSnapshot(
+    routing_generation: int,
+    deduplication_mode: DeduplicationMode,
+    target_ids: tuple[EgressTargetId, ...],
+)
+```
+
+It contains no routing table, routing state, mapping, transport or asyncio
+object. An absent or disabled routing table selects `GLOBAL` mode and passes
+all numeric forwarder IDs, including unnamed destinations. An enabled routing
+table selects `PER_TARGET` mode and passes the one resolved tuple. Therefore
+`GLOBAL + ()` means legacy mode with no configured destinations, while
+`PER_TARGET + ()` means routing is enabled but the source matched no target.
+Snapshot construction preserves target order and rejects duplicate numeric IDs
+rather than silently normalizing them; production numeric matching already
+returns a unique first-occurrence tuple. The routed empty-target case performs
+no global deduplication admission and emits no output while retaining normal
+assembler and multipart metadata cleanup.
 
 ## 13. Campaign D processor/egress boundary
 
 `PythonDataPlaneProcessor.process(frame, snapshot)` completes synchronous
 processing of the entire accepted frame and constructs the complete returned
 tuple of `ProcessorOutput` values before orchestration begins its first
-asynchronous egress send. Routing matching, parsing, assembly, multipart
-metadata observation and cleanup, deduplication decisions, TAG formatting,
-wall-clock observations used for formatting, GID generation, and `touch_s`
-effects belonging to that frame therefore all occur before the first send
-begins.
+asynchronous egress send. The processor stage resolves the frame's target-only
+snapshot before this call. Parsing, assembly, multipart metadata observation
+and cleanup, deduplication decisions, TAG formatting, wall-clock observations
+used for formatting, GID generation, and `touch_s` effects belonging to that
+frame therefore all occur before the first send begins.
 
 The single egress stage dispatches the returned outputs sequentially in tuple
-order. A send failure stops dispatch before any later output is sent, but it
-does not undo processor state, deduplication state, multipart metadata cleanup,
-wall-clock observations, GID generation, `touch_s` effects, or already
-constructed later outputs. The runtime-only completion signal described below
-is an ordering barrier, not an acknowledgement to an ingress source or a
-network-delivery guarantee. The boundary provides no transactional delivery,
-rollback, replay, ingress acknowledgement, delivery acknowledgement, or
-recovery guarantee, including after a partial multi-fragment send.
+order. Legacy-broadcast outputs retain an empty target tuple and call
+`Forwarder.send()`. Targeted outputs contain ordered numeric IDs and call
+`Forwarder.send_to_ids()`; production processing never uses the string
+`send_to()` compatibility API. A send failure stops dispatch before any later
+output is sent, but it does not undo processor state, deduplication state,
+multipart metadata cleanup, wall-clock observations, GID generation, `touch_s`
+effects, or already constructed later outputs. The runtime-only completion
+signal described below is an ordering barrier, not an acknowledgement to an
+ingress source or a network-delivery guarantee. The boundary provides no
+transactional delivery, rollback, replay, ingress acknowledgement, delivery
+acknowledgement, or recovery guarantee, including after a partial
+multi-fragment send.
+
+`ProcessorOutput.message` remains a CRLF-terminated `str`, and encoding still
+occurs separately for each destination in the forwarder. This target-only
+change introduces no bytes output builder, `OutputBatch`, native API or ABI,
+bindings, IPC, multiprocessing, worker pool or egress concurrency.
 
 This whole-frame-before-egress ordering intentionally replaces the former
 processing/send interleaving and is part of the Campaign D processor boundary.
@@ -473,12 +526,13 @@ stage performs no routing matching, parsing, assembly, multipart metadata work,
 deduplication, TAG construction, GID generation, or processor-state mutation.
 
 For each accepted frame, the processor stage coerces the queue item once,
-acquires exactly one routing snapshot, calls the configured
-`DataPlaneProcessor` exactly once, and treats the complete returned
-`tuple[ProcessorOutput, ...]` as that frame's one ordered processor batch.
-Unsupported queue items and invalid compatibility events are rejected before
-snapshot acquisition or processor invocation. An empty output batch may
-complete locally because it has no egress work.
+acquires exactly one routing snapshot, resolves exactly one target-only
+`ProcessingSnapshot`, calls the configured `DataPlaneProcessor` exactly once,
+and treats the complete returned `tuple[ProcessorOutput, ...]` as that frame's
+one ordered processor batch. Unsupported queue items and invalid compatibility
+events are rejected before snapshot acquisition, target matching or processor
+invocation. An empty output batch may complete locally because it has no
+egress work.
 
 After handing a non-empty batch to egress, the processor stage must await an
 explicit process-local completion acknowledgement. It must not consume or

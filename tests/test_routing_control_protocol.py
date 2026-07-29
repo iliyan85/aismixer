@@ -24,7 +24,11 @@ from core.routing_state import RoutingState
 from core.runtime_routing import compile_routing_section
 
 
-AVAILABLE_TARGETS = ("udp:a", "udp:b", "udp:c")
+TARGET_ID_BY_NAME = {
+    "udp:a": 0,
+    "udp:b": 1,
+    "udp:c": 2,
+}
 
 
 def routing_section(routes=None, zones=None):
@@ -48,9 +52,12 @@ def routing_section(routes=None, zones=None):
 def make_service(initial_section=None):
     initial_table = None
     if initial_section is not None:
-        initial_table = compile_routing_section(initial_section, AVAILABLE_TARGETS)
+        initial_table = compile_routing_section(
+            initial_section,
+            TARGET_ID_BY_NAME,
+        )
     state = RoutingState(initial_table)
-    return state, RoutingControlService(state, AVAILABLE_TARGETS)
+    return state, RoutingControlService(state, TARGET_ID_BY_NAME)
 
 
 def make_protocol(initial_section=None):
@@ -272,6 +279,7 @@ def test_valid_replace_request_installs_new_table():
 
     assert response["ok"] is True
     assert state.snapshot().table.match("udp:source").target_ids == ("udp:a",)
+    assert state.snapshot().table.match_target_ids("udp:source") == (0,)
 
 
 def test_replace_response_reports_exact_installed_generation():
@@ -600,3 +608,8 @@ def test_success_response_contains_no_python_only_objects():
     assert isinstance(response["result"]["zone_names"], list)
     assert isinstance(response["result"]["route_names"], list)
     assert isinstance(response["result"]["target_ids"], list)
+    assert response["result"]["target_ids"] == ["udp:a"]
+    assert all(
+        isinstance(target_id, str)
+        for target_id in response["result"]["target_ids"]
+    )

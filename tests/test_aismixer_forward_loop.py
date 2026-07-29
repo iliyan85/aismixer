@@ -15,7 +15,7 @@ from core.ingress_frame import (
     decode_frame_slice,
 )
 from core.network_policy import NetworkPolicy
-from core.routing import RoutingResult, RoutingTable
+from core.routing import RoutingTable
 from core.routing_state import RoutingSnapshot, RoutingState
 from dedup import Deduplicator
 
@@ -27,6 +27,13 @@ MULTIPART_SECOND = "!AIVDM,2,2,7,A,payload2,0*00"
 AIVDO_SENTENCE = "!AIVDO,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*42"
 AIVDO_MULTIPART_FIRST = "!AIVDO,2,1,7,A,payload1,0*00"
 AIVDO_MULTIPART_SECOND = "!AIVDO,2,2,7,A,payload2,0*00"
+TEST_TARGET_ID_BY_NAME = {
+    "udp:aishub": 0,
+    "udp:local_debug": 1,
+    "udp:first": 2,
+    "udp:second": 3,
+    "udp:shared": 4,
+}
 
 
 def make_nmea_sentence(body):
@@ -45,10 +52,13 @@ class FakeForwarder:
     async def send(self, message):
         self.messages.append(message)
 
-    async def send_to(self, target_ids, message):
+    async def send_to_ids(self, target_ids, message):
         self.targeted_messages.append((tuple(target_ids), message))
         if self.on_send_to is not None:
             self.on_send_to(tuple(target_ids), message)
+
+    async def send_to(self, _target_ids, _message):
+        raise AssertionError("string targeted egress path was called")
 
 
 class _OnePacketLoop:
@@ -147,7 +157,7 @@ def tag_block(body):
 
 
 def make_routing_table(routes=None, zones=None):
-    return RoutingTable.from_definitions(
+    table = RoutingTable.from_definitions(
         zones or {
             "source_a": {"include": ["udp:source_a"]},
             "source_b": {"include": ["udp:source_b"]},
@@ -160,10 +170,11 @@ def make_routing_table(routes=None, zones=None):
             }
         ],
     )
+    return table.compile_target_ids(TEST_TARGET_ID_BY_NAME)
 
 
 def make_single_target_table(target_id, source_id="udp:source_a"):
-    return RoutingTable.from_definitions(
+    table = RoutingTable.from_definitions(
         {"source": {"include": [source_id]}},
         [
             {
@@ -173,17 +184,20 @@ def make_single_target_table(target_id, source_id="udp:source_a"):
             }
         ],
     )
+    return table.compile_target_ids(TEST_TARGET_ID_BY_NAME)
 
 
-class RecordingRoutingTable(RoutingTable):
+class RecordingRoutingTable:
     def __init__(self, target_ids):
-        super().__init__(resolved_zones={}, route_definitions=())
-        object.__setattr__(self, "target_ids", tuple(target_ids))
-        object.__setattr__(self, "source_ids", [])
+        self.target_ids = tuple(target_ids)
+        self.source_ids = []
 
-    def match(self, source_id):
+    def match_target_ids(self, source_id):
         self.source_ids.append(source_id)
-        return RoutingResult(("recorded",), self.target_ids)
+        return self.target_ids
+
+    def match(self, _source_id):
+        raise AssertionError("descriptive routing matcher was called")
 
 
 class RecordingRoutingState:
@@ -707,7 +721,7 @@ def test_forward_loop_uses_campaign_c_path_once_per_accepted_event(
             self.parsed_inputs.append(parsed)
             return super().feed_parsed_outcome(parsed)
 
-    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_table = RecordingRoutingTable((0,))
     routing_state = RecordingRoutingState(routing_table)
     guarded_assembler = GuardedAssembler()
     coercion_calls = []
@@ -856,7 +870,7 @@ def test_forward_loop_uses_campaign_c_path_once_per_accepted_event(
     assert [
         target_ids
         for target_ids, _message in fake_forwarder.targeted_messages
-    ] == [("udp:aishub",), ("udp:aishub",)]
+    ] == [(0,), (0,)]
     messages = [
         message
         for _target_ids, message in fake_forwarder.targeted_messages
@@ -979,7 +993,7 @@ def test_mixed_frame_event_unsupported_and_later_frame_preserve_order(
         ("\\c:3,s:frame_two*00\\" + third_sentence).encode("utf-8"),
         source_id="udp:source_a",
     )
-    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_table = RecordingRoutingTable((0,))
     routing_state = RecordingRoutingState(routing_table)
 
     fake_forwarder = asyncio.run(
@@ -1001,15 +1015,15 @@ def test_mixed_frame_event_unsupported_and_later_frame_preserve_order(
     assert fake_forwarder.messages == []
     assert fake_forwarder.targeted_messages == [
         (
-            ("udp:aishub",),
+            (0,),
             tag_block("c:1,s:frame_one") + SENTENCE + "\r\n",
         ),
         (
-            ("udp:aishub",),
+            (0,),
             tag_block("c:2,s:event") + SECOND_SENTENCE + "\r\n",
         ),
         (
-            ("udp:aishub",),
+            (0,),
             tag_block("c:3,s:frame_two") + third_sentence + "\r\n",
         ),
     ]
@@ -1018,7 +1032,7 @@ def test_mixed_frame_event_unsupported_and_later_frame_preserve_order(
 def test_direct_empty_and_non_ais_frames_each_snapshot_and_match_once(
     monkeypatch,
 ):
-    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_table = RecordingRoutingTable((0,))
     routing_state = RecordingRoutingState(routing_table)
     frames = [
         make_direct_frame(b"", source_id="udp:empty"),
@@ -1042,7 +1056,7 @@ def test_direct_empty_and_non_ais_frames_each_snapshot_and_match_once(
 def test_direct_multi_sentence_frame_shares_routing_snapshot_and_match(
     monkeypatch,
 ):
-    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_table = RecordingRoutingTable((0,))
     routing_state = RecordingRoutingState(routing_table)
     frame = make_direct_frame(
         (SENTENCE + "\n" + SECOND_SENTENCE).encode("utf-8"),
@@ -1209,7 +1223,7 @@ def test_bytes_raw_line_is_not_implicitly_decoded(monkeypatch):
 
 
 def test_non_string_event_skips_routing_snapshot_and_match(monkeypatch):
-    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_table = RecordingRoutingTable((0,))
     routing_state = RecordingRoutingState(routing_table)
 
     async def run():
@@ -1237,14 +1251,14 @@ def test_non_string_event_skips_routing_snapshot_and_match(monkeypatch):
     assert fake_forwarder.messages == []
     assert len(fake_forwarder.targeted_messages) == 1
     target_ids, message = fake_forwarder.targeted_messages[0]
-    assert target_ids == ("udp:aishub",)
+    assert target_ids == (0,)
     assert SENTENCE in message
 
 
 def test_accepted_non_ais_event_still_snapshots_and_matches_once(
     monkeypatch,
 ):
-    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_table = RecordingRoutingTable((0,))
     routing_state = RecordingRoutingState(routing_table)
 
     fake_forwarder = asyncio.run(
@@ -2978,7 +2992,7 @@ def test_forward_loop_routing_state_with_no_table_uses_legacy_mode(monkeypatch):
 
 
 def test_forward_loop_routing_mode_matches_event_source_id(monkeypatch):
-    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_table = RecordingRoutingTable((0,))
     routing_state = RecordingRoutingState(routing_table)
     event = make_event(SENTENCE, source_id="udp:source_a")
 
@@ -3012,7 +3026,7 @@ def test_forward_loop_routing_mode_sends_to_matched_targets(monkeypatch):
     assert fake_forwarder.messages == []
     assert len(fake_forwarder.targeted_messages) == 1
     target_ids, message = fake_forwarder.targeted_messages[0]
-    assert target_ids == ("udp:aishub",)
+    assert target_ids == (0,)
     assert SENTENCE in message
 
 
@@ -3032,7 +3046,7 @@ def test_forward_loop_routing_mode_sends_aivdo_to_matched_targets(monkeypatch):
     assert fake_forwarder.messages == []
     assert len(fake_forwarder.targeted_messages) == 1
     target_ids, message = fake_forwarder.targeted_messages[0]
-    assert target_ids == ("udp:aishub",)
+    assert target_ids == (0,)
     assert AIVDO_SENTENCE in message
     assert "!AIVDO" in message
     assert message.startswith("\\c:")
@@ -3072,7 +3086,7 @@ def test_forward_loop_routing_mode_suppresses_duplicate_for_same_target(monkeypa
     )
 
     assert len(fake_forwarder.targeted_messages) == 1
-    assert fake_forwarder.targeted_messages[0][0] == ("udp:aishub",)
+    assert fake_forwarder.targeted_messages[0][0] == (0,)
 
 
 def test_forward_loop_routing_mode_allows_same_sentence_to_two_targets(monkeypatch):
@@ -3096,10 +3110,7 @@ def test_forward_loop_routing_mode_allows_same_sentence_to_two_targets(monkeypat
         )
     )
 
-    assert fake_forwarder.targeted_messages[0][0] == (
-        "udp:aishub",
-        "udp:local_debug",
-    )
+    assert fake_forwarder.targeted_messages[0][0] == (0, 1)
 
 
 def test_routing_dedup_emits_changed_multipart_group_atomically_to_all_targets(
@@ -3162,24 +3173,24 @@ def test_routing_dedup_emits_changed_multipart_group_atomically_to_all_targets(
 
     assert fake_forwarder.messages == []
     assert len(records) == 4
-    assert records[0][0] == ("udp:first",)
+    assert records[0][0] == (2,)
     assert first in records[0][1]
     assert ",g:1-2-111*" in leading_tag(records[0][1])
-    assert records[1][0] == ("udp:first",)
+    assert records[1][0] == (2,)
     assert second in records[1][1]
     assert re.fullmatch(
         r"g:2-2-111\*[0-9A-F]{2}",
         leading_tag(records[1][1]),
     )
 
-    assert records[2][0] == ("udp:first", "udp:second")
+    assert records[2][0] == (2, 3)
     assert first in records[2][1]
     assert re.fullmatch(
         r"c:\d+,s:test_station,g:1-2-222\*[0-9A-F]{2}",
         leading_tag(records[2][1]),
     )
 
-    assert records[3][0] == ("udp:first", "udp:second")
+    assert records[3][0] == (2, 3)
     assert second_new in records[3][1]
     assert re.fullmatch(
         r"g:2-2-222\*[0-9A-F]{2}",
@@ -3247,10 +3258,10 @@ def test_routing_dedup_suppresses_repeated_group_per_target_atomically(
     assert fake_forwarder.messages == []
     assert len(records) == 4
     assert [target_ids for target_ids, _ in records] == [
-        ("udp:first",),
-        ("udp:first",),
-        ("udp:second",),
-        ("udp:second",),
+        (2,),
+        (2,),
+        (3,),
+        (3,),
     ]
     assert first in records[0][1]
     assert second in records[1][1]
@@ -3301,7 +3312,7 @@ def test_forward_loop_routing_mode_dedups_two_sources_to_same_target(monkeypatch
     )
 
     assert len(fake_forwarder.targeted_messages) == 1
-    assert fake_forwarder.targeted_messages[0][0] == ("udp:shared",)
+    assert fake_forwarder.targeted_messages[0][0] == (4,)
 
 
 def test_forward_loop_routing_mode_keeps_two_sources_to_different_targets(monkeypatch):
@@ -3334,8 +3345,8 @@ def test_forward_loop_routing_mode_keeps_two_sources_to_different_targets(monkey
     )
 
     assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
-        ("udp:aishub",),
-        ("udp:local_debug",),
+        (0,),
+        (1,),
     ]
 
 
@@ -3367,7 +3378,7 @@ def test_forward_loop_routing_mode_overlapping_routes_do_not_duplicate_target(
         )
     )
 
-    assert fake_forwarder.targeted_messages[0][0] == ("udp:shared",)
+    assert fake_forwarder.targeted_messages[0][0] == (4,)
 
 
 def test_forward_loop_routing_mode_preserves_multipart_and_tag_behavior(monkeypatch):
@@ -3401,7 +3412,7 @@ def test_forward_loop_routing_mode_preserves_multipart_and_tag_behavior(monkeypa
 
 
 def test_forward_loop_routing_matches_once_for_multi_sentence_event(monkeypatch):
-    routing_table = RecordingRoutingTable(("udp:aishub",))
+    routing_table = RecordingRoutingTable((0,))
     routing_state = RecordingRoutingState(routing_table)
     raw_line = f"{SENTENCE}\n{SECOND_SENTENCE}"
 
@@ -3419,8 +3430,8 @@ def test_forward_loop_routing_matches_once_for_multi_sentence_event(monkeypatch)
     assert fake_forwarder.messages == []
     assert len(fake_forwarder.targeted_messages) == 2
     assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
-        ("udp:aishub",),
-        ("udp:aishub",),
+        (0,),
+        (0,),
     ]
     assert SENTENCE in fake_forwarder.targeted_messages[0][1]
     assert SECOND_SENTENCE in fake_forwarder.targeted_messages[1][1]
@@ -3445,8 +3456,8 @@ def test_forward_loop_snapshot_called_once_per_ingress_event(monkeypatch):
 
     assert routing_state.snapshot_calls == 2
     assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
-        ("udp:aishub",),
-        ("udp:aishub",),
+        (0,),
+        (0,),
     ]
 
 
@@ -3476,8 +3487,8 @@ def test_forward_loop_replacement_between_events_uses_new_snapshot(monkeypatch):
     fake_forwarder = asyncio.run(run())
 
     assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
-        ("udp:first",),
-        ("udp:second",),
+        (2,),
+        (3,),
     ]
 
 
@@ -3522,9 +3533,9 @@ def test_forward_loop_mid_event_replacement_affects_next_event_only(monkeypatch)
     fake_forwarder = asyncio.run(run())
 
     assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
-        ("udp:first",),
-        ("udp:first",),
-        ("udp:second",),
+        (2,),
+        (2,),
+        (3,),
     ]
 
 
@@ -3557,7 +3568,7 @@ def test_forward_loop_replace_none_returns_next_event_to_legacy_mode(monkeypatch
     fake_forwarder = asyncio.run(run())
 
     assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
-        ("udp:first",)
+        (2,)
     ]
     assert len(fake_forwarder.messages) == 1
     assert SECOND_SENTENCE in fake_forwarder.messages[0]
@@ -3604,10 +3615,10 @@ def test_forward_loop_replacement_generation_preserves_tag_behavior(monkeypatch)
     messages = [message for _target_ids, message in fake_forwarder.targeted_messages]
 
     assert [target_ids for target_ids, _ in fake_forwarder.targeted_messages] == [
-        ("udp:first",),
-        ("udp:first",),
-        ("udp:second",),
-        ("udp:second",),
+        (2,),
+        (2,),
+        (3,),
+        (3,),
     ]
     assert re.fullmatch(
         rf"c:\d+,s:test_station,g:1-2-{group_id}\*[0-9A-F]{{2}}",
@@ -3677,7 +3688,7 @@ def test_unrouted_completion_clears_multipart_gid_context(monkeypatch):
     assert [
         target_ids
         for target_ids, _message in fake_forwarder.targeted_messages
-    ] == [("udp:aishub",), ("udp:aishub",)]
+    ] == [(0,), (0,)]
 
     messages = [
         message

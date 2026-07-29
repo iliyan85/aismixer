@@ -2,28 +2,29 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from core.ingress_frame import IngressFrame
-from core.routing import RoutingTable, TargetId
+from core.target_identity import EgressTargetId
 
-if TYPE_CHECKING:
-    from core.routing_state import RoutingSnapshot
+
+class DeduplicationMode(Enum):
+    """Deduplication scope selected for one accepted ingress frame."""
+
+    GLOBAL = "global"
+    PER_TARGET = "per-target"
 
 
 @dataclass(frozen=True, slots=True)
 class ProcessingSnapshot:
-    """Immutable routing view used to process one accepted ingress frame.
-
-    ``routing_table is None`` denotes legacy broadcast/global-dedup mode. A
-    table denotes routed/target-scoped-dedup mode.
-    """
+    """Immutable target-only processing view for one accepted ingress frame."""
 
     routing_generation: int
-    routing_table: RoutingTable | None
+    deduplication_mode: DeduplicationMode
+    target_ids: tuple[EgressTargetId, ...]
 
     def __post_init__(self) -> None:
         if isinstance(self.routing_generation, bool) or not isinstance(
@@ -33,26 +34,28 @@ class ProcessingSnapshot:
             raise TypeError("routing_generation must be a non-negative integer.")
         if self.routing_generation < 0:
             raise ValueError("routing_generation must be a non-negative integer.")
-        if self.routing_table is not None and not isinstance(
-            self.routing_table,
-            RoutingTable,
-        ):
-            raise TypeError("routing_table must be a RoutingTable or None.")
+        if not isinstance(self.deduplication_mode, DeduplicationMode):
+            raise TypeError(
+                "deduplication_mode must be a DeduplicationMode."
+            )
+        if isinstance(self.target_ids, (str, bytes)):
+            raise TypeError(
+                "target_ids must be a non-string iterable of integers."
+            )
+        try:
+            target_ids = tuple(self.target_ids)
+        except TypeError:
+            raise TypeError(
+                "target_ids must be a non-string iterable of integers."
+            ) from None
 
-    @classmethod
-    def from_routing_snapshot(
-        cls,
-        snapshot: RoutingSnapshot,
-    ) -> ProcessingSnapshot:
-        """Adapt an acquired immutable routing snapshot without retaining state."""
-
-        from core.routing_state import RoutingSnapshot
-
-        if not isinstance(snapshot, RoutingSnapshot):
-            raise TypeError("snapshot must be a RoutingSnapshot.")
-        return cls(
-            routing_generation=snapshot.generation,
-            routing_table=snapshot.table,
+        _validate_numeric_target_ids(target_ids)
+        if len(set(target_ids)) != len(target_ids):
+            raise ValueError("ProcessingSnapshot target_ids must be unique.")
+        object.__setattr__(
+            self,
+            "target_ids",
+            target_ids,
         )
 
 
@@ -72,7 +75,7 @@ class ProcessorOutput:
 
     message: str
     disposition: RoutingDisposition
-    target_ids: tuple[TargetId, ...] = ()
+    target_ids: tuple[EgressTargetId, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.message, str):
@@ -83,11 +86,10 @@ class ProcessorOutput:
             self.target_ids,
             Sequence,
         ):
-            raise TypeError("target_ids must be a sequence of strings.")
+            raise TypeError("target_ids must be a sequence of integers.")
 
         target_ids = tuple(self.target_ids)
-        if not all(isinstance(target_id, str) for target_id in target_ids):
-            raise TypeError("target_ids must contain only strings.")
+        _validate_numeric_target_ids(target_ids)
         object.__setattr__(self, "target_ids", target_ids)
 
         if self.disposition is RoutingDisposition.LEGACY_BROADCAST:
@@ -97,6 +99,20 @@ class ProcessorOutput:
                 )
         elif not target_ids:
             raise ValueError("targeted output must contain at least one target ID.")
+
+
+def _validate_numeric_target_ids(
+    target_ids: Iterable[EgressTargetId],
+) -> None:
+    for target_id in target_ids:
+        if isinstance(target_id, bool) or not isinstance(target_id, int):
+            raise TypeError(
+                "target_ids must contain only non-negative integers."
+            )
+        if target_id < 0:
+            raise ValueError(
+                "target_ids must contain only non-negative integers."
+            )
 
 
 @runtime_checkable

@@ -3,7 +3,11 @@ import asyncio
 import pytest
 
 import aismixer
-from core.data_plane import ProcessorOutput, RoutingDisposition
+from core.data_plane import (
+    DeduplicationMode,
+    ProcessorOutput,
+    RoutingDisposition,
+)
 from core.ingress_frame import IngressFrame
 from core.routing import RoutingTable
 from core.routing_state import RoutingSnapshot, RoutingState
@@ -86,6 +90,19 @@ class RecordingRoutingState:
         return self._snapshot
 
 
+class RecordingNumericRoutingTable:
+    def __init__(self, target_ids):
+        self.target_ids = tuple(target_ids)
+        self.source_ids = []
+
+    def match_target_ids(self, source_id):
+        self.source_ids.append(source_id)
+        return self.target_ids
+
+    def match(self, _source_id):
+        raise AssertionError("descriptive routing matcher was called")
+
+
 class ScriptedProcessor:
     def __init__(self, *actions, effects=None):
         self._actions = list(actions)
@@ -119,8 +136,11 @@ class RecordingForwarder:
     async def send(self, message):
         self.events.append(("broadcast", message))
 
-    async def send_to(self, target_ids, message):
+    async def send_to_ids(self, target_ids, message):
         self.events.append(("targeted", tuple(target_ids), message))
+
+    async def send_to(self, _target_ids, _message):
+        raise AssertionError("string targeted egress path was called")
 
 
 class GatedForwarder(RecordingForwarder):
@@ -154,7 +174,7 @@ async def cancel_task(task):
 
 
 def empty_routing_table():
-    return RoutingTable.from_definitions({}, [])
+    return RoutingTable.from_definitions({}, []).compile_target_ids({})
 
 
 def test_unsupported_item_is_rejected_before_snapshot_and_processor():
@@ -176,7 +196,83 @@ def test_unsupported_item_is_rejected_before_snapshot_and_processor():
         assert len(processor.calls) == 1
         assert processor.calls[0][0] is frame
         assert processor.calls[0][1].routing_generation == 7
+        assert (
+            processor.calls[0][1].deduplication_mode
+            is DeduplicationMode.GLOBAL
+        )
         assert egress_queue.batches == []
+
+    asyncio.run(scenario())
+
+
+def test_routed_frame_resolves_one_numeric_target_only_snapshot():
+    async def scenario():
+        frame = make_frame("routed")
+        table = RecordingNumericRoutingTable((3, 1))
+        state = RecordingRoutingState(RoutingSnapshot(8, table))
+        processor = ScriptedProcessor(())
+
+        with pytest.raises(asyncio.CancelledError):
+            await aismixer.processor_stage_loop(
+                FiniteQueue(frame),
+                CompletingEgressQueue(),
+                routing_state=state,
+                processor=processor,
+            )
+
+        assert state.snapshot_calls == 1
+        assert table.source_ids == ["udp:routed"]
+        snapshot = processor.calls[0][1]
+        assert snapshot.routing_generation == 8
+        assert snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
+        assert snapshot.target_ids == (3, 1)
+
+    asyncio.run(scenario())
+
+
+def test_routed_no_match_remains_per_target_with_empty_targets():
+    async def scenario():
+        frame = make_frame("unmatched")
+        table = RecordingNumericRoutingTable(())
+        processor = ScriptedProcessor(())
+
+        with pytest.raises(asyncio.CancelledError):
+            await aismixer.processor_stage_loop(
+                FiniteQueue(frame),
+                CompletingEgressQueue(),
+                routing_state=RecordingRoutingState(
+                    RoutingSnapshot(4, table)
+                ),
+                processor=processor,
+            )
+
+        snapshot = processor.calls[0][1]
+        assert snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
+        assert snapshot.target_ids == ()
+
+    asyncio.run(scenario())
+
+
+def test_legacy_mode_receives_explicit_all_numeric_forwarder_ids():
+    async def scenario():
+        frame = make_frame("legacy")
+        processor = ScriptedProcessor(())
+
+        with pytest.raises(asyncio.CancelledError):
+            await aismixer.processor_stage_loop(
+                FiniteQueue(frame),
+                CompletingEgressQueue(),
+                routing_state=RecordingRoutingState(
+                    RoutingSnapshot(5, None)
+                ),
+                processor=processor,
+                legacy_target_ids=(0, 2, 3),
+            )
+
+        snapshot = processor.calls[0][1]
+        assert snapshot.routing_generation == 5
+        assert snapshot.deduplication_mode is DeduplicationMode.GLOBAL
+        assert snapshot.target_ids == (0, 2, 3)
 
     asyncio.run(scenario())
 
@@ -186,7 +282,7 @@ def test_one_frame_produces_one_complete_ordered_egress_batch():
         frame = make_frame("one")
         outputs = (
             broadcast("first"),
-            targeted("second", "udp:b", "udp:a"),
+            targeted("second", 2, 1),
         )
         state = RecordingRoutingState(RoutingSnapshot(3, None))
         processor = ScriptedProcessor(outputs)
@@ -213,7 +309,7 @@ def test_egress_dispatches_batch_sequentially_in_tuple_order():
     async def scenario():
         outputs = (
             broadcast("first"),
-            targeted("second", "udp:b", "udp:a"),
+            targeted("second", 2, 1),
         )
         completion = asyncio.get_running_loop().create_future()
         queue = asyncio.Queue()
@@ -234,7 +330,7 @@ def test_egress_dispatches_batch_sequentially_in_tuple_order():
 
         assert forwarder.events == [
             ("broadcast", "first\r\n"),
-            ("targeted", ("udp:b", "udp:a"), "second\r\n"),
+            ("targeted", (2, 1), "second\r\n"),
         ]
 
     asyncio.run(scenario())
@@ -395,9 +491,11 @@ def test_routing_replacement_while_blocked_affects_only_the_next_frame():
         first_snapshot = processor.calls[0][1]
         second_snapshot = processor.calls[1][1]
         assert first_snapshot.routing_generation == 0
-        assert first_snapshot.routing_table is first_table
+        assert first_snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
+        assert first_snapshot.target_ids == ()
         assert second_snapshot.routing_generation == 1
-        assert second_snapshot.routing_table is second_table
+        assert second_snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
+        assert second_snapshot.target_ids == ()
 
     asyncio.run(scenario())
 
@@ -476,6 +574,8 @@ def test_main_wires_module_processor_and_forwarder_into_runtime_stages(
 
         class MainForwarder:
             target_ids = ("udp:target",)
+            target_id_by_name = {"udp:target": 1}
+            all_target_ids = (0, 1)
 
             def __init__(self):
                 self.close_calls = 0
@@ -487,8 +587,10 @@ def test_main_wires_module_processor_and_forwarder_into_runtime_stages(
         supervision_calls = []
         builder_calls = []
 
-        def fake_builder(config, routing_state, target_ids):
-            builder_calls.append((config, routing_state, target_ids))
+        def fake_builder(config, routing_state, target_id_by_name):
+            builder_calls.append(
+                (config, routing_state, target_id_by_name)
+            )
             return None
 
         async def fake_supervise_named_tasks(task_specs):
@@ -515,7 +617,7 @@ def test_main_wires_module_processor_and_forwarder_into_runtime_stages(
         await aismixer.main()
 
         assert builder_calls == [
-            ({"control": None}, state, ("udp:target",))
+            ({"control": None}, state, {"udp:target": 1})
         ]
         assert len(supervision_calls) == 1
         specs = {spec.name: spec for spec in supervision_calls[0]}
@@ -541,6 +643,7 @@ def test_main_wires_module_processor_and_forwarder_into_runtime_stages(
         assert processor_factory.keywords == {
             "routing_state": state,
             "processor": processor,
+            "legacy_target_ids": (0, 1),
         }
         assert egress_factory.keywords == {
             "debug": False,
@@ -609,7 +712,7 @@ def test_debug_output_is_emitted_before_send_with_crlf_removed(capsys):
             async def send(self, _message):
                 self.output_seen_at_send = capsys.readouterr().out
 
-            async def send_to(self, _target_ids, _message):
+            async def send_to_ids(self, _target_ids, _message):
                 raise AssertionError("unexpected targeted send")
 
         forwarder = DebugObservingForwarder()

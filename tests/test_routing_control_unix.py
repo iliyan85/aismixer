@@ -58,7 +58,7 @@ def parse_write(write):
 
 
 def make_protocol():
-    service = RoutingControlService(RoutingState(), ("udp:a",))
+    service = RoutingControlService(RoutingState(), {"udp:a": 0})
     return RoutingControlProtocol(service)
 
 
