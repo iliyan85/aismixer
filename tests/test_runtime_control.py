@@ -183,14 +183,14 @@ def test_invalid_socket_mode_is_rejected(socket_mode):
 
 
 def test_disabled_builder_returns_none_without_constructing_stack():
-    def fail_service_factory(_routing_state, _available_target_ids):
+    def fail_service_factory(_routing_state, _target_id_by_name):
         raise AssertionError("service must not be constructed")
 
     assert (
         build_optional_routing_control_server(
             {"control": {"unix": {"enabled": False}}},
             RoutingState(),
-            ("udp:a",),
+            {"udp:a": 0},
             service_factory=fail_service_factory,
         )
         is None
@@ -200,7 +200,7 @@ def test_disabled_builder_returns_none_without_constructing_stack():
 def test_enabled_builder_wires_stack_without_starting_server():
     calls = {}
     routing_state = RoutingState()
-    target_ids = ("udp:a",)
+    target_id_by_name = {"udp:a": 7}
 
     class FakeServer:
         def __init__(self, protocol, socket_path, *, max_request_bytes, socket_mode):
@@ -210,8 +210,8 @@ def test_enabled_builder_wires_stack_without_starting_server():
         async def start(self):
             self.start_count += 1
 
-    def service_factory(state, available_target_ids):
-        calls["service"] = (state, available_target_ids)
+    def service_factory(state, supplied_target_id_by_name):
+        calls["service"] = (state, supplied_target_id_by_name)
         return "service"
 
     def protocol_factory(service):
@@ -225,7 +225,7 @@ def test_enabled_builder_wires_stack_without_starting_server():
             socket_mode="0600",
         ),
         routing_state,
-        target_ids,
+        target_id_by_name,
         service_factory=service_factory,
         protocol_factory=protocol_factory,
         server_factory=FakeServer,
@@ -233,7 +233,7 @@ def test_enabled_builder_wires_stack_without_starting_server():
 
     assert isinstance(server, FakeServer)
     assert server.start_count == 0
-    assert calls["service"] == (routing_state, target_ids)
+    assert calls["service"] == (routing_state, target_id_by_name)
     assert calls["protocol"] == "service"
     assert calls["server"] == ("protocol", "/tmp/control.sock", 1234, 0o600)
 
@@ -247,7 +247,7 @@ def test_builder_stack_updates_supplied_routing_state_without_real_socket():
     server = build_optional_routing_control_server(
         enabled_config(socket_path="/tmp/control.sock"),
         routing_state,
-        ("udp:a",),
+        {"udp:a": 0},
         server_factory=CapturingServer,
     )
 
@@ -303,7 +303,10 @@ async def run_aismixer_main(
 ):
     observer = observer if observer is not None else {}
     routing_state = RoutingState()
+
     class FakeForwarder:
+        all_target_ids = (0,)
+        target_id_by_name = {"udp:a": 0}
         target_ids = ("udp:a",)
 
         def __init__(self):
@@ -319,8 +322,8 @@ async def run_aismixer_main(
         "specs": (),
     }
 
-    def fake_builder(config, state, available_target_ids):
-        builder_calls.append((config, state, available_target_ids))
+    def fake_builder(config, state, target_id_by_name):
+        builder_calls.append((config, state, target_id_by_name))
         return control_server
 
     async def fake_supervise_named_tasks(task_specs):
@@ -357,7 +360,7 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
     result = asyncio.run(run_aismixer_main(monkeypatch, control_server=None))
 
     assert result["builder_calls"] == [
-        ({"control": None}, result["routing_state"], ("udp:a",))
+        ({"control": None}, result["routing_state"], {"udp:a": 0})
     ]
     assert result["supervisor_called"]["value"] is True
     specs = {
@@ -374,6 +377,7 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
     assert processor_factory.keywords == {
         "routing_state": result["routing_state"],
         "processor": aismixer.data_plane_processor,
+        "legacy_target_ids": result["forwarder"].all_target_ids,
     }
     assert egress_factory.args[1] is result["forwarder"]
     assert egress_factory.keywords == {
@@ -481,6 +485,8 @@ class _MainTestSocketModule:
 
 
 class _MainTestForwarder:
+    all_target_ids = (0,)
+    target_id_by_name = {"udp:target": 0}
     target_ids = ("udp:target",)
 
     def __init__(self):
@@ -588,6 +594,7 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         assert processor_factory.keywords == {
             "routing_state": state,
             "processor": aismixer.data_plane_processor,
+            "legacy_target_ids": output_forwarder.all_target_ids,
         }
         assert egress_factory.func is aismixer.egress_stage_loop
         assert egress_factory.args[1] is output_forwarder
@@ -695,6 +702,8 @@ def make_event(raw_line, source_id="udp:source"):
 
 
 class IntegrationForwarder:
+    all_target_ids = (0,)
+    target_id_by_name = {"udp:target": 0}
     target_ids = ("udp:target",)
 
     def __init__(self):
@@ -707,9 +716,12 @@ class IntegrationForwarder:
         self.messages.append(message)
         self.broadcast_event.set()
 
-    async def send_to(self, target_ids, message):
+    async def send_to_ids(self, target_ids, message):
         self.targeted_messages.append((tuple(target_ids), message))
         self.targeted_event.set()
+
+    async def send_to(self, _target_ids, _message):
+        raise AssertionError("runtime targeted egress must use numeric target IDs")
 
 
 @unix_socket_test
@@ -722,7 +734,7 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
         server = build_optional_routing_control_server(
             config,
             routing_state,
-            fake_forwarder.target_ids,
+            fake_forwarder.target_id_by_name,
         )
         assert isinstance(server, RoutingControlUnixServer)
 
@@ -746,6 +758,7 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
                 routing_state=routing_state,
                 processor=processor,
                 output_forwarder=fake_forwarder,
+                legacy_target_ids=fake_forwarder.all_target_ids,
                 debug=False,
             )
         )
@@ -800,7 +813,7 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
         assert replace["result"]["generation"] == 1
         assert routing_state.snapshot().generation == 2
         assert disable["result"]["generation"] == 2
-        assert fake_forwarder.targeted_messages[0][0] == ("udp:target",)
+        assert fake_forwarder.targeted_messages[0][0] == (0,)
         assert fake_forwarder.messages
         assert not path.exists()
 

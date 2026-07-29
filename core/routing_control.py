@@ -8,12 +8,13 @@ installation, and RoutingState remains the single owner of generation numbers.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from core.routing import RoutingTable, ZoneResolutionError
 from core.routing_state import RoutingSnapshot, RoutingState
 from core.runtime_routing import RuntimeRoutingConfigError, compile_routing_section
+from core.target_identity import EgressTargetId, freeze_target_id_by_name
 
 
 class RoutingCandidateConfigError(ValueError):
@@ -42,13 +43,13 @@ class RoutingControlService:
     def __init__(
         self,
         routing_state: RoutingState,
-        available_target_ids: Iterable[str],
+        target_id_by_name: Mapping[str, EgressTargetId],
     ):
         if not isinstance(routing_state, RoutingState):
             raise TypeError("routing_state must be a RoutingState.")
 
         self._routing_state = routing_state
-        self._available_target_ids = _copy_target_ids(available_target_ids)
+        self._target_id_by_name = freeze_target_id_by_name(target_id_by_name)
 
     def status(self) -> RoutingControlStatus:
         """Return a stable immutable view of the current routing snapshot."""
@@ -65,7 +66,7 @@ class RoutingControlService:
         try:
             candidate_table = compile_routing_section(
                 routing_config,
-                self._available_target_ids,
+                self._target_id_by_name,
             )
         except (
             RuntimeRoutingConfigError,
@@ -92,22 +93,6 @@ class RoutingControlService:
             expected_generation=expected_generation,
         )
         return _status_from_snapshot(snapshot)
-
-
-def _copy_target_ids(available_target_ids: Iterable[str]) -> tuple[str, ...]:
-    if isinstance(available_target_ids, str):
-        raise TypeError("available_target_ids must be an iterable of strings.")
-
-    try:
-        copied = tuple(available_target_ids)
-    except TypeError as exc:
-        raise TypeError(
-            "available_target_ids must be an iterable of strings."
-        ) from exc
-
-    if not all(isinstance(target_id, str) for target_id in copied):
-        raise TypeError("available_target_ids must contain only strings.")
-    return copied
 
 
 def _status_from_snapshot(snapshot: RoutingSnapshot) -> RoutingControlStatus:

@@ -171,6 +171,9 @@ async def run_routed_events(
         forwarder_module, "asyncio", _FakeAsyncioModule(fake_loop)
     )
     output_forwarder = Forwarder(forwarders_config)
+    routing_table = routing_table.compile_target_ids(
+        output_forwarder.target_id_by_name
+    )
     processor = PythonDataPlaneProcessor(
         station_id="test_station",
         preserve_ingress_c=True,
@@ -269,7 +272,7 @@ def test_example_routing_config_is_internally_valid():
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
 
     forwarder = Forwarder(config["forwarders"])
-    table = load_optional_routing_table(config, forwarder.target_ids)
+    table = load_optional_routing_table(config, forwarder.target_id_by_name)
 
     assert forwarder.target_ids == ("udp:aishub", "udp:local_debug")
     assert table.match("udp:balchik_roof").target_ids == (
@@ -277,3 +280,5 @@ def test_example_routing_config_is_internally_valid():
         "udp:aishub",
     )
     assert table.match("udpsec:vitara_mobile").target_ids == ("udp:local_debug",)
+    assert table.match_target_ids("udp:balchik_roof") == (1, 0)
+    assert table.match_target_ids("udpsec:vitara_mobile") == (1,)

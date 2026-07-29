@@ -4,13 +4,13 @@ import core.python_data_plane as python_data_plane_module
 from assembler import AIVDMAssembler
 from core.data_plane import (
     DataPlaneProcessor,
+    DeduplicationMode,
     ProcessingSnapshot,
     ProcessorOutput,
     RoutingDisposition,
 )
 from core.ingress_frame import IngressFrame
 from core.python_data_plane import PythonDataPlaneProcessor
-from core.routing import RoutingResult, RoutingTable
 from dedup import Deduplicator
 
 
@@ -59,23 +59,15 @@ def make_frame(
     )
 
 
-def make_snapshot(generation=0, table=None):
+def make_snapshot(
+    generation=0,
+    mode=DeduplicationMode.GLOBAL,
+    target_ids=(),
+):
     return ProcessingSnapshot(
         routing_generation=generation,
-        routing_table=table,
-    )
-
-
-def make_table(*target_ids, source_id=SOURCE_ID):
-    return RoutingTable.from_definitions(
-        {"source": {"include": [source_id]}},
-        [
-            {
-                "name": "source_to_targets",
-                "from_zone": "source",
-                "to": list(target_ids),
-            }
-        ],
+        deduplication_mode=mode,
+        target_ids=target_ids,
     )
 
 
@@ -138,17 +130,13 @@ class SequenceClock:
         return value
 
 
-class CountingRoutingTable(RoutingTable):
-    __slots__ = ("target_ids", "matched_source_ids")
+class RecordingDeduplicator:
+    def __init__(self):
+        self.calls = []
 
-    def __init__(self, target_ids):
-        super().__init__(resolved_zones={}, route_definitions=())
-        object.__setattr__(self, "target_ids", tuple(target_ids))
-        object.__setattr__(self, "matched_source_ids", [])
-
-    def match(self, source_id):
-        self.matched_source_ids.append(source_id)
-        return RoutingResult(("recorded",), self.target_ids)
+    def is_unique(self, message, scope=None):
+        self.calls.append((message, scope))
+        return True
 
 
 def test_processor_satisfies_synchronous_protocol_without_asyncio_dependency():
@@ -157,6 +145,10 @@ def test_processor_satisfies_synchronous_protocol_without_asyncio_dependency():
     assert isinstance(processor, DataPlaneProcessor)
     assert not inspect.iscoroutinefunction(processor.process)
     assert "asyncio" not in vars(python_data_plane_module)
+    assert "RoutingTable" not in vars(python_data_plane_module)
+    process_source = inspect.getsource(PythonDataPlaneProcessor.process)
+    assert "routing_table" not in process_source
+    assert ".match(" not in process_source
 
 
 def test_exact_single_sentence_legacy_output():
@@ -178,71 +170,128 @@ def test_exact_single_sentence_legacy_output():
     )
 
 
-def test_routed_output_preserves_unique_target_declaration_order():
-    table = RoutingTable.from_definitions(
-        {"source": {"include": [SOURCE_ID]}},
-        [
-            {
-                "name": "first_route",
-                "from_zone": "source",
-                "to": ["udp:second", "udp:first"],
-            },
-            {
-                "name": "second_route",
-                "from_zone": "source",
-                "to": ["udp:first", "udp:third"],
-            },
-        ],
-    )
-
+def test_routed_output_preserves_numeric_target_order():
     outputs = make_processor().process(
         make_frame(SENTENCE),
-        make_snapshot(table=table),
+        make_snapshot(
+            mode=DeduplicationMode.PER_TARGET,
+            target_ids=(2, 0, 1),
+        ),
     )
 
     assert len(outputs) == 1
     assert outputs[0].disposition is RoutingDisposition.TARGETED
-    assert outputs[0].target_ids == (
-        "udp:second",
-        "udp:first",
-        "udp:third",
-    )
+    assert outputs[0].target_ids == (2, 0, 1)
 
 
 def test_routed_frame_without_matching_route_returns_no_output():
-    table = make_table("udp:target", source_id="udp:other")
-
     outputs = make_processor().process(
         make_frame(SENTENCE),
-        make_snapshot(table=table),
+        make_snapshot(mode=DeduplicationMode.PER_TARGET),
     )
 
     assert outputs == ()
 
 
-def test_routing_table_is_matched_once_for_frame_with_multiple_sentences():
-    table = CountingRoutingTable(("udp:target",))
+def test_routed_deduplication_uses_numeric_target_ids_as_scopes():
+    deduplicator = RecordingDeduplicator()
+    outputs = make_processor(deduplicator=deduplicator).process(
+        make_frame(SENTENCE),
+        make_snapshot(
+            mode=DeduplicationMode.PER_TARGET,
+            target_ids=(7, 2),
+        ),
+    )
+
+    assert len(outputs) == 1
+    assert outputs[0].target_ids == (7, 2)
+    assert [scope for _message, scope in deduplicator.calls] == [7, 2]
+
+
+def test_routed_targets_are_independent_and_filter_in_snapshot_order():
+    deduplicator = Deduplicator(clock=lambda: 0.0)
+    processor = make_processor(deduplicator=deduplicator)
+    frame = make_frame(SENTENCE)
+
+    first_outputs = processor.process(
+        frame,
+        make_snapshot(
+            mode=DeduplicationMode.PER_TARGET,
+            target_ids=(5,),
+        ),
+    )
+    second_outputs = processor.process(
+        frame,
+        make_snapshot(
+            mode=DeduplicationMode.PER_TARGET,
+            target_ids=(2, 5, 3),
+        ),
+    )
+
+    assert first_outputs[0].target_ids == (5,)
+    assert second_outputs[0].target_ids == (2, 3)
+    assert deduplicator.stats().accepted == 3
+    assert deduplicator.stats().duplicates == 1
+
+
+def test_routed_no_target_message_is_not_admitted_to_global_deduplication():
+    deduplicator = Deduplicator(clock=lambda: 0.0)
+    processor = make_processor(deduplicator=deduplicator)
+    frame = make_frame(SENTENCE)
+
+    assert processor.process(
+        frame,
+        make_snapshot(mode=DeduplicationMode.PER_TARGET),
+    ) == ()
+    global_outputs = processor.process(frame, make_snapshot())
+
+    assert len(global_outputs) == 1
+    assert global_outputs[0].disposition is RoutingDisposition.LEGACY_BROADCAST
+    assert deduplicator.stats().accepted == 1
+    assert deduplicator.stats().duplicates == 0
+
+
+def test_global_mode_ignores_snapshot_targets_and_uses_global_scope():
+    deduplicator = RecordingDeduplicator()
+    outputs = make_processor(deduplicator=deduplicator).process(
+        make_frame(SENTENCE),
+        make_snapshot(
+            mode=DeduplicationMode.GLOBAL,
+            target_ids=(0, 1),
+        ),
+    )
+
+    assert len(outputs) == 1
+    assert outputs[0].disposition is RoutingDisposition.LEGACY_BROADCAST
+    assert outputs[0].target_ids == ()
+    assert [scope for _message, scope in deduplicator.calls] == [None]
+
+
+def test_multiple_sentences_reuse_the_snapshot_numeric_targets():
     frame = make_frame(SENTENCE + SECOND_SENTENCE)
 
     outputs = make_processor().process(
         frame,
-        make_snapshot(table=table),
+        make_snapshot(
+            mode=DeduplicationMode.PER_TARGET,
+            target_ids=(3, 1),
+        ),
     )
 
     assert len(outputs) == 2
-    assert table.matched_source_ids == [SOURCE_ID]
+    assert all(output.target_ids == (3, 1) for output in outputs)
 
 
-def test_routing_table_is_matched_once_even_when_frame_has_no_sentence():
-    table = CountingRoutingTable(("udp:target",))
-
+def test_target_only_snapshot_with_no_sentence_returns_no_output():
     outputs = make_processor().process(
         make_frame("not an AIS sentence"),
-        make_snapshot(table=table),
+        make_snapshot(
+            mode=DeduplicationMode.PER_TARGET,
+            target_ids=(4,),
+        ),
     )
 
     assert outputs == ()
-    assert table.matched_source_ids == [SOURCE_ID]
 
 
 def test_single_sentence_deduplication_is_retained_across_calls():
@@ -396,9 +445,13 @@ def test_normal_completion_consumes_multipart_metadata():
 def test_no_route_completion_consumes_multipart_metadata():
     processor = make_processor(station_id="")
     no_route_snapshot = make_snapshot(
-        table=make_table("udp:target", source_id="udp:other")
+        mode=DeduplicationMode.PER_TARGET,
+        target_ids=(),
     )
-    routed_snapshot = make_snapshot(table=make_table("udp:target"))
+    routed_snapshot = make_snapshot(
+        mode=DeduplicationMode.PER_TARGET,
+        target_ids=(6,),
+    )
     old_first = make_multipart_sentence(1, "old-first")
     old_second = make_multipart_sentence(2, "old-second")
     fresh_second = make_multipart_sentence(2, "fresh-second")
@@ -419,7 +472,7 @@ def test_no_route_completion_consumes_multipart_metadata():
         output.disposition is RoutingDisposition.TARGETED
         for output in outputs
     )
-    assert all(output.target_ids == ("udp:target",) for output in outputs)
+    assert all(output.target_ids == (6,) for output in outputs)
     assert_fresh_multipart_output(outputs, fresh_first, fresh_second)
 
 
@@ -544,15 +597,26 @@ def test_routing_generation_change_does_not_reset_deduplication():
     processor = make_processor(deduplicator=deduplicator)
     frame = make_frame(SENTENCE)
 
-    assert len(processor.process(frame, make_snapshot(generation=1))) == 1
-    assert processor.process(frame, make_snapshot(generation=2)) == ()
+    first_snapshot = make_snapshot(
+        generation=1,
+        mode=DeduplicationMode.PER_TARGET,
+        target_ids=(3,),
+    )
+    second_snapshot = make_snapshot(
+        generation=2,
+        mode=DeduplicationMode.PER_TARGET,
+        target_ids=(3,),
+    )
+
+    assert len(processor.process(frame, first_snapshot)) == 1
+    assert processor.process(frame, second_snapshot) == ()
 
     stats = deduplicator.stats()
     assert stats.duplicates == 1
     assert stats.resets == 0
 
 
-def test_multipart_crosses_generations_and_uses_completion_routing_table():
+def test_multipart_crosses_generations_and_uses_completion_numeric_targets():
     assembler = AIVDMAssembler(clock=lambda: 0.0)
     processor = make_processor(
         assembler=assembler,
@@ -566,11 +630,13 @@ def test_multipart_crosses_generations_and_uses_completion_routing_table():
     )
     start_snapshot = make_snapshot(
         generation=1,
-        table=make_table("udp:old"),
+        mode=DeduplicationMode.PER_TARGET,
+        target_ids=(4,),
     )
     completion_snapshot = make_snapshot(
         generation=2,
-        table=make_table("udp:new-first", "udp:new-second"),
+        mode=DeduplicationMode.PER_TARGET,
+        target_ids=(8, 2),
     )
 
     assert processor.process(make_frame(tagged_first), start_snapshot) == ()
@@ -586,7 +652,7 @@ def test_multipart_crosses_generations_and_uses_completion_routing_table():
         for output in outputs
     )
     assert all(
-        output.target_ids == ("udp:new-first", "udp:new-second")
+        output.target_ids == (8, 2)
         for output in outputs
     )
     assert assembler.stats().completed == 1

@@ -3,7 +3,11 @@ import asyncio
 import pytest
 
 import aismixer
-from core.data_plane import ProcessorOutput, RoutingDisposition
+from core.data_plane import (
+    DeduplicationMode,
+    ProcessorOutput,
+    RoutingDisposition,
+)
 from core.ingress_frame import IngressFrame
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.routing_state import RoutingSnapshot
@@ -77,9 +81,12 @@ class RecordingForwarder:
         self.events.append(("broadcast", message))
         self._raise_if_requested()
 
-    async def send_to(self, target_ids, message):
+    async def send_to_ids(self, target_ids, message):
         self.events.append(("targeted", tuple(target_ids), message))
         self._raise_if_requested()
+
+    async def send_to(self, _target_ids, _message):
+        raise AssertionError("string targeted egress path was called")
 
     def _raise_if_requested(self):
         if self._fail_at == len(self.events):
@@ -121,7 +128,7 @@ class BoundaryObservingForwarder:
         if self._fail_first and len(self.attempted_messages) == 1:
             raise RuntimeError("send failed")
 
-    async def send_to(self, _target_ids, _message):
+    async def send_to_ids(self, _target_ids, _message):
         raise AssertionError("boundary test expects legacy broadcast output")
 
 
@@ -206,7 +213,8 @@ def test_invalid_item_is_ignored_before_snapshot_and_processing_then_loop_contin
     processed_frame, snapshot = processor.calls[0]
     assert processed_frame is frame
     assert snapshot.routing_generation == 7
-    assert snapshot.routing_table is None
+    assert snapshot.deduplication_mode is DeduplicationMode.GLOBAL
+    assert snapshot.target_ids == ()
 
 
 def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
@@ -223,7 +231,7 @@ def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
             ProcessorOutput(
                 "second\r\n",
                 RoutingDisposition.TARGETED,
-                ("udp:second", "udp:first"),
+                (2, 1),
             ),
         )
     )
@@ -248,7 +256,7 @@ def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
         ("broadcast", "first\r\n"),
         (
             "targeted",
-            ("udp:second", "udp:first"),
+            (2, 1),
             "second\r\n",
         ),
     ]

@@ -9,6 +9,7 @@ from functools import partial
 from typing import Any
 from forwarder import Forwarder
 from core.data_plane import (
+    DeduplicationMode,
     ProcessingSnapshot,
     ProcessorOutput,
     RoutingDisposition,
@@ -109,7 +110,10 @@ G_ID_DIGITS = config.get("g_id_digits", 18)
 G_ALWAYS_TAG_SINGLE = config.get("g_always_tag_single", False)
 C_PRESERVE_INGRESS_C = config.get("c_preserve_ingress_c", True)
 forwarder = Forwarder(FORWARDERS)
-initial_routing_table = load_optional_routing_table(config, forwarder.target_ids)
+initial_routing_table = load_optional_routing_table(
+    config,
+    forwarder.target_id_by_name,
+)
 routing_state = RoutingState(initial_routing_table)
 data_plane_processor = PythonDataPlaneProcessor(
     station_id=STATION_ID,
@@ -227,6 +231,7 @@ async def processor_stage_loop(
     egress_queue,
     routing_state=None,
     processor=None,
+    legacy_target_ids=(),
 ):
     """Process one accepted frame and await its egress completion barrier."""
 
@@ -235,6 +240,9 @@ async def processor_stage_loop(
         if processor is None
         else processor
     )
+    if not isinstance(legacy_target_ids, (str, bytes)):
+        legacy_target_ids = tuple(legacy_target_ids)
+
     while True:
         item = await ingress_queue.get()
         frame = coerce_ingress_frame(item)
@@ -242,13 +250,24 @@ async def processor_stage_loop(
             continue
 
         if routing_state is None:
+            routing_generation = 0
+            routing_table = None
+        else:
+            routing_snapshot = routing_state.snapshot()
+            routing_generation = routing_snapshot.generation
+            routing_table = routing_snapshot.table
+
+        if routing_table is None:
             processing_snapshot = ProcessingSnapshot(
-                routing_generation=0,
-                routing_table=None,
+                routing_generation=routing_generation,
+                deduplication_mode=DeduplicationMode.GLOBAL,
+                target_ids=legacy_target_ids,
             )
         else:
-            processing_snapshot = ProcessingSnapshot.from_routing_snapshot(
-                routing_state.snapshot()
+            processing_snapshot = ProcessingSnapshot(
+                routing_generation=routing_generation,
+                deduplication_mode=DeduplicationMode.PER_TARGET,
+                target_ids=routing_table.match_target_ids(frame.source_id),
             )
 
         outputs = active_processor.process(frame, processing_snapshot)
@@ -290,7 +309,7 @@ async def egress_stage_loop(
                 if output.disposition is RoutingDisposition.LEGACY_BROADCAST:
                     await output_forwarder.send(output.message)
                 elif output.disposition is RoutingDisposition.TARGETED:
-                    await output_forwarder.send_to(
+                    await output_forwarder.send_to_ids(
                         output.target_ids,
                         output.message,
                     )
@@ -318,6 +337,7 @@ async def _run_runtime_stages(
     *,
     routing_state=None,
     processor=None,
+    legacy_target_ids=(),
     output_forwarder,
     debug=False,
     timestamp=None,
@@ -334,6 +354,7 @@ async def _run_runtime_stages(
                     egress_queue,
                     routing_state=routing_state,
                     processor=processor,
+                    legacy_target_ids=legacy_target_ids,
                 ),
             ),
             _RuntimeTaskSpec(
@@ -398,7 +419,7 @@ async def main():
     control_server = build_optional_routing_control_server(
         config,
         routing_state,
-        forwarder.target_ids,
+        forwarder.target_id_by_name,
     )
     control_server_started = False
 
@@ -493,6 +514,7 @@ async def main():
                         egress_queue,
                         routing_state=routing_state,
                         processor=data_plane_processor,
+                        legacy_target_ids=forwarder.all_target_ids,
                     ),
                 ),
                 _RuntimeTaskSpec(

@@ -8,7 +8,7 @@ filesystem.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import re
 from typing import TypeAlias
@@ -17,6 +17,7 @@ from core.routing_control import RoutingControlService
 from core.routing_control_protocol import RoutingControlProtocol
 from core.routing_control_unix import RoutingControlUnixServer
 from core.routing_state import RoutingState
+from core.target_identity import EgressTargetId
 
 
 DEFAULT_CONTROL_MAX_REQUEST_BYTES = 1_048_576
@@ -34,7 +35,10 @@ class RoutingControlUnixSettings:
     socket_mode: int = DEFAULT_CONTROL_SOCKET_MODE
 
 
-_ServiceFactory: TypeAlias = Callable[[RoutingState, Iterable[str]], object]
+_ServiceFactory: TypeAlias = Callable[
+    [RoutingState, Mapping[str, EgressTargetId]],
+    object,
+]
 _ProtocolFactory: TypeAlias = Callable[[object], object]
 _ServerFactory: TypeAlias = Callable[..., object]
 _OCTAL_MODE_RE = re.compile(r"^[0-7]{3,4}$")
@@ -96,7 +100,7 @@ def load_optional_routing_control_unix_settings(
 def build_optional_routing_control_server(
     config: Mapping[str, object],
     routing_state: RoutingState,
-    available_target_ids: Iterable[str],
+    target_id_by_name: Mapping[str, EgressTargetId],
     *,
     service_factory: _ServiceFactory = RoutingControlService,
     protocol_factory: _ProtocolFactory = RoutingControlProtocol,
@@ -108,7 +112,7 @@ def build_optional_routing_control_server(
     if settings is None:
         return None
 
-    service = service_factory(routing_state, available_target_ids)
+    service = service_factory(routing_state, target_id_by_name)
     protocol = protocol_factory(service)
     return server_factory(
         protocol,

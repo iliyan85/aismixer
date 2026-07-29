@@ -9,6 +9,7 @@ import time
 
 from assembler import AIVDMAssembler, AssemblyKey, AssemblyStatus
 from core.data_plane import (
+    DeduplicationMode,
     ProcessingSnapshot,
     ProcessorOutput,
     RoutingDisposition,
@@ -17,6 +18,7 @@ from core.ingress_frame import IngressFrame
 from core.parsed_sentence import parse_frame_sentences, parse_leading_s_value
 from core.s_policy import choose_s_value_from_candidates
 from core.state.s_cache import touch_s
+from core.target_identity import EgressTargetId
 from dedup import Deduplicator
 from meta_writer import wrap_with_meta
 
@@ -106,10 +108,8 @@ class PythonDataPlaneProcessor:
     ) -> tuple[ProcessorOutput, ...]:
         """Process one accepted frame without performing transport I/O."""
 
-        routing_table = snapshot.routing_table
-        route_target_ids = ()
-        if routing_table is not None:
-            route_target_ids = routing_table.match(frame.source_id).target_ids
+        deduplication_mode = snapshot.deduplication_mode
+        route_target_ids = snapshot.target_ids
 
         leading_s = parse_leading_s_value(frame)
         parsed_sentences = parse_frame_sentences(
@@ -240,11 +240,11 @@ class PythonDataPlaneProcessor:
                 else tuple(multipart)
             )
 
-            eligible_target_ids: tuple[str, ...] = ()
-            if routing_table is None:
+            eligible_target_ids: tuple[EgressTargetId, ...] = ()
+            if deduplication_mode is DeduplicationMode.GLOBAL:
                 emit_group = self._deduplicator.is_unique(logical_key)
                 disposition = RoutingDisposition.LEGACY_BROADCAST
-            else:
+            elif deduplication_mode is DeduplicationMode.PER_TARGET:
                 eligible_target_ids = tuple(
                     target_id
                     for target_id in route_target_ids
@@ -255,6 +255,11 @@ class PythonDataPlaneProcessor:
                 )
                 emit_group = bool(eligible_target_ids)
                 disposition = RoutingDisposition.TARGETED
+            else:
+                raise AssertionError(
+                    "Unsupported deduplication mode: "
+                    f"{deduplication_mode!r}"
+                )
 
             incoming_s = parsed.tag.s_value
             if (

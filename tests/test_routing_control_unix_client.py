@@ -436,7 +436,7 @@ def routing_section():
 
 
 def make_control_protocol():
-    service = RoutingControlService(RoutingState(), ("udp:a",))
+    service = RoutingControlService(RoutingState(), {"udp:a": 0})
     return RoutingControlProtocol(service)
 
 

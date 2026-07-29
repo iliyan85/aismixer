@@ -1,5 +1,6 @@
 import pytest
 
+import core.routing as routing_module
 from core.routing import (
     CircularZoneReferenceError,
     RouteDefinition,
@@ -501,3 +502,132 @@ def test_routing_table_is_immutable_snapshot_of_inputs():
     assert unmatched.target_ids == ()
     with pytest.raises(TypeError):
         table.resolved_zones["trusted"] = frozenset()
+
+
+def test_numeric_target_compilation_preserves_external_route_definitions():
+    table = RoutingTable.from_definitions(
+        {"trusted": {"include": ["udp:source"]}},
+        [
+            {
+                "name": "trusted_to_targets",
+                "from_zone": "trusted",
+                "to": ["udp:second", "udp:first"],
+            }
+        ],
+    )
+
+    compiled = table.compile_target_ids({
+        "udp:first": 4,
+        "udp:second": 9,
+    })
+
+    assert table.route_definitions[0].to == ("udp:second", "udp:first")
+    assert compiled.route_definitions[0].to == ("udp:second", "udp:first")
+    assert compiled.match("udp:source").target_ids == (
+        "udp:second",
+        "udp:first",
+    )
+    assert compiled.match_target_ids("udp:source") == (9, 4)
+
+
+def test_numeric_target_match_preserves_order_and_first_occurrence():
+    table = RoutingTable.from_definitions(
+        {"trusted": {"include": ["udp:source"]}},
+        [
+            {
+                "name": "first_route",
+                "from_zone": "trusted",
+                "to": ["udp:second", "udp:first", "udp:second"],
+            },
+            {
+                "name": "second_route",
+                "from_zone": "trusted",
+                "to": ["udp:first", "udp:third"],
+            },
+        ],
+    ).compile_target_ids({
+        "udp:first": 4,
+        "udp:second": 9,
+        "udp:third": 12,
+    })
+
+    assert table.match_target_ids("udp:source") == (9, 4, 12)
+    assert table.match_target_ids("udp:unmatched") == ()
+
+
+def test_numeric_target_match_does_not_call_descriptive_match(monkeypatch):
+    table = RoutingTable.from_definitions(
+        {"trusted": {"include": ["udp:source"]}},
+        [
+            {
+                "name": "descriptive_name",
+                "from_zone": "trusted",
+                "to": ["udp:target"],
+            }
+        ],
+    ).compile_target_ids({"udp:target": 3})
+
+    def fail_descriptive_match(_self, _source_id):
+        raise AssertionError("descriptive match must not be called")
+
+    def fail_descriptive_route_result(*_args, **_kwargs):
+        raise AssertionError("descriptive route result must not be built")
+
+    monkeypatch.setattr(RoutingTable, "match", fail_descriptive_match)
+    monkeypatch.setattr(
+        routing_module,
+        "match_routes",
+        fail_descriptive_route_result,
+    )
+
+    assert table.match_target_ids("udp:source") == (3,)
+
+
+def test_uncompiled_table_rejects_numeric_target_match_deterministically():
+    table = RoutingTable.from_definitions({}, [])
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"no compiled numeric target plan.*compile_target_ids",
+    ):
+        table.match_target_ids("udp:source")
+
+
+def test_numeric_target_program_is_immutable_and_copies_mapping():
+    target_id_by_name = {"udp:target": 7}
+    table = RoutingTable.from_definitions(
+        {"trusted": {"include": ["udp:source"]}},
+        [
+            {
+                "name": "trusted_to_target",
+                "from_zone": "trusted",
+                "to": ["udp:target"],
+            }
+        ],
+    ).compile_target_ids(target_id_by_name)
+
+    target_id_by_name["udp:target"] = 99
+
+    assert table.match_target_ids("udp:source") == (7,)
+    compiled_routes = table._compiled_target_routes
+    assert isinstance(compiled_routes, tuple)
+    with pytest.raises(TypeError):
+        compiled_routes[0] = compiled_routes[0]
+    with pytest.raises(AttributeError):
+        compiled_routes[0].target_ids = (99,)
+
+
+def test_numeric_target_compilation_reports_unknown_external_names():
+    table = RoutingTable.from_definitions(
+        {"trusted": {"include": ["udp:source"]}},
+        [
+            {
+                "name": "trusted_to_missing",
+                "from_zone": "trusted",
+                "to": ["udp:missing"],
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="udp:missing"):
+        table.compile_target_ids({"udp:target": 0})
