@@ -96,6 +96,7 @@ class RoutingTable:
     route_definitions: tuple[RouteDefinition, ...]
     _compiled_target_routes: tuple[_CompiledTargetRoute, ...] | None = field(
         default=None,
+        init=False,
         repr=False,
     )
 
@@ -106,27 +107,9 @@ class RoutingTable:
         }
         route_definitions = tuple(self.route_definitions)
         _validate_route_zone_references(resolved_zones, route_definitions)
-        compiled_target_routes = self._compiled_target_routes
-        if compiled_target_routes is not None:
-            compiled_target_routes = tuple(compiled_target_routes)
-            if len(compiled_target_routes) != len(route_definitions):
-                raise ValueError(
-                    "Compiled target routes must correspond to route definitions."
-                )
-            if not all(
-                isinstance(route, _CompiledTargetRoute)
-                for route in compiled_target_routes
-            ):
-                raise TypeError(
-                    "Compiled target routes must contain immutable compiled routes."
-                )
         object.__setattr__(self, "resolved_zones", MappingProxyType(resolved_zones))
         object.__setattr__(self, "route_definitions", route_definitions)
-        object.__setattr__(
-            self,
-            "_compiled_target_routes",
-            compiled_target_routes,
-        )
+        object.__setattr__(self, "_compiled_target_routes", None)
 
     @classmethod
     def from_definitions(
@@ -190,11 +173,16 @@ class RoutingTable:
             )
             for route in self.route_definitions
         )
-        return RoutingTable(
+        compiled_table = RoutingTable(
             resolved_zones=self.resolved_zones,
             route_definitions=self.route_definitions,
-            _compiled_target_routes=compiled_target_routes,
         )
+        object.__setattr__(
+            compiled_table,
+            "_compiled_target_routes",
+            compiled_target_routes,
+        )
+        return compiled_table
 
     def match_target_ids(
         self,

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 import core.routing as routing_module
@@ -504,6 +506,15 @@ def test_routing_table_is_immutable_snapshot_of_inputs():
         table.resolved_zones["trusted"] = frozenset()
 
 
+def test_compiled_target_routes_cannot_be_passed_to_constructor():
+    with pytest.raises(TypeError, match="_compiled_target_routes"):
+        RoutingTable(
+            resolved_zones={},
+            route_definitions=(),
+            _compiled_target_routes=(),
+        )
+
+
 def test_numeric_target_compilation_preserves_external_route_definitions():
     table = RoutingTable.from_definitions(
         {"trusted": {"include": ["udp:source"]}},
@@ -528,6 +539,164 @@ def test_numeric_target_compilation_preserves_external_route_definitions():
         "udp:first",
     )
     assert compiled.match_target_ids("udp:source") == (9, 4)
+
+
+def test_empty_numeric_target_compilation_is_distinct_from_uncompiled_table():
+    table = RoutingTable.from_definitions({}, [])
+
+    compiled = table.compile_target_ids({})
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"no compiled numeric target plan.*compile_target_ids",
+    ):
+        table.match_target_ids("udp:source")
+    assert compiled.match_target_ids("udp:source") == ()
+
+
+def test_recompiling_installs_new_plan_without_mutating_original_table():
+    table = RoutingTable.from_definitions(
+        {"trusted": {"include": ["udp:source"]}},
+        [
+            RouteDefinition(
+                name="trusted_route",
+                from_zone="trusted",
+                to=("udp:target",),
+            )
+        ],
+    ).compile_target_ids({"udp:target": 7})
+
+    recompiled = table.compile_target_ids({"udp:target": 11})
+
+    assert recompiled is not table
+    assert recompiled.match_target_ids("udp:source") == (11,)
+    assert table.match_target_ids("udp:source") == (7,)
+
+
+def test_replacing_route_definitions_discards_compiled_target_routes():
+    table = RoutingTable.from_definitions(
+        {"trusted": {"include": ["udp:source"]}},
+        [
+            RouteDefinition(
+                name="original_route",
+                from_zone="trusted",
+                to=("udp:original",),
+            )
+        ],
+    ).compile_target_ids({"udp:original": 7})
+    replacement = replace(
+        table,
+        route_definitions=(
+            RouteDefinition(
+                name="replacement_route",
+                from_zone="trusted",
+                to=("udp:replacement",),
+            ),
+        ),
+    )
+
+    descriptive = replacement.match("udp:source")
+
+    assert descriptive.route_names == ("replacement_route",)
+    assert descriptive.target_ids == ("udp:replacement",)
+    with pytest.raises(
+        RuntimeError,
+        match=r"no compiled numeric target plan.*compile_target_ids",
+    ):
+        replacement.match_target_ids("udp:source")
+
+    recompiled = replacement.compile_target_ids({"udp:replacement": 11})
+
+    assert recompiled.match_target_ids("udp:source") == (11,)
+    assert table.match_target_ids("udp:source") == (7,)
+
+
+def test_replacing_resolved_zones_discards_compiled_target_routes():
+    table = RoutingTable.from_definitions(
+        {"trusted": {"include": ["udp:original-source"]}},
+        [
+            RouteDefinition(
+                name="trusted_route",
+                from_zone="trusted",
+                to=("udp:target",),
+            )
+        ],
+    ).compile_target_ids({"udp:target": 7})
+    replacement = replace(
+        table,
+        resolved_zones={"trusted": frozenset({"udp:replacement-source"})},
+    )
+
+    assert replacement.match("udp:replacement-source").target_ids == (
+        "udp:target",
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=r"no compiled numeric target plan.*compile_target_ids",
+    ):
+        replacement.match_target_ids("udp:replacement-source")
+    assert table.match_target_ids("udp:original-source") == (7,)
+    assert table.match_target_ids("udp:replacement-source") == ()
+
+
+def test_replacing_both_descriptive_fields_discards_compiled_target_routes():
+    table = RoutingTable.from_definitions(
+        {"original": {"include": ["udp:original-source"]}},
+        [
+            RouteDefinition(
+                name="original_route",
+                from_zone="original",
+                to=("udp:original-target",),
+            )
+        ],
+    ).compile_target_ids({"udp:original-target": 7})
+    replacement = replace(
+        table,
+        resolved_zones={
+            "replacement": frozenset({"udp:replacement-source"}),
+        },
+        route_definitions=(
+            RouteDefinition(
+                name="replacement_route",
+                from_zone="replacement",
+                to=("udp:replacement-target",),
+            ),
+        ),
+    )
+
+    descriptive = replacement.match("udp:replacement-source")
+
+    assert descriptive.route_names == ("replacement_route",)
+    assert descriptive.target_ids == ("udp:replacement-target",)
+    with pytest.raises(
+        RuntimeError,
+        match=r"no compiled numeric target plan.*compile_target_ids",
+    ):
+        replacement.match_target_ids("udp:replacement-source")
+    assert table.match_target_ids("udp:original-source") == (7,)
+
+
+def test_plain_replacement_discards_compiled_target_routes():
+    table = RoutingTable.from_definitions(
+        {"trusted": {"include": ["udp:source"]}},
+        [
+            RouteDefinition(
+                name="trusted_route",
+                from_zone="trusted",
+                to=("udp:target",),
+            )
+        ],
+    ).compile_target_ids({"udp:target": 7})
+
+    replacement = replace(table)
+
+    assert replacement.match("udp:source") == table.match("udp:source")
+    with pytest.raises(
+        RuntimeError,
+        match=r"no compiled numeric target plan.*compile_target_ids",
+    ):
+        replacement.match_target_ids("udp:source")
+    assert table.match_target_ids("udp:source") == (7,)
 
 
 def test_numeric_target_match_preserves_order_and_first_occurrence():
