@@ -95,6 +95,33 @@ def test_target_ids_returns_only_explicit_ids_in_declaration_order():
         forwarder.target_ids[0] = "udp:changed"
 
 
+def test_numeric_target_registry_uses_declaration_order_for_every_destination():
+    forwarder = Forwarder(_targets())
+
+    assert forwarder.all_target_ids == (0, 1, 2)
+    assert dict(forwarder.target_id_by_name) == {
+        "udp:aishub": 1,
+        "udp:local_debug": 2,
+    }
+
+
+def test_numeric_target_registry_views_are_immutable():
+    forwarder = Forwarder(_targets())
+
+    with pytest.raises(TypeError):
+        forwarder.all_target_ids[0] = 99
+    with pytest.raises(TypeError):
+        forwarder.target_id_by_name["udp:aishub"] = 0
+
+
+def test_empty_forwarder_has_empty_numeric_target_registry():
+    forwarder = Forwarder([])
+
+    assert forwarder.all_target_ids == ()
+    assert forwarder.target_ids == ()
+    assert dict(forwarder.target_id_by_name) == {}
+
+
 def test_entries_without_id_remain_valid_for_legacy_broadcast(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder([{"host": "127.0.0.1", "port": 19000}])
@@ -160,6 +187,22 @@ def test_send_to_rejects_unknown_target_id(monkeypatch):
     assert loop.sends == []
 
 
+def test_send_to_preserves_partial_send_behavior_for_later_unknown_target(
+    monkeypatch,
+):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+
+    with pytest.raises(UnknownForwarderTargetError, match="udp:missing"):
+        real_asyncio.run(
+            forwarder.send_to(("udp:aishub", "udp:missing"), "partial")
+        )
+
+    assert [(addr, data) for addr, data, _ in loop.sends] == [
+        (("192.0.2.20", 10110), b"partial")
+    ]
+
+
 def test_duplicate_configured_ids_are_rejected():
     with pytest.raises(ForwarderConfigError, match="udp:archive"):
         Forwarder([
@@ -184,15 +227,20 @@ def test_original_config_mutation_after_construction_does_not_change_behavior(
     config[1]["host"] = "203.0.113.51"
     config.append({"id": "new", "host": "203.0.113.52", "port": 9998})
 
+    assert forwarder.all_target_ids == (0, 1)
     assert forwarder.target_ids == ("udp:aishub",)
+    assert dict(forwarder.target_id_by_name) == {"udp:aishub": 1}
 
     real_asyncio.run(forwarder.send("unchanged"))
     real_asyncio.run(forwarder.send_to(("udp:aishub",), "named"))
+    real_asyncio.run(forwarder.send_to_ids((0, 1), "numeric"))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19000), b"unchanged"),
         (("192.0.2.20", 10110), b"unchanged"),
         (("192.0.2.20", 10110), b"named"),
+        (("127.0.0.1", 19000), b"numeric"),
+        (("192.0.2.20", 10110), b"numeric"),
     ]
 
 
@@ -208,6 +256,121 @@ def test_targeted_sends_reuse_transport_cache(monkeypatch):
         (("192.0.2.20", 10110), b"two"),
     ]
     assert [addr for addr, _ in loop.created] == [("192.0.2.20", 10110)]
+
+
+def test_send_to_ids_supports_unnamed_destination(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+
+    real_asyncio.run(forwarder.send_to_ids((0,), "unnamed"))
+
+    assert [(addr, data) for addr, data, _ in loop.sends] == [
+        (("127.0.0.1", 19000), b"unnamed")
+    ]
+
+
+def test_send_to_ids_preserves_requested_order(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+
+    real_asyncio.run(forwarder.send_to_ids((2, 0, 1), "ordered"))
+
+    assert [(addr, data) for addr, data, _ in loop.sends] == [
+        (("127.0.0.1", 19001), b"ordered"),
+        (("127.0.0.1", 19000), b"ordered"),
+        (("192.0.2.20", 10110), b"ordered"),
+    ]
+
+
+def test_send_to_ids_deduplicates_by_first_occurrence(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+    requested_ids = (target_id for target_id in (2, 0, 2, 1, 0))
+
+    real_asyncio.run(forwarder.send_to_ids(requested_ids, "deduped"))
+
+    assert [(addr, data) for addr, data, _ in loop.sends] == [
+        (("127.0.0.1", 19001), b"deduped"),
+        (("127.0.0.1", 19000), b"deduped"),
+        (("192.0.2.20", 10110), b"deduped"),
+    ]
+
+
+def test_send_to_ids_reuses_transport_cache(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+
+    real_asyncio.run(forwarder.send_to_ids((1,), "one"))
+    real_asyncio.run(forwarder.send_to_ids((1,), "two"))
+
+    assert [(addr, data) for addr, data, _ in loop.sends] == [
+        (("192.0.2.20", 10110), b"one"),
+        (("192.0.2.20", 10110), b"two"),
+    ]
+    assert [addr for addr, _ in loop.created] == [("192.0.2.20", 10110)]
+
+
+def test_send_to_ids_keeps_shared_endpoint_target_ids_distinct(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder([
+        {"id": "first", "host": "192.0.2.20", "port": 10110},
+        {"id": "second", "host": "192.0.2.20", "port": 10110},
+    ])
+
+    real_asyncio.run(forwarder.send_to_ids((0, 1, 0), "shared"))
+
+    assert [(addr, data) for addr, data, _ in loop.sends] == [
+        (("192.0.2.20", 10110), b"shared"),
+        (("192.0.2.20", 10110), b"shared"),
+    ]
+    assert [addr for addr, _ in loop.created] == [("192.0.2.20", 10110)]
+
+
+def test_send_to_ids_empty_input_sends_nothing(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+
+    real_asyncio.run(forwarder.send_to_ids((), "nothing"))
+
+    assert loop.sends == []
+    assert loop.created == []
+
+
+@pytest.mark.parametrize("invalid_target_id", [True, False, "1", 1.0, None, object()])
+def test_send_to_ids_rejects_non_integer_target_ids_before_sending(
+    monkeypatch,
+    invalid_target_id,
+):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+
+    with pytest.raises(TypeError, match="must be integers"):
+        real_asyncio.run(
+            forwarder.send_to_ids((1, invalid_target_id), "invalid")
+        )
+
+    assert loop.sends == []
+    assert loop.created == []
+
+
+@pytest.mark.parametrize("invalid_target_id", [-1, 3])
+def test_send_to_ids_rejects_unknown_integer_ids_before_sending(
+    monkeypatch,
+    invalid_target_id,
+):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+
+    with pytest.raises(
+        UnknownForwarderTargetError,
+        match=rf"target ID: {invalid_target_id}$",
+    ):
+        real_asyncio.run(
+            forwarder.send_to_ids((1, invalid_target_id), "invalid")
+        )
+
+    assert loop.sends == []
+    assert loop.created == []
 
 
 def test_source_ip_is_copied_into_immutable_target_entry():

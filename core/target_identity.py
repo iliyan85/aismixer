@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from typing import TypeAlias
+
+
+EgressTargetId: TypeAlias = int
+
 
 def build_udp_target_id(configured_id: str) -> str:
     """Build the canonical opaque target ID for a configured UDP forwarder."""

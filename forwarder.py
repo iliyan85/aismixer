@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Iterable, Mapping
 
-from core.target_identity import build_udp_target_id
+from core.target_identity import EgressTargetId, build_udp_target_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,23 +31,34 @@ class Forwarder:
         self._destinations = tuple(
             _destination_from_entry(entry) for entry in self._targets
         )
+        self._all_target_ids = tuple(range(len(self._destinations)))
 
-        registry: dict[str, _UdpDestination] = {}
-        for entry, destination in zip(self._targets, self._destinations):
+        target_id_by_name: dict[str, EgressTargetId] = {}
+        for target_id, entry in enumerate(self._targets):
             if "id" not in entry:
                 continue
-            target_id = build_udp_target_id(entry["id"])
-            if target_id in registry:
-                raise ForwarderConfigError(f"Duplicate UDP forwarder target ID: {target_id}")
-            registry[target_id] = destination
+            target_name = build_udp_target_id(entry["id"])
+            if target_name in target_id_by_name:
+                raise ForwarderConfigError(
+                    f"Duplicate UDP forwarder target ID: {target_name}"
+                )
+            target_id_by_name[target_name] = target_id
 
-        self._target_registry = MappingProxyType(registry)
-        self._target_ids = tuple(registry)
+        self._target_id_by_name = MappingProxyType(target_id_by_name)
+        self._target_ids = tuple(target_id_by_name)
         self.transports = {}
 
     @property
     def target_ids(self):
         return self._target_ids
+
+    @property
+    def all_target_ids(self) -> tuple[EgressTargetId, ...]:
+        return self._all_target_ids
+
+    @property
+    def target_id_by_name(self) -> Mapping[str, EgressTargetId]:
+        return self._target_id_by_name
 
     async def _ensure_transport(self, loop, destination):
         key = _transport_cache_key(destination)
@@ -78,25 +89,48 @@ class Forwarder:
         transport = await self._ensure_transport(loop, destination)
         transport.sendto(message.encode())
 
-    async def send(self, message):
+    async def _dispatch_to_ids(
+        self,
+        target_ids: Iterable[EgressTargetId],
+        message,
+    ) -> None:
         loop = asyncio.get_running_loop()
-        for destination in self._destinations:
-            await self._send_to_destination(loop, destination, message)
+        for target_id in target_ids:
+            await self._send_to_destination(
+                loop,
+                self._destinations[target_id],
+                message,
+            )
+
+    async def send(self, message):
+        await self._dispatch_to_ids(self._all_target_ids, message)
 
     def close(self):
         for transport in self.transports.values():
             transport.close()
         self.transports.clear()
 
+    async def send_to_ids(
+        self,
+        target_ids: Iterable[EgressTargetId],
+        message,
+    ) -> None:
+        validated_target_ids = _validate_numeric_target_ids(
+            target_ids,
+            len(self._destinations),
+        )
+        await self._dispatch_to_ids(validated_target_ids, message)
+
     async def send_to(self, target_ids, message):
         loop = asyncio.get_running_loop()
         for target_id in _dedupe_target_ids(target_ids):
             try:
-                destination = self._target_registry[target_id]
+                numeric_target_id = self._target_id_by_name[target_id]
             except KeyError as exc:
                 raise UnknownForwarderTargetError(
                     f"Unknown UDP forwarder target ID: {target_id}"
                 ) from exc
+            destination = self._destinations[numeric_target_id]
             await self._send_to_destination(loop, destination, message)
 
 
@@ -171,6 +205,34 @@ def _dedupe_target_ids(target_ids: Iterable[str]) -> tuple[str, ...]:
     ordered: list[str] = []
     seen: set[str] = set()
     for target_id in target_ids:
+        if target_id in seen:
+            continue
+        seen.add(target_id)
+        ordered.append(target_id)
+    return tuple(ordered)
+
+
+def _validate_numeric_target_ids(
+    target_ids: Iterable[EgressTargetId],
+    destination_count: int,
+) -> tuple[EgressTargetId, ...]:
+    if isinstance(target_ids, (str, bytes)):
+        raise TypeError(
+            "target_ids must be an iterable of integer egress target IDs."
+        )
+
+    ordered: list[EgressTargetId] = []
+    seen: set[EgressTargetId] = set()
+    for target_id in target_ids:
+        if isinstance(target_id, bool) or not isinstance(target_id, int):
+            raise TypeError(
+                "UDP forwarder numeric target IDs must be integers, "
+                f"got {type(target_id).__name__}."
+            )
+        if target_id < 0 or target_id >= destination_count:
+            raise UnknownForwarderTargetError(
+                f"Unknown UDP forwarder target ID: {target_id}"
+            )
         if target_id in seen:
             continue
         seen.add(target_id)
