@@ -518,7 +518,8 @@ no encoding, decoding, normalization, or per-destination payload copy. Debug
 presentation is observational only: it removes one trailing `b"\r\n"` for
 display when present and decodes that display view as UTF-8 with replacement
 for invalid input. The original unmodified bytes object remains the object
-sent to the forwarder, so debug output cannot alter or block network dispatch.
+sent to the forwarder. Invalid UTF-8 is replaced only in the display view and
+cannot alter the network payload.
 
 Legacy broadcast and numeric targeted egress remain separate branches and
 continue to use `Forwarder.send()` and `Forwarder.send_to_ids()`,
