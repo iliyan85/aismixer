@@ -71,5 +71,12 @@ class RoutingState:
 
 
 def _validate_table(table: RoutingTable | None) -> None:
-    if table is not None and not isinstance(table, RoutingTable):
+    if table is None:
+        return
+    if not isinstance(table, RoutingTable):
         raise TypeError("RoutingState table must be a RoutingTable or None.")
+    if not table.has_compiled_target_plan:
+        raise ValueError(
+            "RoutingState requires a compiled numeric target plan; "
+            "call RoutingTable.compile_target_ids() before installation."
+        )

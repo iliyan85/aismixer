@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from core.routing import RoutingTable
@@ -8,7 +10,7 @@ from core.routing_state import (
 )
 
 
-def make_table(target_id="udp:aishub"):
+def make_uncompiled_table(target_id="udp:aishub"):
     return RoutingTable.from_definitions(
         {"trusted": {"include": ["udp:source_a"]}},
         [
@@ -21,12 +23,22 @@ def make_table(target_id="udp:aishub"):
     )
 
 
+def make_table(target_id="udp:aishub"):
+    return make_uncompiled_table(target_id).compile_target_ids({target_id: 0})
+
+
 def test_default_state_starts_at_generation_zero_with_no_table():
     state = RoutingState()
 
     snapshot = state.snapshot()
 
     assert snapshot == RoutingSnapshot(generation=0, table=None)
+
+
+def test_explicit_none_starts_at_generation_zero_with_no_table():
+    state = RoutingState(None)
+
+    assert state.snapshot() == RoutingSnapshot(generation=0, table=None)
 
 
 def test_initial_routing_table_is_exposed_at_generation_zero():
@@ -37,6 +49,27 @@ def test_initial_routing_table_is_exposed_at_generation_zero():
 
     assert snapshot.generation == 0
     assert snapshot.table is table
+
+
+def test_uncompiled_initial_table_is_rejected_immediately():
+    with pytest.raises(
+        ValueError,
+        match=r"compiled numeric target plan.*compile_target_ids",
+    ):
+        RoutingState(make_uncompiled_table())
+
+
+def test_uncompiled_initial_table_does_not_initialize_state():
+    state = RoutingState.__new__(RoutingState)
+
+    with pytest.raises(
+        ValueError,
+        match=r"compiled numeric target plan.*compile_target_ids",
+    ):
+        state.__init__(make_uncompiled_table())
+
+    assert not hasattr(state, "_lock")
+    assert not hasattr(state, "_snapshot")
 
 
 def test_snapshot_retrieval_does_not_increment_generation():
@@ -145,6 +178,52 @@ def test_invalid_replacement_leaves_state_unchanged():
     assert state.snapshot() is snapshot
     assert state.snapshot().generation == 0
     assert state.snapshot().table is table
+
+
+def test_uncompiled_replacement_leaves_snapshot_and_generation_unchanged():
+    table = make_table()
+    state = RoutingState(table)
+    snapshot = state.snapshot()
+
+    with pytest.raises(
+        ValueError,
+        match=r"compiled numeric target plan.*compile_target_ids",
+    ):
+        state.replace(make_uncompiled_table())
+
+    assert state.snapshot() is snapshot
+    assert state.snapshot().generation == 0
+    assert state.snapshot().table is table
+
+
+def test_dataclass_replacement_is_uncompiled_and_rejected():
+    table = make_table()
+    state = RoutingState(table)
+    snapshot = state.snapshot()
+    uncompiled_replacement = replace(table)
+
+    assert uncompiled_replacement.has_compiled_target_plan is False
+    with pytest.raises(
+        ValueError,
+        match=r"compiled numeric target plan.*compile_target_ids",
+    ):
+        state.replace(uncompiled_replacement)
+
+    assert state.snapshot() is snapshot
+
+
+def test_uncompiled_validation_precedes_stale_generation_check():
+    table = make_table()
+    state = RoutingState(table)
+    snapshot = state.snapshot()
+
+    with pytest.raises(ValueError, match="compiled numeric target plan"):
+        state.replace(
+            make_uncompiled_table(),
+            expected_generation=snapshot.generation + 1,
+        )
+
+    assert state.snapshot() is snapshot
 
 
 def test_consecutive_successful_replacements_increment_generations_monotonically():
