@@ -90,6 +90,8 @@ def tag_block(content):
 
 
 def leading_tag_content(message):
+    if isinstance(message, bytes):
+        message = message.decode("utf-8")
     end = message.find("\\", 1)
     return message[1:end].split("*", 1)[0]
 
@@ -103,8 +105,8 @@ def assert_fresh_multipart_output(
     timestamp=WALL_TIME,
 ):
     assert len(outputs) == 2
-    assert outputs[0].message.endswith(first + "\r\n")
-    assert outputs[1].message.endswith(second + "\r\n")
+    assert outputs[0].message.endswith((first + "\r\n").encode("utf-8"))
+    assert outputs[1].message.endswith((second + "\r\n").encode("utf-8"))
     assert leading_tag_content(outputs[0].message) == (
         f"c:{timestamp},s:192_0_2_10,g:1-2-{gid}"
     )
@@ -160,7 +162,7 @@ def test_exact_single_sentence_legacy_output():
         tag_block(f"c:{WALL_TIME},s:test_station")
         + SENTENCE
         + "\r\n"
-    )
+    ).encode("utf-8")
     assert outputs == (
         ProcessorOutput(
             message=expected_message,
@@ -168,6 +170,77 @@ def test_exact_single_sentence_legacy_output():
             target_ids=(),
         ),
     )
+
+
+def test_processor_builds_once_per_emitted_sentence(monkeypatch):
+    calls = []
+    original_builder = python_data_plane_module.build_output_bytes
+
+    def recording_builder(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(
+        python_data_plane_module,
+        "build_output_bytes",
+        recording_builder,
+    )
+    first = make_multipart_sentence(1, "first")
+    second = make_multipart_sentence(2, "second")
+    processor = make_processor()
+
+    assert processor.process(make_frame(first), make_snapshot()) == ()
+    outputs = processor.process(make_frame(second), make_snapshot())
+
+    assert len(outputs) == 2
+    assert len(calls) == 2
+
+
+def test_dedup_suppressed_output_does_not_invoke_builder(monkeypatch):
+    calls = []
+    original_builder = python_data_plane_module.build_output_bytes
+
+    def recording_builder(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(
+        python_data_plane_module,
+        "build_output_bytes",
+        recording_builder,
+    )
+    processor = make_processor(deduplicator=Deduplicator(clock=lambda: 0.0))
+    frame = make_frame(SENTENCE)
+
+    assert len(processor.process(frame, make_snapshot())) == 1
+    calls.clear()
+    assert processor.process(frame, make_snapshot()) == ()
+    assert calls == []
+
+
+def test_routed_no_match_does_not_invoke_builder(monkeypatch):
+    def fail_builder(*_args, **_kwargs):
+        raise AssertionError("builder must not be invoked")
+
+    monkeypatch.setattr(
+        python_data_plane_module,
+        "build_output_bytes",
+        fail_builder,
+    )
+
+    assert make_processor().process(
+        make_frame(SENTENCE),
+        make_snapshot(mode=DeduplicationMode.PER_TARGET),
+    ) == ()
+
+
+def test_processor_delegates_framing_and_encoding_to_output_builder():
+    process_source = inspect.getsource(PythonDataPlaneProcessor.process)
+
+    assert "build_output_bytes(" in process_source
+    assert "wrap_with_meta" not in process_source
+    assert "\\r\\n" not in process_source
+    assert ".encode(" not in process_source
 
 
 def test_routed_output_preserves_numeric_target_order():

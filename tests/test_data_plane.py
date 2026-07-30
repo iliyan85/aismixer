@@ -13,6 +13,10 @@ from core.data_plane import (
 from core.ingress_frame import IngressFrame
 
 
+class _BytesSubclass(bytes):
+    pass
+
+
 def make_frame() -> IngressFrame:
     return IngressFrame(
         kind="udp",
@@ -167,15 +171,17 @@ def test_processing_snapshot_rejects_duplicate_target_ids():
 
 
 def test_processor_output_is_frozen_slotted_and_has_no_runtime_objects():
+    message = b"formatted message\r\n"
     output = ProcessorOutput(
-        message="formatted message\r\n",
+        message=message,
         disposition=RoutingDisposition.LEGACY_BROADCAST,
     )
 
     with pytest.raises(FrozenInstanceError):
-        output.message = "changed\r\n"
+        output.message = b"changed\r\n"
 
     assert not hasattr(output, "__dict__")
+    assert output.message is message
     assert tuple(field.name for field in fields(output)) == (
         "message",
         "disposition",
@@ -187,7 +193,7 @@ def test_targeted_processor_output_preserves_order_repeats_and_copies_input():
     target_ids = [2, 0, 2]
 
     output = ProcessorOutput(
-        message="formatted message\r\n",
+        message=b"formatted message\r\n",
         disposition=RoutingDisposition.TARGETED,
         target_ids=target_ids,
     )
@@ -200,7 +206,7 @@ def test_targeted_processor_output_preserves_order_repeats_and_copies_input():
 
 def test_legacy_processor_output_has_explicit_disposition_and_no_targets():
     output = ProcessorOutput(
-        message="formatted message\r\n",
+        message=b"formatted message\r\n",
         disposition=RoutingDisposition.LEGACY_BROADCAST,
     )
 
@@ -212,27 +218,46 @@ def test_legacy_processor_output_has_explicit_disposition_and_no_targets():
     ("message", "disposition", "target_ids", "exception"),
     [
         (
-            "message\r\n",
+            b"message\r\n",
             RoutingDisposition.LEGACY_BROADCAST,
             (0,),
             ValueError,
         ),
-        ("message\r\n", RoutingDisposition.TARGETED, (), ValueError),
-        ("message\r\n", "targeted", (0,), TypeError),
-        (b"message\r\n", RoutingDisposition.TARGETED, (0,), TypeError),
-        ("message\r\n", RoutingDisposition.TARGETED, "0", TypeError),
-        ("message\r\n", RoutingDisposition.TARGETED, b"\x00", TypeError),
+        (b"message\r\n", RoutingDisposition.TARGETED, (), ValueError),
+        (b"message\r\n", "targeted", (0,), TypeError),
+        ("message\r\n", RoutingDisposition.TARGETED, (0,), TypeError),
         (
-            "message\r\n",
+            bytearray(b"message\r\n"),
+            RoutingDisposition.TARGETED,
+            (0,),
+            TypeError,
+        ),
+        (
+            memoryview(b"message\r\n"),
+            RoutingDisposition.TARGETED,
+            (0,),
+            TypeError,
+        ),
+        (
+            _BytesSubclass(b"message\r\n"),
+            RoutingDisposition.TARGETED,
+            (0,),
+            TypeError,
+        ),
+        (object(), RoutingDisposition.TARGETED, (0,), TypeError),
+        (b"message\r\n", RoutingDisposition.TARGETED, "0", TypeError),
+        (b"message\r\n", RoutingDisposition.TARGETED, b"\x00", TypeError),
+        (
+            b"message\r\n",
             RoutingDisposition.TARGETED,
             (target_id for target_id in (0,)),
             TypeError,
         ),
-        ("message\r\n", RoutingDisposition.TARGETED, (True,), TypeError),
-        ("message\r\n", RoutingDisposition.TARGETED, ("0",), TypeError),
-        ("message\r\n", RoutingDisposition.TARGETED, (0.0,), TypeError),
-        ("message\r\n", RoutingDisposition.TARGETED, (object(),), TypeError),
-        ("message\r\n", RoutingDisposition.TARGETED, (-1,), ValueError),
+        (b"message\r\n", RoutingDisposition.TARGETED, (True,), TypeError),
+        (b"message\r\n", RoutingDisposition.TARGETED, ("0",), TypeError),
+        (b"message\r\n", RoutingDisposition.TARGETED, (0.0,), TypeError),
+        (b"message\r\n", RoutingDisposition.TARGETED, (object(),), TypeError),
+        (b"message\r\n", RoutingDisposition.TARGETED, (-1,), ValueError),
     ],
 )
 def test_processor_output_rejects_invalid_values(
@@ -249,9 +274,20 @@ def test_processor_output_rejects_invalid_values(
         )
 
 
+def test_processor_output_does_not_require_crlf_framing():
+    payload = b"already formatted"
+
+    output = ProcessorOutput(
+        message=payload,
+        disposition=RoutingDisposition.LEGACY_BROADCAST,
+    )
+
+    assert output.message is payload
+
+
 def test_minimal_synchronous_fake_satisfies_processor_protocol():
     output = ProcessorOutput(
-        message="formatted message\r\n",
+        message=b"formatted message\r\n",
         disposition=RoutingDisposition.LEGACY_BROADCAST,
     )
 

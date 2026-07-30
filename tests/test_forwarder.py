@@ -1,4 +1,5 @@
 import asyncio as real_asyncio
+import inspect
 import socket
 
 import pytest
@@ -60,6 +61,10 @@ class _FakeAsyncioModule:
         return self._loop
 
 
+class _BytesSubclass(bytes):
+    pass
+
+
 def _patch_forwarder_loop(monkeypatch):
     loop = _FakeLoop()
     monkeypatch.setattr(forwarder_module, "asyncio", _FakeAsyncioModule(loop))
@@ -77,14 +82,55 @@ def _targets():
 def test_send_broadcasts_to_legacy_and_named_entries(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder(_targets())
+    payload = b"message"
 
-    real_asyncio.run(forwarder.send("message"))
+    real_asyncio.run(forwarder.send(payload))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19000), b"message"),
         (("192.0.2.20", 10110), b"message"),
         (("127.0.0.1", 19001), b"message"),
     ]
+    assert all(data is payload for _addr, data, _transport in loop.sends)
+
+
+def test_forwarder_contains_no_encoding_operation():
+    assert ".encode(" not in inspect.getsource(Forwarder)
+
+
+@pytest.mark.parametrize("api_name", ["send", "send_to_ids", "send_to"])
+@pytest.mark.parametrize(
+    "invalid_payload",
+    [
+        "message",
+        bytearray(b"message"),
+        memoryview(b"message"),
+        _BytesSubclass(b"message"),
+        object(),
+    ],
+    ids=["str", "bytearray", "memoryview", "bytes-subclass", "object"],
+)
+def test_send_apis_reject_non_exact_bytes_before_transport_creation(
+    monkeypatch,
+    api_name,
+    invalid_payload,
+):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+
+    if api_name == "send":
+        operation = forwarder.send(invalid_payload)
+    elif api_name == "send_to_ids":
+        operation = forwarder.send_to_ids((1,), invalid_payload)
+    else:
+        operation = forwarder.send_to(("udp:aishub",), invalid_payload)
+
+    with pytest.raises(TypeError, match="immutable bytes"):
+        real_asyncio.run(operation)
+
+    assert loop.created == []
+    assert loop.sends == []
+    assert forwarder.transports == {}
 
 
 def test_target_ids_returns_only_explicit_ids_in_declaration_order():
@@ -128,7 +174,7 @@ def test_entries_without_id_remain_valid_for_legacy_broadcast(monkeypatch):
 
     assert forwarder.target_ids == ()
 
-    real_asyncio.run(forwarder.send("legacy"))
+    real_asyncio.run(forwarder.send(b"legacy"))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19000), b"legacy")
@@ -139,7 +185,9 @@ def test_send_to_sends_only_requested_targets(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder(_targets())
 
-    real_asyncio.run(forwarder.send_to(("udp:local_debug",), "targeted"))
+    real_asyncio.run(
+        forwarder.send_to(("udp:local_debug",), b"targeted")
+    )
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19001), b"targeted")
@@ -149,15 +197,20 @@ def test_send_to_sends_only_requested_targets(monkeypatch):
 def test_send_to_preserves_requested_order(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder(_targets())
+    payload = b"ordered"
 
     real_asyncio.run(
-        forwarder.send_to(("udp:local_debug", "udp:aishub"), "ordered")
+        forwarder.send_to(
+            ("udp:local_debug", "udp:aishub"),
+            payload,
+        )
     )
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19001), b"ordered"),
         (("192.0.2.20", 10110), b"ordered"),
     ]
+    assert all(data is payload for _addr, data, _transport in loop.sends)
 
 
 def test_send_to_deduplicates_repeated_target_ids_by_first_occurrence(monkeypatch):
@@ -167,7 +220,7 @@ def test_send_to_deduplicates_repeated_target_ids_by_first_occurrence(monkeypatc
     real_asyncio.run(
         forwarder.send_to(
             ("udp:local_debug", "udp:aishub", "udp:local_debug"),
-            "deduped",
+            b"deduped",
         )
     )
 
@@ -182,7 +235,9 @@ def test_send_to_rejects_unknown_target_id(monkeypatch):
     forwarder = Forwarder(_targets())
 
     with pytest.raises(UnknownForwarderTargetError, match="udp:missing"):
-        real_asyncio.run(forwarder.send_to(("udp:missing",), "lost"))
+        real_asyncio.run(
+            forwarder.send_to(("udp:missing",), b"lost")
+        )
 
     assert loop.sends == []
 
@@ -195,7 +250,10 @@ def test_send_to_preserves_partial_send_behavior_for_later_unknown_target(
 
     with pytest.raises(UnknownForwarderTargetError, match="udp:missing"):
         real_asyncio.run(
-            forwarder.send_to(("udp:aishub", "udp:missing"), "partial")
+            forwarder.send_to(
+                ("udp:aishub", "udp:missing"),
+                b"partial",
+            )
         )
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
@@ -231,9 +289,9 @@ def test_original_config_mutation_after_construction_does_not_change_behavior(
     assert forwarder.target_ids == ("udp:aishub",)
     assert dict(forwarder.target_id_by_name) == {"udp:aishub": 1}
 
-    real_asyncio.run(forwarder.send("unchanged"))
-    real_asyncio.run(forwarder.send_to(("udp:aishub",), "named"))
-    real_asyncio.run(forwarder.send_to_ids((0, 1), "numeric"))
+    real_asyncio.run(forwarder.send(b"unchanged"))
+    real_asyncio.run(forwarder.send_to(("udp:aishub",), b"named"))
+    real_asyncio.run(forwarder.send_to_ids((0, 1), b"numeric"))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19000), b"unchanged"),
@@ -248,8 +306,8 @@ def test_targeted_sends_reuse_transport_cache(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder(_targets())
 
-    real_asyncio.run(forwarder.send_to(("udp:aishub",), "one"))
-    real_asyncio.run(forwarder.send_to(("udp:aishub",), "two"))
+    real_asyncio.run(forwarder.send_to(("udp:aishub",), b"one"))
+    real_asyncio.run(forwarder.send_to(("udp:aishub",), b"two"))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("192.0.2.20", 10110), b"one"),
@@ -262,7 +320,7 @@ def test_send_to_ids_supports_unnamed_destination(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder(_targets())
 
-    real_asyncio.run(forwarder.send_to_ids((0,), "unnamed"))
+    real_asyncio.run(forwarder.send_to_ids((0,), b"unnamed"))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19000), b"unnamed")
@@ -272,14 +330,16 @@ def test_send_to_ids_supports_unnamed_destination(monkeypatch):
 def test_send_to_ids_preserves_requested_order(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder(_targets())
+    payload = b"ordered"
 
-    real_asyncio.run(forwarder.send_to_ids((2, 0, 1), "ordered"))
+    real_asyncio.run(forwarder.send_to_ids((2, 0, 1), payload))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19001), b"ordered"),
         (("127.0.0.1", 19000), b"ordered"),
         (("192.0.2.20", 10110), b"ordered"),
     ]
+    assert all(data is payload for _addr, data, _transport in loop.sends)
 
 
 def test_send_to_ids_deduplicates_by_first_occurrence(monkeypatch):
@@ -287,7 +347,7 @@ def test_send_to_ids_deduplicates_by_first_occurrence(monkeypatch):
     forwarder = Forwarder(_targets())
     requested_ids = (target_id for target_id in (2, 0, 2, 1, 0))
 
-    real_asyncio.run(forwarder.send_to_ids(requested_ids, "deduped"))
+    real_asyncio.run(forwarder.send_to_ids(requested_ids, b"deduped"))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19001), b"deduped"),
@@ -300,8 +360,8 @@ def test_send_to_ids_reuses_transport_cache(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder(_targets())
 
-    real_asyncio.run(forwarder.send_to_ids((1,), "one"))
-    real_asyncio.run(forwarder.send_to_ids((1,), "two"))
+    real_asyncio.run(forwarder.send_to_ids((1,), b"one"))
+    real_asyncio.run(forwarder.send_to_ids((1,), b"two"))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("192.0.2.20", 10110), b"one"),
@@ -316,13 +376,15 @@ def test_send_to_ids_keeps_shared_endpoint_target_ids_distinct(monkeypatch):
         {"id": "first", "host": "192.0.2.20", "port": 10110},
         {"id": "second", "host": "192.0.2.20", "port": 10110},
     ])
+    payload = b"shared"
 
-    real_asyncio.run(forwarder.send_to_ids((0, 1, 0), "shared"))
+    real_asyncio.run(forwarder.send_to_ids((0, 1, 0), payload))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("192.0.2.20", 10110), b"shared"),
         (("192.0.2.20", 10110), b"shared"),
     ]
+    assert all(data is payload for _addr, data, _transport in loop.sends)
     assert [addr for addr, _ in loop.created] == [("192.0.2.20", 10110)]
 
 
@@ -330,7 +392,7 @@ def test_send_to_ids_empty_input_sends_nothing(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder(_targets())
 
-    real_asyncio.run(forwarder.send_to_ids((), "nothing"))
+    real_asyncio.run(forwarder.send_to_ids((), b"nothing"))
 
     assert loop.sends == []
     assert loop.created == []
@@ -346,7 +408,7 @@ def test_send_to_ids_rejects_non_integer_target_ids_before_sending(
 
     with pytest.raises(TypeError, match="must be integers"):
         real_asyncio.run(
-            forwarder.send_to_ids((1, invalid_target_id), "invalid")
+            forwarder.send_to_ids((1, invalid_target_id), b"invalid")
         )
 
     assert loop.sends == []
@@ -366,7 +428,7 @@ def test_send_to_ids_rejects_unknown_integer_ids_before_sending(
         match=rf"target ID: {invalid_target_id}$",
     ):
         real_asyncio.run(
-            forwarder.send_to_ids((1, invalid_target_id), "invalid")
+            forwarder.send_to_ids((1, invalid_target_id), b"invalid")
         )
 
     assert loop.sends == []
@@ -390,7 +452,7 @@ def test_source_ip_binds_ipv4_transport(monkeypatch):
         {"host": "198.51.100.20", "port": 10110, "source_ip": "192.0.2.15"}
     ])
 
-    real_asyncio.run(forwarder.send("bound"))
+    real_asyncio.run(forwarder.send(b"bound"))
 
     assert loop.endpoint_kwargs == [{
         "remote_addr": ("198.51.100.20", 10110),
@@ -408,7 +470,7 @@ def test_source_ip_binds_ipv6_transport(monkeypatch):
         {"host": "2001:db8:50::20", "port": 10110, "source_ip": "2001:db8:10::15"}
     ])
 
-    real_asyncio.run(forwarder.send("bound-v6"))
+    real_asyncio.run(forwarder.send(b"bound-v6"))
 
     assert loop.endpoint_kwargs == [{
         "remote_addr": ("2001:db8:50::20", 10110),
@@ -423,7 +485,7 @@ def test_hostname_destination_is_constrained_to_source_family(monkeypatch):
         {"host": "feed.example.net", "port": 10110, "source_ip": "192.0.2.15"}
     ])
 
-    real_asyncio.run(forwarder.send("hostname"))
+    real_asyncio.run(forwarder.send(b"hostname"))
 
     assert loop.endpoint_kwargs == [{
         "remote_addr": ("feed.example.net", 10110),
@@ -441,8 +503,8 @@ def test_same_destination_with_different_source_ips_gets_distinct_transports(
         {"host": "198.51.100.20", "port": 10110, "source_ip": "192.0.2.16"},
     ])
 
-    real_asyncio.run(forwarder.send("one"))
-    real_asyncio.run(forwarder.send("two"))
+    real_asyncio.run(forwarder.send(b"one"))
+    real_asyncio.run(forwarder.send(b"two"))
 
     assert len(loop.created) == 2
     assert sorted(forwarder.transports) == [
@@ -459,7 +521,7 @@ def test_system_default_forwarder_keeps_legacy_transport_arguments(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder([{"host": "198.51.100.20", "port": 10110}])
 
-    real_asyncio.run(forwarder.send("default"))
+    real_asyncio.run(forwarder.send(b"default"))
 
     assert loop.endpoint_kwargs == [{
         "remote_addr": ("198.51.100.20", 10110),
@@ -488,7 +550,7 @@ def test_close_closes_cached_transports(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder([{"host": "127.0.0.1", "port": 19000}])
 
-    real_asyncio.run(forwarder.send("message"))
+    real_asyncio.run(forwarder.send(b"message"))
     transport = loop.created[0][1]
     forwarder.close()
 

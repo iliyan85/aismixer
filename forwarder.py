@@ -85,14 +85,19 @@ class Forwarder:
             self.transports[key] = transport
         return self.transports[key]
 
-    async def _send_to_destination(self, loop, destination, message):
+    async def _send_to_destination(
+        self,
+        loop,
+        destination,
+        message: bytes,
+    ) -> None:
         transport = await self._ensure_transport(loop, destination)
-        transport.sendto(message.encode())
+        transport.sendto(message)
 
     async def _dispatch_to_ids(
         self,
         target_ids: Iterable[EgressTargetId],
-        message,
+        message: bytes,
     ) -> None:
         loop = asyncio.get_running_loop()
         for target_id in target_ids:
@@ -102,7 +107,8 @@ class Forwarder:
                 message,
             )
 
-    async def send(self, message):
+    async def send(self, message: bytes) -> None:
+        message = _validate_payload(message)
         await self._dispatch_to_ids(self._all_target_ids, message)
 
     def close(self):
@@ -113,15 +119,21 @@ class Forwarder:
     async def send_to_ids(
         self,
         target_ids: Iterable[EgressTargetId],
-        message,
+        message: bytes,
     ) -> None:
+        message = _validate_payload(message)
         validated_target_ids = _validate_numeric_target_ids(
             target_ids,
             len(self._destinations),
         )
         await self._dispatch_to_ids(validated_target_ids, message)
 
-    async def send_to(self, target_ids, message):
+    async def send_to(
+        self,
+        target_ids: Iterable[str],
+        message: bytes,
+    ) -> None:
+        message = _validate_payload(message)
         loop = asyncio.get_running_loop()
         for target_id in _dedupe_target_ids(target_ids):
             try:
@@ -132,6 +144,12 @@ class Forwarder:
                 ) from exc
             destination = self._destinations[numeric_target_id]
             await self._send_to_destination(loop, destination, message)
+
+
+def _validate_payload(message: object) -> bytes:
+    if type(message) is not bytes:
+        raise TypeError("message must be immutable bytes.")
+    return message
 
 
 def _copy_target_entry(entry: Mapping[str, object]) -> Mapping[str, object]:

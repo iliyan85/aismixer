@@ -14,9 +14,14 @@ from core.runtime_routing import load_optional_routing_table
 from core.routing_state import RoutingState
 from dedup import Deduplicator
 from forwarder import Forwarder
+from meta_writer import wrap_with_meta
 
 
 SENTENCE = "!AIVDM,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*5C"
+WALL_TIME = 123
+EXPECTED_DATAGRAM = (
+    wrap_with_meta(SENTENCE, "test_station", timestamp=WALL_TIME) + "\r\n"
+).encode("utf-8")
 LEGACY_ADDR = ("127.0.0.1", 19000)
 TARGET_A_ADDR = ("127.0.0.1", 19001)
 TARGET_B_ADDR = ("127.0.0.1", 19002)
@@ -171,9 +176,10 @@ async def run_routed_events(
         forwarder_module, "asyncio", _FakeAsyncioModule(fake_loop)
     )
     output_forwarder = Forwarder(forwarders_config)
-    routing_table = routing_table.compile_target_ids(
-        output_forwarder.target_id_by_name
-    )
+    if routing_table is not None:
+        routing_table = routing_table.compile_target_ids(
+            output_forwarder.target_id_by_name
+        )
     processor = PythonDataPlaneProcessor(
         station_id="test_station",
         preserve_ingress_c=True,
@@ -181,6 +187,7 @@ async def run_routed_events(
         always_tag_single=False,
         assembler=AIVDMAssembler(),
         deduplicator=Deduplicator(),
+        wall_clock=lambda: WALL_TIME,
     )
 
     queue = real_asyncio.Queue()
@@ -229,10 +236,8 @@ def test_routed_udp_delivers_same_sentence_to_distinct_targets(monkeypatch):
     by_addr = datagrams_by_addr(fake_loop)
 
     assert LEGACY_ADDR not in by_addr
-    assert len(by_addr[TARGET_A_ADDR]) == 1
-    assert len(by_addr[TARGET_B_ADDR]) == 1
-    assert SENTENCE.encode() in by_addr[TARGET_A_ADDR][0]
-    assert SENTENCE.encode() in by_addr[TARGET_B_ADDR][0]
+    assert by_addr[TARGET_A_ADDR] == [EXPECTED_DATAGRAM]
+    assert by_addr[TARGET_B_ADDR] == [EXPECTED_DATAGRAM]
 
 
 def test_routed_udp_deduplicates_same_sentence_for_shared_target(monkeypatch):
@@ -249,8 +254,29 @@ def test_routed_udp_deduplicates_same_sentence_for_shared_target(monkeypatch):
     by_addr = datagrams_by_addr(fake_loop)
 
     assert LEGACY_ADDR not in by_addr
-    assert len(by_addr[SHARED_ADDR]) == 1
-    assert SENTENCE.encode() in by_addr[SHARED_ADDR][0]
+    assert by_addr[SHARED_ADDR] == [EXPECTED_DATAGRAM]
+
+
+def test_legacy_broadcast_sends_exact_same_datagram_object_to_all_destinations(
+    monkeypatch,
+):
+    fake_loop = real_asyncio.run(
+        run_routed_events(
+            monkeypatch,
+            split_targets_forwarders(),
+            None,
+            [make_event("udp:source_a")],
+            expected_datagrams=3,
+        )
+    )
+
+    assert [
+        remote_addr
+        for remote_addr, _data, _transport in fake_loop.sends
+    ] == [LEGACY_ADDR, TARGET_A_ADDR, TARGET_B_ADDR]
+    payloads = [data for _remote_addr, data, _transport in fake_loop.sends]
+    assert payloads == [EXPECTED_DATAGRAM] * 3
+    assert all(payload is payloads[0] for payload in payloads)
 
 
 def test_routed_udp_no_route_sends_no_datagram_and_task_stays_running(monkeypatch):

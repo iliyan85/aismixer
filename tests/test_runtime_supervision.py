@@ -24,7 +24,7 @@ def make_frame(label="frame"):
 
 def broadcast(message):
     return ProcessorOutput(
-        f"{message}\r\n",
+        f"{message}\r\n".encode("utf-8"),
         RoutingDisposition.LEGACY_BROADCAST,
     )
 
@@ -307,7 +307,7 @@ def test_egress_failure_propagates_through_ack_and_cancels_ingress_side():
         assert exc_info.value is failure
         assert processor.calls[0][0] is frame
         assert len(processor.calls) == 1
-        assert output_forwarder.messages == ["one\r\n"]
+        assert output_forwarder.messages == [b"one\r\n"]
         assert len(egress_queue.put_items) == 1
         batch = egress_queue.put_items[0]
         assert batch.outputs is processor.outputs

@@ -46,16 +46,24 @@ def make_nmea_sentence(body):
 class FakeForwarder:
     def __init__(self, on_send_to=None):
         self.messages = []
+        self.raw_messages = []
         self.targeted_messages = []
+        self.raw_targeted_messages = []
         self.on_send_to = on_send_to
 
     async def send(self, message):
-        self.messages.append(message)
+        assert type(message) is bytes
+        self.raw_messages.append(message)
+        self.messages.append(message.decode("utf-8"))
 
     async def send_to_ids(self, target_ids, message):
-        self.targeted_messages.append((tuple(target_ids), message))
+        assert type(message) is bytes
+        numeric_target_ids = tuple(target_ids)
+        self.raw_targeted_messages.append((numeric_target_ids, message))
+        display_message = message.decode("utf-8")
+        self.targeted_messages.append((numeric_target_ids, display_message))
         if self.on_send_to is not None:
-            self.on_send_to(tuple(target_ids), message)
+            self.on_send_to(numeric_target_ids, display_message)
 
     async def send_to(self, _target_ids, _message):
         raise AssertionError("string targeted egress path was called")

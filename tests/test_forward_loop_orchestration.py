@@ -225,11 +225,11 @@ def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
     processor = ScriptedProcessor(
         (
             ProcessorOutput(
-                "first\r\n",
+                b"first\r\n",
                 RoutingDisposition.LEGACY_BROADCAST,
             ),
             ProcessorOutput(
-                "second\r\n",
+                b"second\r\n",
                 RoutingDisposition.TARGETED,
                 (2, 1),
             ),
@@ -253,11 +253,11 @@ def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
     assert state.snapshot_calls == 1
     assert len(processor.calls) == 1
     assert forwarder.events == [
-        ("broadcast", "first\r\n"),
+        ("broadcast", b"first\r\n"),
         (
             "targeted",
             (2, 1),
-            "second\r\n",
+            b"second\r\n",
         ),
     ]
 
@@ -266,11 +266,11 @@ def test_dispatch_failure_stops_before_later_output_dispatch():
     processor = ScriptedProcessor(
         (
             ProcessorOutput(
-                "first\r\n",
+                b"first\r\n",
                 RoutingDisposition.LEGACY_BROADCAST,
             ),
             ProcessorOutput(
-                "second\r\n",
+                b"second\r\n",
                 RoutingDisposition.LEGACY_BROADCAST,
             ),
         )
@@ -287,7 +287,7 @@ def test_dispatch_failure_stops_before_later_output_dispatch():
         )
 
     assert len(processor.calls) == 1
-    assert forwarder.events == [("broadcast", "first\r\n")]
+    assert forwarder.events == [("broadcast", b"first\r\n")]
 
 
 def test_whole_frame_processing_and_effects_complete_before_ordered_egress():
@@ -325,8 +325,12 @@ def test_whole_frame_processing_and_effects_complete_before_ordered_egress():
     assert processor.completed is True
     assert outputs is not None
     assert len(outputs) == 2
-    assert outputs[0].message.endswith(FIRST_SENTENCE + "\r\n")
-    assert outputs[1].message.endswith(SECOND_SENTENCE + "\r\n")
+    assert outputs[0].message.endswith(
+        (FIRST_SENTENCE + "\r\n").encode("ascii")
+    )
+    assert outputs[1].message.endswith(
+        (SECOND_SENTENCE + "\r\n").encode("ascii")
+    )
 
     first_send = forwarder.observations[0]
     assert first_send == {
@@ -379,8 +383,12 @@ def test_first_send_failure_keeps_completed_effects_and_later_output():
     assert processor.completed is True
     assert outputs is not None
     assert len(outputs) == 2
-    assert outputs[0].message.endswith(FIRST_SENTENCE + "\r\n")
-    assert outputs[1].message.endswith(SECOND_SENTENCE + "\r\n")
+    assert outputs[0].message.endswith(
+        (FIRST_SENTENCE + "\r\n").encode("ascii")
+    )
+    assert outputs[1].message.endswith(
+        (SECOND_SENTENCE + "\r\n").encode("ascii")
+    )
     assert forwarder.attempted_messages == [outputs[0].message]
 
     assert touched_s_values == ["boundary", "boundary"]
