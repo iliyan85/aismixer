@@ -179,11 +179,11 @@
 
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Campaign D processor boundary</p>
-        <h2>Explicit processing stages and ordered egress</h2>
-        <p class="section-intro">Immutable ingress frames now pass through one ingress fan-in, a processor stage that invokes the synchronous Python reference processor, and one ordered egress stage, all within one process-local supervised lifecycle. Exact lifecycle rules and edge cases remain in the normative behavioural contract.</p>
+        <p class="eyebrow">Campaign D–E data-plane foundation</p>
+        <h2>Explicit processing, exact bytes, and unified egress</h2>
+        <p class="section-intro">Immutable ingress frames move through explicit single-process stages. Each accepted frame receives one <span class="kbd">ProcessingSnapshot</span>, and <span class="kbd">PythonDataPlaneProcessor</span>—the sole production and reference processor—returns one ordered <span class="kbd">OutputBatch</span>. Each <span class="kbd">ProcessorOutput</span> carries exact immutable bytes and explicit numeric target IDs for one unified egress path. Exact lifecycle rules and edge cases remain in the normative behavioural contract.</p>
       </div>
-      <div class="pipeline representation-pipeline" role="group" aria-label="Campaign D production data-plane stages">
+      <div class="pipeline representation-pipeline" role="group" aria-label="Campaign D–E production data-plane stages">
         <div class="pipeline-node">
           <strong>UDP / UDPSEC producers</strong>
           <span>Immutable <span class="kbd">IngressFrame</span></span>
@@ -196,17 +196,17 @@
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
           <strong><span class="kbd">PythonDataPlaneProcessor</span></strong>
-          <span>One snapshot and one synchronous call per accepted frame</span>
+          <span>One <span class="kbd">ProcessingSnapshot</span> and one synchronous call per accepted frame</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Ordered <span class="kbd">ProcessorOutput</span> batch</strong>
-          <span>Complete tuple before asynchronous egress</span>
+          <strong>Ordered <span class="kbd">OutputBatch</span></strong>
+          <span>Exact bytes and explicit numeric targets per <span class="kbd">ProcessorOutput</span></span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Egress stage and UDP targets</strong>
-          <span>Sequential dispatch in tuple order</span>
+          <strong>Unified numeric egress</strong>
+          <span>Sequential dispatch through <span class="kbd">send_to_ids()</span></span>
         </div>
       </div>
       <div class="grid state-grid">
@@ -217,28 +217,28 @@
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧾</div>
-          <h3>Synchronous reference processor</h3>
-          <p><span class="kbd">DataPlaneProcessor</span> is the explicit contract. <span class="kbd">PythonDataPlaneProcessor</span> is the sole production and reference implementation; processing remains Python-only and process-local.</p>
+          <h3>One frame, one <span class="kbd">ProcessingSnapshot</span></h3>
+          <p>Each accepted frame receives exactly one immutable <span class="kbd">ProcessingSnapshot</span>. Configured external target names remain the operator interface, while production matching uses a precompiled numeric target-only plan and preserves target order.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
-          <h3>One frame, one snapshot</h3>
-          <p>Each accepted frame receives one immutable routing snapshot and one source match, and the processor is invoked exactly once for that frame.</p>
+          <h3>Ordered <span class="kbd">OutputBatch</span> result</h3>
+          <p><span class="kbd">DataPlaneProcessor</span> returns <span class="kbd">OutputBatch</span>, and <span class="kbd">PythonDataPlaneProcessor</span> remains the sole production and reference implementation. Every <span class="kbd">ProcessorOutput</span> carries explicit ordered numeric target IDs.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
-          <h3>Ordered completion barrier</h3>
-          <p>The complete <span class="kbd">tuple[ProcessorOutput, ...]</span> is constructed before the first asynchronous send. A non-empty batch prevents later-frame processing until sequential egress completes successfully.</p>
+          <h3>Exact bytes and one encoding</h3>
+          <p>Each emitted NMEA sentence becomes one exact immutable <span class="kbd">bytes</span> payload and is encoded as UTF-8 once. Multipart fragments remain separate payloads; a group is never concatenated into one output.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⏱️</div>
-          <h3>Fail-fast runtime supervision</h3>
-          <p>UDP producers, UDPSEC producers, fan-in, processor, and egress share one process-local lifecycle. Failure or unexpected completion cancels and awaits sibling tasks; there is no automatic restart, retry, rollback, or delivery replay.</p>
+          <h3>Ordered completion barrier</h3>
+          <p>Complete frame processing precedes the first egress dispatch. A non-empty <span class="kbd">OutputBatch</span> prevents later-frame processing until sequential dispatch returns without error; this is not a delivery acknowledgement or transaction and does not roll back completed processor effects.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧭</div>
-          <h3>Future boundaries remain explicit</h3>
-          <p>Native processing, coordinator/worker processes, multiprocessing, cross-process supervision, and IPC remain future work. Campaign D defines no native API or ABI.</p>
+          <h3>Process-local fail-fast lifecycle</h3>
+          <p>Essential asyncio stages share one supervised lifecycle within the current process. Failure or unexpected completion cancels and awaits sibling tasks; there is no automatic restart, retry, rollback, delivery acknowledgement, or replay.</p>
         </article>
       </div>
       <div class="callout">
@@ -285,16 +285,16 @@
       <div class="section-heading">
         <p class="eyebrow">Reference semantics and staged evolution</p>
         <h2>A native-ready reference foundation</h2>
-        <p class="section-intro">Campaign C established the immutable, bytes-native ingress representation. Campaign D now defines the synchronous processor contract and explicit single-process runtime boundary, while <span class="kbd">PythonDataPlaneProcessor</span> remains the sole production and reference implementation.</p>
+        <p class="section-intro">Campaign C established immutable bytes-native ingress. Campaign D added the synchronous processor contract and explicit process-local runtime stages. Campaign E completed numeric target identity, compiled target-only routing, exact immutable output bytes, <span class="kbd">OutputBatch</span>, and unified numeric egress. <span class="kbd">PythonDataPlaneProcessor</span> remains the sole production and reference implementation.</p>
       </div>
-      <div class="pipeline reference-pipeline" role="group" aria-label="Implemented processor foundation and future differential implementation">
+      <div class="pipeline reference-pipeline" role="group" aria-label="Implemented Campaign C–E foundation and future differential implementation">
         <div class="pipeline-node">
           <strong>Immutable ingress representation</strong>
           <span class="status-badge status-implemented">Implemented now</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Synchronous <span class="kbd">DataPlaneProcessor</span> contract</strong>
+          <strong><span class="kbd">ProcessingSnapshot</span> and compiled numeric routing</strong>
           <span class="status-badge status-implemented">Implemented now</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
@@ -303,23 +303,28 @@
           <span class="status-badge status-implemented">Implemented now</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong>Exact bytes in ordered <span class="kbd">OutputBatch</span></strong>
+          <span class="status-badge status-implemented">Implemented now</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node pipeline-node-future">
-          <strong>Future differential implementation</strong>
+          <strong>Future differential/native implementation</strong>
           <span class="status-badge status-future">Native processor not implemented</span>
         </div>
       </div>
       <div class="grid feature-row">
         <article class="card">
           <h3>Implemented now</h3>
-          <p>Immutable <span class="kbd">IngressFrame</span>, bytes-native scan spans and parsed metadata, the synchronous processor contract, <span class="kbd">PythonDataPlaneProcessor</span>, explicit processor and egress stages, and process-local task supervision are implemented.</p>
+          <p>Immutable <span class="kbd">IngressFrame</span> values, bytes-native scan spans, and <span class="kbd">ParsedSentence</span> metadata form the ingress representation. Each accepted frame is paired with one <span class="kbd">ProcessingSnapshot</span>; when routing is enabled, its targets come from the compiled numeric target-only plan. <span class="kbd">PythonDataPlaneProcessor</span> produces exact immutable output bytes in an ordered <span class="kbd">OutputBatch</span> with explicit numeric target IDs on every <span class="kbd">ProcessorOutput</span>. Production egress is unified through <span class="kbd">send_to_ids()</span>, and stage supervision remains process-local.</p>
         </article>
         <article class="card">
-          <h3>Future architecture</h3>
-          <p>A native processor and differential conformance execution, coordinator and dedicated ingress/egress worker processes, multiprocessing, IPC and routing-snapshot distribution, and cross-process restart and recovery remain future work.</p>
+          <h3>Campaign F — worker readiness</h3>
+          <p>Campaign F prepares future worker boundaries through bounded queues and backpressure policy, processor-instance ownership, worker lifecycle preparation, and a metrics boundary. It does not itself introduce coordinator processes, IPC, a multiprocess runtime, or native bindings.</p>
         </article>
         <article class="card">
-          <h3>Boundaries remain explicit</h3>
-          <p>No native processor exists today. No C or C++ API, ABI, or binding strategy has been selected; current supervision remains within one process, and no performance claim is made.</p>
+          <h3>Later process architecture and native implementation</h3>
+          <p>Later work covers a coordinator, dedicated ingress and egress workers, cross-process supervision, IPC and routing-snapshot distribution, restart and recovery policy, and a native processor with bindings behind the established contracts. No native processor exists today, no native API or ABI has been selected, and no performance claim is made.</p>
         </article>
       </div>
     </section>
@@ -328,7 +333,7 @@
       <div class="section-heading">
         <p class="eyebrow">Routing and logical zones</p>
         <h2>Express stream policy with source identities</h2>
-        <p class="section-intro">Static logical routing connects named ingress sources to named UDP egress targets through reusable source sets and ordered routes.</p>
+        <p class="section-intro">Static logical routing connects named ingress sources to named UDP egress targets through reusable source sets and ordered routes. Names remain the configuration and control interface, while production matching uses a precompiled numeric target-only plan.</p>
       </div>
       <div class="pipeline" role="group" aria-label="Logical routing flow">
         <div class="pipeline-node"><strong>Named ingress</strong><span>UDP and UDPSEC sources</span></div>
@@ -349,11 +354,11 @@
           <p>Zones are sets of internal source identities—not map areas, MMSI filters, vessel filters, or payload rules.</p>
         </article>
         <article class="card">
-          <h3>Per-target stream quality</h3>
-          <p>Routing mode scopes deduplication to each logical target, so one delivery path does not suppress another.</p>
+          <h3>Preserved order and per-target quality</h3>
+          <p>The compiled plan preserves declared target order. Routing mode scopes deduplication to each logical target, so one dispatch path does not suppress another.</p>
         </article>
       </div>
-      <p class="boundary-note"><span class="kbd">source_id</span> is an internal routing identity. It is separate from the NMEA TAG <span class="kbd">s</span> value emitted downstream.</p>
+      <p class="boundary-note"><strong>Names stay operator-facing.</strong> Process-local numeric target IDs are not configuration values. <span class="kbd">source_id</span> remains separate from the NMEA TAG <span class="kbd">s</span> value emitted downstream.</p>
     </section>
 
     <section id="runtime-control" class="section">
@@ -566,6 +571,7 @@
             <li>Immutable <span class="kbd">IngressFrame</span> production boundary with one retained legacy <span class="kbd">IngressEvent</span> adapter.</li>
             <li>Bytes-native scanning, immutable half-open spans, parse-once fragment/TAG metadata, and the parsed assembler production path.</li>
             <li>The synchronous <span class="kbd">DataPlaneProcessor</span> contract and <span class="kbd">PythonDataPlaneProcessor</span> as the sole production and reference implementation.</li>
+            <li>One <span class="kbd">ProcessingSnapshot</span> per accepted frame, compiled numeric target-only routing, exact immutable output bytes with one UTF-8 encoding per emitted sentence, ordered <span class="kbd">OutputBatch</span> results with explicit numeric targets, and unified egress through <span class="kbd">send_to_ids()</span>.</li>
             <li>Explicit ingress fan-in, processor, and ordered egress stages with a completion barrier and process-local fail-fast task supervision.</li>
             <li>Logical routing, zones, and target-scoped deduplication.</li>
             <li>Runtime routing control with <span class="kbd">aismixerctl</span>.</li>
@@ -580,9 +586,10 @@
           <h3 class="status-label">Planned work</h3>
           <ul class="list">
             <li>A native implementation, bindings, and differential conformance execution; none exists today.</li>
-            <li>Bytes-native assembler and output state beyond the current Python string compatibility boundary.</li>
+            <li>Further bytes-native assembler state beyond the current Python string compatibility boundary.</li>
             <li>Benchmarks and profiling before any performance claim.</li>
-            <li>Coordinator and dedicated ingress/egress worker processes, multiprocessing, IPC, routing-snapshot distribution, and cross-process restart and recovery.</li>
+            <li>Campaign F worker readiness: bounded queues and backpressure policy, processor-instance ownership, worker lifecycle preparation, and a metrics boundary—without coordinator processes, IPC, multiprocessing, or native bindings in Campaign F itself.</li>
+            <li>Later process architecture: a coordinator and dedicated ingress/egress workers, cross-process supervision, IPC, routing-snapshot distribution, and restart and recovery policy.</li>
             <li>A broader ingress and egress adapter architecture beyond the current UDP pathways.</li>
           </ul>
         </article>

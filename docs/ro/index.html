@@ -180,11 +180,11 @@
 
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Limita procesorului din Campaign D</p>
-        <h2>Etape explicite de procesare și egress ordonat</h2>
-        <p class="section-intro">Cadrele ingress imuabile trec printr-un singur fan-in ingress, o etapă a procesorului care invocă procesorul sincron de referință implementat în Python și o etapă egress ordonată; întregul traseu este supravegheat într-un singur ciclu de viață local procesului. Regulile exacte și cazurile marginale rămân în contractul comportamental normativ.</p>
+        <p class="eyebrow">Fundamentul planului de date din campaniile D–E</p>
+        <h2>Etape explicite, rezultate imuabile și egress numeric unificat</h2>
+        <p class="section-intro">Cadrele ingress imuabile trec prin etape explicite într-un singur proces. Fiecare cadru acceptat primește un singur <span class="kbd">ProcessingSnapshot</span>, iar <span class="kbd">PythonDataPlaneProcessor</span> returnează un <span class="kbd">OutputBatch</span> ordonat ale cărui elemente <span class="kbd">ProcessorOutput</span> conțin octeții exacți și ID-uri numerice explicite ale destinațiilor. Egress folosește o singură cale numerică de expediere, iar implementarea Python rămâne unicul procesor de producție și de referință. Regulile exacte și cazurile marginale rămân în contractul comportamental normativ.</p>
       </div>
-      <div class="pipeline representation-pipeline" role="group" aria-label="Etapele actuale ale planului de date din Campaign D">
+      <div class="pipeline representation-pipeline" role="group" aria-label="Etapele actuale ale planului de date din campaniile D–E">
         <div class="pipeline-node">
           <strong>Producători UDP / UDPSEC</strong>
           <span><span class="kbd">IngressFrame</span> imuabil</span>
@@ -197,17 +197,17 @@
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
           <strong><span class="kbd">PythonDataPlaneProcessor</span></strong>
-          <span>Un snapshot de rutare și o invocare sincronă pentru fiecare cadru acceptat</span>
+          <span>Un <span class="kbd">ProcessingSnapshot</span> și o invocare sincronă pentru fiecare cadru acceptat</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Lot ordonat de <span class="kbd">ProcessorOutput</span></strong>
-          <span>Tuplul complet este construit înaintea primei trimiteri asincrone</span>
+          <strong><span class="kbd">OutputBatch</span> ordonat</strong>
+          <span><span class="kbd">ProcessorOutput</span> cu octeți exacți și ID-uri numerice explicite ale destinațiilor</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Etapă egress și destinații UDP</strong>
-          <span>Expediere secvențială în ordinea tuplului</span>
+          <strong>Egress numeric unificat către destinații UDP</strong>
+          <span>Expediere secvențială prin <span class="kbd">send_to_ids()</span></span>
         </div>
       </div>
       <div class="grid state-grid">
@@ -218,28 +218,28 @@
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧾</div>
-          <h3>Procesor sincron de referință</h3>
-          <p><span class="kbd">DataPlaneProcessor</span> este contractul explicit. <span class="kbd">PythonDataPlaneProcessor</span> este unica implementare actuală de producție și referință; procesarea rămâne exclusiv Python și locală procesului.</p>
+          <h3>Un cadru, un <span class="kbd">ProcessingSnapshot</span></h3>
+          <p>Fiecare cadru acceptat primește exact un <span class="kbd">ProcessingSnapshot</span>. Numele configurate ale destinațiilor rămân interfața pentru operatori, în timp ce potrivirea din calea de producție folosește un plan numeric precompilat, bazat numai pe destinații, și păstrează ordinea acestora.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
-          <h3>Un cadru, un snapshot</h3>
-          <p>Fiecare cadru acceptat primește un singur snapshot imuabil de rutare și o singură potrivire a sursei, iar procesorul este invocat exact o dată pentru cadrul respectiv.</p>
+          <h3>Rezultat <span class="kbd">OutputBatch</span> ordonat</h3>
+          <p><span class="kbd">DataPlaneProcessor</span> returnează un <span class="kbd">OutputBatch</span>, iar <span class="kbd">PythonDataPlaneProcessor</span> rămâne unica implementare de producție și de referință. Fiecare <span class="kbd">ProcessorOutput</span> conține ID-uri numerice explicite și ordonate ale destinațiilor.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
-          <h3>Barieră de finalizare ordonată</h3>
-          <p>Procesorul sincron construiește întregul <span class="kbd">tuple[ProcessorOutput, ...]</span> înainte de prima trimitere asincronă. Pentru un lot nevid, procesarea cadrului următor așteaptă finalizarea cu succes a expedierii secvențiale prin egress.</p>
+          <h3>Octeți exacți și o singură codificare</h3>
+          <p>Fiecare propoziție NMEA emisă devine un singur payload exact și imuabil de tip <span class="kbd">bytes</span>. Codificarea UTF-8 are loc o singură dată pentru fiecare propoziție emisă, iar fragmentele multipart rămân payload-uri separate.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⏱️</div>
-          <h3>Supraveghere fail-fast locală procesului</h3>
-          <p>Task-urile producătorilor UDP și UDPSEC, ale fan-in-ului ingress și ale etapelor de procesare și egress sunt supravegheate într-un singur ciclu de viață local procesului. Un eșec sau o finalizare neașteptată anulează și așteaptă task-urile surori. Nu există repornire automată, reîncercare, rollback ori reluare a livrării.</p>
+          <h3>Barieră de finalizare ordonată</h3>
+          <p>Procesarea completă a cadrului precedă prima expediere. Pentru un <span class="kbd">OutputBatch</span> nevid, procesarea cadrului următor așteaptă până când expedierea egress secvențială se încheie fără eroare; aceasta nu reprezintă livrare tranzacțională și nu oferă rollback.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧭</div>
-          <h3>Limitele viitoare rămân explicite</h3>
-          <p>Procesarea nativă, procesele coordinator/worker, multiprocessing, supravegherea între procese și IPC rămân activități viitoare. Campaign D nu definește niciun API sau ABI nativ.</p>
+          <h3>Ciclu de viață fail-fast local procesului</h3>
+          <p>Etapele asyncio esențiale au un singur ciclu de viață supravegheat, local procesului. Un eșec sau o finalizare neașteptată anulează și așteaptă task-urile surori. Nu există repornire automată, reîncercare, rollback, confirmare a livrării sau replay.</p>
         </article>
       </div>
       <div class="callout">
@@ -279,24 +279,24 @@
           <p>Aceasta este o bază pentru conformitate diferențială viitoare, nu un sistem complet de monitorizare sau de export Prometheus.</p>
         </article>
       </div>
-      <p class="boundary-note"><strong>Locală prin proiectare.</strong> Această stare este nepersistentă și nu este partajată între procese. Runtime-ul actual supraveghează task-urile asyncio esențiale într-un singur proces; procesele coordinator/worker, IPC și sincronizarea stării între procese nu există încă.</p>
+      <p class="boundary-note"><strong>Locală prin proiectare.</strong> Această stare este nepersistentă și nu este partajată între procese. Runtime-ul actual supraveghează task-urile asyncio esențiale într-un singur proces; procesele coordonator/worker, IPC și sincronizarea stării între procese nu există încă.</p>
     </section>
 
     <section id="native-foundation" class="section">
       <div class="section-heading">
         <p class="eyebrow">Semantică de referință și evoluție etapizată</p>
-        <h2>O bază de referință pregătită pentru o implementare nativă viitoare</h2>
-        <p class="section-intro">Campaign C a stabilit reprezentarea ingress imuabilă și bazată pe octeți. Campaign D definește acum contractul sincron al procesorului și limita explicită a runtime-ului într-un singur proces, iar <span class="kbd">PythonDataPlaneProcessor</span> rămâne unica implementare de producție și referință.</p>
+        <h2>Un fundament de referință pregătit pentru implementare nativă</h2>
+        <p class="section-intro">Campania C a stabilit reprezentarea ingress imuabilă și bazată nativ pe octeți. Campania D a adăugat contractul sincron al procesorului și etapele explicite ale runtime-ului local unui singur proces. Campania E a completat fundamentul Python cu identitatea numerică a destinațiilor, rutarea numerică compilată, bazată numai pe destinații, octeți de ieșire exacți și imuabili, <span class="kbd">OutputBatch</span> și egress numeric unificat; <span class="kbd">PythonDataPlaneProcessor</span> rămâne unica implementare de producție și de referință.</p>
       </div>
-      <div class="pipeline reference-pipeline" role="group" aria-label="Fundația implementată a procesorului și viitoarea implementare diferențială">
+      <div class="pipeline reference-pipeline" role="group" aria-label="Fundamentul implementat din campaniile C–E și viitoarea implementare diferențială">
         <div class="pipeline-node">
           <strong>Reprezentare ingress imuabilă</strong>
           <span class="status-badge status-implemented">Implementată acum</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Contract sincron <span class="kbd">DataPlaneProcessor</span></strong>
-          <span class="status-badge status-implemented">Implementat acum</span>
+          <strong><span class="kbd">ProcessingSnapshot</span> și rutare numerică compilată</strong>
+          <span class="status-badge status-implemented">Implementate acum</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
@@ -304,23 +304,28 @@
           <span class="status-badge status-implemented">Implementat acum</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
+        <div class="pipeline-node">
+          <strong><span class="kbd">OutputBatch</span> ordonat cu octeți exacți</strong>
+          <span class="status-badge status-implemented">Implementat acum</span>
+        </div>
+        <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node pipeline-node-future">
-          <strong>Implementare diferențială viitoare</strong>
+          <strong>Implementare diferențială / nativă viitoare</strong>
           <span class="status-badge status-future">Procesorul nativ nu este implementat</span>
         </div>
       </div>
       <div class="grid feature-row">
         <article class="card">
           <h3>Implementat acum</h3>
-          <p><span class="kbd">IngressFrame</span> imuabil, intervalele de scanare la nivel de octeți și metadatele parsate, contractul sincron al procesorului, <span class="kbd">PythonDataPlaneProcessor</span>, etapele explicite de procesare și egress și supravegherea task-urilor într-un singur proces sunt implementate.</p>
+          <p>Fundamentul implementat include <span class="kbd">IngressFrame</span> imuabil, intervale de scanare bazate pe octeți și metadate <span class="kbd">ParsedSentence</span>. Fiecare cadru acceptat primește câte un <span class="kbd">ProcessingSnapshot</span>; când rutarea este activată, destinațiile sale provin din planul numeric compilat, bazat numai pe destinații. <span class="kbd">PythonDataPlaneProcessor</span> produce octeți de ieșire exacți și imuabili într-un <span class="kbd">OutputBatch</span> ordonat, cu ID-uri numerice explicite pentru fiecare <span class="kbd">ProcessorOutput</span>. Egress-ul de producție este unificat prin <span class="kbd">send_to_ids()</span>, iar supravegherea etapelor rămâne locală procesului.</p>
         </article>
         <article class="card">
-          <h3>Arhitectură viitoare</h3>
-          <p>Un procesor nativ și rularea testelor de conformitate diferențială, un coordinator și procese worker dedicate pentru ingress și egress, multiprocessing, IPC și distribuirea snapshot-urilor de rutare, precum și politicile de repornire și recuperare într-o arhitectură multiproces rămân activități viitoare.</p>
+          <h3>Campania F — pregătirea pentru workeri</h3>
+          <p>Campania F va defini cozi cu capacitate limitată și o politică de backpressure, deținerea instanței procesorului, pregătirea ciclului de viață al workerilor și limita pentru metrici. Nu introduce prin ea însăși un coordonator, IPC, un runtime multiproces sau binding-uri native.</p>
         </article>
         <article class="card">
-          <h3>Limitele rămân explicite</h3>
-          <p>În prezent nu există niciun procesor nativ. Nu a fost ales niciun API sau ABI nativ și nicio strategie pentru binding-uri C ori C++; supravegherea actuală rămâne într-un singur proces și nu se face nicio afirmație de performanță.</p>
+          <h3>Arhitectură de procese și implementare nativă ulterioare</h3>
+          <p>Ulterior pot fi introduse un coordonator, procese worker dedicate pentru ingress și egress, supraveghere între procese, IPC, distribuirea snapshot-urilor de rutare, politici de repornire și recuperare, precum și un procesor nativ și binding-urile sale în spatele contractelor stabilite. Niciun procesor nativ nu este implementat, nu a fost ales niciun API sau ABI și nu se face nicio afirmație de performanță.</p>
         </article>
       </div>
     </section>
@@ -329,7 +334,7 @@
       <div class="section-heading">
         <p class="eyebrow">Rutare și zone logice</p>
         <h2>Exprimați politica fluxului prin identitățile surselor</h2>
-        <p class="section-intro">Rutarea logică statică leagă surse ingress denumite de destinații UDP egress denumite, prin seturi de surse reutilizabile și rute ordonate.</p>
+        <p class="section-intro">Rutarea logică statică leagă surse ingress denumite de destinații UDP egress denumite, prin seturi reutilizabile de surse și rute ordonate. Numele rămân interfața de configurare și control, iar potrivirea din calea de producție folosește un plan numeric precompilat care conține numai destinațiile și le păstrează ordinea.</p>
       </div>
       <div class="pipeline" role="group" aria-label="Fluxul rutării logice">
         <div class="pipeline-node"><strong>Ingress denumit</strong><span>Surse UDP și UDPSEC</span></div>
@@ -350,11 +355,11 @@
           <p>Zonele sunt seturi de identități interne ale surselor, nu regiuni pe hartă, filtre MMSI, filtre pentru nave sau reguli aplicate payload-ului.</p>
         </article>
         <article class="card">
-          <h3>Calitatea fluxului pentru fiecare destinație</h3>
-          <p>Modul de rutare aplică deduplicarea separat pentru fiecare destinație logică, astfel încât un traseu de livrare să nu suprime altul.</p>
+          <h3>Ordine păstrată și calitate pentru fiecare destinație</h3>
+          <p>Modul de rutare aplică deduplicarea separat pentru fiecare destinație logică, astfel încât o cale de expediere să nu o suprime pe alta. Ordinea configurată a destinațiilor se păstrează în expedierea secvențială.</p>
         </article>
       </div>
-      <p class="boundary-note"><span class="kbd">source_id</span> este o identitate internă de rutare. Este separată de valoarea NMEA TAG <span class="kbd">s</span> emisă în aval.</p>
+      <p class="boundary-note"><strong>Numele rămân interfața operatorilor.</strong> ID-urile numerice ale destinațiilor sunt locale procesului și nu sunt valori de configurare. Identificatorul <span class="kbd">source_id</span> rămâne separat de valoarea NMEA TAG <span class="kbd">s</span> emisă în aval.</p>
     </section>
 
     <section id="runtime-control" class="section">
@@ -567,6 +572,7 @@
             <li>Limită de producție imuabilă cu <span class="kbd">IngressFrame</span> și un singur adaptor păstrat pentru obiectele legacy <span class="kbd">IngressEvent</span>.</li>
             <li>Scanare la nivel de octeți, intervale imuabile semi-deschise, parsarea unică a câmpurilor fragmentului NMEA și a metadatelor TAG și calea de producție prin intrarea parsată în modulul de asamblare.</li>
             <li>Contractul explicit și sincron <span class="kbd">DataPlaneProcessor</span>, precum și <span class="kbd">PythonDataPlaneProcessor</span> ca unică implementare actuală de producție și referință.</li>
+            <li>Câte un <span class="kbd">ProcessingSnapshot</span> pentru fiecare cadru acceptat, rutare numerică compilată bazată numai pe destinații, ieșiri cu octeți exacți și imuabili într-un <span class="kbd">OutputBatch</span> ordonat, o singură codificare UTF-8 pentru fiecare propoziție emisă, ID-uri numerice explicite pentru fiecare <span class="kbd">ProcessorOutput</span> și egress numeric unificat prin <span class="kbd">send_to_ids()</span>.</li>
             <li>Un singur fan-in ingress, etape explicite de procesare și egress ordonat, o barieră de finalizare pentru loturile nevide și supraveghere fail-fast locală procesului.</li>
             <li>Rutare logică, zone și deduplicare separată pentru fiecare destinație.</li>
             <li>Controlul rutării la runtime prin <span class="kbd">aismixerctl</span>.</li>
@@ -581,9 +587,10 @@
           <h3 class="status-label">Activități planificate</h3>
           <ul class="list">
             <li>Implementarea nativă, binding-urile și rularea testelor de conformitate diferențială rămân activități viitoare.</li>
-            <li>Stare la nivel de octeți pentru modulul de asamblare și pentru ieșire, dincolo de limita Python actuală de compatibilitate cu șiruri.</li>
+            <li>Stare suplimentară bazată pe octeți pentru modulul de asamblare, dincolo de limita actuală de compatibilitate Python cu șirurile.</li>
             <li>Benchmark-uri și profilare înaintea oricărei afirmații de performanță.</li>
-            <li>Un coordinator și procese worker dedicate pentru ingress și egress, multiprocessing, IPC, distribuirea snapshot-urilor de rutare, precum și politici de repornire și recuperare într-o arhitectură multiproces.</li>
+            <li>Campania F va pregăti arhitectura pentru viitori workeri prin cozi cu capacitate limitată și o politică de backpressure, deținerea instanței procesorului, pregătirea ciclului de viață al workerilor și limita pentru metrici; nu va introduce procese coordonator, multiprocessing, IPC sau binding-uri native.</li>
+            <li>Arhitectura ulterioară poate adăuga un coordonator și procese worker dedicate pentru ingress și egress, supraveghere între procese, IPC, distribuirea snapshot-urilor de rutare, precum și politici de repornire și recuperare.</li>
             <li>O arhitectură mai largă pentru adaptoarele ingress și egress, dincolo de traseele UDP actuale.</li>
           </ul>
         </article>
