@@ -199,6 +199,7 @@ async def run_routed_events(
             egress_queue,
             routing_state=routing_state,
             processor=processor,
+            legacy_target_ids=output_forwarder.all_target_ids,
             output_forwarder=output_forwarder,
             debug=False,
             timestamp=aismixer.ts,

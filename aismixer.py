@@ -10,9 +10,8 @@ from typing import Any
 from forwarder import Forwarder
 from core.data_plane import (
     DeduplicationMode,
+    OutputBatch,
     ProcessingSnapshot,
-    ProcessorOutput,
-    RoutingDisposition,
 )
 from core.ingress_frame import (
     coerce_ingress_frame,
@@ -128,7 +127,7 @@ data_plane_processor = PythonDataPlaneProcessor(
 class _EgressBatch:
     """Private process-local handoff with a runtime-only ordering barrier."""
 
-    outputs: tuple[ProcessorOutput, ...]
+    output_batch: OutputBatch
     completion: asyncio.Future
 
 
@@ -229,9 +228,10 @@ def compile_input_policies(entries, kind):
 async def processor_stage_loop(
     ingress_queue,
     egress_queue,
+    *,
     routing_state=None,
     processor=None,
-    legacy_target_ids=(),
+    legacy_target_ids,
 ):
     """Process one accepted frame and await its egress completion barrier."""
 
@@ -270,13 +270,13 @@ async def processor_stage_loop(
                 target_ids=routing_table.match_target_ids(frame.source_id),
             )
 
-        outputs = active_processor.process(frame, processing_snapshot)
-        if not outputs:
+        output_batch = active_processor.process(frame, processing_snapshot)
+        if not output_batch.outputs:
             continue
 
         completion = asyncio.get_running_loop().create_future()
         batch = _EgressBatch(
-            outputs=outputs,
+            output_batch=output_batch,
             completion=completion,
         )
         try:
@@ -293,13 +293,13 @@ async def egress_stage_loop(
     debug=False,
     timestamp=None,
 ):
-    """Dispatch complete processor batches sequentially in tuple order."""
+    """Dispatch complete processor batches sequentially in output order."""
 
     active_timestamp = ts if timestamp is None else timestamp
     while True:
         batch = await egress_queue.get()
         try:
-            for output in batch.outputs:
+            for output in batch.output_batch.outputs:
                 if debug:
                     message = output.message
                     if message.endswith(b"\r\n"):
@@ -312,18 +312,10 @@ async def egress_stage_loop(
                         f"{active_timestamp()} OUTPUT => {display_message}"
                     )
 
-                if output.disposition is RoutingDisposition.LEGACY_BROADCAST:
-                    await output_forwarder.send(output.message)
-                elif output.disposition is RoutingDisposition.TARGETED:
-                    await output_forwarder.send_to_ids(
-                        output.target_ids,
-                        output.message,
-                    )
-                else:
-                    raise AssertionError(
-                        "Unsupported routing disposition: "
-                        f"{output.disposition!r}"
-                    )
+                await output_forwarder.send_to_ids(
+                    output.target_ids,
+                    output.message,
+                )
         except asyncio.CancelledError:
             if not batch.completion.done():
                 batch.completion.cancel()
@@ -343,7 +335,7 @@ async def _run_runtime_stages(
     *,
     routing_state=None,
     processor=None,
-    legacy_target_ids=(),
+    legacy_target_ids,
     output_forwarder,
     debug=False,
     timestamp=None,

@@ -10,9 +10,9 @@ import time
 from assembler import AIVDMAssembler, AssemblyKey, AssemblyStatus
 from core.data_plane import (
     DeduplicationMode,
+    OutputBatch,
     ProcessingSnapshot,
     ProcessorOutput,
-    RoutingDisposition,
 )
 from core.ingress_frame import IngressFrame
 from core.output_builder import build_output_bytes
@@ -105,7 +105,7 @@ class PythonDataPlaneProcessor:
         self,
         frame: IngressFrame,
         snapshot: ProcessingSnapshot,
-    ) -> tuple[ProcessorOutput, ...]:
+    ) -> OutputBatch:
         """Process one accepted frame without performing transport I/O."""
 
         deduplication_mode = snapshot.deduplication_mode
@@ -242,8 +242,8 @@ class PythonDataPlaneProcessor:
 
             eligible_target_ids: tuple[EgressTargetId, ...] = ()
             if deduplication_mode is DeduplicationMode.GLOBAL:
+                eligible_target_ids = route_target_ids
                 emit_group = self._deduplicator.is_unique(logical_key)
-                disposition = RoutingDisposition.LEGACY_BROADCAST
             elif deduplication_mode is DeduplicationMode.PER_TARGET:
                 eligible_target_ids = tuple(
                     target_id
@@ -254,7 +254,6 @@ class PythonDataPlaneProcessor:
                     )
                 )
                 emit_group = bool(eligible_target_ids)
-                disposition = RoutingDisposition.TARGETED
             else:
                 raise AssertionError(
                     "Unsupported deduplication mode: "
@@ -301,7 +300,6 @@ class PythonDataPlaneProcessor:
                 outputs.append(
                     ProcessorOutput(
                         message=message,
-                        disposition=disposition,
                         target_ids=eligible_target_ids,
                     )
                 )
@@ -314,7 +312,7 @@ class PythonDataPlaneProcessor:
             ):
                 self._discard_multipart_contexts((outcome.group_key,))
 
-        return tuple(outputs)
+        return OutputBatch(outputs=tuple(outputs))
 
     def _discard_multipart_contexts(
         self,
