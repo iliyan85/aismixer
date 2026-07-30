@@ -770,3 +770,38 @@ This contract was consolidated at the end of Campaign A.
   multiprocessing, coordinator/worker model, or IPC protocol.
 - This is a Campaign D closure snapshot, not a guarantee that future test
   counts will remain identical.
+
+## 20. Campaign E closure baseline
+
+- Closure snapshot date: 2026-07-30.
+- Branch: `main`.
+- Audited source commit:
+  `4d80cf817728833fd4385d0cf6eedd217148afc4` (`4d80cf8`).
+- Environment: Python 3.14.5 and pytest 9.1.1 on Windows 11
+  (`Windows-11-10.0.26200-SP0`, AMD64, 64-bit).
+- Focused results:
+  - target registry, forwarder, routing compilation, routing state, and
+    routing control: `182 passed`;
+  - routing-control protocol and transports, runtime control, runtime routing
+    integration, and runtime stages: `192 passed, 16 skipped`;
+  - data-plane contracts, Python processor, and output builder: `90 passed`;
+  - runtime stages, supervision, routing integration, and complete forwarding:
+    `138 passed`.
+- Final full-suite result: `1922 passed, 18 skipped, 0 failed`
+  (1940 collected).
+- `git diff --check`: passed.
+- Campaign E established immutable dense numeric egress target identity and
+  compiled numeric target-only routing while keeping external target names
+  string-facing.
+- The processor-output boundary now carries exact immutable bytes, with one
+  UTF-8 encoding per emitted sentence. The public ordered result is
+  `OutputBatch`, and every `ProcessorOutput` carries explicit numeric target
+  IDs.
+- Production egress is unified through `send_to_ids()`. Frame-level
+  processing, sequential output and destination dispatch, and the non-empty
+  batch completion barrier remain preserved.
+- Campaign E introduced no native implementation, native API or ABI, bindings,
+  IPC, multiprocessing, coordinator/worker process architecture, or worker
+  model.
+- This is a Campaign E closure snapshot, not a guarantee that future test
+  counts will remain identical.

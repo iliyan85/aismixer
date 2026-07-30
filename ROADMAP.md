@@ -17,7 +17,34 @@ migration is practical.
 
 ## Implemented Baseline
 
-The following capabilities are implemented in the current codebase:
+The current codebase includes the following completed Python/native-ready
+foundation. "Native-ready" describes explicit contracts and separable
+boundaries; it does not mean that a native implementation or bindings exist:
+
+- A consolidated behavioural contract with explicit state ownership, ordering,
+  failure, and delivery guarantees and limitations.
+- Immutable `IngressFrame` values and a bytes-native parsed ingress
+  representation.
+- An explicit synchronous `DataPlaneProcessor` boundary with immutable
+  snapshot and output values, with `PythonDataPlaneProcessor` as the sole
+  production reference implementation.
+- Explicit single-process ingress fan-in, processor, and egress stages with
+  process-local fail-fast supervision.
+- An ordered completion barrier that prevents processor work on a later frame
+  from running ahead of the current non-empty batch's egress dispatch.
+- An immutable dense numeric egress target registry covering every configured
+  destination, including unnamed legacy destinations, while configuration and
+  control target names remain string-facing.
+- Immutable routing snapshots with process-local generations and compiled
+  numeric target-only matching in the production path.
+- Exact immutable bytes at the processor-output boundary, with TAG formatting
+  delegated to the canonical writer and one UTF-8 encoding per emitted
+  sentence.
+- Ordered `OutputBatch` processor results, explicit numeric targets on every
+  `ProcessorOutput`, and unified numeric production egress through
+  `send_to_ids()`.
+
+The following service and operational capabilities are also implemented:
 
 - Plain UDP ingress.
 - Authenticated encrypted UDPSEC ingress through `nmea_sproxy`.
@@ -25,24 +52,10 @@ The following capabilities are implemented in the current codebase:
 - Multipart AIVDM/AIVDO assembly.
 - NMEA TAG `s`/`c`/`g` handling.
 - Legacy global deduplication and broadcast forwarding.
-- Internal `source_id` and `target_id` routing identities.
 - Named UDP egress targets.
 - Logical zones with `include`, `union`, `intersection`, and `difference`.
 - Static routing loaded from configuration.
 - Target-scoped deduplication in routing mode.
-- Immutable routing snapshots.
-- Process-local routing generations.
-- Immutable `IngressFrame` values and a bytes-native parsed ingress
-  representation.
-- An explicit synchronous `DataPlaneProcessor` boundary with immutable
-  snapshot and output values.
-- `PythonDataPlaneProcessor` as the current and sole Python reference
-  processor.
-- Explicit single-process ingress fan-in, processor, and egress stages.
-- An ordered completion barrier that prevents processor work on a later frame
-  from running ahead of the current non-empty batch's egress dispatch.
-- Process-local fail-fast supervision for UDP, UDPSEC, ingress fan-in,
-  processor, and egress tasks.
 - Runtime routing status, replacement, and disable operations.
 - Versioned JSON routing-control protocol.
 - Opt-in POSIX Unix-domain control server.
@@ -74,7 +87,7 @@ Remaining deployment hardening:
   primary runtime exception or prevent a later closer from running; correcting
   that is cleanup hardening, not a Campaign D processor-boundary guarantee.
 
-### 2. Process Architecture
+### 2. Campaign F — Worker Readiness
 
 Already implemented:
 
@@ -83,14 +96,25 @@ Already implemented:
 
 Still future:
 
+- Define bounded queues and backpressure for future worker boundaries; no
+  end-to-end worker backpressure guarantee exists today.
+- Define processor instance ownership and worker lifecycle.
+- Define the metrics boundary between stages and future workers.
+- Use explicit egress-worker terminology for future forwarding workers.
+- Prepare the current contracts for staged process separation without
+  introducing coordinator processes, IPC, or native bindings in Campaign F.
+
+### 3. Later Process Architecture And Native Implementation
+
 - Introduce a coordinator process and dedicated ingress and egress workers.
 - Define cross-process lifecycle supervision and failure handling.
-- Add IPC and routing-snapshot distribution between processes.
+- Add IPC and routing-snapshot distribution across processes.
 - Define worker restart and recovery policy.
-- Use explicit egress-worker terminology for forwarding workers.
+- Implement any native processor and its bindings behind the established
+  contracts.
 - Migrate in stages rather than as a single large rewrite.
 
-### 3. Routing-State Operations
+### 4. Routing-State Operations
 
 - Consider optional persistence or controlled restoration of runtime routing
   state.
@@ -99,7 +123,7 @@ Still future:
 - Improve operational observability around active routes, targets,
   generations, and control operations.
 
-### 4. Maritime Security And Data-Quality Research
+### 5. Maritime Security And Data-Quality Research
 
 - Research AIS spoof and anomaly detection.
 - Surface receiver and feed quality signals.
