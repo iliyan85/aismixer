@@ -111,6 +111,12 @@ class RoutingTable:
         object.__setattr__(self, "route_definitions", route_definitions)
         object.__setattr__(self, "_compiled_target_routes", None)
 
+    @property
+    def has_compiled_target_plan(self) -> bool:
+        """Return whether numeric target compilation has completed."""
+
+        return self._compiled_target_routes is not None
+
     @classmethod
     def from_definitions(
         cls,

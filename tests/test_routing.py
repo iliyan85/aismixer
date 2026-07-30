@@ -546,6 +546,8 @@ def test_empty_numeric_target_compilation_is_distinct_from_uncompiled_table():
 
     compiled = table.compile_target_ids({})
 
+    assert table.has_compiled_target_plan is False
+    assert compiled.has_compiled_target_plan is True
     with pytest.raises(
         RuntimeError,
         match=r"no compiled numeric target plan.*compile_target_ids",
@@ -569,6 +571,8 @@ def test_recompiling_installs_new_plan_without_mutating_original_table():
     recompiled = table.compile_target_ids({"udp:target": 11})
 
     assert recompiled is not table
+    assert table.has_compiled_target_plan is True
+    assert recompiled.has_compiled_target_plan is True
     assert recompiled.match_target_ids("udp:source") == (11,)
     assert table.match_target_ids("udp:source") == (7,)
 
@@ -690,6 +694,8 @@ def test_plain_replacement_discards_compiled_target_routes():
 
     replacement = replace(table)
 
+    assert table.has_compiled_target_plan is True
+    assert replacement.has_compiled_target_plan is False
     assert replacement.match("udp:source") == table.match("udp:source")
     with pytest.raises(
         RuntimeError,
