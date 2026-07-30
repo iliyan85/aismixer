@@ -302,9 +302,15 @@ async def egress_stage_loop(
             for output in batch.outputs:
                 if debug:
                     message = output.message
-                    if message.endswith("\r\n"):
+                    if message.endswith(b"\r\n"):
                         message = message[:-2]
-                    print(f"{active_timestamp()} OUTPUT => {message}")
+                    display_message = message.decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                    print(
+                        f"{active_timestamp()} OUTPUT => {display_message}"
+                    )
 
                 if output.disposition is RoutingDisposition.LEGACY_BROADCAST:
                     await output_forwarder.send(output.message)

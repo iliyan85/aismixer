@@ -70,16 +70,17 @@ class RoutingDisposition(Enum):
 class ProcessorOutput:
     """One fully formatted message and its transport-independent routing.
 
-    ``message`` retains the current CRLF-terminated ``str`` representation.
+    ``message`` is a completely formatted, normally CRLF-terminated immutable
+    ``bytes`` payload.
     """
 
-    message: str
+    message: bytes
     disposition: RoutingDisposition
     target_ids: tuple[EgressTargetId, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.message, str):
-            raise TypeError("message must be a string.")
+        if type(self.message) is not bytes:
+            raise TypeError("message must be immutable bytes.")
         if not isinstance(self.disposition, RoutingDisposition):
             raise TypeError("disposition must be a RoutingDisposition.")
         if isinstance(self.target_ids, (str, bytes)) or not isinstance(

@@ -496,10 +496,38 @@ transactional delivery, rollback, replay, ingress acknowledgement, delivery
 acknowledgement, or recovery guarantee, including after a partial
 multi-fragment send.
 
-`ProcessorOutput.message` remains a CRLF-terminated `str`, and encoding still
-occurs separately for each destination in the forwarder. This target-only
-change introduces no bytes output builder, `OutputBatch`, native API or ABI,
-bindings, IPC, multiprocessing, worker pool or egress concurrency.
+`ProcessorOutput.message` is an exact immutable `bytes` payload containing one
+completely formatted output sentence, normally terminated by CRLF. The
+processor-output boundary accepts an existing `bytes` object without copying
+it and rejects `str`, mutable buffers, views, and other payload types. It does
+not decode or encode the payload and does not require CRLF at this general
+immutable boundary.
+
+`core.output_builder.build_output_bytes()` is the sole production output
+builder. It delegates canonical TAG formatting and checksum calculation to the
+existing string-facing `meta_writer.wrap_with_meta()` implementation, appends
+exactly one CRLF terminator to the complete TAG-plus-NMEA text, and then
+performs one explicit UTF-8 encoding operation. Encoding therefore occurs once
+for each emitted NMEA sentence, including once for each emitted multipart
+fragment, and never once for an entire multipart group. TAG fields, NMEA text,
+and framing are not encoded separately.
+
+The forwarder accepts the immutable bytes payload and passes the same object
+unchanged to `transport.sendto()` for every selected destination. It performs
+no encoding, decoding, normalization, or per-destination payload copy. Debug
+presentation is observational only: it removes one trailing `b"\r\n"` for
+display when present and decodes that display view as UTF-8 with replacement
+for invalid input. The original unmodified bytes object remains the object
+sent to the forwarder. Invalid UTF-8 is replaced only in the display view and
+cannot alter the network payload.
+
+Legacy broadcast and numeric targeted egress remain separate branches and
+continue to use `Forwarder.send()` and `Forwarder.send_to_ids()`,
+respectively. `ProcessorOutput`, `RoutingDisposition`, the returned processor
+tuple, and the private runtime `_EgressBatch` envelope remain in place.
+`OutputBatch` and a unified egress branch are deferred to Campaign E4. This
+bytes-boundary change introduces no native API or ABI, bindings, IPC,
+multiprocessing, worker pool, or egress concurrency.
 
 This whole-frame-before-egress ordering intentionally replaces the former
 processing/send interleaving and is part of the Campaign D processor boundary.

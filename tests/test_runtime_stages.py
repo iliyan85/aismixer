@@ -26,14 +26,14 @@ def make_frame(label):
 
 def broadcast(message):
     return ProcessorOutput(
-        f"{message}\r\n",
+        f"{message}\r\n".encode("utf-8"),
         RoutingDisposition.LEGACY_BROADCAST,
     )
 
 
 def targeted(message, *target_ids):
     return ProcessorOutput(
-        f"{message}\r\n",
+        f"{message}\r\n".encode("utf-8"),
         RoutingDisposition.TARGETED,
         target_ids,
     )
@@ -320,7 +320,7 @@ def test_egress_dispatches_batch_sequentially_in_tuple_order():
         )
         try:
             await forwarder.first_send_started.wait()
-            assert forwarder.events == [("broadcast", "first\r\n")]
+            assert forwarder.events == [("broadcast", b"first\r\n")]
             assert not completion.done()
 
             forwarder.release_first_send.set()
@@ -329,8 +329,8 @@ def test_egress_dispatches_batch_sequentially_in_tuple_order():
             await cancel_task(task)
 
         assert forwarder.events == [
-            ("broadcast", "first\r\n"),
-            ("targeted", (2, 1), "second\r\n"),
+            ("broadcast", b"first\r\n"),
+            ("targeted", (2, 1), b"second\r\n"),
         ]
 
     asyncio.run(scenario())
@@ -404,8 +404,8 @@ def test_successful_acknowledgement_allows_the_next_frame():
             second_frame,
         ]
         assert forwarder.events == [
-            ("broadcast", "first\r\n"),
-            ("broadcast", "second\r\n"),
+            ("broadcast", b"first\r\n"),
+            ("broadcast", b"second\r\n"),
         ]
 
     asyncio.run(scenario())
@@ -444,8 +444,8 @@ def test_first_send_failure_preserves_effects_and_prevents_later_work():
 
         assert [call[0] for call in processor.calls] == [first_frame]
         assert effects == ["constructed:first", "constructed:later"]
-        assert outputs[1].message == "later\r\n"
-        assert forwarder.events == [("broadcast", "first\r\n")]
+        assert outputs[1].message == b"later\r\n"
+        assert forwarder.events == [("broadcast", b"first\r\n")]
         assert ingress_queue.qsize() == 1
 
     asyncio.run(scenario())
@@ -692,7 +692,7 @@ def test_outputless_frame_completes_locally_and_allows_next_frame():
             second_frame,
         ]
         assert len(egress_queue.batches) == 1
-        assert forwarder.events == [("broadcast", "second\r\n")]
+        assert forwarder.events == [("broadcast", b"second\r\n")]
 
     asyncio.run(scenario())
 
@@ -737,10 +737,51 @@ def test_debug_output_is_emitted_before_send_with_crlf_removed(capsys):
     asyncio.run(scenario())
 
 
+def test_debug_decode_is_non_throwing_and_does_not_modify_payload(capsys):
+    async def scenario():
+        payload = b"invalid-\xff\r\n"
+        output = ProcessorOutput(
+            payload,
+            RoutingDisposition.LEGACY_BROADCAST,
+        )
+        completion = asyncio.get_running_loop().create_future()
+        queue = asyncio.Queue()
+        await queue.put(aismixer._EgressBatch((output,), completion))
+
+        class IdentityRecordingForwarder:
+            def __init__(self):
+                self.message = None
+
+            async def send(self, message):
+                self.message = message
+
+            async def send_to_ids(self, _target_ids, _message):
+                raise AssertionError("unexpected targeted send")
+
+        forwarder = IdentityRecordingForwarder()
+        task = asyncio.create_task(
+            aismixer.egress_stage_loop(
+                queue,
+                forwarder,
+                debug=True,
+                timestamp=lambda: "STAMP",
+            )
+        )
+        try:
+            await completion
+        finally:
+            await cancel_task(task)
+
+        assert forwarder.message is payload
+        assert capsys.readouterr().out == "STAMP OUTPUT => invalid-\ufffd\n"
+
+    asyncio.run(scenario())
+
+
 def test_unsupported_disposition_is_a_programming_error():
     async def scenario():
         class InvalidOutput:
-            message = "invalid\r\n"
+            message = b"invalid\r\n"
             disposition = object()
             target_ids = ()
 

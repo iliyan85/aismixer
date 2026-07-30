@@ -15,12 +15,12 @@ from core.data_plane import (
     RoutingDisposition,
 )
 from core.ingress_frame import IngressFrame
+from core.output_builder import build_output_bytes
 from core.parsed_sentence import parse_frame_sentences, parse_leading_s_value
 from core.s_policy import choose_s_value_from_candidates
 from core.state.s_cache import touch_s
 from core.target_identity import EgressTargetId
 from dedup import Deduplicator
-from meta_writer import wrap_with_meta
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,7 +290,7 @@ class PythonDataPlaneProcessor:
                 else:
                     g_triplet = None
 
-                wrapped_line = wrap_with_meta(
+                message = build_output_bytes(
                     full_line,
                     s_value,
                     timestamp_for_header,
@@ -300,7 +300,7 @@ class PythonDataPlaneProcessor:
                 )
                 outputs.append(
                     ProcessorOutput(
-                        message=wrapped_line + "\r\n",
+                        message=message,
                         disposition=disposition,
                         target_ids=eligible_target_ids,
                     )
