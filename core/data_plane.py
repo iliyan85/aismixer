@@ -59,30 +59,20 @@ class ProcessingSnapshot:
         )
 
 
-class RoutingDisposition(Enum):
-    """How orchestration should deliver one processor output."""
-
-    LEGACY_BROADCAST = "legacy-broadcast"
-    TARGETED = "targeted"
-
-
 @dataclass(frozen=True, slots=True)
 class ProcessorOutput:
-    """One fully formatted message and its transport-independent routing.
+    """One fully formatted message and its explicit numeric targets.
 
     ``message`` is a completely formatted, normally CRLF-terminated immutable
     ``bytes`` payload.
     """
 
     message: bytes
-    disposition: RoutingDisposition
-    target_ids: tuple[EgressTargetId, ...] = ()
+    target_ids: tuple[EgressTargetId, ...]
 
     def __post_init__(self) -> None:
         if type(self.message) is not bytes:
             raise TypeError("message must be immutable bytes.")
-        if not isinstance(self.disposition, RoutingDisposition):
-            raise TypeError("disposition must be a RoutingDisposition.")
         if isinstance(self.target_ids, (str, bytes)) or not isinstance(
             self.target_ids,
             Sequence,
@@ -93,13 +83,28 @@ class ProcessorOutput:
         _validate_numeric_target_ids(target_ids)
         object.__setattr__(self, "target_ids", target_ids)
 
-        if self.disposition is RoutingDisposition.LEGACY_BROADCAST:
-            if target_ids:
-                raise ValueError(
-                    "legacy broadcast output must not contain target IDs."
-                )
-        elif not target_ids:
-            raise ValueError("targeted output must contain at least one target ID.")
+
+@dataclass(frozen=True, slots=True)
+class OutputBatch:
+    """Immutable ordered processor outputs for one accepted ingress frame."""
+
+    outputs: tuple[ProcessorOutput, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.outputs, (str, bytes)) or not isinstance(
+            self.outputs,
+            Sequence,
+        ):
+            raise TypeError(
+                "outputs must be a non-string sequence of ProcessorOutput values."
+            )
+
+        outputs = tuple(self.outputs)
+        if not all(isinstance(output, ProcessorOutput) for output in outputs):
+            raise TypeError(
+                "outputs must contain only ProcessorOutput values."
+            )
+        object.__setattr__(self, "outputs", outputs)
 
 
 def _validate_numeric_target_ids(
@@ -124,5 +129,5 @@ class DataPlaneProcessor(Protocol):
         self,
         frame: IngressFrame,
         snapshot: ProcessingSnapshot,
-    ) -> tuple[ProcessorOutput, ...]:
+    ) -> OutputBatch:
         ...

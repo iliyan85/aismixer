@@ -5,9 +5,9 @@ from assembler import AIVDMAssembler
 from core.data_plane import (
     DataPlaneProcessor,
     DeduplicationMode,
+    OutputBatch,
     ProcessingSnapshot,
     ProcessorOutput,
-    RoutingDisposition,
 )
 from core.ingress_frame import IngressFrame
 from core.python_data_plane import PythonDataPlaneProcessor
@@ -82,6 +82,16 @@ def make_processor(**overrides):
     return PythonDataPlaneProcessor(**arguments)
 
 
+def process_batch(processor, frame, snapshot):
+    batch = processor.process(frame, snapshot)
+    assert type(batch) is OutputBatch
+    return batch
+
+
+def process_outputs(processor, frame, snapshot):
+    return process_batch(processor, frame, snapshot).outputs
+
+
 def tag_block(content):
     checksum = 0
     for character in content:
@@ -153,32 +163,37 @@ def test_processor_satisfies_synchronous_protocol_without_asyncio_dependency():
     assert ".match(" not in process_source
 
 
-def test_exact_single_sentence_legacy_output():
+def test_exact_single_sentence_global_output_uses_snapshot_targets():
     processor = make_processor()
+    snapshot = make_snapshot(target_ids=(3, 1))
 
-    outputs = processor.process(make_frame(SENTENCE), make_snapshot())
+    batch = process_batch(processor, make_frame(SENTENCE), snapshot)
 
     expected_message = (
         tag_block(f"c:{WALL_TIME},s:test_station")
         + SENTENCE
         + "\r\n"
     ).encode("utf-8")
-    assert outputs == (
-        ProcessorOutput(
-            message=expected_message,
-            disposition=RoutingDisposition.LEGACY_BROADCAST,
-            target_ids=(),
+    assert batch == OutputBatch(
+        outputs=(
+            ProcessorOutput(
+                message=expected_message,
+                target_ids=(3, 1),
+            ),
         ),
     )
 
 
 def test_processor_builds_once_per_emitted_sentence(monkeypatch):
     calls = []
+    built_messages = []
     original_builder = python_data_plane_module.build_output_bytes
 
     def recording_builder(*args, **kwargs):
         calls.append((args, kwargs))
-        return original_builder(*args, **kwargs)
+        message = original_builder(*args, **kwargs)
+        built_messages.append(message)
+        return message
 
     monkeypatch.setattr(
         python_data_plane_module,
@@ -189,11 +204,14 @@ def test_processor_builds_once_per_emitted_sentence(monkeypatch):
     second = make_multipart_sentence(2, "second")
     processor = make_processor()
 
-    assert processor.process(make_frame(first), make_snapshot()) == ()
-    outputs = processor.process(make_frame(second), make_snapshot())
+    assert process_outputs(processor, make_frame(first), make_snapshot()) == ()
+    outputs = process_outputs(processor, make_frame(second), make_snapshot())
 
     assert len(outputs) == 2
     assert len(calls) == 2
+    assert outputs[0].message is built_messages[0]
+    assert outputs[1].message is built_messages[1]
+    assert outputs[0].message is not outputs[1].message
 
 
 def test_dedup_suppressed_output_does_not_invoke_builder(monkeypatch):
@@ -212,9 +230,9 @@ def test_dedup_suppressed_output_does_not_invoke_builder(monkeypatch):
     processor = make_processor(deduplicator=Deduplicator(clock=lambda: 0.0))
     frame = make_frame(SENTENCE)
 
-    assert len(processor.process(frame, make_snapshot())) == 1
+    assert len(process_outputs(processor, frame, make_snapshot())) == 1
     calls.clear()
-    assert processor.process(frame, make_snapshot()) == ()
+    assert process_outputs(processor, frame, make_snapshot()) == ()
     assert calls == []
 
 
@@ -228,7 +246,8 @@ def test_routed_no_match_does_not_invoke_builder(monkeypatch):
         fail_builder,
     )
 
-    assert make_processor().process(
+    assert process_outputs(
+        make_processor(),
         make_frame(SENTENCE),
         make_snapshot(mode=DeduplicationMode.PER_TARGET),
     ) == ()
@@ -244,7 +263,8 @@ def test_processor_delegates_framing_and_encoding_to_output_builder():
 
 
 def test_routed_output_preserves_numeric_target_order():
-    outputs = make_processor().process(
+    outputs = process_outputs(
+        make_processor(),
         make_frame(SENTENCE),
         make_snapshot(
             mode=DeduplicationMode.PER_TARGET,
@@ -253,12 +273,12 @@ def test_routed_output_preserves_numeric_target_order():
     )
 
     assert len(outputs) == 1
-    assert outputs[0].disposition is RoutingDisposition.TARGETED
     assert outputs[0].target_ids == (2, 0, 1)
 
 
 def test_routed_frame_without_matching_route_returns_no_output():
-    outputs = make_processor().process(
+    outputs = process_outputs(
+        make_processor(),
         make_frame(SENTENCE),
         make_snapshot(mode=DeduplicationMode.PER_TARGET),
     )
@@ -268,7 +288,8 @@ def test_routed_frame_without_matching_route_returns_no_output():
 
 def test_routed_deduplication_uses_numeric_target_ids_as_scopes():
     deduplicator = RecordingDeduplicator()
-    outputs = make_processor(deduplicator=deduplicator).process(
+    outputs = process_outputs(
+        make_processor(deduplicator=deduplicator),
         make_frame(SENTENCE),
         make_snapshot(
             mode=DeduplicationMode.PER_TARGET,
@@ -286,14 +307,16 @@ def test_routed_targets_are_independent_and_filter_in_snapshot_order():
     processor = make_processor(deduplicator=deduplicator)
     frame = make_frame(SENTENCE)
 
-    first_outputs = processor.process(
+    first_outputs = process_outputs(
+        processor,
         frame,
         make_snapshot(
             mode=DeduplicationMode.PER_TARGET,
             target_ids=(5,),
         ),
     )
-    second_outputs = processor.process(
+    second_outputs = process_outputs(
+        processor,
         frame,
         make_snapshot(
             mode=DeduplicationMode.PER_TARGET,
@@ -312,21 +335,22 @@ def test_routed_no_target_message_is_not_admitted_to_global_deduplication():
     processor = make_processor(deduplicator=deduplicator)
     frame = make_frame(SENTENCE)
 
-    assert processor.process(
+    assert process_outputs(
+        processor,
         frame,
         make_snapshot(mode=DeduplicationMode.PER_TARGET),
     ) == ()
-    global_outputs = processor.process(frame, make_snapshot())
+    global_outputs = process_outputs(processor, frame, make_snapshot())
 
     assert len(global_outputs) == 1
-    assert global_outputs[0].disposition is RoutingDisposition.LEGACY_BROADCAST
     assert deduplicator.stats().accepted == 1
     assert deduplicator.stats().duplicates == 0
 
 
-def test_global_mode_ignores_snapshot_targets_and_uses_global_scope():
+def test_global_mode_carries_snapshot_targets_and_uses_global_scope():
     deduplicator = RecordingDeduplicator()
-    outputs = make_processor(deduplicator=deduplicator).process(
+    outputs = process_outputs(
+        make_processor(deduplicator=deduplicator),
         make_frame(SENTENCE),
         make_snapshot(
             mode=DeduplicationMode.GLOBAL,
@@ -335,15 +359,43 @@ def test_global_mode_ignores_snapshot_targets_and_uses_global_scope():
     )
 
     assert len(outputs) == 1
-    assert outputs[0].disposition is RoutingDisposition.LEGACY_BROADCAST
-    assert outputs[0].target_ids == ()
+    assert outputs[0].target_ids == (0, 1)
     assert [scope for _message, scope in deduplicator.calls] == [None]
+
+
+def test_global_mode_with_empty_targets_still_builds_output(monkeypatch):
+    calls = []
+    original_builder = python_data_plane_module.build_output_bytes
+
+    def recording_builder(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(
+        python_data_plane_module,
+        "build_output_bytes",
+        recording_builder,
+    )
+
+    outputs = process_outputs(
+        make_processor(),
+        make_frame(SENTENCE),
+        make_snapshot(
+            mode=DeduplicationMode.GLOBAL,
+            target_ids=(),
+        ),
+    )
+
+    assert len(outputs) == 1
+    assert outputs[0].target_ids == ()
+    assert len(calls) == 1
 
 
 def test_multiple_sentences_reuse_the_snapshot_numeric_targets():
     frame = make_frame(SENTENCE + SECOND_SENTENCE)
 
-    outputs = make_processor().process(
+    outputs = process_outputs(
+        make_processor(),
         frame,
         make_snapshot(
             mode=DeduplicationMode.PER_TARGET,
@@ -356,7 +408,8 @@ def test_multiple_sentences_reuse_the_snapshot_numeric_targets():
 
 
 def test_target_only_snapshot_with_no_sentence_returns_no_output():
-    outputs = make_processor().process(
+    outputs = process_outputs(
+        make_processor(),
         make_frame("not an AIS sentence"),
         make_snapshot(
             mode=DeduplicationMode.PER_TARGET,
@@ -372,8 +425,8 @@ def test_single_sentence_deduplication_is_retained_across_calls():
     processor = make_processor(deduplicator=deduplicator)
     frame = make_frame(SENTENCE)
 
-    first_outputs = processor.process(frame, make_snapshot())
-    duplicate_outputs = processor.process(frame, make_snapshot())
+    first_outputs = process_outputs(processor, frame, make_snapshot())
+    duplicate_outputs = process_outputs(processor, frame, make_snapshot())
 
     assert len(first_outputs) == 1
     assert duplicate_outputs == ()
@@ -387,10 +440,10 @@ def test_assembler_state_is_retained_across_process_calls():
     first = make_multipart_sentence(1, "first")
     second = make_multipart_sentence(2, "second")
 
-    assert processor.process(make_frame(first), make_snapshot()) == ()
+    assert process_outputs(processor, make_frame(first), make_snapshot()) == ()
     assert assembler.stats().current_groups == 1
 
-    outputs = processor.process(make_frame(second), make_snapshot())
+    outputs = process_outputs(processor, make_frame(second), make_snapshot())
 
     assert len(outputs) == 2
     assert assembler.stats().current_groups == 0
@@ -404,10 +457,10 @@ def test_completed_multipart_group_is_deduplicated_atomically():
     second = make_multipart_sentence(2, "second")
     snapshot = make_snapshot()
 
-    assert processor.process(make_frame(first), snapshot) == ()
-    assert len(processor.process(make_frame(second), snapshot)) == 2
-    assert processor.process(make_frame(first), snapshot) == ()
-    assert processor.process(make_frame(second), snapshot) == ()
+    assert process_outputs(processor, make_frame(first), snapshot) == ()
+    assert len(process_outputs(processor, make_frame(second), snapshot)) == 2
+    assert process_outputs(processor, make_frame(first), snapshot) == ()
+    assert process_outputs(processor, make_frame(second), snapshot) == ()
     assert deduplicator.stats().accepted == 1
     assert deduplicator.stats().duplicates == 1
 
@@ -420,13 +473,18 @@ def test_conflict_discards_all_metadata_for_invalidated_generation():
     fresh_first = make_multipart_sentence(1, "fresh-first")
     snapshot = make_snapshot()
 
-    assert processor.process(
+    assert process_outputs(
+        processor,
         make_frame(f"\\s:stale,c:111,g:1-2-111*00\\{old_first}"),
         snapshot,
     ) == ()
-    assert processor.process(make_frame(conflicting_first), snapshot) == ()
-    assert processor.process(make_frame(fresh_second), snapshot) == ()
-    outputs = processor.process(make_frame(fresh_first), snapshot)
+    assert process_outputs(
+        processor,
+        make_frame(conflicting_first),
+        snapshot,
+    ) == ()
+    assert process_outputs(processor, make_frame(fresh_second), snapshot) == ()
+    outputs = process_outputs(processor, make_frame(fresh_first), snapshot)
 
     assert_fresh_multipart_output(outputs, fresh_first, fresh_second)
 
@@ -440,13 +498,14 @@ def test_expiry_discards_old_metadata_before_fresh_arrival_is_observed():
     fresh_first = make_multipart_sentence(1, "fresh-first")
     snapshot = make_snapshot()
 
-    assert processor.process(
+    assert process_outputs(
+        processor,
         make_frame(f"\\s:stale,c:111,g:1-2-111*00\\{old_first}"),
         snapshot,
     ) == ()
     assembler_clock.now = 1.0
-    assert processor.process(make_frame(fresh_second), snapshot) == ()
-    outputs = processor.process(make_frame(fresh_first), snapshot)
+    assert process_outputs(processor, make_frame(fresh_second), snapshot) == ()
+    outputs = process_outputs(processor, make_frame(fresh_first), snapshot)
 
     assert assembler.stats().expired == 1
     assert_fresh_multipart_output(outputs, fresh_first, fresh_second)
@@ -477,16 +536,23 @@ def test_capacity_eviction_discards_victim_metadata():
     )
     snapshot = make_snapshot()
 
-    assert processor.process(
+    assert process_outputs(
+        processor,
         make_frame(
             f"\\s:stale,c:111,g:1-2-111*00\\{a_old_first}"
         ),
         snapshot,
     ) == ()
-    assert processor.process(make_frame(b_first), snapshot) == ()
-    assert len(processor.process(make_frame(b_second), snapshot)) == 2
-    assert processor.process(make_frame(a_fresh_second), snapshot) == ()
-    outputs = processor.process(make_frame(a_fresh_first), snapshot)
+    assert process_outputs(processor, make_frame(b_first), snapshot) == ()
+    assert len(
+        process_outputs(processor, make_frame(b_second), snapshot)
+    ) == 2
+    assert process_outputs(
+        processor,
+        make_frame(a_fresh_second),
+        snapshot,
+    ) == ()
+    outputs = process_outputs(processor, make_frame(a_fresh_first), snapshot)
 
     assert assembler.stats().capacity_evicted == 1
     assert_fresh_multipart_output(
@@ -504,13 +570,16 @@ def test_normal_completion_consumes_multipart_metadata():
     fresh_first = make_multipart_sentence(1, "fresh-first")
     snapshot = make_snapshot()
 
-    assert processor.process(
+    assert process_outputs(
+        processor,
         make_frame(f"\\s:stale,c:111,g:1-2-111*00\\{old_first}"),
         snapshot,
     ) == ()
-    assert len(processor.process(make_frame(old_second), snapshot)) == 2
-    assert processor.process(make_frame(fresh_second), snapshot) == ()
-    outputs = processor.process(make_frame(fresh_first), snapshot)
+    assert len(
+        process_outputs(processor, make_frame(old_second), snapshot)
+    ) == 2
+    assert process_outputs(processor, make_frame(fresh_second), snapshot) == ()
+    outputs = process_outputs(processor, make_frame(fresh_first), snapshot)
 
     assert_fresh_multipart_output(outputs, fresh_first, fresh_second)
 
@@ -530,21 +599,30 @@ def test_no_route_completion_consumes_multipart_metadata():
     fresh_second = make_multipart_sentence(2, "fresh-second")
     fresh_first = make_multipart_sentence(1, "fresh-first")
 
-    assert processor.process(
+    assert process_outputs(
+        processor,
         make_frame(f"\\s:stale,c:111,g:1-2-111*00\\{old_first}"),
         no_route_snapshot,
     ) == ()
     assert (
-        processor.process(make_frame(old_second), no_route_snapshot)
+        process_outputs(
+            processor,
+            make_frame(old_second),
+            no_route_snapshot,
+        )
         == ()
     )
-    assert processor.process(make_frame(fresh_second), routed_snapshot) == ()
-    outputs = processor.process(make_frame(fresh_first), routed_snapshot)
-
-    assert all(
-        output.disposition is RoutingDisposition.TARGETED
-        for output in outputs
+    assert process_outputs(
+        processor,
+        make_frame(fresh_second),
+        routed_snapshot,
+    ) == ()
+    outputs = process_outputs(
+        processor,
+        make_frame(fresh_first),
+        routed_snapshot,
     )
+
     assert all(output.target_ids == (6,) for output in outputs)
     assert_fresh_multipart_output(outputs, fresh_first, fresh_second)
 
@@ -557,17 +635,18 @@ def test_dedup_suppressed_completion_consumes_multipart_metadata():
     fresh_first = make_multipart_sentence(1, "fresh-first")
     snapshot = make_snapshot()
 
-    assert processor.process(make_frame(first), snapshot) == ()
-    assert len(processor.process(make_frame(second), snapshot)) == 2
+    assert process_outputs(processor, make_frame(first), snapshot) == ()
+    assert len(process_outputs(processor, make_frame(second), snapshot)) == 2
 
-    assert processor.process(
+    assert process_outputs(
+        processor,
         make_frame(f"\\s:stale,c:111,g:1-2-111*00\\{first}"),
         snapshot,
     ) == ()
-    assert processor.process(make_frame(second), snapshot) == ()
+    assert process_outputs(processor, make_frame(second), snapshot) == ()
 
-    assert processor.process(make_frame(fresh_second), snapshot) == ()
-    outputs = processor.process(make_frame(fresh_first), snapshot)
+    assert process_outputs(processor, make_frame(fresh_second), snapshot) == ()
+    outputs = process_outputs(processor, make_frame(fresh_first), snapshot)
 
     assert_fresh_multipart_output(outputs, fresh_first, fresh_second)
 
@@ -576,7 +655,8 @@ def test_injected_wall_clock_preserves_single_and_multipart_c_zero_asymmetry():
     single_clock = SequenceClock(1234)
     single_processor = make_processor(wall_clock=single_clock)
 
-    single_outputs = single_processor.process(
+    single_outputs = process_outputs(
+        single_processor,
         make_frame(f"\\c:0*00\\{SENTENCE}"),
         make_snapshot(),
     )
@@ -591,11 +671,13 @@ def test_injected_wall_clock_preserves_single_and_multipart_c_zero_asymmetry():
     first = make_multipart_sentence(1, "zero-first")
     second = make_multipart_sentence(2, "zero-second")
 
-    assert multipart_processor.process(
+    assert process_outputs(
+        multipart_processor,
         make_frame(f"\\c:0*00\\{first}"),
         make_snapshot(),
     ) == ()
-    multipart_outputs = multipart_processor.process(
+    multipart_outputs = process_outputs(
+        multipart_processor,
         make_frame(f"\\c:111*00\\{second}"),
         make_snapshot(),
     )
@@ -612,8 +694,8 @@ def test_multipart_continuation_retains_wall_clock_observation():
     first = make_multipart_sentence(1, "first")
     second = make_multipart_sentence(2, "second")
 
-    assert processor.process(make_frame(first), make_snapshot()) == ()
-    outputs = processor.process(make_frame(second), make_snapshot())
+    assert process_outputs(processor, make_frame(first), make_snapshot()) == ()
+    outputs = process_outputs(processor, make_frame(second), make_snapshot())
 
     assert leading_tag_content(outputs[0].message).startswith(
         "c:1234,s:test_station,g:1-2-"
@@ -636,8 +718,8 @@ def test_injected_gid_generator_receives_digits_once_and_reuses_gid():
     first = make_multipart_sentence(1, "first")
     second = make_multipart_sentence(2, "second")
 
-    assert processor.process(make_frame(first), make_snapshot()) == ()
-    outputs = processor.process(make_frame(second), make_snapshot())
+    assert process_outputs(processor, make_frame(first), make_snapshot()) == ()
+    outputs = process_outputs(processor, make_frame(second), make_snapshot())
 
     assert generator_calls == [6]
     assert leading_tag_content(outputs[0].message).endswith(
@@ -655,13 +737,13 @@ def test_injected_touch_s_operation_observes_each_emitted_sentence_only():
     second = make_multipart_sentence(2, "second")
     snapshot = make_snapshot()
 
-    assert processor.process(make_frame(first), snapshot) == ()
-    outputs = processor.process(make_frame(second), snapshot)
+    assert process_outputs(processor, make_frame(first), snapshot) == ()
+    outputs = process_outputs(processor, make_frame(second), snapshot)
     assert len(outputs) == 2
     assert touched_s_values == ["test_station", "test_station"]
 
-    assert processor.process(make_frame(first), snapshot) == ()
-    assert processor.process(make_frame(second), snapshot) == ()
+    assert process_outputs(processor, make_frame(first), snapshot) == ()
+    assert process_outputs(processor, make_frame(second), snapshot) == ()
     assert touched_s_values == ["test_station", "test_station"]
 
 
@@ -681,8 +763,8 @@ def test_routing_generation_change_does_not_reset_deduplication():
         target_ids=(3,),
     )
 
-    assert len(processor.process(frame, first_snapshot)) == 1
-    assert processor.process(frame, second_snapshot) == ()
+    assert len(process_outputs(processor, frame, first_snapshot)) == 1
+    assert process_outputs(processor, frame, second_snapshot) == ()
 
     stats = deduplicator.stats()
     assert stats.duplicates == 1
@@ -712,18 +794,22 @@ def test_multipart_crosses_generations_and_uses_completion_numeric_targets():
         target_ids=(8, 2),
     )
 
-    assert processor.process(make_frame(tagged_first), start_snapshot) == ()
-    outputs = processor.process(make_frame(second), completion_snapshot)
+    assert process_outputs(
+        processor,
+        make_frame(tagged_first),
+        start_snapshot,
+    ) == ()
+    outputs = process_outputs(
+        processor,
+        make_frame(second),
+        completion_snapshot,
+    )
 
     assert len(outputs) == 2
     assert leading_tag_content(outputs[0].message) == (
         "c:123,s:gen_source,g:1-2-444"
     )
     assert leading_tag_content(outputs[1].message) == "g:2-2-444"
-    assert all(
-        output.disposition is RoutingDisposition.TARGETED
-        for output in outputs
-    )
     assert all(
         output.target_ids == (8, 2)
         for output in outputs

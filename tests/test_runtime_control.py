@@ -707,14 +707,11 @@ class IntegrationForwarder:
     target_ids = ("udp:target",)
 
     def __init__(self):
-        self.messages = []
         self.targeted_messages = []
-        self.broadcast_event = asyncio.Event()
         self.targeted_event = asyncio.Event()
 
-    async def send(self, message):
-        self.messages.append(message)
-        self.broadcast_event.set()
+    async def send(self, _message):
+        raise AssertionError("runtime egress must use numeric target IDs")
 
     async def send_to_ids(self, target_ids, message):
         self.targeted_messages.append((tuple(target_ids), message))
@@ -792,6 +789,7 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
 
             await ingress_queue.put(make_event(SENTENCE))
             await asyncio.wait_for(fake_forwarder.targeted_event.wait(), timeout=1)
+            fake_forwarder.targeted_event.clear()
 
             disable = await client.request(
                 {
@@ -803,7 +801,7 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
             )
 
             await ingress_queue.put(make_event(SECOND_SENTENCE))
-            await asyncio.wait_for(fake_forwarder.broadcast_event.wait(), timeout=1)
+            await asyncio.wait_for(fake_forwarder.targeted_event.wait(), timeout=1)
         finally:
             runtime_task.cancel()
             await asyncio.gather(runtime_task, return_exceptions=True)
@@ -813,8 +811,10 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
         assert replace["result"]["generation"] == 1
         assert routing_state.snapshot().generation == 2
         assert disable["result"]["generation"] == 2
-        assert fake_forwarder.targeted_messages[0][0] == (0,)
-        assert fake_forwarder.messages
+        assert [
+            target_ids
+            for target_ids, _message in fake_forwarder.targeted_messages
+        ] == [(0,), (0,)]
         assert not path.exists()
 
     asyncio.run(scenario())

@@ -1,12 +1,13 @@
 import asyncio
+import inspect
 
 import pytest
 
 import aismixer
 from core.data_plane import (
     DeduplicationMode,
+    OutputBatch,
     ProcessorOutput,
-    RoutingDisposition,
 )
 from core.ingress_frame import IngressFrame
 from core.routing import RoutingTable
@@ -24,19 +25,15 @@ def make_frame(label):
     )
 
 
-def broadcast(message):
+def output(message, *target_ids):
     return ProcessorOutput(
         f"{message}\r\n".encode("utf-8"),
-        RoutingDisposition.LEGACY_BROADCAST,
-    )
-
-
-def targeted(message, *target_ids):
-    return ProcessorOutput(
-        f"{message}\r\n".encode("utf-8"),
-        RoutingDisposition.TARGETED,
         target_ids,
     )
+
+
+def output_batch(*outputs):
+    return OutputBatch(outputs)
 
 
 class FiniteQueue:
@@ -133,14 +130,14 @@ class RecordingForwarder:
     def __init__(self):
         self.events = []
 
-    async def send(self, message):
-        self.events.append(("broadcast", message))
+    async def send(self, _message):
+        raise AssertionError("production egress called compatibility send()")
 
     async def send_to_ids(self, target_ids, message):
-        self.events.append(("targeted", tuple(target_ids), message))
+        self.events.append(("numeric", tuple(target_ids), message))
 
     async def send_to(self, _target_ids, _message):
-        raise AssertionError("string targeted egress path was called")
+        raise AssertionError("production egress called compatibility send_to()")
 
 
 class GatedForwarder(RecordingForwarder):
@@ -151,9 +148,9 @@ class GatedForwarder(RecordingForwarder):
         self.second_send_started = asyncio.Event()
         self.task = None
 
-    async def send(self, message):
+    async def send_to_ids(self, target_ids, message):
         self.task = asyncio.current_task()
-        self.events.append(("broadcast", message))
+        self.events.append(("numeric", tuple(target_ids), message))
         if len(self.events) == 1:
             self.first_send_started.set()
             await self.release_first_send.wait()
@@ -162,8 +159,8 @@ class GatedForwarder(RecordingForwarder):
 
 
 class FirstSendFailingForwarder(RecordingForwarder):
-    async def send(self, message):
-        self.events.append(("broadcast", message))
+    async def send_to_ids(self, target_ids, message):
+        self.events.append(("numeric", tuple(target_ids), message))
         raise RuntimeError("send failed")
 
 
@@ -171,6 +168,102 @@ async def cancel_task(task):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.parametrize(
+    ("operation", "required_arguments"),
+    [
+        (aismixer.processor_stage_loop, {}),
+        (
+            aismixer._run_runtime_stages,
+            {"output_forwarder": object()},
+        ),
+    ],
+)
+def test_runtime_orchestration_requires_explicit_legacy_target_ids(
+    operation,
+    required_arguments,
+):
+    operation_signature = inspect.signature(operation)
+    parameter = operation_signature.parameters["legacy_target_ids"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+    with pytest.raises(TypeError, match="legacy_target_ids"):
+        operation(
+            object(),
+            object(),
+            **required_arguments,
+        )
+
+
+def test_global_mode_accepts_explicit_empty_target_ids():
+    async def scenario():
+        frame = make_frame("empty-global-registry")
+        processor = ScriptedProcessor(output_batch())
+
+        with pytest.raises(asyncio.CancelledError):
+            await aismixer.processor_stage_loop(
+                FiniteQueue(frame),
+                CompletingEgressQueue(),
+                processor=processor,
+                legacy_target_ids=(),
+            )
+
+        snapshot = processor.calls[0][1]
+        assert snapshot.deduplication_mode is DeduplicationMode.GLOBAL
+        assert snapshot.target_ids == ()
+
+    asyncio.run(scenario())
+
+
+def test_non_empty_global_target_ids_reach_numeric_egress_unchanged():
+    async def scenario():
+        payload = b"global\r\n"
+
+        class SnapshotTargetProcessor:
+            def process(self, _frame, snapshot):
+                return OutputBatch(
+                    (
+                        ProcessorOutput(
+                            payload,
+                            snapshot.target_ids,
+                        ),
+                    )
+                )
+
+        class SignallingForwarder(RecordingForwarder):
+            def __init__(self):
+                super().__init__()
+                self.sent = asyncio.Event()
+
+            async def send_to_ids(self, target_ids, message):
+                await super().send_to_ids(target_ids, message)
+                self.sent.set()
+
+        ingress_queue = asyncio.Queue()
+        await ingress_queue.put(make_frame("global-targets"))
+        forwarder = SignallingForwarder()
+        task = asyncio.create_task(
+            aismixer._run_runtime_stages(
+                ingress_queue,
+                asyncio.Queue(maxsize=1),
+                processor=SnapshotTargetProcessor(),
+                legacy_target_ids=(7, 2),
+                output_forwarder=forwarder,
+            )
+        )
+        try:
+            await asyncio.wait_for(forwarder.sent.wait(), timeout=1.0)
+        finally:
+            await cancel_task(task)
+
+        assert forwarder.events == [
+            ("numeric", (7, 2), payload),
+        ]
+        assert forwarder.events[0][2] is payload
+
+    asyncio.run(scenario())
 
 
 def empty_routing_table():
@@ -181,7 +274,7 @@ def test_unsupported_item_is_rejected_before_snapshot_and_processor():
     async def scenario():
         frame = make_frame("accepted")
         state = RecordingRoutingState(RoutingSnapshot(7, None))
-        processor = ScriptedProcessor(())
+        processor = ScriptedProcessor(output_batch())
         egress_queue = CompletingEgressQueue()
 
         with pytest.raises(asyncio.CancelledError):
@@ -190,6 +283,7 @@ def test_unsupported_item_is_rejected_before_snapshot_and_processor():
                 egress_queue,
                 routing_state=state,
                 processor=processor,
+                legacy_target_ids=(),
             )
 
         assert state.snapshot_calls == 1
@@ -210,7 +304,7 @@ def test_routed_frame_resolves_one_numeric_target_only_snapshot():
         frame = make_frame("routed")
         table = RecordingNumericRoutingTable((3, 1))
         state = RecordingRoutingState(RoutingSnapshot(8, table))
-        processor = ScriptedProcessor(())
+        processor = ScriptedProcessor(output_batch())
 
         with pytest.raises(asyncio.CancelledError):
             await aismixer.processor_stage_loop(
@@ -218,6 +312,7 @@ def test_routed_frame_resolves_one_numeric_target_only_snapshot():
                 CompletingEgressQueue(),
                 routing_state=state,
                 processor=processor,
+                legacy_target_ids=(),
             )
 
         assert state.snapshot_calls == 1
@@ -234,7 +329,7 @@ def test_routed_no_match_remains_per_target_with_empty_targets():
     async def scenario():
         frame = make_frame("unmatched")
         table = RecordingNumericRoutingTable(())
-        processor = ScriptedProcessor(())
+        processor = ScriptedProcessor(output_batch())
 
         with pytest.raises(asyncio.CancelledError):
             await aismixer.processor_stage_loop(
@@ -244,6 +339,7 @@ def test_routed_no_match_remains_per_target_with_empty_targets():
                     RoutingSnapshot(4, table)
                 ),
                 processor=processor,
+                legacy_target_ids=(),
             )
 
         snapshot = processor.calls[0][1]
@@ -256,7 +352,7 @@ def test_routed_no_match_remains_per_target_with_empty_targets():
 def test_legacy_mode_receives_explicit_all_numeric_forwarder_ids():
     async def scenario():
         frame = make_frame("legacy")
-        processor = ScriptedProcessor(())
+        processor = ScriptedProcessor(output_batch())
 
         with pytest.raises(asyncio.CancelledError):
             await aismixer.processor_stage_loop(
@@ -280,12 +376,12 @@ def test_legacy_mode_receives_explicit_all_numeric_forwarder_ids():
 def test_one_frame_produces_one_complete_ordered_egress_batch():
     async def scenario():
         frame = make_frame("one")
-        outputs = (
-            broadcast("first"),
-            targeted("second", 2, 1),
+        processor_batch = output_batch(
+            output("first", 0),
+            output("second", 2, 1),
         )
         state = RecordingRoutingState(RoutingSnapshot(3, None))
-        processor = ScriptedProcessor(outputs)
+        processor = ScriptedProcessor(processor_batch)
         egress_queue = CompletingEgressQueue()
 
         with pytest.raises(asyncio.CancelledError):
@@ -294,33 +390,41 @@ def test_one_frame_produces_one_complete_ordered_egress_batch():
                 egress_queue,
                 routing_state=state,
                 processor=processor,
+                legacy_target_ids=(),
             )
 
         assert state.snapshot_calls == 1
         assert len(processor.calls) == 1
         assert len(egress_queue.batches) == 1
-        assert egress_queue.batches[0].outputs is outputs
-        assert egress_queue.batches[0].outputs == outputs
+        envelope = egress_queue.batches[0]
+        assert envelope.output_batch is processor_batch
+        assert envelope.output_batch.outputs == processor_batch.outputs
+        assert aismixer._EgressBatch.__slots__ == (
+            "output_batch",
+            "completion",
+        )
 
     asyncio.run(scenario())
 
 
 def test_egress_dispatches_batch_sequentially_in_tuple_order():
     async def scenario():
-        outputs = (
-            broadcast("first"),
-            targeted("second", 2, 1),
+        processor_batch = output_batch(
+            output("first", 0),
+            output("second", 2, 1),
         )
         completion = asyncio.get_running_loop().create_future()
         queue = asyncio.Queue()
-        await queue.put(aismixer._EgressBatch(outputs, completion))
+        await queue.put(aismixer._EgressBatch(processor_batch, completion))
         forwarder = GatedForwarder()
         task = asyncio.create_task(
             aismixer.egress_stage_loop(queue, forwarder)
         )
         try:
             await forwarder.first_send_started.wait()
-            assert forwarder.events == [("broadcast", b"first\r\n")]
+            assert forwarder.events == [
+                ("numeric", (0,), b"first\r\n")
+            ]
             assert not completion.done()
 
             forwarder.release_first_send.set()
@@ -329,8 +433,8 @@ def test_egress_dispatches_batch_sequentially_in_tuple_order():
             await cancel_task(task)
 
         assert forwarder.events == [
-            ("broadcast", b"first\r\n"),
-            ("targeted", (2, 1), b"second\r\n"),
+            ("numeric", (0,), b"first\r\n"),
+            ("numeric", (2, 1), b"second\r\n"),
         ]
 
     asyncio.run(scenario())
@@ -341,8 +445,8 @@ def test_processor_does_not_run_ahead_while_first_batch_is_unacknowledged():
         first_frame = make_frame("first")
         second_frame = make_frame("second")
         processor = ScriptedProcessor(
-            (broadcast("first"),),
-            (broadcast("second"),),
+            output_batch(output("first", 0)),
+            output_batch(output("second", 0)),
         )
         ingress_queue = asyncio.Queue()
         await ingress_queue.put(first_frame)
@@ -354,6 +458,7 @@ def test_processor_does_not_run_ahead_while_first_batch_is_unacknowledged():
                 ingress_queue,
                 egress_queue,
                 processor=processor,
+                legacy_target_ids=(),
                 output_forwarder=forwarder,
             )
         )
@@ -373,8 +478,8 @@ def test_successful_acknowledgement_allows_the_next_frame():
         second_frame = make_frame("second")
         second_call = asyncio.Event()
         processor = ScriptedProcessor(
-            (broadcast("first"),),
-            (broadcast("second"),),
+            output_batch(output("first", 0)),
+            output_batch(output("second", 0)),
         )
         processor.add_call_events(asyncio.Event(), second_call)
         ingress_queue = asyncio.Queue()
@@ -386,6 +491,7 @@ def test_successful_acknowledgement_allows_the_next_frame():
                 ingress_queue,
                 asyncio.Queue(maxsize=1),
                 processor=processor,
+                legacy_target_ids=(),
                 output_forwarder=forwarder,
             )
         )
@@ -404,8 +510,8 @@ def test_successful_acknowledgement_allows_the_next_frame():
             second_frame,
         ]
         assert forwarder.events == [
-            ("broadcast", b"first\r\n"),
-            ("broadcast", b"second\r\n"),
+            ("numeric", (0,), b"first\r\n"),
+            ("numeric", (0,), b"second\r\n"),
         ]
 
     asyncio.run(scenario())
@@ -416,7 +522,10 @@ def test_first_send_failure_preserves_effects_and_prevents_later_work():
         first_frame = make_frame("first")
         second_frame = make_frame("second")
         effects = []
-        outputs = (broadcast("first"), broadcast("later"))
+        processor_batch = output_batch(
+            output("first", 0),
+            output("later", 0),
+        )
 
         def record_effects(call_index):
             if call_index == 0:
@@ -425,8 +534,8 @@ def test_first_send_failure_preserves_effects_and_prevents_later_work():
                 effects.append("processed:second-frame")
 
         processor = ScriptedProcessor(
-            outputs,
-            (broadcast("second-frame"),),
+            processor_batch,
+            output_batch(output("second-frame", 0)),
             effects=record_effects,
         )
         ingress_queue = asyncio.Queue()
@@ -439,13 +548,16 @@ def test_first_send_failure_preserves_effects_and_prevents_later_work():
                 ingress_queue,
                 asyncio.Queue(maxsize=1),
                 processor=processor,
+                legacy_target_ids=(),
                 output_forwarder=forwarder,
             )
 
         assert [call[0] for call in processor.calls] == [first_frame]
         assert effects == ["constructed:first", "constructed:later"]
-        assert outputs[1].message == b"later\r\n"
-        assert forwarder.events == [("broadcast", b"first\r\n")]
+        assert processor_batch.outputs[1].message == b"later\r\n"
+        assert forwarder.events == [
+            ("numeric", (0,), b"first\r\n")
+        ]
         assert ingress_queue.qsize() == 1
 
     asyncio.run(scenario())
@@ -460,8 +572,8 @@ def test_routing_replacement_while_blocked_affects_only_the_next_frame():
         second_frame = make_frame("second")
         second_call = asyncio.Event()
         processor = ScriptedProcessor(
-            (broadcast("first"),),
-            (broadcast("second"),),
+            output_batch(output("first", 0)),
+            output_batch(output("second", 0)),
         )
         processor.add_call_events(asyncio.Event(), second_call)
         ingress_queue = asyncio.Queue()
@@ -474,6 +586,7 @@ def test_routing_replacement_while_blocked_affects_only_the_next_frame():
                 asyncio.Queue(maxsize=1),
                 routing_state=state,
                 processor=processor,
+                legacy_target_ids=(),
                 output_forwarder=forwarder,
             )
         )
@@ -511,6 +624,7 @@ def test_processor_exception_propagates_and_cancels_blocked_egress():
                 ingress_queue,
                 egress_queue,
                 processor=processor,
+                legacy_target_ids=(),
                 output_forwarder=forwarder,
             )
         )
@@ -534,13 +648,14 @@ def test_cancellation_resolves_active_acknowledgement_and_stage_tasks():
     async def scenario():
         ingress_queue = asyncio.Queue()
         egress_queue = RecordingEgressQueue()
-        processor = ScriptedProcessor((broadcast("first"),))
+        processor = ScriptedProcessor(output_batch(output("first", 0)))
         forwarder = GatedForwarder()
         task = asyncio.create_task(
             aismixer._run_runtime_stages(
                 ingress_queue,
                 egress_queue,
                 processor=processor,
+                legacy_target_ids=(),
                 output_forwarder=forwarder,
             )
         )
@@ -658,7 +773,10 @@ def test_outputless_frame_completes_locally_and_allows_next_frame():
     async def scenario():
         first_frame = make_frame("empty")
         second_frame = make_frame("output")
-        processor = ScriptedProcessor((), (broadcast("second"),))
+        processor = ScriptedProcessor(
+            output_batch(),
+            output_batch(output("second", 0)),
+        )
         ingress_queue = asyncio.Queue()
         await ingress_queue.put(first_frame)
         await ingress_queue.put(second_frame)
@@ -669,8 +787,8 @@ def test_outputless_frame_completes_locally_and_allows_next_frame():
                 super().__init__()
                 self.sent = asyncio.Event()
 
-            async def send(self, message):
-                await super().send(message)
+            async def send_to_ids(self, target_ids, message):
+                await super().send_to_ids(target_ids, message)
                 self.sent.set()
 
         forwarder = SignallingForwarder()
@@ -679,6 +797,7 @@ def test_outputless_frame_completes_locally_and_allows_next_frame():
                 ingress_queue,
                 egress_queue,
                 processor=processor,
+                legacy_target_ids=(),
                 output_forwarder=forwarder,
             )
         )
@@ -692,7 +811,9 @@ def test_outputless_frame_completes_locally_and_allows_next_frame():
             second_frame,
         ]
         assert len(egress_queue.batches) == 1
-        assert forwarder.events == [("broadcast", b"second\r\n")]
+        assert forwarder.events == [
+            ("numeric", (0,), b"second\r\n")
+        ]
 
     asyncio.run(scenario())
 
@@ -702,7 +823,10 @@ def test_debug_output_is_emitted_before_send_with_crlf_removed(capsys):
         completion = asyncio.get_running_loop().create_future()
         queue = asyncio.Queue()
         await queue.put(
-            aismixer._EgressBatch((broadcast("message"),), completion)
+            aismixer._EgressBatch(
+                output_batch(output("message", 0)),
+                completion,
+            )
         )
 
         class DebugObservingForwarder:
@@ -710,10 +834,14 @@ def test_debug_output_is_emitted_before_send_with_crlf_removed(capsys):
                 self.output_seen_at_send = None
 
             async def send(self, _message):
+                raise AssertionError("production egress called send()")
+
+            async def send_to_ids(self, target_ids, _message):
+                assert tuple(target_ids) == (0,)
                 self.output_seen_at_send = capsys.readouterr().out
 
-            async def send_to_ids(self, _target_ids, _message):
-                raise AssertionError("unexpected targeted send")
+            async def send_to(self, _target_ids, _message):
+                raise AssertionError("production egress called send_to()")
 
         forwarder = DebugObservingForwarder()
         task = asyncio.create_task(
@@ -742,21 +870,27 @@ def test_debug_decode_is_non_throwing_and_does_not_modify_payload(capsys):
         payload = b"invalid-\xff\r\n"
         output = ProcessorOutput(
             payload,
-            RoutingDisposition.LEGACY_BROADCAST,
+            (2, 1),
         )
         completion = asyncio.get_running_loop().create_future()
         queue = asyncio.Queue()
-        await queue.put(aismixer._EgressBatch((output,), completion))
+        await queue.put(
+            aismixer._EgressBatch(OutputBatch((output,)), completion)
+        )
 
         class IdentityRecordingForwarder:
             def __init__(self):
                 self.message = None
 
-            async def send(self, message):
+            async def send(self, _message):
+                raise AssertionError("production egress called send()")
+
+            async def send_to_ids(self, target_ids, message):
+                self.target_ids = tuple(target_ids)
                 self.message = message
 
-            async def send_to_ids(self, _target_ids, _message):
-                raise AssertionError("unexpected targeted send")
+            async def send_to(self, _target_ids, _message):
+                raise AssertionError("production egress called send_to()")
 
         forwarder = IdentityRecordingForwarder()
         task = asyncio.create_task(
@@ -773,33 +907,29 @@ def test_debug_decode_is_non_throwing_and_does_not_modify_payload(capsys):
             await cancel_task(task)
 
         assert forwarder.message is payload
+        assert forwarder.target_ids == (2, 1)
         assert capsys.readouterr().out == "STAMP OUTPUT => invalid-\ufffd\n"
 
     asyncio.run(scenario())
 
 
-def test_unsupported_disposition_is_a_programming_error():
+def test_empty_target_ids_use_unified_numeric_dispatch_without_failure():
     async def scenario():
-        class InvalidOutput:
-            message = b"invalid\r\n"
-            disposition = object()
-            target_ids = ()
-
+        payload = b"no-destinations\r\n"
+        output = ProcessorOutput(payload, ())
         completion = asyncio.get_running_loop().create_future()
         queue = asyncio.Queue()
         await queue.put(
-            aismixer._EgressBatch((InvalidOutput(),), completion)
+            aismixer._EgressBatch(OutputBatch((output,)), completion)
         )
-        task = asyncio.create_task(
-            aismixer.egress_stage_loop(queue, RecordingForwarder())
-        )
+        forwarder = RecordingForwarder()
+        task = asyncio.create_task(aismixer.egress_stage_loop(queue, forwarder))
 
-        with pytest.raises(
-            AssertionError,
-            match="Unsupported routing disposition",
-        ):
-            await task
+        try:
+            await completion
+        finally:
+            await cancel_task(task)
 
-        assert isinstance(completion.exception(), AssertionError)
+        assert forwarder.events == [("numeric", (), payload)]
 
     asyncio.run(scenario())

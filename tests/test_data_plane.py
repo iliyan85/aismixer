@@ -3,12 +3,13 @@ from dataclasses import FrozenInstanceError, fields
 
 import pytest
 
+import core.data_plane as data_plane_module
 from core.data_plane import (
     DataPlaneProcessor,
     DeduplicationMode,
+    OutputBatch,
     ProcessingSnapshot,
     ProcessorOutput,
-    RoutingDisposition,
 )
 from core.ingress_frame import IngressFrame
 
@@ -174,7 +175,7 @@ def test_processor_output_is_frozen_slotted_and_has_no_runtime_objects():
     message = b"formatted message\r\n"
     output = ProcessorOutput(
         message=message,
-        disposition=RoutingDisposition.LEGACY_BROADCAST,
+        target_ids=(),
     )
 
     with pytest.raises(FrozenInstanceError):
@@ -184,92 +185,83 @@ def test_processor_output_is_frozen_slotted_and_has_no_runtime_objects():
     assert output.message is message
     assert tuple(field.name for field in fields(output)) == (
         "message",
-        "disposition",
         "target_ids",
     )
 
 
-def test_targeted_processor_output_preserves_order_repeats_and_copies_input():
+def test_processor_output_preserves_target_order_repeats_and_copies_input():
     target_ids = [2, 0, 2]
 
     output = ProcessorOutput(
         message=b"formatted message\r\n",
-        disposition=RoutingDisposition.TARGETED,
         target_ids=target_ids,
     )
     target_ids.append(1)
 
-    assert output.disposition is RoutingDisposition.TARGETED
     assert output.target_ids == (2, 0, 2)
     assert isinstance(output.target_ids, tuple)
 
 
-def test_legacy_processor_output_has_explicit_disposition_and_no_targets():
+def test_processor_output_allows_explicit_empty_target_ids():
     output = ProcessorOutput(
         message=b"formatted message\r\n",
-        disposition=RoutingDisposition.LEGACY_BROADCAST,
+        target_ids=(),
     )
 
-    assert output.disposition is RoutingDisposition.LEGACY_BROADCAST
     assert output.target_ids == ()
 
 
+def test_processor_output_requires_explicit_target_ids():
+    with pytest.raises(TypeError):
+        ProcessorOutput(message=b"formatted message\r\n")
+
+
+def test_routing_disposition_is_not_part_of_the_public_contract():
+    assert not hasattr(data_plane_module, "RoutingDisposition")
+
+
 @pytest.mark.parametrize(
-    ("message", "disposition", "target_ids", "exception"),
+    ("message", "target_ids", "exception"),
     [
-        (
-            b"message\r\n",
-            RoutingDisposition.LEGACY_BROADCAST,
-            (0,),
-            ValueError,
-        ),
-        (b"message\r\n", RoutingDisposition.TARGETED, (), ValueError),
-        (b"message\r\n", "targeted", (0,), TypeError),
-        ("message\r\n", RoutingDisposition.TARGETED, (0,), TypeError),
+        ("message\r\n", (0,), TypeError),
         (
             bytearray(b"message\r\n"),
-            RoutingDisposition.TARGETED,
             (0,),
             TypeError,
         ),
         (
             memoryview(b"message\r\n"),
-            RoutingDisposition.TARGETED,
             (0,),
             TypeError,
         ),
         (
             _BytesSubclass(b"message\r\n"),
-            RoutingDisposition.TARGETED,
             (0,),
             TypeError,
         ),
-        (object(), RoutingDisposition.TARGETED, (0,), TypeError),
-        (b"message\r\n", RoutingDisposition.TARGETED, "0", TypeError),
-        (b"message\r\n", RoutingDisposition.TARGETED, b"\x00", TypeError),
+        (object(), (0,), TypeError),
+        (b"message\r\n", "0", TypeError),
+        (b"message\r\n", b"\x00", TypeError),
         (
             b"message\r\n",
-            RoutingDisposition.TARGETED,
             (target_id for target_id in (0,)),
             TypeError,
         ),
-        (b"message\r\n", RoutingDisposition.TARGETED, (True,), TypeError),
-        (b"message\r\n", RoutingDisposition.TARGETED, ("0",), TypeError),
-        (b"message\r\n", RoutingDisposition.TARGETED, (0.0,), TypeError),
-        (b"message\r\n", RoutingDisposition.TARGETED, (object(),), TypeError),
-        (b"message\r\n", RoutingDisposition.TARGETED, (-1,), ValueError),
+        (b"message\r\n", (True,), TypeError),
+        (b"message\r\n", ("0",), TypeError),
+        (b"message\r\n", (0.0,), TypeError),
+        (b"message\r\n", (object(),), TypeError),
+        (b"message\r\n", (-1,), ValueError),
     ],
 )
 def test_processor_output_rejects_invalid_values(
     message,
-    disposition,
     target_ids,
     exception,
 ):
     with pytest.raises(exception):
         ProcessorOutput(
             message=message,
-            disposition=disposition,
             target_ids=target_ids,
         )
 
@@ -279,23 +271,93 @@ def test_processor_output_does_not_require_crlf_framing():
 
     output = ProcessorOutput(
         message=payload,
-        disposition=RoutingDisposition.LEGACY_BROADCAST,
+        target_ids=(),
     )
 
     assert output.message is payload
 
 
+def test_output_batch_is_frozen_slotted_empty_and_transport_agnostic():
+    batch = OutputBatch(outputs=())
+
+    with pytest.raises(FrozenInstanceError):
+        batch.outputs = ()
+
+    assert not hasattr(batch, "__dict__")
+    assert tuple(field.name for field in fields(batch)) == ("outputs",)
+    assert batch.outputs == ()
+    source = inspect.getsource(OutputBatch)
+    for forbidden_name in (
+        "asyncio",
+        "Future",
+        "Queue",
+        "transport",
+        "completion",
+    ):
+        assert forbidden_name not in source
+
+
+def test_output_batch_preserves_order_identity_and_copies_mutable_input():
+    first = ProcessorOutput(
+        message=b"first\r\n",
+        target_ids=(2, 0),
+    )
+    second = ProcessorOutput(
+        message=b"second\r\n",
+        target_ids=(),
+    )
+    mutable_outputs = [first, second]
+
+    batch = OutputBatch(outputs=mutable_outputs)
+    mutable_outputs.reverse()
+
+    assert batch.outputs == (first, second)
+    assert isinstance(batch.outputs, tuple)
+    assert batch.outputs[0] is first
+    assert batch.outputs[1] is second
+
+
+@pytest.mark.parametrize(
+    "outputs",
+    [
+        "outputs",
+        b"outputs",
+        (output for output in ()),
+        object(),
+        None,
+    ],
+)
+def test_output_batch_rejects_invalid_output_collection(outputs):
+    with pytest.raises(TypeError, match="sequence"):
+        OutputBatch(outputs=outputs)
+
+
+@pytest.mark.parametrize(
+    "outputs",
+    [
+        (object(),),
+        [
+            ProcessorOutput(message=b"valid\r\n", target_ids=(0,)),
+            object(),
+        ],
+    ],
+)
+def test_output_batch_rejects_non_processor_output_elements(outputs):
+    with pytest.raises(TypeError, match="ProcessorOutput"):
+        OutputBatch(outputs=outputs)
+
+
 def test_minimal_synchronous_fake_satisfies_processor_protocol():
     output = ProcessorOutput(
         message=b"formatted message\r\n",
-        disposition=RoutingDisposition.LEGACY_BROADCAST,
+        target_ids=(),
     )
 
     class FakeProcessor:
         def process(self, frame, snapshot):
             assert frame is expected_frame
             assert snapshot is expected_snapshot
-            return (output,)
+            return OutputBatch(outputs=(output,))
 
     expected_frame = make_frame()
     expected_snapshot = ProcessingSnapshot(
@@ -307,4 +369,7 @@ def test_minimal_synchronous_fake_satisfies_processor_protocol():
 
     assert isinstance(processor, DataPlaneProcessor)
     assert not inspect.iscoroutinefunction(processor.process)
-    assert processor.process(expected_frame, expected_snapshot) == (output,)
+    batch = processor.process(expected_frame, expected_snapshot)
+    assert type(batch) is OutputBatch
+    assert batch.outputs == (output,)
+    assert batch.outputs[0] is output

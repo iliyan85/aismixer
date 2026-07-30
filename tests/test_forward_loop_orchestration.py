@@ -5,8 +5,8 @@ import pytest
 import aismixer
 from core.data_plane import (
     DeduplicationMode,
+    OutputBatch,
     ProcessorOutput,
-    RoutingDisposition,
 )
 from core.ingress_frame import IngressFrame
 from core.python_data_plane import PythonDataPlaneProcessor
@@ -27,6 +27,17 @@ def make_frame(payload=b"!AIVDM,1,1,,A,payload,0*00"):
         assembler_key="192.0.2.10:17778",
         payload=payload,
     )
+
+
+def output(message, *target_ids):
+    return ProcessorOutput(
+        f"{message}\r\n".encode("utf-8"),
+        target_ids,
+    )
+
+
+def output_batch(*outputs):
+    return OutputBatch(outputs)
 
 
 class FiniteQueue:
@@ -56,7 +67,11 @@ class ScriptedProcessor:
 
     def process(self, frame, snapshot):
         self.calls.append((frame, snapshot))
-        return self._batches.pop(0) if self._batches else ()
+        return (
+            self._batches.pop(0)
+            if self._batches
+            else OutputBatch(outputs=())
+        )
 
 
 class CompletionRecordingProcessor:
@@ -77,16 +92,15 @@ class RecordingForwarder:
         self.events = []
         self._fail_at = fail_at
 
-    async def send(self, message):
-        self.events.append(("broadcast", message))
-        self._raise_if_requested()
+    async def send(self, _message):
+        raise AssertionError("production egress called compatibility send()")
 
     async def send_to_ids(self, target_ids, message):
-        self.events.append(("targeted", tuple(target_ids), message))
+        self.events.append(("numeric", tuple(target_ids), message))
         self._raise_if_requested()
 
     async def send_to(self, _target_ids, _message):
-        raise AssertionError("string targeted egress path was called")
+        raise AssertionError("production egress called compatibility send_to()")
 
     def _raise_if_requested(self):
         if self._fail_at == len(self.events):
@@ -113,11 +127,15 @@ class BoundaryObservingForwarder:
         self.observations = []
         self.attempted_messages = []
 
-    async def send(self, message):
+    async def send(self, _message):
+        raise AssertionError("production egress called compatibility send()")
+
+    async def send_to_ids(self, target_ids, message):
         self.observations.append(
             {
                 "processor_completed": self._processor.completed,
                 "outputs": self._processor.outputs,
+                "target_ids": tuple(target_ids),
                 "dedup_stats": self._deduplicator.stats(),
                 "touched_s_values": tuple(self._touched_s_values),
                 "clock_observations": tuple(self._clock_observations),
@@ -128,8 +146,8 @@ class BoundaryObservingForwarder:
         if self._fail_first and len(self.attempted_messages) == 1:
             raise RuntimeError("send failed")
 
-    async def send_to_ids(self, _target_ids, _message):
-        raise AssertionError("boundary test expects legacy broadcast output")
+    async def send_to(self, _target_ids, _message):
+        raise AssertionError("production egress called compatibility send_to()")
 
 
 async def run_runtime_stages(
@@ -144,6 +162,7 @@ async def run_runtime_stages(
         asyncio.Queue(),
         routing_state=routing_state,
         processor=processor,
+        legacy_target_ids=(),
         output_forwarder=output_forwarder,
         debug=False,
     )
@@ -192,7 +211,7 @@ def test_invalid_item_is_ignored_before_snapshot_and_processing_then_loop_contin
     state = RecordingRoutingState(
         RoutingSnapshot(generation=7, table=None)
     )
-    processor = ScriptedProcessor(())
+    processor = ScriptedProcessor(output_batch())
     output_forwarder = RecordingForwarder()
 
     with pytest.raises(
@@ -223,16 +242,9 @@ def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
         RoutingSnapshot(generation=3, table=None)
     )
     processor = ScriptedProcessor(
-        (
-            ProcessorOutput(
-                b"first\r\n",
-                RoutingDisposition.LEGACY_BROADCAST,
-            ),
-            ProcessorOutput(
-                b"second\r\n",
-                RoutingDisposition.TARGETED,
-                (2, 1),
-            ),
+        output_batch(
+            output("first", 0),
+            output("second", 2, 1),
         )
     )
     forwarder = RecordingForwarder()
@@ -253,9 +265,9 @@ def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
     assert state.snapshot_calls == 1
     assert len(processor.calls) == 1
     assert forwarder.events == [
-        ("broadcast", b"first\r\n"),
+        ("numeric", (0,), b"first\r\n"),
         (
-            "targeted",
+            "numeric",
             (2, 1),
             b"second\r\n",
         ),
@@ -264,15 +276,9 @@ def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
 
 def test_dispatch_failure_stops_before_later_output_dispatch():
     processor = ScriptedProcessor(
-        (
-            ProcessorOutput(
-                b"first\r\n",
-                RoutingDisposition.LEGACY_BROADCAST,
-            ),
-            ProcessorOutput(
-                b"second\r\n",
-                RoutingDisposition.LEGACY_BROADCAST,
-            ),
+        output_batch(
+            output("first", 0),
+            output("second", 0),
         )
     )
     forwarder = RecordingForwarder(fail_at=1)
@@ -287,7 +293,7 @@ def test_dispatch_failure_stops_before_later_output_dispatch():
         )
 
     assert len(processor.calls) == 1
-    assert forwarder.events == [("broadcast", b"first\r\n")]
+    assert forwarder.events == [("numeric", (0,), b"first\r\n")]
 
 
 def test_whole_frame_processing_and_effects_complete_before_ordered_egress():
@@ -321,21 +327,22 @@ def test_whole_frame_processing_and_effects_complete_before_ordered_egress():
             )
         )
 
-    outputs = processor.outputs
+    output_batch_result = processor.outputs
     assert processor.completed is True
-    assert outputs is not None
-    assert len(outputs) == 2
-    assert outputs[0].message.endswith(
+    assert isinstance(output_batch_result, OutputBatch)
+    assert len(output_batch_result.outputs) == 2
+    assert output_batch_result.outputs[0].message.endswith(
         (FIRST_SENTENCE + "\r\n").encode("ascii")
     )
-    assert outputs[1].message.endswith(
+    assert output_batch_result.outputs[1].message.endswith(
         (SECOND_SENTENCE + "\r\n").encode("ascii")
     )
 
     first_send = forwarder.observations[0]
     assert first_send == {
         "processor_completed": True,
-        "outputs": outputs,
+        "outputs": output_batch_result,
+        "target_ids": (),
         "dedup_stats": deduplicator.stats(),
         "touched_s_values": ("boundary", "boundary"),
         "clock_observations": (1001.9, 1002.9),
@@ -346,7 +353,7 @@ def test_whole_frame_processing_and_effects_complete_before_ordered_egress():
     }
     assert first_send["dedup_stats"].accepted == 2
     assert forwarder.attempted_messages == [
-        output.message for output in outputs
+        output.message for output in output_batch_result.outputs
     ]
 
 
@@ -379,17 +386,19 @@ def test_first_send_failure_keeps_completed_effects_and_later_output():
             )
         )
 
-    outputs = processor.outputs
+    output_batch_result = processor.outputs
     assert processor.completed is True
-    assert outputs is not None
-    assert len(outputs) == 2
-    assert outputs[0].message.endswith(
+    assert isinstance(output_batch_result, OutputBatch)
+    assert len(output_batch_result.outputs) == 2
+    assert output_batch_result.outputs[0].message.endswith(
         (FIRST_SENTENCE + "\r\n").encode("ascii")
     )
-    assert outputs[1].message.endswith(
+    assert output_batch_result.outputs[1].message.endswith(
         (SECOND_SENTENCE + "\r\n").encode("ascii")
     )
-    assert forwarder.attempted_messages == [outputs[0].message]
+    assert forwarder.attempted_messages == [
+        output_batch_result.outputs[0].message
+    ]
 
     assert touched_s_values == ["boundary", "boundary"]
     assert clock_observations == [1001.9, 1002.9]
@@ -398,4 +407,8 @@ def test_first_send_failure_keeps_completed_effects_and_later_output():
         (6, "222222"),
     ]
     assert deduplicator.stats().accepted == 2
-    assert forwarder.observations[0]["outputs"] is outputs
+    assert (
+        forwarder.observations[0]["outputs"]
+        is output_batch_result
+    )
+    assert forwarder.observations[0]["target_ids"] == ()

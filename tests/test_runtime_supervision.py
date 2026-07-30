@@ -4,7 +4,7 @@ import gc
 import pytest
 
 import aismixer
-from core.data_plane import ProcessorOutput, RoutingDisposition
+from core.data_plane import OutputBatch, ProcessorOutput
 from core.ingress_frame import IngressFrame
 
 
@@ -22,11 +22,15 @@ def make_frame(label="frame"):
     )
 
 
-def broadcast(message):
+def output(message, *target_ids):
     return ProcessorOutput(
         f"{message}\r\n".encode("utf-8"),
-        RoutingDisposition.LEGACY_BROADCAST,
+        target_ids,
     )
+
+
+def output_batch(*outputs):
+    return OutputBatch(outputs)
 
 
 async def wait_for_event(event):
@@ -103,16 +107,19 @@ class FailingForwarder:
         self.failure = failure
         self.started = asyncio.Event()
         self.task = None
-        self.messages = []
+        self.calls = []
 
-    async def send(self, message):
+    async def send(self, _message):
+        raise AssertionError("production egress called compatibility send()")
+
+    async def send_to_ids(self, target_ids, message):
         self.task = asyncio.current_task()
-        self.messages.append(message)
+        self.calls.append((tuple(target_ids), message))
         self.started.set()
         raise self.failure
 
     async def send_to(self, _target_ids, _message):
-        raise AssertionError("expected legacy broadcast output")
+        raise AssertionError("production egress called compatibility send_to()")
 
 
 class GatedForwarder:
@@ -121,11 +128,14 @@ class GatedForwarder:
         self.release = asyncio.Event()
         self.cancelled = asyncio.Event()
         self.task = None
-        self.messages = []
+        self.calls = []
 
-    async def send(self, message):
+    async def send(self, _message):
+        raise AssertionError("production egress called compatibility send()")
+
+    async def send_to_ids(self, target_ids, message):
         self.task = asyncio.current_task()
-        self.messages.append(message)
+        self.calls.append((tuple(target_ids), message))
         self.started.set()
         try:
             await self.release.wait()
@@ -134,7 +144,7 @@ class GatedForwarder:
             raise
 
     async def send_to(self, _target_ids, _message):
-        raise AssertionError("expected legacy broadcast output")
+        raise AssertionError("production egress called compatibility send_to()")
 
 
 class GetProbeQueue:
@@ -265,7 +275,7 @@ def test_egress_failure_propagates_through_ack_and_cancels_ingress_side():
         }
         ingress_queue = ObservingQueue()
         egress_queue = ObservingQueue(maxsize=1)
-        processor = ScriptedProcessor((broadcast("one"),))
+        processor = ScriptedProcessor(output_batch(output("one", 0)))
         output_forwarder = FailingForwarder(failure)
         specs = [
             make_spec(role, probe.run)
@@ -279,6 +289,7 @@ def test_egress_failure_propagates_through_ack_and_cancels_ingress_side():
                         ingress_queue,
                         egress_queue,
                         processor=processor,
+                        legacy_target_ids=(),
                     ),
                 ),
                 make_spec(
@@ -307,10 +318,10 @@ def test_egress_failure_propagates_through_ack_and_cancels_ingress_side():
         assert exc_info.value is failure
         assert processor.calls[0][0] is frame
         assert len(processor.calls) == 1
-        assert output_forwarder.messages == [b"one\r\n"]
+        assert output_forwarder.calls == [((0,), b"one\r\n")]
         assert len(egress_queue.put_items) == 1
         batch = egress_queue.put_items[0]
-        assert batch.outputs is processor.outputs
+        assert batch.output_batch is processor.outputs
         assert batch.completion.done()
         assert not batch.completion.cancelled()
         assert processor.task is not None
@@ -443,7 +454,7 @@ def test_external_cancellation_cleans_all_tasks_and_active_acknowledgement():
         }
         ingress_queue = ObservingQueue()
         egress_queue = ObservingQueue(maxsize=1)
-        processor = ScriptedProcessor((broadcast("one"),))
+        processor = ScriptedProcessor(output_batch(output("one", 0)))
         output_forwarder = GatedForwarder()
         specs = [
             make_spec(role, probe.run)
@@ -457,6 +468,7 @@ def test_external_cancellation_cleans_all_tasks_and_active_acknowledgement():
                         ingress_queue,
                         egress_queue,
                         processor=processor,
+                        legacy_target_ids=(),
                     ),
                 ),
                 make_spec(

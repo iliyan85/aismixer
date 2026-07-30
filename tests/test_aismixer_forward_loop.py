@@ -44,24 +44,32 @@ def make_nmea_sentence(body):
 
 
 class FakeForwarder:
+    all_target_ids = tuple(TEST_TARGET_ID_BY_NAME.values())
+
     def __init__(self, on_send_to=None):
         self.messages = []
         self.raw_messages = []
         self.targeted_messages = []
         self.raw_targeted_messages = []
+        self.numeric_sends = []
         self.on_send_to = on_send_to
 
-    async def send(self, message):
-        assert type(message) is bytes
-        self.raw_messages.append(message)
-        self.messages.append(message.decode("utf-8"))
+    async def send(self, _message):
+        raise AssertionError("legacy broadcast egress path was called")
 
     async def send_to_ids(self, target_ids, message):
         assert type(message) is bytes
         numeric_target_ids = tuple(target_ids)
-        self.raw_targeted_messages.append((numeric_target_ids, message))
+        self.numeric_sends.append((numeric_target_ids, message))
         display_message = message.decode("utf-8")
-        self.targeted_messages.append((numeric_target_ids, display_message))
+        if numeric_target_ids == self.all_target_ids:
+            self.raw_messages.append(message)
+            self.messages.append(display_message)
+        else:
+            self.raw_targeted_messages.append((numeric_target_ids, message))
+            self.targeted_messages.append(
+                (numeric_target_ids, display_message)
+            )
         if self.on_send_to is not None:
             self.on_send_to(numeric_target_ids, display_message)
 
@@ -517,6 +525,7 @@ async def run_forward_loop_events(
             queue,
             egress_queue,
             processor=processor,
+            legacy_target_ids=fake_forwarder.all_target_ids,
             output_forwarder=fake_forwarder,
             debug=False,
             timestamp=aismixer.ts,
@@ -623,6 +632,7 @@ async def start_forward_loop_capture(
             egress_queue,
             routing_state=routing_state,
             processor=processor,
+            legacy_target_ids=fake_forwarder.all_target_ids,
             output_forwarder=fake_forwarder,
             debug=False,
             timestamp=aismixer.ts,
@@ -653,6 +663,7 @@ async def run_multipart_forward_loop(
             queue,
             egress_queue,
             processor=processor,
+            legacy_target_ids=fake_forwarder.all_target_ids,
             output_forwarder=fake_forwarder,
             debug=False,
             timestamp=aismixer.ts,
@@ -2860,7 +2871,7 @@ def test_capacity_eviction_clears_all_multipart_contexts_only_for_victim(
     ]
 
 
-def test_forward_loop_legacy_mode_calls_send_not_send_to(monkeypatch):
+def test_forward_loop_legacy_mode_uses_all_numeric_targets(monkeypatch):
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
             monkeypatch,
@@ -2871,6 +2882,9 @@ def test_forward_loop_legacy_mode_calls_send_not_send_to(monkeypatch):
 
     assert len(fake_forwarder.messages) == 1
     assert fake_forwarder.targeted_messages == []
+    assert fake_forwarder.numeric_sends[0][0] == (
+        fake_forwarder.all_target_ids
+    )
 
 
 def test_forward_loop_legacy_mode_keeps_global_deduplication(monkeypatch):

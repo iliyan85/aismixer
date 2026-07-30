@@ -462,46 +462,72 @@ ProcessingSnapshot(
 It contains no routing table, routing state, mapping, transport or asyncio
 object. An absent or disabled routing table selects `GLOBAL` mode and passes
 all numeric forwarder IDs, including unnamed destinations. An enabled routing
-table selects `PER_TARGET` mode and passes the one resolved tuple. Therefore
-`GLOBAL + ()` means legacy mode with no configured destinations, while
-`PER_TARGET + ()` means routing is enabled but the source matched no target.
-Snapshot construction preserves target order and rejects duplicate numeric IDs
-rather than silently normalizing them; production numeric matching already
-returns a unique first-occurrence tuple. The routed empty-target case performs
-no global deduplication admission and emits no output while retaining normal
-assembler and multipart metadata cleanup.
+table selects `PER_TARGET` mode and passes the one resolved tuple. Runtime
+orchestration must supply `legacy_target_ids` explicitly: omission is a
+call-contract error, while an explicit empty tuple represents a genuinely
+empty global destination registry. Accordingly,
+`GLOBAL + ()` means global deduplication remains active with no configured
+forwarder destinations. A globally unique message still completes normal
+processor state changes and output construction, but its explicit empty target
+tuple results in no datagrams. `PER_TARGET + ()` means routing is enabled but
+the source matched no target; it performs no global deduplication admission,
+does not invoke the output builder, and returns no processor output while
+retaining normal assembler and multipart metadata cleanup. Snapshot
+construction preserves target order and rejects duplicate numeric IDs rather
+than silently normalizing them; production numeric matching already returns a
+unique first-occurrence tuple.
 
 ## 13. Campaign D processor/egress boundary
 
 `PythonDataPlaneProcessor.process(frame, snapshot)` completes synchronous
 processing of the entire accepted frame and constructs the complete returned
-tuple of `ProcessorOutput` values before orchestration begins its first
-asynchronous egress send. The processor stage resolves the frame's target-only
-snapshot before this call. Parsing, assembly, multipart metadata observation
-and cleanup, deduplication decisions, TAG formatting, wall-clock observations
-used for formatting, GID generation, and `touch_s` effects belonging to that
-frame therefore all occur before the first send begins.
+`OutputBatch` before orchestration begins its first asynchronous egress send.
+The processor stage resolves the frame's target-only snapshot before this
+call. Parsing, assembly, multipart metadata observation and cleanup,
+deduplication decisions, TAG formatting, wall-clock observations used for
+formatting, GID generation, and `touch_s` effects belonging to that frame
+therefore all occur before the first send begins.
 
-The single egress stage dispatches the returned outputs sequentially in tuple
-order. Legacy-broadcast outputs retain an empty target tuple and call
-`Forwarder.send()`. Targeted outputs contain ordered numeric IDs and call
-`Forwarder.send_to_ids()`; production processing never uses the string
-`send_to()` compatibility API. A send failure stops dispatch before any later
-output is sent, but it does not undo processor state, deduplication state,
-multipart metadata cleanup, wall-clock observations, GID generation, `touch_s`
-effects, or already constructed later outputs. The runtime-only completion
-signal described below is an ordering barrier, not an acknowledgement to an
-ingress source or a network-delivery guarantee. The boundary provides no
-transactional delivery, rollback, replay, ingress acknowledgement, delivery
-acknowledgement, or recovery guarantee, including after a partial
-multi-fragment send.
+The public, transport-agnostic result contracts are frozen and slotted:
 
-`ProcessorOutput.message` is an exact immutable `bytes` payload containing one
-completely formatted output sentence, normally terminated by CRLF. The
-processor-output boundary accepts an existing `bytes` object without copying
-it and rejects `str`, mutable buffers, views, and other payload types. It does
-not decode or encode the payload and does not require CRLF at this general
-immutable boundary.
+```text
+ProcessorOutput(
+    message: bytes,
+    target_ids: tuple[EgressTargetId, ...],
+)
+
+OutputBatch(
+    outputs: tuple[ProcessorOutput, ...],
+)
+```
+
+`OutputBatch` is the processor return value and is a valid result when empty.
+It preserves output order and the exact `ProcessorOutput` object identities
+while defensively converting an accepted mutable sequence to a tuple. It
+contains no completion Future, queue, transport, asyncio object, or other
+runtime state.
+
+Each `ProcessorOutput` contains one completely formatted output sentence and
+its explicit ordered numeric target IDs. `ProcessorOutput.message` is an exact
+immutable `bytes` payload, normally terminated by CRLF. The boundary accepts
+an existing `bytes` object without copying it and rejects `str`, mutable
+buffers, views, and other payload types. It does not decode or encode the
+payload and does not require CRLF at this general immutable boundary. Target
+order and repeats are preserved, and an empty target tuple is valid.
+
+The single egress stage dispatches `OutputBatch.outputs` sequentially in their
+stored order. Every output uses the one numeric production path,
+`Forwarder.send_to_ids(output.target_ids, output.message)`. `Forwarder.send()`
+and the string-targeted `Forwarder.send_to()` remain public compatibility APIs
+but production orchestration calls neither. A send failure stops dispatch
+before any later output is sent, but it does not undo processor state,
+deduplication state, multipart metadata cleanup, wall-clock observations, GID
+generation, `touch_s` effects, or already constructed later outputs. The
+runtime-only completion signal described below is an ordering barrier, not an
+acknowledgement to an ingress source or a network-delivery guarantee. The
+boundary provides no transactional delivery, rollback, replay, ingress
+acknowledgement, delivery acknowledgement, or recovery guarantee, including
+after a partial multi-fragment send.
 
 `core.output_builder.build_output_bytes()` is the sole production output
 builder. It delegates canonical TAG formatting and checksum calculation to the
@@ -521,13 +547,11 @@ for invalid input. The original unmodified bytes object remains the object
 sent to the forwarder. Invalid UTF-8 is replaced only in the display view and
 cannot alter the network payload.
 
-Legacy broadcast and numeric targeted egress remain separate branches and
-continue to use `Forwarder.send()` and `Forwarder.send_to_ids()`,
-respectively. `ProcessorOutput`, `RoutingDisposition`, the returned processor
-tuple, and the private runtime `_EgressBatch` envelope remain in place.
-`OutputBatch` and a unified egress branch are deferred to Campaign E4. This
-bytes-boundary change introduces no native API or ABI, bindings, IPC,
-multiprocessing, worker pool, or egress concurrency.
+The unified numeric egress path preserves per-sentence payload construction,
+same-object reuse across selected destinations, sequential output ordering,
+and sequential destination ordering. Campaign E4 introduces no native API or
+ABI, bindings, IPC, multiprocessing, worker pool, batch-level payload
+concatenation, or egress concurrency.
 
 This whole-frame-before-egress ordering intentionally replaces the former
 processing/send interleaving and is part of the Campaign D processor boundary.
@@ -556,11 +580,11 @@ deduplication, TAG construction, GID generation, or processor-state mutation.
 For each accepted frame, the processor stage coerces the queue item once,
 acquires exactly one routing snapshot, resolves exactly one target-only
 `ProcessingSnapshot`, calls the configured `DataPlaneProcessor` exactly once,
-and treats the complete returned `tuple[ProcessorOutput, ...]` as that frame's
-one ordered processor batch. Unsupported queue items and invalid compatibility
-events are rejected before snapshot acquisition, target matching or processor
-invocation. An empty output batch may complete locally because it has no
-egress work.
+and treats the complete returned `OutputBatch` as that frame's one ordered
+processor result. Unsupported queue items and invalid compatibility events are
+rejected before snapshot acquisition, target matching or processor invocation.
+An `OutputBatch` with no outputs completes locally because it has no egress
+work.
 
 After handing a non-empty batch to egress, the processor stage must await an
 explicit process-local completion acknowledgement. It must not consume or
@@ -581,11 +605,13 @@ above, and no later accepted frame is processed after the failure. Runtime
 shutdown or cancellation must resolve or cancel pending stage work and
 acknowledgements so that no stage remains blocked or orphaned.
 
-The inter-stage queues, batch envelope, and completion acknowledgement are
-private runtime-orchestration mechanisms. They do not alter
-`DataPlaneProcessor`, `ProcessingSnapshot`, or `ProcessorOutput`, and they
-define neither a native API or ABI nor an IPC protocol. Campaign D3 introduces
-no multiprocessing, threads, worker pool, or second processor implementation.
+The inter-stage queues and completion acknowledgement are private
+runtime-orchestration mechanisms. The private `_EgressBatch` envelope contains
+one public `OutputBatch` and one process-local completion Future; the Future
+remains outside `OutputBatch` and every other public data-plane contract. These
+mechanisms define neither a native API or ABI nor an IPC protocol. The runtime
+uses no multiprocessing, threads, worker pool, or second processor
+implementation.
 
 ### Runtime lifecycle supervision
 
