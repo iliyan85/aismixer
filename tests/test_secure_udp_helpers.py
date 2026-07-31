@@ -354,14 +354,13 @@ class _FakeSecureLoop:
         raise asyncio.CancelledError()
 
 
-class _FakeSocketModule:
-    def __init__(self, fake_socket, real_socket_module):
+class _FakeSecureSocketFactory:
+    def __init__(self, fake_socket):
         self._fake_socket = fake_socket
-        self.AF_INET6 = real_socket_module.AF_INET6
-        self.AF_INET = real_socket_module.AF_INET
-        self.SOCK_DGRAM = real_socket_module.SOCK_DGRAM
+        self.calls = []
 
-    def socket(self, *args, **kwargs):
+    def __call__(self, listen_ip, *, reuse_address):
+        self.calls.append((listen_ip, reuse_address))
         return self._fake_socket
 
 
@@ -508,8 +507,12 @@ def _run_secure_server_with_packets(
         if monotonic_clock is None
         else monotonic_clock
     )
+    socket_factory = _FakeSecureSocketFactory(fake_socket)
     monkeypatch.setattr(
-        secure, "socket", _FakeSocketModule(fake_socket, secure.socket))
+        secure,
+        "create_udp_listener_socket",
+        socket_factory,
+    )
     monkeypatch.setattr(secure, "asyncio", _FakeAsyncioModule(fake_loop))
 
     with pytest.raises(asyncio.CancelledError):
@@ -527,6 +530,7 @@ def _run_secure_server_with_packets(
         )
 
     assert fake_socket.close_count == 1
+    assert socket_factory.calls == [("127.0.0.1", False)]
     return fake_queue, fake_socket
 
 
@@ -539,10 +543,11 @@ def test_secure_server_closes_owned_socket_when_bind_fails(monkeypatch):
             raise bind_failure
 
     fake_socket = BindFailingSocket()
+    socket_factory = _FakeSecureSocketFactory(fake_socket)
     monkeypatch.setattr(
         secure,
-        "socket",
-        _FakeSocketModule(fake_socket, secure.socket),
+        "create_udp_listener_socket",
+        socket_factory,
     )
 
     with pytest.raises(OSError) as excinfo:
@@ -556,6 +561,7 @@ def test_secure_server_closes_owned_socket_when_bind_fails(monkeypatch):
 
     assert excinfo.value is bind_failure
     assert fake_socket.close_count == 1
+    assert socket_factory.calls == [("127.0.0.1", False)]
 
 
 def test_secure_server_closes_owned_socket_when_runtime_fails(monkeypatch):
@@ -566,10 +572,11 @@ def test_secure_server_closes_owned_socket_when_runtime_fails(monkeypatch):
     async def fail_runtime(*_args, **_kwargs):
         raise runtime_failure
 
+    socket_factory = _FakeSecureSocketFactory(fake_socket)
     monkeypatch.setattr(
         secure,
-        "socket",
-        _FakeSocketModule(fake_socket, secure.socket),
+        "create_udp_listener_socket",
+        socket_factory,
     )
     monkeypatch.setattr(secure, "_secure_server_loop", fail_runtime)
 
@@ -584,6 +591,7 @@ def test_secure_server_closes_owned_socket_when_runtime_fails(monkeypatch):
 
     assert excinfo.value is runtime_failure
     assert fake_socket.close_count == 1
+    assert socket_factory.calls == [("127.0.0.1", False)]
 
 
 def _install_test_session(

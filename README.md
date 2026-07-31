@@ -236,6 +236,11 @@ python3 aismixer.py
 
 ### Network endpoint controls
 
+`listen_ip` selects one address family for both `udp_inputs` and `sec_inputs`:
+`0.0.0.0` listens on all local IPv4 addresses and accepts IPv4 only, while `::`
+listens on all local IPv6 addresses and accepts IPv6 only. For dual-stack
+ingress, configure both entries explicitly; they may use the same port number.
+
 Two optional network-boundary controls are available in AISMixer
 configuration:
 
@@ -267,7 +272,7 @@ sec_inputs:
     listen_port: 19999
     allow_from:
       - 2001:db8:42::/64
-      - 203.0.113.44
+      - 2001:db8:43::44
 
 forwarders:
   - id: aishub
@@ -916,6 +921,12 @@ python3 aismixer.py
 
 ### Контрол на мрежовите крайни точки
 
+`listen_ip` избира едно адресно семейство както за `udp_inputs`, така и за
+`sec_inputs`: `0.0.0.0` слуша на всички локални IPv4 адреси и приема само IPv4,
+а `::` слуша на всички локални IPv6 адреси и приема само IPv6. За вход
+едновременно през IPv4 и IPv6 конфигурирайте изрично и двата записа; те могат да
+използват един и същ номер на порт.
+
 В конфигурацията на AISMixer има два незадължителни механизма за контрол на
 мрежовата граница:
 
@@ -948,7 +959,7 @@ sec_inputs:
     listen_port: 19999
     allow_from:
       - 2001:db8:42::/64
-      - 203.0.113.44
+      - 2001:db8:43::44
 
 forwarders:
   - id: aishub
@@ -1617,6 +1628,12 @@ python3 aismixer.py
 
 ### Controale pentru endpoint-urile de rețea
 
+`listen_ip` selectează o singură familie de adrese atât pentru `udp_inputs`, cât
+și pentru `sec_inputs`: `0.0.0.0` ascultă pe toate adresele IPv4 locale și
+acceptă numai IPv4, iar `::` ascultă pe toate adresele IPv6 locale și acceptă
+numai IPv6. Pentru ingress dual-stack, configurați explicit ambele intrări;
+acestea pot folosi același număr de port.
+
 În configurația AISMixer sunt disponibile două controale opționale pentru
 perimetrul de rețea:
 
@@ -1649,7 +1666,7 @@ sec_inputs:
     listen_port: 19999
     allow_from:
       - 2001:db8:42::/64
-      - 203.0.113.44
+      - 2001:db8:43::44
 
 forwarders:
   - id: aishub

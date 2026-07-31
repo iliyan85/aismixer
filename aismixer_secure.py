@@ -3,7 +3,6 @@ import asyncio
 import base64
 import binascii
 import json
-import socket
 import time
 import yaml
 from collections import OrderedDict, deque
@@ -15,6 +14,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from core.ingress_frame import frame_from_text_payload
 from core.network_policy import NetworkPolicy
 from core.source_identity import build_udpsec_source_id
+from core.udp_listener import create_udp_listener_socket
 from core.udpsec_crypto import (
     DOMAIN_CONTEXT,
     build_client_auth_digest,
@@ -1119,10 +1119,7 @@ async def secure_server(
 ):
     """Run one secure ingress producer and close its owned socket exactly once."""
 
-    sock = socket.socket(
-        socket.AF_INET6 if ':' in ip else socket.AF_INET,
-        socket.SOCK_DGRAM,
-    )
+    sock = create_udp_listener_socket(ip, reuse_address=False)
     try:
         await _secure_server_loop(
             sock,

@@ -1,5 +1,4 @@
 import asyncio
-import socket
 import yaml
 import os
 import time
@@ -23,6 +22,7 @@ from core.runtime_control import build_optional_routing_control_server
 from core.runtime_routing import load_optional_routing_table
 from core.routing_state import RoutingState
 from core.source_identity import build_udp_source_id
+from core.udp_listener import create_udp_listener_socket
 from aismixer_secure import secure_server
 
 try:
@@ -464,10 +464,8 @@ async def main():
             input_queues.append(q)
             ip = entry["listen_ip"]
             port = entry["listen_port"]
-            family = socket.AF_INET6 if ':' in ip else socket.AF_INET
-            sock = socket.socket(family, socket.SOCK_DGRAM)
+            sock = create_udp_listener_socket(ip, reuse_address=True)
             udp_sockets.append(sock)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((ip, port))
             sock.setblocking(False)
             print(f"{ts()} Listening on {format_source(ip, port)}")

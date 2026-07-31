@@ -455,9 +455,6 @@ class _MainTestSocket:
         self.bind_calls = []
         self.close_count = 0
 
-    def setsockopt(self, *_args):
-        return None
-
     def bind(self, address):
         self.bind_calls.append(address)
         if self.bind_exc is not None:
@@ -470,17 +467,12 @@ class _MainTestSocket:
         self.close_count += 1
 
 
-class _MainTestSocketModule:
-    AF_INET = object()
-    AF_INET6 = object()
-    SOCK_DGRAM = object()
-    SOL_SOCKET = object()
-    SO_REUSEADDR = object()
-
+class _MainTestSocketFactory:
     def __init__(self, sockets):
         self._sockets = iter(sockets)
 
-    def socket(self, _family, _socket_type):
+    def __call__(self, _listen_ip, *, reuse_address):
+        assert reuse_address is True
         return next(self._sockets)
 
 
@@ -515,8 +507,8 @@ def _configure_main_lifecycle_test(
     monkeypatch.setattr(aismixer, "forwarder", output_forwarder)
     monkeypatch.setattr(
         aismixer,
-        "socket",
-        _MainTestSocketModule(sockets),
+        "create_udp_listener_socket",
+        _MainTestSocketFactory(sockets),
     )
     monkeypatch.setattr(
         aismixer,
