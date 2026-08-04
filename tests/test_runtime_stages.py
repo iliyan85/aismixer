@@ -370,7 +370,7 @@ def test_fan_in_normalizes_legacy_target_ids_once_for_repeated_use():
 
         legacy_target_ids = SinglePassTargetIds()
         ingress_queue = asyncio.Queue()
-        processing_queue = asyncio.Queue()
+        processing_queue = aismixer._BoundedProcessingQueue(2)
         task = asyncio.create_task(
             aismixer.ingress_fan_in_loop(
                 (ingress_queue,),
@@ -460,48 +460,80 @@ def routing_table_for_sources(target_name, target_id, *source_ids):
 
 
 def test_supported_item_is_coerced_before_routing_snapshot(monkeypatch):
-    raw_item = object()
-    frame = make_frame("coerced")
-    events = []
+    async def scenario():
+        raw_item = object()
+        frame = make_frame("coerced")
+        events = []
 
-    def coerce(item):
-        assert item is raw_item
-        events.append("coerce")
-        return frame
+        def coerce(item):
+            assert item is raw_item
+            events.append("coerce")
+            return frame
 
-    class OrderedRoutingState:
-        def snapshot(self):
-            events.append("snapshot")
-            return RoutingSnapshot(6, None)
+        class OrderedRoutingState:
+            def snapshot(self):
+                events.append("snapshot")
+                return RoutingSnapshot(6, None)
 
-    monkeypatch.setattr(aismixer, "coerce_ingress_frame", coerce)
+        monkeypatch.setattr(aismixer, "coerce_ingress_frame", coerce)
+        ingress_queue = asyncio.Queue()
+        processing_queue = aismixer._BoundedProcessingQueue(1)
+        task = asyncio.create_task(
+            aismixer.ingress_fan_in_loop(
+                (ingress_queue,),
+                processing_queue,
+                routing_state=OrderedRoutingState(),
+                legacy_target_ids=(4,),
+            )
+        )
+        try:
+            await ingress_queue.put(raw_item)
+            work_item = await asyncio.wait_for(
+                processing_queue.get(),
+                timeout=1.0,
+            )
+        finally:
+            await cancel_task(task)
 
-    work_item = aismixer._bind_processing_work_item(
-        raw_item,
-        routing_state=OrderedRoutingState(),
-        legacy_target_ids=(4,),
-    )
+        assert events == ["coerce", "snapshot"]
+        assert work_item.frame is frame
+        assert work_item.snapshot == ProcessingSnapshot(
+            routing_generation=6,
+            deduplication_mode=DeduplicationMode.GLOBAL,
+            target_ids=(4,),
+        )
 
-    assert events == ["coerce", "snapshot"]
-    assert work_item.frame is frame
-    assert work_item.snapshot == ProcessingSnapshot(
-        routing_generation=6,
-        deduplication_mode=DeduplicationMode.GLOBAL,
-        target_ids=(4,),
-    )
+    asyncio.run(scenario())
 
 
 def test_unsupported_item_is_rejected_before_routing_snapshot():
-    state = RecordingRoutingState(RoutingSnapshot(7, None))
+    async def scenario():
+        state = RecordingRoutingState(RoutingSnapshot(7, None))
+        frame = make_frame("supported-after-invalid")
+        ingress_queue = asyncio.Queue()
+        processing_queue = aismixer._BoundedProcessingQueue(1)
+        task = asyncio.create_task(
+            aismixer.ingress_fan_in_loop(
+                (ingress_queue,),
+                processing_queue,
+                routing_state=state,
+                legacy_target_ids=(),
+            )
+        )
+        try:
+            await ingress_queue.put(object())
+            await ingress_queue.put(frame)
+            work_item = await asyncio.wait_for(
+                processing_queue.get(),
+                timeout=1.0,
+            )
+        finally:
+            await cancel_task(task)
 
-    work_item = aismixer._bind_processing_work_item(
-        object(),
-        routing_state=state,
-        legacy_target_ids=(),
-    )
+        assert work_item.frame is frame
+        assert state.snapshot_calls == 1
 
-    assert work_item is None
-    assert state.snapshot_calls == 0
+    asyncio.run(scenario())
 
 
 def test_routed_frame_resolves_one_numeric_target_only_snapshot():
@@ -510,7 +542,7 @@ def test_routed_frame_resolves_one_numeric_target_only_snapshot():
         table = RecordingNumericRoutingTable((3, 1))
         state = RecordingRoutingState(RoutingSnapshot(8, table))
         input_queue = asyncio.Queue()
-        output_queue = asyncio.Queue()
+        output_queue = aismixer._BoundedProcessingQueue(1)
         task = asyncio.create_task(
             aismixer.ingress_fan_in_loop(
                 (input_queue,),
@@ -740,6 +772,140 @@ def test_successful_acknowledgement_allows_the_next_frame():
     asyncio.run(scenario())
 
 
+def test_bounded_congestion_propagates_to_ingress_and_recovers_in_order(
+    monkeypatch,
+):
+    async def scenario():
+        frames = tuple(
+            make_frame(label)
+            for label in ("first", "second", "third", "fourth", "fifth")
+        )
+        first_frame, second_frame, third_frame, fourth_frame, fifth_frame = (
+            frames
+        )
+        state = WaitableRoutingState(None)
+        first_bound = asyncio.Event()
+        second_bound = asyncio.Event()
+        third_bound = asyncio.Event()
+        state.add_snapshot_events(first_bound, second_bound, third_bound)
+        processor = ScriptedProcessor(
+            *(output_batch(output(frame.source_id, 0)) for frame in frames)
+        )
+
+        class CongestionForwarder(RecordingForwarder):
+            def __init__(self):
+                super().__init__()
+                self.first_send_started = asyncio.Event()
+                self.release_first_send = asyncio.Event()
+                self.all_sent = asyncio.Event()
+
+            async def send_to_ids(self, target_ids, message):
+                await super().send_to_ids(target_ids, message)
+                if len(self.events) == 1:
+                    self.first_send_started.set()
+                    await self.release_first_send.wait()
+                if len(self.events) == len(frames):
+                    self.all_sent.set()
+
+        third_removed = asyncio.Event()
+
+        class ObservedIngressQueue(asyncio.Queue):
+            async def get(self):
+                item = await super().get()
+                if item is third_frame:
+                    third_removed.set()
+                return item
+
+        processing_queues = []
+        processing_queue_type = aismixer._BoundedProcessingQueue
+
+        def recording_processing_queue(maxsize):
+            queue = processing_queue_type(maxsize)
+            processing_queues.append(queue)
+            return queue
+
+        monkeypatch.setattr(
+            aismixer,
+            "_BoundedProcessingQueue",
+            recording_processing_queue,
+        )
+        ingress_queue = ObservedIngressQueue(maxsize=1)
+        egress_queue = asyncio.Queue(maxsize=1)
+        forwarder = CongestionForwarder()
+        await ingress_queue.put(first_frame)
+        runtime_task = asyncio.create_task(
+            aismixer._run_runtime_stages(
+                ingress_queue,
+                egress_queue,
+                routing_state=state,
+                processor=processor,
+                legacy_target_ids=(),
+                output_forwarder=forwarder,
+                processing_queue_maxsize=1,
+            )
+        )
+        fifth_put_attempted = asyncio.Event()
+        fifth_put_completed = asyncio.Event()
+        fifth_put_task = None
+
+        async def put_fifth_frame():
+            fifth_put_attempted.set()
+            await ingress_queue.put(fifth_frame)
+            fifth_put_completed.set()
+
+        try:
+            await asyncio.wait_for(
+                forwarder.first_send_started.wait(),
+                timeout=1.0,
+            )
+            await ingress_queue.put(second_frame)
+            await asyncio.wait_for(second_bound.wait(), timeout=1.0)
+
+            await ingress_queue.put(third_frame)
+            await asyncio.wait_for(third_removed.wait(), timeout=1.0)
+            await ingress_queue.put(fourth_frame)
+            fifth_put_task = asyncio.create_task(put_fifth_frame())
+            await asyncio.wait_for(fifth_put_attempted.wait(), timeout=1.0)
+
+            assert first_bound.is_set()
+            assert not third_bound.is_set()
+            assert state.snapshot_calls == 2
+            assert [call[0] for call in processor.calls] == [first_frame]
+            assert len(processing_queues) == 1
+            processing_queue = processing_queues[0]
+            assert processing_queue.maxsize == 1
+            assert processing_queue.qsize() == 1
+            assert ingress_queue.maxsize == 1
+            assert ingress_queue.qsize() == 1
+            assert ingress_queue.full()
+            assert not fifth_put_completed.is_set()
+            assert not fifth_put_task.done()
+
+            forwarder.release_first_send.set()
+            await asyncio.wait_for(forwarder.all_sent.wait(), timeout=1.0)
+            await asyncio.wait_for(fifth_put_completed.wait(), timeout=1.0)
+        finally:
+            if fifth_put_task is not None and not fifth_put_task.done():
+                fifth_put_task.cancel()
+            if fifth_put_task is not None:
+                await asyncio.gather(fifth_put_task, return_exceptions=True)
+            await cancel_task(runtime_task)
+
+        assert [call[0] for call in processor.calls] == list(frames)
+        assert [event[2] for event in forwarder.events] == [
+            f"udp:{label}\r\n".encode("ascii")
+            for label in ("first", "second", "third", "fourth", "fifth")
+        ]
+        assert state.snapshot_calls == len(frames)
+        assert third_bound.is_set()
+        assert processing_queue.maxsize == 1
+        assert processing_queue.qsize() == 0
+        assert ingress_queue.maxsize == 1
+        assert ingress_queue.qsize() == 0
+
+    asyncio.run(scenario())
+
+
 def test_first_send_failure_preserves_effects_and_prevents_later_work():
     async def scenario():
         first_frame = make_frame("first")
@@ -789,6 +955,7 @@ def test_first_send_failure_preserves_effects_and_prevents_later_work():
 @pytest.mark.parametrize("disable_routing", [False, True])
 def test_routing_change_affects_only_later_handoffs_while_blocked(
     disable_routing,
+    monkeypatch,
 ):
     async def scenario():
         first_frame = make_frame("first")
@@ -817,6 +984,18 @@ def test_routing_change_affects_only_later_handoffs_while_blocked(
         second_bound = asyncio.Event()
         third_bound = asyncio.Event()
         state.add_snapshot_events(first_bound, second_bound, third_bound)
+        match_calls = []
+        original_match_target_ids = RoutingTable.match_target_ids
+
+        def record_match(table, source_id):
+            match_calls.append((table, source_id))
+            return original_match_target_ids(table, source_id)
+
+        monkeypatch.setattr(
+            RoutingTable,
+            "match_target_ids",
+            record_match,
+        )
         second_call = asyncio.Event()
         third_call = asyncio.Event()
         processor = ScriptedProcessor(
@@ -829,7 +1008,16 @@ def test_routing_change_affects_only_later_handoffs_while_blocked(
             second_call,
             third_call,
         )
-        ingress_queue = asyncio.Queue()
+        third_removed = asyncio.Event()
+
+        class ObservedIngressQueue(asyncio.Queue):
+            async def get(self):
+                item = await super().get()
+                if item is third_frame:
+                    third_removed.set()
+                return item
+
+        ingress_queue = ObservedIngressQueue()
         await ingress_queue.put(first_frame)
         await ingress_queue.put(second_frame)
         forwarder = GatedForwarder()
@@ -841,6 +1029,7 @@ def test_routing_change_affects_only_later_handoffs_while_blocked(
                 processor=processor,
                 legacy_target_ids=(9, 4),
                 output_forwarder=forwarder,
+                processing_queue_maxsize=1,
             )
         )
         try:
@@ -849,14 +1038,30 @@ def test_routing_change_affects_only_later_handoffs_while_blocked(
             assert first_bound.is_set()
             assert len(processor.calls) == 1
             assert ingress_queue.qsize() == 0
+            assert state.snapshot_calls == 2
+            assert [source_id for _, source_id in match_calls] == [
+                first_frame.source_id,
+                second_frame.source_id,
+            ]
 
-            state.replace(second_table)
             await ingress_queue.put(third_frame)
-            await asyncio.wait_for(third_bound.wait(), timeout=1.0)
+            await asyncio.wait_for(third_removed.wait(), timeout=1.0)
+
+            # The reader owns the accepted third frame, but the only queued
+            # processing slot still belongs to the second frame. Routing is
+            # deliberately unbound until that slot is released on dequeue.
+            assert not third_bound.is_set()
+            assert state.snapshot_calls == 2
+            assert [source_id for _, source_id in match_calls] == [
+                first_frame.source_id,
+                second_frame.source_id,
+            ]
             assert len(processor.calls) == 1
 
+            state.replace(second_table)
             forwarder.release_first_send.set()
             await asyncio.wait_for(second_call.wait(), timeout=1.0)
+            await asyncio.wait_for(third_bound.wait(), timeout=1.0)
             await asyncio.wait_for(third_call.wait(), timeout=1.0)
         finally:
             await cancel_task(task)
@@ -880,6 +1085,15 @@ def test_routing_change_affects_only_later_handoffs_while_blocked(
             (9, 4) if disable_routing else (7,)
         )
         assert state.snapshot_calls == 3
+        assert [source_id for _, source_id in match_calls] == (
+            [first_frame.source_id, second_frame.source_id]
+            if disable_routing
+            else [
+                first_frame.source_id,
+                second_frame.source_id,
+                third_frame.source_id,
+            ]
+        )
 
     asyncio.run(scenario())
 
@@ -911,6 +1125,34 @@ def test_processor_exception_propagates_and_cancels_blocked_egress():
         assert egress_queue.getter_task.done()
         assert egress_queue.getter_task.cancelled()
         assert forwarder.events == []
+
+    asyncio.run(scenario())
+
+
+def test_processor_failure_after_dequeue_releases_processing_capacity():
+    async def scenario():
+        processing_queue = aismixer._BoundedProcessingQueue(1)
+        first_item = make_work_item(make_frame("failure-releases-slot"))
+        await processing_queue.admit(lambda: first_item)
+        processor = ScriptedProcessor(RuntimeError("processor failed"))
+
+        with pytest.raises(RuntimeError, match="processor failed"):
+            await aismixer.processor_stage_loop(
+                processing_queue,
+                CompletingEgressQueue(),
+                processor=processor,
+            )
+
+        replacement = make_work_item(make_frame("replacement"))
+        await asyncio.wait_for(
+            processing_queue.admit(lambda: replacement),
+            timeout=1.0,
+        )
+
+        assert processing_queue.maxsize == 1
+        assert processing_queue.qsize() == 1
+        assert await processing_queue.get() is replacement
+        assert processing_queue.qsize() == 0
 
     asyncio.run(scenario())
 
@@ -1028,14 +1270,22 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
         egress_factory = specs["egress-stage"].coroutine_factory
         assert fan_in_factory.func is aismixer.ingress_fan_in_loop
         assert fan_in_factory.args[0] == ()
-        ingress_queue = fan_in_factory.args[1]
+        processing_queue = fan_in_factory.args[1]
         assert processor_factory.func is aismixer.processor_stage_loop
-        assert processor_factory.args[0] is ingress_queue
+        assert processor_factory.args[0] is processing_queue
         egress_queue = processor_factory.args[1]
         assert egress_factory.func is aismixer.egress_stage_loop
         assert egress_factory.args == (egress_queue, output_forwarder)
-        assert isinstance(ingress_queue, asyncio.Queue)
+        assert isinstance(
+            processing_queue,
+            aismixer._BoundedProcessingQueue,
+        )
+        assert (
+            processing_queue.maxsize
+            == aismixer.DEFAULT_PROCESSING_QUEUE_MAXSIZE
+        )
         assert isinstance(egress_queue, asyncio.Queue)
+        assert egress_queue.maxsize == 1
         assert fan_in_factory.keywords == {
             "routing_state": state,
             "legacy_target_ids": (0, 1),
@@ -1080,6 +1330,7 @@ def test_outputless_frame_completes_locally_and_allows_next_frame():
                 processor=processor,
                 legacy_target_ids=(),
                 output_forwarder=forwarder,
+                processing_queue_maxsize=1,
             )
         )
         try:

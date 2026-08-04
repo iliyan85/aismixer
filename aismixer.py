@@ -14,6 +14,7 @@ from core.data_plane import (
     ProcessingWorkItem,
 )
 from core.ingress_frame import (
+    IngressFrame,
     coerce_ingress_frame,
     frame_from_udp_datagram,
 )
@@ -25,6 +26,10 @@ from core.routing_state import RoutingState
 from core.source_identity import build_udp_source_id
 from core.udp_listener import create_udp_listener_socket
 from aismixer_secure import secure_server
+
+
+DEFAULT_INGRESS_QUEUE_MAXSIZE = 1024
+DEFAULT_PROCESSING_QUEUE_MAXSIZE = 1024
 
 try:
     from setproctitle import setproctitle
@@ -145,6 +150,59 @@ class _RuntimeTaskSpec:
     coroutine_factory: Callable[[], Coroutine[Any, Any, None]]
 
 
+def _validate_queue_capacity(capacity, *, name):
+    """Return one positive item-count queue capacity."""
+
+    if isinstance(capacity, bool) or not isinstance(capacity, int):
+        raise TypeError(f"{name} must be an integer")
+    if capacity < 1:
+        raise ValueError(f"{name} must be at least 1")
+    return capacity
+
+
+class _BoundedProcessingQueue:
+    """Own a bounded work queue and its matching admission permits."""
+
+    __slots__ = ("_slots", "_work_queue")
+
+    def __init__(self, maxsize):
+        maxsize = _validate_queue_capacity(
+            maxsize,
+            name="processing_queue_maxsize",
+        )
+        self._work_queue = asyncio.Queue(maxsize=maxsize)
+        self._slots = asyncio.BoundedSemaphore(maxsize)
+
+    @property
+    def maxsize(self):
+        return self._work_queue.maxsize
+
+    def qsize(self):
+        return self._work_queue.qsize()
+
+    async def admit(self, work_item_factory):
+        """Wait for capacity, then synchronously bind and enqueue one item."""
+
+        await self._slots.acquire()
+        try:
+            work_item = work_item_factory()
+            if not isinstance(work_item, ProcessingWorkItem):
+                raise TypeError(
+                    "work_item_factory must return a ProcessingWorkItem"
+                )
+            self._work_queue.put_nowait(work_item)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    async def get(self):
+        """Dequeue one item and immediately return its queue-slot permit."""
+
+        work_item = await self._work_queue.get()
+        self._slots.release()
+        return work_item
+
+
 async def _cancel_and_await_tasks(tasks):
     for task in tasks:
         if not task.done():
@@ -198,16 +256,15 @@ async def _supervise_named_tasks(task_specs):
 
 
 def _bind_processing_work_item(
-    item,
+    frame,
     *,
     routing_state=None,
     legacy_target_ids,
 ):
-    """Coerce one raw ingress item and bind its target-only snapshot."""
+    """Bind one accepted frame to its target-only routing snapshot."""
 
-    frame = coerce_ingress_frame(item)
-    if frame is None:
-        return None
+    if not isinstance(frame, IngressFrame):
+        raise TypeError("frame must be an IngressFrame")
 
     if routing_state is None:
         routing_generation = 0
@@ -238,12 +295,17 @@ def _bind_processing_work_item(
 
 async def ingress_fan_in_loop(
     input_queues,
-    output_queue,
+    processing_queue,
     *,
     routing_state=None,
     legacy_target_ids,
 ):
-    """Bind accepted ingress items while owning every private reader task."""
+    """Bind accepted ingress items while owning every private reader task.
+
+    Each reader may hold one accepted frame while awaiting the shared
+    processing capacity. Separate input queues isolate private backlogs but
+    do not imply fair admission among readers.
+    """
 
     if isinstance(legacy_target_ids, (str, bytes)):
         raise TypeError(
@@ -254,13 +316,17 @@ async def ingress_fan_in_loop(
     async def reader(q):
         while True:
             item = await q.get()
-            work_item = _bind_processing_work_item(
-                item,
-                routing_state=routing_state,
-                legacy_target_ids=legacy_target_ids,
+            frame = coerce_ingress_frame(item)
+            if frame is None:
+                continue
+            await processing_queue.admit(
+                partial(
+                    _bind_processing_work_item,
+                    frame,
+                    routing_state=routing_state,
+                    legacy_target_ids=legacy_target_ids,
+                )
             )
-            if work_item is not None:
-                await output_queue.put(work_item)
 
     if not input_queues:
         await asyncio.get_running_loop().create_future()
@@ -375,10 +441,11 @@ async def _run_runtime_stages(
     output_forwarder,
     debug=False,
     timestamp=None,
+    processing_queue_maxsize=DEFAULT_PROCESSING_QUEUE_MAXSIZE,
 ):
     """Run one ingress binding, processor, and egress lifecycle."""
 
-    processing_queue = asyncio.Queue()
+    processing_queue = _BoundedProcessingQueue(processing_queue_maxsize)
 
     await _supervise_named_tasks(
         (
@@ -452,10 +519,18 @@ async def handle_socket(
         await queue.put(frame)
 
 
-async def main():
+async def main(
+    *,
+    ingress_queue_maxsize=DEFAULT_INGRESS_QUEUE_MAXSIZE,
+    processing_queue_maxsize=DEFAULT_PROCESSING_QUEUE_MAXSIZE,
+):
+    ingress_queue_maxsize = _validate_queue_capacity(
+        ingress_queue_maxsize,
+        name="ingress_queue_maxsize",
+    )
+    processor_queue = _BoundedProcessingQueue(processing_queue_maxsize)
     processor = create_data_plane_processor()
     input_queues = []
-    processor_queue = asyncio.Queue()
     egress_queue = asyncio.Queue(maxsize=1)
     runtime_task_specs = []
     udp_sockets = []
@@ -477,7 +552,7 @@ async def main():
         for index, (entry, ingress_policy) in enumerate(
             zip(SEC_INPUTS, sec_input_policies)
         ):
-            q = asyncio.Queue()
+            q = asyncio.Queue(maxsize=ingress_queue_maxsize)
             input_queues.append(q)
             ip = entry["listen_ip"]
             port = entry["listen_port"]
@@ -507,7 +582,7 @@ async def main():
         for index, (entry, ingress_policy) in enumerate(
             zip(UDP_INPUTS, udp_input_policies)
         ):
-            q = asyncio.Queue()
+            q = asyncio.Queue(maxsize=ingress_queue_maxsize)
             input_queues.append(q)
             ip = entry["listen_ip"]
             port = entry["listen_port"]

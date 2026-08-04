@@ -741,6 +741,72 @@ def test_fan_in_parent_cancellation_cancels_and_awaits_all_readers():
     asyncio.run(scenario())
 
 
+def test_fan_in_cancellation_cleans_processing_capacity_waiter():
+    async def scenario():
+        queued_item = processing_work_item(make_frame("queued"))
+        replacement_item = processing_work_item(make_frame("replacement"))
+        processing_queue = aismixer._BoundedProcessingQueue(1)
+        await processing_queue.admit(lambda: queued_item)
+
+        class OneItemQueue:
+            def __init__(self, item):
+                self._item = item
+                self.returned = asyncio.Event()
+                self.reader_task = None
+                self._delivered = False
+
+            async def get(self):
+                self.reader_task = asyncio.current_task()
+                if not self._delivered:
+                    self._delivered = True
+                    self.returned.set()
+                    return self._item
+                await asyncio.Future()
+
+        class SnapshotGuard:
+            def __init__(self):
+                self.calls = 0
+
+            def snapshot(self):
+                self.calls += 1
+                raise AssertionError(
+                    "routing must not be captured before admission"
+                )
+
+        input_queue = OneItemQueue(make_frame("waiting"))
+        routing_state = SnapshotGuard()
+        parent = asyncio.create_task(
+            aismixer.ingress_fan_in_loop(
+                (input_queue,),
+                processing_queue,
+                routing_state=routing_state,
+                legacy_target_ids=(),
+            ),
+            name="test-capacity-waiting-fan-in",
+        )
+        await wait_for_event(input_queue.returned)
+
+        assert processing_queue.qsize() == 1
+        assert routing_state.calls == 0
+        assert input_queue.reader_task is not None
+
+        parent.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await parent
+
+        assert input_queue.reader_task.done()
+        assert input_queue.reader_task.cancelled()
+        assert input_queue.reader_task not in asyncio.all_tasks()
+        assert routing_state.calls == 0
+
+        assert await processing_queue.get() is queued_item
+        await processing_queue.admit(lambda: replacement_item)
+        assert processing_queue.qsize() == 1
+        assert await processing_queue.get() is replacement_item
+
+    asyncio.run(scenario())
+
+
 def test_fan_in_cleanup_retrieves_secondary_reader_exception():
     async def scenario():
         loop = asyncio.get_running_loop()

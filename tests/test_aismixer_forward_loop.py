@@ -106,6 +106,22 @@ class _FakeQueue:
         self.items.append(item)
 
 
+class _ObservedBoundedQueue(asyncio.Queue):
+    def __init__(self, *, maxsize):
+        super().__init__(maxsize=maxsize)
+        self.put_started = []
+        self.put_completed = []
+
+    async def put(self, item):
+        started = asyncio.Event()
+        completed = asyncio.Event()
+        self.put_started.append(started)
+        self.put_completed.append(completed)
+        started.set()
+        await super().put(item)
+        completed.set()
+
+
 class FakeClock:
     def __init__(self, now=0.0):
         self.now = now
@@ -430,12 +446,84 @@ def test_handle_socket_empty_ingress_policy_drops_all_packets(monkeypatch):
     assert queue.items == []
 
 
+def test_handle_socket_waits_for_private_queue_capacity_before_next_receive(
+    monkeypatch,
+):
+    async def scenario():
+        first_packet = (SENTENCE.encode(), ("192.0.2.10", 17778))
+        second_packet = (
+            SECOND_SENTENCE.encode(),
+            ("192.0.2.10", 17778),
+        )
+        receive_started = tuple(asyncio.Event() for _ in range(3))
+
+        class ControlledPacketLoop:
+            def __init__(self):
+                self.calls = 0
+
+            async def sock_recvfrom(self, _sock, _size):
+                call_index = self.calls
+                self.calls += 1
+                receive_started[call_index].set()
+                if call_index == 0:
+                    return first_packet
+                if call_index == 1:
+                    return second_packet
+                await asyncio.get_running_loop().create_future()
+
+        fake_loop = ControlledPacketLoop()
+        queue = _ObservedBoundedQueue(maxsize=1)
+        occupied_slot = object()
+        queue.put_nowait(occupied_slot)
+
+        monkeypatch.setattr(
+            aismixer,
+            "asyncio",
+            _FakeAsyncioModule(fake_loop),
+        )
+        monkeypatch.setattr(aismixer, "DEBUG", False)
+
+        task = asyncio.create_task(
+            aismixer.handle_socket(object(), queue)
+        )
+        try:
+            await asyncio.wait_for(receive_started[0].wait(), timeout=1)
+            while not queue.put_started:
+                await asyncio.sleep(0)
+
+            assert fake_loop.calls == 1
+            assert queue.qsize() == 1
+            assert queue.get_nowait() is occupied_slot
+
+            await asyncio.wait_for(queue.put_completed[0].wait(), timeout=1)
+            await asyncio.wait_for(receive_started[1].wait(), timeout=1)
+            while len(queue.put_started) < 2:
+                await asyncio.sleep(0)
+
+            assert fake_loop.calls == 2
+            assert not queue.put_completed[1].is_set()
+            first_frame = queue.get_nowait()
+
+            await asyncio.wait_for(queue.put_completed[1].wait(), timeout=1)
+            await asyncio.wait_for(receive_started[2].wait(), timeout=1)
+            second_frame = queue.get_nowait()
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert first_frame.payload == SENTENCE.encode()
+        assert second_frame.payload == SECOND_SENTENCE.encode()
+
+    asyncio.run(scenario())
+
+
 def test_ingress_fan_in_loop_binds_frame_and_drops_unsupported(
     monkeypatch,
 ):
     async def run():
         input_queue = asyncio.Queue()
-        output_queue = asyncio.Queue()
+        processing_queue = aismixer._BoundedProcessingQueue(1)
         frame = make_direct_frame(SENTENCE.encode("utf-8"))
         unsupported = object()
         unsupported_coerced = asyncio.Event()
@@ -455,7 +543,7 @@ def test_ingress_fan_in_loop_binds_frame_and_drops_unsupported(
         task = asyncio.create_task(
             aismixer.ingress_fan_in_loop(
                 [input_queue],
-                output_queue,
+                processing_queue,
                 legacy_target_ids=(4, 1),
             )
         )
@@ -463,14 +551,14 @@ def test_ingress_fan_in_loop_binds_frame_and_drops_unsupported(
             await input_queue.put(frame)
             await input_queue.put(unsupported)
             work_item = await asyncio.wait_for(
-                output_queue.get(),
+                processing_queue.get(),
                 timeout=0.5,
             )
             await asyncio.wait_for(
                 unsupported_coerced.wait(),
                 timeout=0.5,
             )
-            return frame, work_item, output_queue.empty()
+            return frame, work_item, processing_queue.qsize() == 0
         finally:
             task.cancel()
             try:

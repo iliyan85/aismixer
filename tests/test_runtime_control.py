@@ -390,10 +390,18 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
     fan_in_factory = specs["ingress-fan-in"].coroutine_factory
     processor_factory = specs["processor-stage"].coroutine_factory
     egress_factory = specs["egress-stage"].coroutine_factory
+    processing_queue = fan_in_factory.args[1]
+    assert fan_in_factory.args[0] == ()
     assert fan_in_factory.keywords == {
         "routing_state": result["routing_state"],
         "legacy_target_ids": result["forwarder"].all_target_ids,
     }
+    assert isinstance(processing_queue, aismixer._BoundedProcessingQueue)
+    assert (
+        processing_queue.maxsize
+        == aismixer.DEFAULT_PROCESSING_QUEUE_MAXSIZE
+    )
+    assert processor_factory.args[0] is processing_queue
     assert processor_factory.keywords == {
         "processor": result["processor"],
     }
@@ -552,13 +560,143 @@ def _configure_main_lifecycle_test(
 
 def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
     async def scenario():
-        udp_socket = _MainTestSocket()
+        first_udp_socket = _MainTestSocket()
+        second_udp_socket = _MainTestSocket()
         supervision_calls = []
 
         async def fake_supervisor(task_specs):
             supervision_calls.append(tuple(task_specs))
 
         state, output_forwarder, processor = _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure_one",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10111,
+                },
+                {
+                    "id": "secure_two",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10112,
+                },
+            ),
+            udp_inputs=(
+                {
+                    "id": "plain_one",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10110,
+                },
+                {
+                    "id": "plain_two",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10113,
+                },
+            ),
+            sockets=(first_udp_socket, second_udp_socket),
+            supervisor=fake_supervisor,
+        )
+
+        await aismixer.main()
+
+        assert len(supervision_calls) == 1
+        specs = supervision_calls[0]
+        assert [spec.name for spec in specs] == [
+            "udpsec-ingress:0:secure_one",
+            "udpsec-ingress:1:secure_two",
+            "udp-ingress:0:plain_one",
+            "udp-ingress:1:plain_two",
+            "ingress-fan-in",
+            "processor-stage",
+            "egress-stage",
+        ]
+
+        secure_factories = tuple(
+            spec.coroutine_factory for spec in specs[:2]
+        )
+        udp_factories = tuple(
+            spec.coroutine_factory for spec in specs[2:4]
+        )
+        fan_in_factory = specs[4].coroutine_factory
+        processor_factory = specs[5].coroutine_factory
+        egress_factory = specs[6].coroutine_factory
+
+        assert all(
+            factory.func is aismixer.secure_server
+            for factory in secure_factories
+        )
+        assert [factory.args[1:] for factory in secure_factories] == [
+            ("127.0.0.1", 10111),
+            ("127.0.0.1", 10112),
+        ]
+        assert [
+            factory.keywords["sec_input_id"]
+            for factory in secure_factories
+        ] == ["secure_one", "secure_two"]
+        assert all(
+            factory.func is aismixer.handle_socket
+            for factory in udp_factories
+        )
+        assert [factory.args[0] for factory in udp_factories] == [
+            first_udp_socket,
+            second_udp_socket,
+        ]
+        assert [factory.args[2] for factory in udp_factories] == [
+            "plain_one",
+            "plain_two",
+        ]
+
+        input_queues = tuple(
+            factory.args[0] for factory in secure_factories
+        ) + tuple(factory.args[1] for factory in udp_factories)
+        assert len({id(queue) for queue in input_queues}) == 4
+        assert all(
+            isinstance(queue, asyncio.Queue)
+            and queue.maxsize == aismixer.DEFAULT_INGRESS_QUEUE_MAXSIZE
+            for queue in input_queues
+        )
+        assert fan_in_factory.func is aismixer.ingress_fan_in_loop
+        assert fan_in_factory.args[0] == input_queues
+        assert fan_in_factory.keywords == {
+            "routing_state": state,
+            "legacy_target_ids": output_forwarder.all_target_ids,
+        }
+        processing_queue = fan_in_factory.args[1]
+        assert isinstance(
+            processing_queue,
+            aismixer._BoundedProcessingQueue,
+        )
+        assert (
+            processing_queue.maxsize
+            == aismixer.DEFAULT_PROCESSING_QUEUE_MAXSIZE
+        )
+        assert processor_factory.func is aismixer.processor_stage_loop
+        assert processor_factory.args[0] is processing_queue
+        assert processor_factory.keywords == {
+            "processor": processor,
+        }
+        assert egress_factory.func is aismixer.egress_stage_loop
+        assert egress_factory.args[1] is output_forwarder
+        assert processor_factory.args[1] is egress_factory.args[0]
+        assert egress_factory.args[0].maxsize == 1
+        assert first_udp_socket.close_count == 1
+        assert second_udp_socket.close_count == 1
+        assert output_forwarder.close_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_main_accepts_explicit_capacities_with_isolated_input_queues(
+    monkeypatch,
+):
+    async def scenario():
+        udp_socket = _MainTestSocket()
+        supervision_calls = []
+
+        async def fake_supervisor(task_specs):
+            supervision_calls.append(tuple(task_specs))
+
+        _configure_main_lifecycle_test(
             monkeypatch,
             sec_inputs=(
                 {
@@ -578,47 +716,39 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
             supervisor=fake_supervisor,
         )
 
-        await aismixer.main()
+        await aismixer.main(
+            ingress_queue_maxsize=1,
+            processing_queue_maxsize=2,
+        )
 
-        assert len(supervision_calls) == 1
         specs = supervision_calls[0]
-        assert [spec.name for spec in specs] == [
-            "udpsec-ingress:0:secure_station",
-            "udp-ingress:0:plain_station",
-            "ingress-fan-in",
-            "processor-stage",
-            "egress-stage",
-        ]
-
-        secure_factory = specs[0].coroutine_factory
-        udp_factory = specs[1].coroutine_factory
+        secure_queue = specs[0].coroutine_factory.args[0]
+        udp_queue = specs[1].coroutine_factory.args[1]
         fan_in_factory = specs[2].coroutine_factory
         processor_factory = specs[3].coroutine_factory
-        egress_factory = specs[4].coroutine_factory
 
-        assert secure_factory.func is aismixer.secure_server
-        assert secure_factory.args[1:] == ("127.0.0.1", 10111)
-        assert secure_factory.keywords["sec_input_id"] == "secure_station"
-        assert udp_factory.func is aismixer.handle_socket
-        assert udp_factory.args[0] is udp_socket
-        assert udp_factory.args[2] == "plain_station"
-        assert fan_in_factory.func is aismixer.ingress_fan_in_loop
-        assert fan_in_factory.args[0] == (
-            secure_factory.args[0],
-            udp_factory.args[1],
+        assert secure_queue is not udp_queue
+        assert secure_queue.maxsize == 1
+        assert udp_queue.maxsize == 1
+        secure_queue.put_nowait(object())
+        blocked_secure_put = asyncio.create_task(
+            secure_queue.put(object())
         )
-        assert fan_in_factory.keywords == {
-            "routing_state": state,
-            "legacy_target_ids": output_forwarder.all_target_ids,
-        }
-        assert processor_factory.func is aismixer.processor_stage_loop
-        assert processor_factory.keywords == {
-            "processor": processor,
-        }
-        assert egress_factory.func is aismixer.egress_stage_loop
-        assert egress_factory.args[1] is output_forwarder
-        assert udp_socket.close_count == 1
-        assert output_forwarder.close_count == 1
+        await asyncio.sleep(0)
+        assert secure_queue.full()
+        assert not blocked_secure_put.done()
+        assert udp_queue.empty()
+        udp_queue.put_nowait(object())
+        assert udp_queue.full()
+
+        # Private capacity is isolated; this makes no admission-fairness claim.
+        secure_queue.get_nowait()
+        await blocked_secure_put
+        assert secure_queue.full()
+
+        processing_queue = fan_in_factory.args[1]
+        assert processing_queue.maxsize == 2
+        assert processor_factory.args[0] is processing_queue
 
     asyncio.run(scenario())
 
