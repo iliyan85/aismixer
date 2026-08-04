@@ -4,7 +4,13 @@ import gc
 import pytest
 
 import aismixer
-from core.data_plane import OutputBatch, ProcessorOutput
+from core.data_plane import (
+    DeduplicationMode,
+    OutputBatch,
+    ProcessingSnapshot,
+    ProcessingWorkItem,
+    ProcessorOutput,
+)
 from core.ingress_frame import IngressFrame
 
 
@@ -31,6 +37,17 @@ def output(message, *target_ids):
 
 def output_batch(*outputs):
     return OutputBatch(outputs)
+
+
+def processing_work_item(frame):
+    return ProcessingWorkItem(
+        frame=frame,
+        snapshot=ProcessingSnapshot(
+            routing_generation=0,
+            deduplication_mode=DeduplicationMode.GLOBAL,
+            target_ids=(),
+        ),
+    )
 
 
 async def wait_for_event(event):
@@ -289,7 +306,6 @@ def test_egress_failure_propagates_through_ack_and_cancels_ingress_side():
                         ingress_queue,
                         egress_queue,
                         processor=processor,
-                        legacy_target_ids=(),
                     ),
                 ),
                 make_spec(
@@ -310,7 +326,7 @@ def test_egress_failure_propagates_through_ack_and_cancels_ingress_side():
         await wait_for_event(ingress_queue.get_started)
         await wait_for_event(egress_queue.get_started)
         frame = make_frame("egress-failure")
-        await ingress_queue.put(frame)
+        await ingress_queue.put(processing_work_item(frame))
 
         with pytest.raises(RuntimeError) as exc_info:
             await supervisor
@@ -468,7 +484,6 @@ def test_external_cancellation_cleans_all_tasks_and_active_acknowledgement():
                         ingress_queue,
                         egress_queue,
                         processor=processor,
-                        legacy_target_ids=(),
                     ),
                 ),
                 make_spec(
@@ -488,7 +503,9 @@ def test_external_cancellation_cleans_all_tasks_and_active_acknowledgement():
         await wait_for_probes(*upstream.values())
         await wait_for_event(ingress_queue.get_started)
         await wait_for_event(egress_queue.get_started)
-        await ingress_queue.put(make_frame("cancel"))
+        await ingress_queue.put(
+            processing_work_item(make_frame("cancel"))
+        )
         await wait_for_event(output_forwarder.started)
 
         assert len(egress_queue.put_items) == 1
@@ -532,6 +549,7 @@ def test_fan_in_reader_failure_cancels_and_awaits_sibling_readers():
             aismixer.ingress_fan_in_loop(
                 (failing_queue, sibling_queue),
                 output_queue,
+                legacy_target_ids=(),
             ),
             name="test-fan-in-parent",
         )
@@ -567,7 +585,11 @@ def test_fan_in_reader_failure_cancels_and_awaits_sibling_readers():
 def test_empty_fan_in_remains_pending_and_cancels_cleanly():
     async def scenario():
         task = asyncio.create_task(
-            aismixer.ingress_fan_in_loop((), asyncio.Queue()),
+            aismixer.ingress_fan_in_loop(
+                (),
+                asyncio.Queue(),
+                legacy_target_ids=(),
+            ),
             name="test-empty-fan-in",
         )
         try:
@@ -614,7 +636,11 @@ def test_supervisor_with_empty_fan_in_stays_active_and_cancels_cleanly():
             nonlocal fan_in_task
             fan_in_task = asyncio.current_task()
             fan_in_started.set()
-            await aismixer.ingress_fan_in_loop((), asyncio.Queue())
+            await aismixer.ingress_fan_in_loop(
+                (),
+                asyncio.Queue(),
+                legacy_target_ids=(),
+            )
 
         supervisor = asyncio.create_task(
             aismixer._supervise_named_tasks(
@@ -686,7 +712,11 @@ def test_fan_in_parent_cancellation_cancels_and_awaits_all_readers():
     async def scenario():
         queues = (GetProbeQueue(), GetProbeQueue(), GetProbeQueue())
         parent = asyncio.create_task(
-            aismixer.ingress_fan_in_loop(queues, asyncio.Queue()),
+            aismixer.ingress_fan_in_loop(
+                queues,
+                asyncio.Queue(),
+                legacy_target_ids=(),
+            ),
             name="test-fan-in-parent",
         )
 
@@ -731,6 +761,7 @@ def test_fan_in_cleanup_retrieves_secondary_reader_exception():
             aismixer.ingress_fan_in_loop(
                 (primary_queue, secondary_queue),
                 asyncio.Queue(),
+                legacy_target_ids=(),
             ),
             name="test-fan-in-parent",
         )

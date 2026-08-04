@@ -6,7 +6,8 @@ import pytest
 import aismixer
 import core.ingress_frame as ingress_frame_module
 import core.python_data_plane as python_data_plane_module
-from assembler import AIVDMAssembler
+from assembler import AIVDMAssembler, AssemblyStatus
+from core.data_plane import DeduplicationMode, ProcessingWorkItem
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.event import IngressEvent
 from core.ingress_frame import (
@@ -111,6 +112,25 @@ class FakeClock:
 
     def __call__(self):
         return self.now
+
+
+class SignallingAssembler(AIVDMAssembler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._outcome_waiters = []
+
+    def expect_outcome(self):
+        waiter = asyncio.get_running_loop().create_future()
+        self._outcome_waiters.append(waiter)
+        return waiter
+
+    def feed_parsed_outcome(self, parsed):
+        outcome = super().feed_parsed_outcome(parsed)
+        if self._outcome_waiters:
+            waiter = self._outcome_waiters.pop(0)
+            if not waiter.done():
+                waiter.set_result(outcome)
+        return outcome
 
 
 def make_event(
@@ -410,21 +430,47 @@ def test_handle_socket_empty_ingress_policy_drops_all_packets(monkeypatch):
     assert queue.items == []
 
 
-def test_ingress_fan_in_loop_passes_queue_items_through_unchanged():
+def test_ingress_fan_in_loop_binds_frame_and_drops_unsupported(
+    monkeypatch,
+):
     async def run():
         input_queue = asyncio.Queue()
         output_queue = asyncio.Queue()
         frame = make_direct_frame(SENTENCE.encode("utf-8"))
         unsupported = object()
+        unsupported_coerced = asyncio.Event()
+        original_coercer = aismixer.coerce_ingress_frame
+
+        def recording_coercer(item):
+            result = original_coercer(item)
+            if item is unsupported:
+                unsupported_coerced.set()
+            return result
+
+        monkeypatch.setattr(
+            aismixer,
+            "coerce_ingress_frame",
+            recording_coercer,
+        )
         task = asyncio.create_task(
-            aismixer.ingress_fan_in_loop([input_queue], output_queue)
+            aismixer.ingress_fan_in_loop(
+                [input_queue],
+                output_queue,
+                legacy_target_ids=(4, 1),
+            )
         )
         try:
             await input_queue.put(frame)
             await input_queue.put(unsupported)
-            first = await asyncio.wait_for(output_queue.get(), timeout=0.5)
-            second = await asyncio.wait_for(output_queue.get(), timeout=0.5)
-            return frame, unsupported, first, second
+            work_item = await asyncio.wait_for(
+                output_queue.get(),
+                timeout=0.5,
+            )
+            await asyncio.wait_for(
+                unsupported_coerced.wait(),
+                timeout=0.5,
+            )
+            return frame, work_item, output_queue.empty()
         finally:
             task.cancel()
             try:
@@ -432,10 +478,17 @@ def test_ingress_fan_in_loop_passes_queue_items_through_unchanged():
             except asyncio.CancelledError:
                 pass
 
-    frame, unsupported, first, second = asyncio.run(run())
+    frame, work_item, output_queue_is_empty = asyncio.run(run())
 
-    assert first is frame
-    assert second is unsupported
+    assert isinstance(work_item, ProcessingWorkItem)
+    assert work_item.frame is frame
+    assert work_item.snapshot.routing_generation == 0
+    assert (
+        work_item.snapshot.deduplication_mode
+        is DeduplicationMode.GLOBAL
+    )
+    assert work_item.snapshot.target_ids == (4, 1)
+    assert output_queue_is_empty is True
 
 
 async def wait_for_sends(fake_forwarder, task, count, timeout=0.5):
@@ -2552,7 +2605,7 @@ def test_expired_generation_clears_multipart_s_context_before_fresh_state(
     monkeypatch,
 ):
     clock = FakeClock()
-    assembler_instance = AIVDMAssembler(timeout=1.0, clock=clock)
+    assembler_instance = SignallingAssembler(timeout=1.0, clock=clock)
     assembler_key = "shared-receiver"
     gid = "424242"
     old_first = make_nmea_sentence("AIVDM,2,1,7,A,11EXPO,0")
@@ -2569,17 +2622,26 @@ def test_expired_generation_clears_multipart_s_context_before_fresh_state(
             assembler_instance=assembler_instance,
         )
         try:
+            old_outcome = assembler_instance.expect_outcome()
             await queue.put(
                 make_event(old_arrival, assembler_key=assembler_key)
             )
-            await asyncio.sleep(0)
+            assert (
+                await asyncio.wait_for(old_outcome, timeout=0.5)
+            ).status is AssemblyStatus.PENDING
             assert fake_forwarder.messages == []
 
             clock.now = 1.0
+            fresh_second_outcome = assembler_instance.expect_outcome()
             await queue.put(
                 make_event(fresh_second_arrival, assembler_key=assembler_key)
             )
-            await asyncio.sleep(0)
+            assert (
+                await asyncio.wait_for(
+                    fresh_second_outcome,
+                    timeout=0.5,
+                )
+            ).status is AssemblyStatus.PENDING
             assert fake_forwarder.messages == []
 
             clock.now = 1.1
@@ -2610,7 +2672,7 @@ def test_expired_generation_clears_multipart_s_context_before_fresh_state(
 
 def test_expired_generation_clears_multipart_c_context(monkeypatch):
     clock = FakeClock()
-    assembler_instance = AIVDMAssembler(timeout=1.0, clock=clock)
+    assembler_instance = SignallingAssembler(timeout=1.0, clock=clock)
     assembler_key = "shared-receiver"
     group_id = "424242"
     old_first = make_nmea_sentence("AIVDM,2,1,7,A,11CEPO,0")
@@ -2626,20 +2688,29 @@ def test_expired_generation_clears_multipart_c_context(monkeypatch):
             assembler_instance=assembler_instance,
         )
         try:
+            old_outcome = assembler_instance.expect_outcome()
             await queue.put(
                 make_event(old_arrival, assembler_key=assembler_key)
             )
-            await asyncio.sleep(0)
+            assert (
+                await asyncio.wait_for(old_outcome, timeout=0.5)
+            ).status is AssemblyStatus.PENDING
             assert fake_forwarder.messages == []
 
             clock.now = 1.0
+            fresh_second_outcome = assembler_instance.expect_outcome()
             await queue.put(
                 make_event(
                     fresh_second_arrival,
                     assembler_key=assembler_key,
                 )
             )
-            await asyncio.sleep(0)
+            assert (
+                await asyncio.wait_for(
+                    fresh_second_outcome,
+                    timeout=0.5,
+                )
+            ).status is AssemblyStatus.PENDING
             assert fake_forwarder.messages == []
 
             clock.now = 1.1
@@ -2675,7 +2746,7 @@ def test_expired_generation_clears_multipart_c_context(monkeypatch):
 
 def test_expired_generation_clears_multipart_gid_context(monkeypatch):
     clock = FakeClock()
-    assembler_instance = AIVDMAssembler(timeout=1.0, clock=clock)
+    assembler_instance = SignallingAssembler(timeout=1.0, clock=clock)
     assembler_key = "shared-receiver"
     old_first = make_nmea_sentence("AIVDM,2,1,7,A,11GEPO,0")
     fresh_first = make_nmea_sentence("AIVDM,2,1,7,A,11GEPN,0")
@@ -2689,17 +2760,26 @@ def test_expired_generation_clears_multipart_gid_context(monkeypatch):
             gid_generator=lambda _digits: "999999",
         )
         try:
+            old_outcome = assembler_instance.expect_outcome()
             await queue.put(
                 make_event(old_arrival, assembler_key=assembler_key)
             )
-            await asyncio.sleep(0)
+            assert (
+                await asyncio.wait_for(old_outcome, timeout=0.5)
+            ).status is AssemblyStatus.PENDING
             assert fake_forwarder.messages == []
 
             clock.now = 1.0
+            fresh_second_outcome = assembler_instance.expect_outcome()
             await queue.put(
                 make_event(fresh_second, assembler_key=assembler_key)
             )
-            await asyncio.sleep(0)
+            assert (
+                await asyncio.wait_for(
+                    fresh_second_outcome,
+                    timeout=0.5,
+                )
+            ).status is AssemblyStatus.PENDING
             assert fake_forwarder.messages == []
 
             clock.now = 1.1
@@ -3512,6 +3592,116 @@ def test_forward_loop_replacement_between_events_uses_new_snapshot(monkeypatch):
         (2,),
         (3,),
     ]
+
+
+def test_multipart_completion_uses_new_bound_snapshot_without_reset():
+    async def run():
+        multipart_forwarded = asyncio.Event()
+
+        class RecordingProcessor(PythonDataPlaneProcessor):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.calls = []
+                self.reset_calls = 0
+
+            def process(self, frame, snapshot):
+                self.calls.append((frame, snapshot))
+                return super().process(frame, snapshot)
+
+            def reset(self):
+                self.reset_calls += 1
+                return super().reset()
+
+        send_count = 0
+
+        def observe_send(_target_ids, _message):
+            nonlocal send_count
+            send_count += 1
+            if send_count == 2:
+                multipart_forwarded.set()
+
+        assembler = SignallingAssembler()
+        deduplicator = Deduplicator(clock=lambda: 0.0)
+        processor = RecordingProcessor(
+            station_id="test_station",
+            assembler=assembler,
+            deduplicator=deduplicator,
+            wall_clock=lambda: 1_700_000_000,
+            gid_generator=lambda _digits: "999999",
+        )
+        routing_state = RoutingState(
+            make_single_target_table("udp:first")
+        )
+        fake_forwarder = FakeForwarder(on_send_to=observe_send)
+        ingress_queue = asyncio.Queue()
+        task = asyncio.create_task(
+            aismixer._run_runtime_stages(
+                ingress_queue,
+                asyncio.Queue(maxsize=1),
+                routing_state=routing_state,
+                processor=processor,
+                legacy_target_ids=fake_forwarder.all_target_ids,
+                output_forwarder=fake_forwarder,
+                debug=False,
+                timestamp=aismixer.ts,
+            )
+        )
+        try:
+            first_outcome = assembler.expect_outcome()
+            await ingress_queue.put(
+                make_event(
+                    MULTIPART_FIRST,
+                    source_id="udp:source_a",
+                    assembler_key="cross-generation",
+                )
+            )
+            assert (
+                await asyncio.wait_for(first_outcome, timeout=0.5)
+            ).status is AssemblyStatus.PENDING
+
+            routing_state.replace(
+                make_single_target_table("udp:second")
+            )
+            await ingress_queue.put(
+                make_event(
+                    MULTIPART_SECOND,
+                    source_id="udp:source_a",
+                    assembler_key="cross-generation",
+                )
+            )
+            await asyncio.wait_for(
+                multipart_forwarded.wait(),
+                timeout=0.5,
+            )
+        finally:
+            await cancel_task(task)
+
+        return processor, assembler, deduplicator, fake_forwarder
+
+    processor, assembler, deduplicator, fake_forwarder = asyncio.run(run())
+
+    assert len(processor.calls) == 2
+    first_snapshot = processor.calls[0][1]
+    completion_snapshot = processor.calls[1][1]
+    assert first_snapshot.routing_generation == 0
+    assert first_snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
+    assert first_snapshot.target_ids == (2,)
+    assert completion_snapshot.routing_generation == 1
+    assert (
+        completion_snapshot.deduplication_mode
+        is DeduplicationMode.PER_TARGET
+    )
+    assert completion_snapshot.target_ids == (3,)
+    assert [
+        target_ids
+        for target_ids, _message in fake_forwarder.targeted_messages
+    ] == [(3,), (3,)]
+    assert fake_forwarder.messages == []
+    assert processor.reset_calls == 0
+    assert assembler.stats().completed == 1
+    assert assembler.stats().resets == 0
+    assert deduplicator.stats().accepted == 1
+    assert deduplicator.stats().resets == 0
 
 
 def test_forward_loop_mid_event_replacement_affects_next_event_only(monkeypatch):

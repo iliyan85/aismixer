@@ -60,6 +60,20 @@ class ProcessingSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessingWorkItem:
+    """Immutable ingress-to-processor handoff with routing resolved."""
+
+    frame: IngressFrame
+    snapshot: ProcessingSnapshot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.frame, IngressFrame):
+            raise TypeError("frame must be an IngressFrame.")
+        if not isinstance(self.snapshot, ProcessingSnapshot):
+            raise TypeError("snapshot must be a ProcessingSnapshot.")
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessorOutput:
     """One fully formatted message and its explicit numeric targets.
 

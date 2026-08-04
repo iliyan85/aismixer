@@ -41,16 +41,6 @@ def output_batch(*outputs):
     return OutputBatch(outputs)
 
 
-class FiniteQueue:
-    def __init__(self, *items):
-        self._items = list(items)
-
-    async def get(self):
-        if self._items:
-            return self._items.pop(0)
-        raise asyncio.CancelledError()
-
-
 class RecordingRoutingState:
     def __init__(self, snapshot):
         self._snapshot = snapshot
@@ -65,9 +55,12 @@ class ScriptedProcessor:
     def __init__(self, *batches):
         self._batches = list(batches)
         self.calls = []
+        self.processed = None
 
     def process(self, frame, snapshot):
         self.calls.append((frame, snapshot))
+        if self.processed is not None:
+            self.processed.set()
         return (
             self._batches.pop(0)
             if self._batches
@@ -80,11 +73,14 @@ class CompletionRecordingProcessor:
         self._delegate = delegate
         self.completed = False
         self.outputs = None
+        self.processed = None
 
     def process(self, frame, snapshot):
         outputs = self._delegate.process(frame, snapshot)
         self.outputs = outputs
         self.completed = True
+        if self.processed is not None:
+            self.processed.set()
         return outputs
 
 
@@ -102,12 +98,15 @@ class RecordingForwarder:
     def __init__(self, fail_at=None):
         self.events = []
         self._fail_at = fail_at
+        self.sent = None
 
     async def send(self, _message):
         raise AssertionError("production egress called compatibility send()")
 
     async def send_to_ids(self, target_ids, message):
         self.events.append(("numeric", tuple(target_ids), message))
+        if self.sent is not None:
+            self.sent.set()
         self._raise_if_requested()
 
     async def send_to(self, _target_ids, _message):
@@ -137,6 +136,7 @@ class BoundaryObservingForwarder:
         self._fail_first = fail_first
         self.observations = []
         self.attempted_messages = []
+        self.sent = None
 
     async def send(self, _message):
         raise AssertionError("production egress called compatibility send()")
@@ -154,6 +154,8 @@ class BoundaryObservingForwarder:
             }
         )
         self.attempted_messages.append(message)
+        if self.sent is not None:
+            self.sent.set()
         if self._fail_first and len(self.attempted_messages) == 1:
             raise RuntimeError("send failed")
 
@@ -177,6 +179,19 @@ async def run_runtime_stages(
         output_forwarder=output_forwarder,
         debug=False,
     )
+
+
+async def cancel_task(task):
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def wait_for_count(items, changed, expected_count):
+    while len(items) < expected_count:
+        changed.clear()
+        if len(items) >= expected_count:
+            break
+        await asyncio.wait_for(changed.wait(), timeout=1)
 
 
 def make_boundary_processor():
@@ -219,208 +234,240 @@ def make_boundary_processor():
 
 
 def test_invalid_item_is_ignored_before_snapshot_and_processing_then_loop_continues():
-    frame = make_frame()
-    state = RecordingRoutingState(
-        RoutingSnapshot(generation=7, table=None)
-    )
-    processor = ScriptedProcessor(output_batch())
-    output_forwarder = RecordingForwarder()
-
-    with pytest.raises(
-        RuntimeError,
-        match="processor-stage.*cancelled unexpectedly",
-    ):
-        asyncio.run(
+    async def scenario():
+        frame = make_frame()
+        state = RecordingRoutingState(
+            RoutingSnapshot(generation=7, table=None)
+        )
+        processor = ScriptedProcessor(output_batch())
+        processor.processed = asyncio.Event()
+        output_forwarder = RecordingForwarder()
+        ingress_queue = asyncio.Queue()
+        task = asyncio.create_task(
             run_runtime_stages(
-                FiniteQueue(object(), frame),
+                ingress_queue,
                 processor=processor,
                 output_forwarder=output_forwarder,
                 routing_state=state,
             )
         )
+        try:
+            await ingress_queue.put(object())
+            await ingress_queue.put(frame)
+            await asyncio.wait_for(processor.processed.wait(), timeout=1)
+        finally:
+            await cancel_task(task)
 
-    assert state.snapshot_calls == 1
-    assert len(processor.calls) == 1
-    processed_frame, snapshot = processor.calls[0]
-    assert processed_frame is frame
-    assert snapshot.routing_generation == 7
-    assert snapshot.deduplication_mode is DeduplicationMode.GLOBAL
-    assert snapshot.target_ids == ()
+        assert state.snapshot_calls == 1
+        assert len(processor.calls) == 1
+        processed_frame, snapshot = processor.calls[0]
+        assert processed_frame is frame
+        assert snapshot.routing_generation == 7
+        assert snapshot.deduplication_mode is DeduplicationMode.GLOBAL
+        assert snapshot.target_ids == ()
+
+    asyncio.run(scenario())
 
 
 def test_processor_is_called_once_and_outputs_are_dispatched_sequentially():
-    frame = make_frame()
-    state = RecordingRoutingState(
-        RoutingSnapshot(generation=3, table=None)
-    )
-    processor = ScriptedProcessor(
-        output_batch(
-            output("first", 0),
-            output("second", 2, 1),
+    async def scenario():
+        frame = make_frame()
+        state = RecordingRoutingState(
+            RoutingSnapshot(generation=3, table=None)
         )
-    )
-    forwarder = RecordingForwarder()
-
-    with pytest.raises(
-        RuntimeError,
-        match="processor-stage.*cancelled unexpectedly",
-    ):
-        asyncio.run(
+        processor = ScriptedProcessor(
+            output_batch(
+                output("first", 0),
+                output("second", 2, 1),
+            )
+        )
+        forwarder = RecordingForwarder()
+        forwarder.sent = asyncio.Event()
+        ingress_queue = asyncio.Queue()
+        task = asyncio.create_task(
             run_runtime_stages(
-                FiniteQueue(frame),
+                ingress_queue,
                 processor=processor,
                 output_forwarder=forwarder,
                 routing_state=state,
             )
         )
+        try:
+            await ingress_queue.put(frame)
+            await wait_for_count(forwarder.events, forwarder.sent, 2)
+        finally:
+            await cancel_task(task)
 
-    assert state.snapshot_calls == 1
-    assert len(processor.calls) == 1
-    assert forwarder.events == [
-        ("numeric", (0,), b"first\r\n"),
-        (
-            "numeric",
-            (2, 1),
-            b"second\r\n",
-        ),
-    ]
+        assert state.snapshot_calls == 1
+        assert len(processor.calls) == 1
+        assert forwarder.events == [
+            ("numeric", (0,), b"first\r\n"),
+            (
+                "numeric",
+                (2, 1),
+                b"second\r\n",
+            ),
+        ]
+
+    asyncio.run(scenario())
 
 
 def test_dispatch_failure_stops_before_later_output_dispatch():
-    processor = ScriptedProcessor(
-        output_batch(
-            output("first", 0),
-            output("second", 0),
+    async def scenario():
+        processor = ScriptedProcessor(
+            output_batch(
+                output("first", 0),
+                output("second", 0),
+            )
         )
-    )
-    forwarder = RecordingForwarder(fail_at=1)
-
-    with pytest.raises(RuntimeError, match="send failed"):
-        asyncio.run(
+        forwarder = RecordingForwarder(fail_at=1)
+        ingress_queue = asyncio.Queue()
+        task = asyncio.create_task(
             run_runtime_stages(
-                FiniteQueue(make_frame()),
+                ingress_queue,
                 processor=processor,
                 output_forwarder=forwarder,
             )
         )
+        await ingress_queue.put(make_frame())
 
-    assert len(processor.calls) == 1
-    assert forwarder.events == [("numeric", (0,), b"first\r\n")]
+        with pytest.raises(RuntimeError, match="send failed"):
+            await task
+
+        assert len(processor.calls) == 1
+        assert forwarder.events == [("numeric", (0,), b"first\r\n")]
+
+    asyncio.run(scenario())
 
 
 def test_whole_frame_processing_and_effects_complete_before_ordered_egress():
-    (
-        processor,
-        deduplicator,
-        touched_s_values,
-        clock_observations,
-        gid_observations,
-    ) = make_boundary_processor()
-    forwarder = BoundaryObservingForwarder(
-        processor,
-        deduplicator,
-        touched_s_values,
-        clock_observations,
-        gid_observations,
-    )
-    frame = make_frame(
-        (FIRST_SENTENCE + "\n" + SECOND_SENTENCE).encode("ascii")
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match="processor-stage.*cancelled unexpectedly",
-    ):
-        asyncio.run(
+    async def scenario():
+        (
+            processor,
+            deduplicator,
+            touched_s_values,
+            clock_observations,
+            gid_observations,
+        ) = make_boundary_processor()
+        forwarder = BoundaryObservingForwarder(
+            processor,
+            deduplicator,
+            touched_s_values,
+            clock_observations,
+            gid_observations,
+        )
+        forwarder.sent = asyncio.Event()
+        frame = make_frame(
+            (FIRST_SENTENCE + "\n" + SECOND_SENTENCE).encode("ascii")
+        )
+        ingress_queue = asyncio.Queue()
+        task = asyncio.create_task(
             run_runtime_stages(
-                FiniteQueue(frame),
+                ingress_queue,
                 processor=processor,
                 output_forwarder=forwarder,
             )
         )
+        try:
+            await ingress_queue.put(frame)
+            await wait_for_count(
+                forwarder.attempted_messages,
+                forwarder.sent,
+                2,
+            )
+        finally:
+            await cancel_task(task)
 
-    output_batch_result = processor.outputs
-    assert processor.completed is True
-    assert isinstance(output_batch_result, OutputBatch)
-    assert len(output_batch_result.outputs) == 2
-    assert output_batch_result.outputs[0].message.endswith(
-        (FIRST_SENTENCE + "\r\n").encode("ascii")
-    )
-    assert output_batch_result.outputs[1].message.endswith(
-        (SECOND_SENTENCE + "\r\n").encode("ascii")
-    )
+        output_batch_result = processor.outputs
+        assert processor.completed is True
+        assert isinstance(output_batch_result, OutputBatch)
+        assert len(output_batch_result.outputs) == 2
+        assert output_batch_result.outputs[0].message.endswith(
+            (FIRST_SENTENCE + "\r\n").encode("ascii")
+        )
+        assert output_batch_result.outputs[1].message.endswith(
+            (SECOND_SENTENCE + "\r\n").encode("ascii")
+        )
 
-    first_send = forwarder.observations[0]
-    assert first_send == {
-        "processor_completed": True,
-        "outputs": output_batch_result,
-        "target_ids": (),
-        "dedup_stats": deduplicator.stats(),
-        "touched_s_values": ("boundary", "boundary"),
-        "clock_observations": (1001.9, 1002.9),
-        "gid_observations": (
-            (6, "111111"),
-            (6, "222222"),
-        ),
-    }
-    assert first_send["dedup_stats"].accepted == 2
-    assert forwarder.attempted_messages == [
-        output.message for output in output_batch_result.outputs
-    ]
+        first_send = forwarder.observations[0]
+        assert first_send == {
+            "processor_completed": True,
+            "outputs": output_batch_result,
+            "target_ids": (),
+            "dedup_stats": deduplicator.stats(),
+            "touched_s_values": ("boundary", "boundary"),
+            "clock_observations": (1001.9, 1002.9),
+            "gid_observations": (
+                (6, "111111"),
+                (6, "222222"),
+            ),
+        }
+        assert first_send["dedup_stats"].accepted == 2
+        assert forwarder.attempted_messages == [
+            output.message for output in output_batch_result.outputs
+        ]
+
+    asyncio.run(scenario())
 
 
 def test_first_send_failure_keeps_completed_effects_and_later_output():
-    (
-        processor,
-        deduplicator,
-        touched_s_values,
-        clock_observations,
-        gid_observations,
-    ) = make_boundary_processor()
-    forwarder = BoundaryObservingForwarder(
-        processor,
-        deduplicator,
-        touched_s_values,
-        clock_observations,
-        gid_observations,
-        fail_first=True,
-    )
-    frame = make_frame(
-        (FIRST_SENTENCE + "\n" + SECOND_SENTENCE).encode("ascii")
-    )
-
-    with pytest.raises(RuntimeError, match="send failed"):
-        asyncio.run(
+    async def scenario():
+        (
+            processor,
+            deduplicator,
+            touched_s_values,
+            clock_observations,
+            gid_observations,
+        ) = make_boundary_processor()
+        forwarder = BoundaryObservingForwarder(
+            processor,
+            deduplicator,
+            touched_s_values,
+            clock_observations,
+            gid_observations,
+            fail_first=True,
+        )
+        frame = make_frame(
+            (FIRST_SENTENCE + "\n" + SECOND_SENTENCE).encode("ascii")
+        )
+        ingress_queue = asyncio.Queue()
+        task = asyncio.create_task(
             run_runtime_stages(
-                FiniteQueue(frame),
+                ingress_queue,
                 processor=processor,
                 output_forwarder=forwarder,
             )
         )
+        await ingress_queue.put(frame)
 
-    output_batch_result = processor.outputs
-    assert processor.completed is True
-    assert isinstance(output_batch_result, OutputBatch)
-    assert len(output_batch_result.outputs) == 2
-    assert output_batch_result.outputs[0].message.endswith(
-        (FIRST_SENTENCE + "\r\n").encode("ascii")
-    )
-    assert output_batch_result.outputs[1].message.endswith(
-        (SECOND_SENTENCE + "\r\n").encode("ascii")
-    )
-    assert forwarder.attempted_messages == [
-        output_batch_result.outputs[0].message
-    ]
+        with pytest.raises(RuntimeError, match="send failed"):
+            await task
 
-    assert touched_s_values == ["boundary", "boundary"]
-    assert clock_observations == [1001.9, 1002.9]
-    assert gid_observations == [
-        (6, "111111"),
-        (6, "222222"),
-    ]
-    assert deduplicator.stats().accepted == 2
-    assert (
-        forwarder.observations[0]["outputs"]
-        is output_batch_result
-    )
-    assert forwarder.observations[0]["target_ids"] == ()
+        output_batch_result = processor.outputs
+        assert processor.completed is True
+        assert isinstance(output_batch_result, OutputBatch)
+        assert len(output_batch_result.outputs) == 2
+        assert output_batch_result.outputs[0].message.endswith(
+            (FIRST_SENTENCE + "\r\n").encode("ascii")
+        )
+        assert output_batch_result.outputs[1].message.endswith(
+            (SECOND_SENTENCE + "\r\n").encode("ascii")
+        )
+        assert forwarder.attempted_messages == [
+            output_batch_result.outputs[0].message
+        ]
+
+        assert touched_s_values == ["boundary", "boundary"]
+        assert clock_observations == [1001.9, 1002.9]
+        assert gid_observations == [
+            (6, "111111"),
+            (6, "222222"),
+        ]
+        assert deduplicator.stats().accepted == 2
+        assert (
+            forwarder.observations[0]["outputs"]
+            is output_batch_result
+        )
+        assert forwarder.observations[0]["target_ids"] == ()
+
+    asyncio.run(scenario())

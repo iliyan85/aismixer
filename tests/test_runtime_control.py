@@ -6,6 +6,7 @@ import pytest
 
 import aismixer
 from assembler import AIVDMAssembler
+from core.data_plane import DeduplicationMode
 from core.event import IngressEvent
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.routing_control_protocol import ROUTING_CONTROL_PROTOCOL_VERSION
@@ -25,6 +26,7 @@ from dedup import Deduplicator
 
 SENTENCE = "!AIVDM,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*5C"
 SECOND_SENTENCE = "!AIVDM,1,1,,B,25Muq?002>G?svP00<:O?vN60<0,0*00"
+THIRD_SENTENCE = "!AIVDM,1,1,,A,35Muq?002>G?svP00<:O?vN60<0,0*00"
 
 HAS_UNIX_SOCKETS = (
     hasattr(socket, "AF_UNIX")
@@ -385,12 +387,15 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
         "processor-stage",
         "egress-stage",
     )
+    fan_in_factory = specs["ingress-fan-in"].coroutine_factory
     processor_factory = specs["processor-stage"].coroutine_factory
     egress_factory = specs["egress-stage"].coroutine_factory
-    assert processor_factory.keywords == {
+    assert fan_in_factory.keywords == {
         "routing_state": result["routing_state"],
-        "processor": result["processor"],
         "legacy_target_ids": result["forwarder"].all_target_ids,
+    }
+    assert processor_factory.keywords == {
+        "processor": result["processor"],
     }
     assert result["processor_factory_calls"] == [None]
     assert egress_factory.args[1] is result["forwarder"]
@@ -602,11 +607,13 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
             secure_factory.args[0],
             udp_factory.args[1],
         )
+        assert fan_in_factory.keywords == {
+            "routing_state": state,
+            "legacy_target_ids": output_forwarder.all_target_ids,
+        }
         assert processor_factory.func is aismixer.processor_stage_loop
         assert processor_factory.keywords == {
-            "routing_state": state,
             "processor": processor,
-            "legacy_target_ids": output_forwarder.all_target_ids,
         }
         assert egress_factory.func is aismixer.egress_stage_loop
         assert egress_factory.args[1] is output_forwarder
@@ -714,13 +721,15 @@ def make_event(raw_line, source_id="udp:source"):
 
 
 class IntegrationForwarder:
-    all_target_ids = (0,)
-    target_id_by_name = {"udp:target": 0}
-    target_ids = ("udp:target",)
+    all_target_ids = (0, 1)
+    target_id_by_name = {"udp:target": 1}
+    target_ids = ("udp:legacy", "udp:target")
 
     def __init__(self):
         self.targeted_messages = []
         self.targeted_event = asyncio.Event()
+        self.first_send_started = asyncio.Event()
+        self.release_first_send = asyncio.Event()
 
     async def send(self, _message):
         raise AssertionError("runtime egress must use numeric target IDs")
@@ -728,17 +737,57 @@ class IntegrationForwarder:
     async def send_to_ids(self, target_ids, message):
         self.targeted_messages.append((tuple(target_ids), message))
         self.targeted_event.set()
+        if len(self.targeted_messages) == 1:
+            self.first_send_started.set()
+            await self.release_first_send.wait()
 
     async def send_to(self, _target_ids, _message):
         raise AssertionError("runtime targeted egress must use numeric target IDs")
 
 
 @unix_socket_test
-def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
+def test_runtime_control_unix_stack_updates_staged_routing(
+    tmp_path,
+    monkeypatch,
+):
     async def scenario():
         path = tmp_path / "control.sock"
         routing_state = RoutingState()
         fake_forwarder = IntegrationForwarder()
+        bound_work_items = []
+        work_item_bound = asyncio.Event()
+        original_bind = aismixer._bind_processing_work_item
+
+        def observe_bind(*args, **kwargs):
+            work_item = original_bind(*args, **kwargs)
+            if work_item is not None:
+                bound_work_items.append(work_item)
+                work_item_bound.set()
+            return work_item
+
+        monkeypatch.setattr(
+            aismixer,
+            "_bind_processing_work_item",
+            observe_bind,
+        )
+
+        async def wait_for_bound_count(expected_count):
+            while len(bound_work_items) < expected_count:
+                work_item_bound.clear()
+                if len(bound_work_items) >= expected_count:
+                    break
+                await asyncio.wait_for(work_item_bound.wait(), timeout=1)
+
+        async def wait_for_send_count(expected_count):
+            while len(fake_forwarder.targeted_messages) < expected_count:
+                fake_forwarder.targeted_event.clear()
+                if len(fake_forwarder.targeted_messages) >= expected_count:
+                    break
+                await asyncio.wait_for(
+                    fake_forwarder.targeted_event.wait(),
+                    timeout=1,
+                )
+
         config = enabled_config(socket_path=str(path))
         server = build_optional_routing_control_server(
             config,
@@ -747,7 +796,7 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
         )
         assert isinstance(server, RoutingControlUnixServer)
 
-        processor = PythonDataPlaneProcessor(
+        processor_delegate = PythonDataPlaneProcessor(
             station_id="test_station",
             preserve_ingress_c=True,
             preserve_ingress_gid=True,
@@ -755,6 +804,20 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
             assembler=AIVDMAssembler(),
             deduplicator=Deduplicator(),
         )
+
+        class ResetRecordingProcessor:
+            def __init__(self, delegate):
+                self._delegate = delegate
+                self.reset_calls = 0
+
+            def process(self, frame, snapshot):
+                return self._delegate.process(frame, snapshot)
+
+            def reset(self):
+                self.reset_calls += 1
+                return self._delegate.reset()
+
+        processor = ResetRecordingProcessor(processor_delegate)
 
         await server.start()
         client = RoutingControlUnixClient(path)
@@ -800,8 +863,13 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
             )
 
             await ingress_queue.put(make_event(SENTENCE))
-            await asyncio.wait_for(fake_forwarder.targeted_event.wait(), timeout=1)
-            fake_forwarder.targeted_event.clear()
+            await asyncio.wait_for(
+                fake_forwarder.first_send_started.wait(),
+                timeout=1,
+            )
+
+            await ingress_queue.put(make_event(SECOND_SENTENCE))
+            await wait_for_bound_count(2)
 
             disable = await client.request(
                 {
@@ -812,9 +880,14 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
                 }
             )
 
-            await ingress_queue.put(make_event(SECOND_SENTENCE))
-            await asyncio.wait_for(fake_forwarder.targeted_event.wait(), timeout=1)
+            await ingress_queue.put(make_event(THIRD_SENTENCE))
+            await wait_for_bound_count(3)
+
+            assert len(fake_forwarder.targeted_messages) == 1
+            fake_forwarder.release_first_send.set()
+            await wait_for_send_count(3)
         finally:
+            fake_forwarder.release_first_send.set()
             runtime_task.cancel()
             await asyncio.gather(runtime_task, return_exceptions=True)
             await server.close()
@@ -824,9 +897,22 @@ def test_runtime_control_unix_stack_updates_staged_routing(tmp_path):
         assert routing_state.snapshot().generation == 2
         assert disable["result"]["generation"] == 2
         assert [
+            (
+                work_item.snapshot.routing_generation,
+                work_item.snapshot.deduplication_mode,
+                work_item.snapshot.target_ids,
+            )
+            for work_item in bound_work_items
+        ] == [
+            (1, DeduplicationMode.PER_TARGET, (1,)),
+            (1, DeduplicationMode.PER_TARGET, (1,)),
+            (2, DeduplicationMode.GLOBAL, (0, 1)),
+        ]
+        assert [
             target_ids
             for target_ids, _message in fake_forwarder.targeted_messages
-        ] == [(0,), (0,)]
+        ] == [(1,), (1,), (0, 1)]
+        assert processor.reset_calls == 0
         assert not path.exists()
 
     asyncio.run(scenario())

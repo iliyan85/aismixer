@@ -11,6 +11,7 @@ from core.data_plane import (
     DeduplicationMode,
     OutputBatch,
     ProcessingSnapshot,
+    ProcessingWorkItem,
 )
 from core.ingress_frame import (
     coerce_ingress_frame,
@@ -196,13 +197,70 @@ async def _supervise_named_tasks(task_specs):
         await _cancel_and_await_tasks(tasks)
 
 
-async def ingress_fan_in_loop(input_queues, output_queue):
-    """Preserve queue identity while owning every private reader task."""
+def _bind_processing_work_item(
+    item,
+    *,
+    routing_state=None,
+    legacy_target_ids,
+):
+    """Coerce one raw ingress item and bind its target-only snapshot."""
+
+    frame = coerce_ingress_frame(item)
+    if frame is None:
+        return None
+
+    if routing_state is None:
+        routing_generation = 0
+        routing_table = None
+    else:
+        routing_snapshot = routing_state.snapshot()
+        routing_generation = routing_snapshot.generation
+        routing_table = routing_snapshot.table
+
+    if routing_table is None:
+        processing_snapshot = ProcessingSnapshot(
+            routing_generation=routing_generation,
+            deduplication_mode=DeduplicationMode.GLOBAL,
+            target_ids=legacy_target_ids,
+        )
+    else:
+        processing_snapshot = ProcessingSnapshot(
+            routing_generation=routing_generation,
+            deduplication_mode=DeduplicationMode.PER_TARGET,
+            target_ids=routing_table.match_target_ids(frame.source_id),
+        )
+
+    return ProcessingWorkItem(
+        frame=frame,
+        snapshot=processing_snapshot,
+    )
+
+
+async def ingress_fan_in_loop(
+    input_queues,
+    output_queue,
+    *,
+    routing_state=None,
+    legacy_target_ids,
+):
+    """Bind accepted ingress items while owning every private reader task."""
+
+    if isinstance(legacy_target_ids, (str, bytes)):
+        raise TypeError(
+            "legacy_target_ids must be a non-string iterable"
+        )
+    legacy_target_ids = tuple(legacy_target_ids)
 
     async def reader(q):
         while True:
             item = await q.get()
-            await output_queue.put(item)
+            work_item = _bind_processing_work_item(
+                item,
+                routing_state=routing_state,
+                legacy_target_ids=legacy_target_ids,
+            )
+            if work_item is not None:
+                await output_queue.put(work_item)
 
     if not input_queues:
         await asyncio.get_running_loop().create_future()
@@ -231,46 +289,24 @@ def compile_input_policies(entries, kind):
 
 
 async def processor_stage_loop(
-    ingress_queue,
+    processing_queue,
     egress_queue,
     *,
-    routing_state=None,
     processor,
-    legacy_target_ids,
 ):
-    """Process one accepted frame and await its egress completion barrier."""
-
-    if not isinstance(legacy_target_ids, (str, bytes)):
-        legacy_target_ids = tuple(legacy_target_ids)
+    """Process one bound work item and await its egress completion barrier."""
 
     while True:
-        item = await ingress_queue.get()
-        frame = coerce_ingress_frame(item)
-        if frame is None:
-            continue
-
-        if routing_state is None:
-            routing_generation = 0
-            routing_table = None
-        else:
-            routing_snapshot = routing_state.snapshot()
-            routing_generation = routing_snapshot.generation
-            routing_table = routing_snapshot.table
-
-        if routing_table is None:
-            processing_snapshot = ProcessingSnapshot(
-                routing_generation=routing_generation,
-                deduplication_mode=DeduplicationMode.GLOBAL,
-                target_ids=legacy_target_ids,
-            )
-        else:
-            processing_snapshot = ProcessingSnapshot(
-                routing_generation=routing_generation,
-                deduplication_mode=DeduplicationMode.PER_TARGET,
-                target_ids=routing_table.match_target_ids(frame.source_id),
+        work_item = await processing_queue.get()
+        if not isinstance(work_item, ProcessingWorkItem):
+            raise TypeError(
+                "processor queue item must be a ProcessingWorkItem"
             )
 
-        output_batch = processor.process(frame, processing_snapshot)
+        output_batch = processor.process(
+            work_item.frame,
+            work_item.snapshot,
+        )
         if not output_batch.outputs:
             continue
 
@@ -340,19 +376,29 @@ async def _run_runtime_stages(
     debug=False,
     timestamp=None,
 ):
-    """Run exactly one processor stage and one egress stage as one lifecycle."""
+    """Run one ingress binding, processor, and egress lifecycle."""
+
+    processing_queue = asyncio.Queue()
 
     await _supervise_named_tasks(
         (
             _RuntimeTaskSpec(
+                name="ingress-fan-in",
+                coroutine_factory=partial(
+                    ingress_fan_in_loop,
+                    (ingress_queue,),
+                    processing_queue,
+                    routing_state=routing_state,
+                    legacy_target_ids=legacy_target_ids,
+                ),
+            ),
+            _RuntimeTaskSpec(
                 name="processor-stage",
                 coroutine_factory=partial(
                     processor_stage_loop,
-                    ingress_queue,
+                    processing_queue,
                     egress_queue,
-                    routing_state=routing_state,
                     processor=processor,
-                    legacy_target_ids=legacy_target_ids,
                 ),
             ),
             _RuntimeTaskSpec(
@@ -501,6 +547,8 @@ async def main():
                         ingress_fan_in_loop,
                         tuple(input_queues),
                         processor_queue,
+                        routing_state=routing_state,
+                        legacy_target_ids=forwarder.all_target_ids,
                     ),
                 ),
                 _RuntimeTaskSpec(
@@ -509,9 +557,7 @@ async def main():
                         processor_stage_loop,
                         processor_queue,
                         egress_queue,
-                        routing_state=routing_state,
                         processor=processor,
-                        legacy_target_ids=forwarder.all_target_ids,
                     ),
                 ),
                 _RuntimeTaskSpec(

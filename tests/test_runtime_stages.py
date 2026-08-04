@@ -7,6 +7,8 @@ import aismixer
 from core.data_plane import (
     DeduplicationMode,
     OutputBatch,
+    ProcessingSnapshot,
+    ProcessingWorkItem,
     ProcessorOutput,
 )
 from core.ingress_frame import IngressFrame
@@ -23,6 +25,23 @@ def make_frame(label):
         remote_ip="192.0.2.10",
         assembler_key=f"192.0.2.10:{label}",
         payload=f"!AIVDM,1,1,,A,{label},0*00".encode("ascii"),
+    )
+
+
+def make_work_item(
+    frame,
+    *,
+    generation=0,
+    mode=DeduplicationMode.GLOBAL,
+    target_ids=(),
+):
+    return ProcessingWorkItem(
+        frame=frame,
+        snapshot=ProcessingSnapshot(
+            routing_generation=generation,
+            deduplication_mode=mode,
+            target_ids=target_ids,
+        ),
     )
 
 
@@ -86,6 +105,27 @@ class RecordingRoutingState:
     def snapshot(self):
         self.snapshot_calls += 1
         return self._snapshot
+
+
+class WaitableRoutingState:
+    def __init__(self, table):
+        self._state = RoutingState(table)
+        self.snapshot_calls = 0
+        self._snapshot_events = []
+
+    def add_snapshot_events(self, *events):
+        self._snapshot_events.extend(events)
+
+    def snapshot(self):
+        snapshot = self._state.snapshot()
+        call_index = self.snapshot_calls
+        self.snapshot_calls += 1
+        if call_index < len(self._snapshot_events):
+            self._snapshot_events[call_index].set()
+        return snapshot
+
+    def replace(self, table):
+        return self._state.replace(table)
 
 
 class RecordingNumericRoutingTable:
@@ -214,8 +254,8 @@ def test_processor_factory_uses_current_runtime_configuration(monkeypatch):
     ("operation", "required_arguments"),
     [
         (
-            aismixer.processor_stage_loop,
-            {"processor": object()},
+            aismixer.ingress_fan_in_loop,
+            {},
         ),
         (
             aismixer._run_runtime_stages,
@@ -248,7 +288,7 @@ def test_runtime_orchestration_requires_explicit_legacy_target_ids(
     [
         (
             aismixer.processor_stage_loop,
-            {"legacy_target_ids": ()},
+            {},
         ),
         (
             aismixer._run_runtime_stages,
@@ -276,22 +316,83 @@ def test_runtime_orchestration_requires_explicit_processor(
         )
 
 
+def test_processor_stage_signature_has_no_routing_dependencies():
+    signature = inspect.signature(aismixer.processor_stage_loop)
+
+    assert tuple(signature.parameters) == (
+        "processing_queue",
+        "egress_queue",
+        "processor",
+    )
+    assert signature.parameters["processor"].kind is (
+        inspect.Parameter.KEYWORD_ONLY
+    )
+    source = inspect.getsource(aismixer.processor_stage_loop)
+    for forbidden_operation in (
+        "coerce_ingress_frame",
+        "legacy_target_ids",
+        "match_target_ids",
+        "routing_state",
+        ".snapshot()",
+    ):
+        assert forbidden_operation not in source
+
+
 def test_global_mode_accepts_explicit_empty_target_ids():
+    frame = make_frame("empty-global-registry")
+
+    work_item = aismixer._bind_processing_work_item(
+        frame,
+        legacy_target_ids=(),
+    )
+
+    assert isinstance(work_item, ProcessingWorkItem)
+    assert work_item.frame is frame
+    assert work_item.snapshot.routing_generation == 0
+    assert (
+        work_item.snapshot.deduplication_mode
+        is DeduplicationMode.GLOBAL
+    )
+    assert work_item.snapshot.target_ids == ()
+
+
+def test_fan_in_normalizes_legacy_target_ids_once_for_repeated_use():
     async def scenario():
-        frame = make_frame("empty-global-registry")
-        processor = ScriptedProcessor(output_batch())
+        class SinglePassTargetIds:
+            def __init__(self):
+                self.iterations = 0
 
-        with pytest.raises(asyncio.CancelledError):
-            await aismixer.processor_stage_loop(
-                FiniteQueue(frame),
-                CompletingEgressQueue(),
-                processor=processor,
-                legacy_target_ids=(),
+            def __iter__(self):
+                self.iterations += 1
+                if self.iterations > 1:
+                    raise AssertionError("legacy target IDs were re-read")
+                return iter((5, 2))
+
+        legacy_target_ids = SinglePassTargetIds()
+        ingress_queue = asyncio.Queue()
+        processing_queue = asyncio.Queue()
+        task = asyncio.create_task(
+            aismixer.ingress_fan_in_loop(
+                (ingress_queue,),
+                processing_queue,
+                legacy_target_ids=legacy_target_ids,
             )
+        )
+        try:
+            await ingress_queue.put(make_frame("first-legacy"))
+            await ingress_queue.put(make_frame("second-legacy"))
+            work_items = (
+                await asyncio.wait_for(processing_queue.get(), timeout=1.0),
+                await asyncio.wait_for(processing_queue.get(), timeout=1.0),
+            )
+        finally:
+            await cancel_task(task)
 
-        snapshot = processor.calls[0][1]
-        assert snapshot.deduplication_mode is DeduplicationMode.GLOBAL
-        assert snapshot.target_ids == ()
+        assert legacy_target_ids.iterations == 1
+        assert [item.snapshot.target_ids for item in work_items] == [
+            (5, 2),
+            (5, 2),
+        ]
 
     asyncio.run(scenario())
 
@@ -345,37 +446,62 @@ def test_non_empty_global_target_ids_reach_numeric_egress_unchanged():
     asyncio.run(scenario())
 
 
-def empty_routing_table():
-    return RoutingTable.from_definitions({}, []).compile_target_ids({})
+def routing_table_for_sources(target_name, target_id, *source_ids):
+    return RoutingTable.from_definitions(
+        {"sources": {"include": list(source_ids)}},
+        [
+            {
+                "name": f"sources_to_{target_name}",
+                "from_zone": "sources",
+                "to": [target_name],
+            }
+        ],
+    ).compile_target_ids({target_name: target_id})
 
 
-def test_unsupported_item_is_rejected_before_snapshot_and_processor():
-    async def scenario():
-        frame = make_frame("accepted")
-        state = RecordingRoutingState(RoutingSnapshot(7, None))
-        processor = ScriptedProcessor(output_batch())
-        egress_queue = CompletingEgressQueue()
+def test_supported_item_is_coerced_before_routing_snapshot(monkeypatch):
+    raw_item = object()
+    frame = make_frame("coerced")
+    events = []
 
-        with pytest.raises(asyncio.CancelledError):
-            await aismixer.processor_stage_loop(
-                FiniteQueue(object(), frame),
-                egress_queue,
-                routing_state=state,
-                processor=processor,
-                legacy_target_ids=(),
-            )
+    def coerce(item):
+        assert item is raw_item
+        events.append("coerce")
+        return frame
 
-        assert state.snapshot_calls == 1
-        assert len(processor.calls) == 1
-        assert processor.calls[0][0] is frame
-        assert processor.calls[0][1].routing_generation == 7
-        assert (
-            processor.calls[0][1].deduplication_mode
-            is DeduplicationMode.GLOBAL
-        )
-        assert egress_queue.batches == []
+    class OrderedRoutingState:
+        def snapshot(self):
+            events.append("snapshot")
+            return RoutingSnapshot(6, None)
 
-    asyncio.run(scenario())
+    monkeypatch.setattr(aismixer, "coerce_ingress_frame", coerce)
+
+    work_item = aismixer._bind_processing_work_item(
+        raw_item,
+        routing_state=OrderedRoutingState(),
+        legacy_target_ids=(4,),
+    )
+
+    assert events == ["coerce", "snapshot"]
+    assert work_item.frame is frame
+    assert work_item.snapshot == ProcessingSnapshot(
+        routing_generation=6,
+        deduplication_mode=DeduplicationMode.GLOBAL,
+        target_ids=(4,),
+    )
+
+
+def test_unsupported_item_is_rejected_before_routing_snapshot():
+    state = RecordingRoutingState(RoutingSnapshot(7, None))
+
+    work_item = aismixer._bind_processing_work_item(
+        object(),
+        routing_state=state,
+        legacy_target_ids=(),
+    )
+
+    assert work_item is None
+    assert state.snapshot_calls == 0
 
 
 def test_routed_frame_resolves_one_numeric_target_only_snapshot():
@@ -383,20 +509,30 @@ def test_routed_frame_resolves_one_numeric_target_only_snapshot():
         frame = make_frame("routed")
         table = RecordingNumericRoutingTable((3, 1))
         state = RecordingRoutingState(RoutingSnapshot(8, table))
-        processor = ScriptedProcessor(output_batch())
-
-        with pytest.raises(asyncio.CancelledError):
-            await aismixer.processor_stage_loop(
-                FiniteQueue(frame),
-                CompletingEgressQueue(),
+        input_queue = asyncio.Queue()
+        output_queue = asyncio.Queue()
+        task = asyncio.create_task(
+            aismixer.ingress_fan_in_loop(
+                (input_queue,),
+                output_queue,
                 routing_state=state,
-                processor=processor,
                 legacy_target_ids=(),
             )
+        )
+        await input_queue.put(frame)
+        try:
+            work_item = await asyncio.wait_for(
+                output_queue.get(),
+                timeout=1.0,
+            )
+        finally:
+            await cancel_task(task)
 
         assert state.snapshot_calls == 1
         assert table.source_ids == ["udp:routed"]
-        snapshot = processor.calls[0][1]
+        assert isinstance(work_item, ProcessingWorkItem)
+        assert work_item.frame is frame
+        snapshot = work_item.snapshot
         assert snapshot.routing_generation == 8
         assert snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
         assert snapshot.target_ids == (3, 1)
@@ -405,49 +541,52 @@ def test_routed_frame_resolves_one_numeric_target_only_snapshot():
 
 
 def test_routed_no_match_remains_per_target_with_empty_targets():
-    async def scenario():
-        frame = make_frame("unmatched")
-        table = RecordingNumericRoutingTable(())
-        processor = ScriptedProcessor(output_batch())
+    frame = make_frame("unmatched")
+    table = RecordingNumericRoutingTable(())
 
-        with pytest.raises(asyncio.CancelledError):
-            await aismixer.processor_stage_loop(
-                FiniteQueue(frame),
-                CompletingEgressQueue(),
-                routing_state=RecordingRoutingState(
-                    RoutingSnapshot(4, table)
-                ),
-                processor=processor,
-                legacy_target_ids=(),
-            )
+    work_item = aismixer._bind_processing_work_item(
+        frame,
+        routing_state=RecordingRoutingState(RoutingSnapshot(4, table)),
+        legacy_target_ids=(9,),
+    )
 
-        snapshot = processor.calls[0][1]
-        assert snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
-        assert snapshot.target_ids == ()
-
-    asyncio.run(scenario())
+    assert work_item.snapshot.routing_generation == 4
+    assert (
+        work_item.snapshot.deduplication_mode
+        is DeduplicationMode.PER_TARGET
+    )
+    assert work_item.snapshot.target_ids == ()
 
 
 def test_legacy_mode_receives_explicit_all_numeric_forwarder_ids():
+    frame = make_frame("legacy")
+
+    work_item = aismixer._bind_processing_work_item(
+        frame,
+        routing_state=RecordingRoutingState(RoutingSnapshot(5, None)),
+        legacy_target_ids=[0, 2, 3],
+    )
+
+    assert work_item.snapshot.routing_generation == 5
+    assert work_item.snapshot.deduplication_mode is DeduplicationMode.GLOBAL
+    assert work_item.snapshot.target_ids == (0, 2, 3)
+
+
+def test_processor_stage_rejects_raw_internal_queue_items():
     async def scenario():
-        frame = make_frame("legacy")
         processor = ScriptedProcessor(output_batch())
 
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(
+            TypeError,
+            match="processor queue item must be a ProcessingWorkItem",
+        ):
             await aismixer.processor_stage_loop(
-                FiniteQueue(frame),
+                FiniteQueue(make_frame("raw")),
                 CompletingEgressQueue(),
-                routing_state=RecordingRoutingState(
-                    RoutingSnapshot(5, None)
-                ),
                 processor=processor,
-                legacy_target_ids=(0, 2, 3),
             )
 
-        snapshot = processor.calls[0][1]
-        assert snapshot.routing_generation == 5
-        assert snapshot.deduplication_mode is DeduplicationMode.GLOBAL
-        assert snapshot.target_ids == (0, 2, 3)
+        assert processor.calls == []
 
     asyncio.run(scenario())
 
@@ -455,25 +594,28 @@ def test_legacy_mode_receives_explicit_all_numeric_forwarder_ids():
 def test_one_frame_produces_one_complete_ordered_egress_batch():
     async def scenario():
         frame = make_frame("one")
+        work_item = make_work_item(
+            frame,
+            generation=3,
+            target_ids=(4,),
+        )
         processor_batch = output_batch(
             output("first", 0),
             output("second", 2, 1),
         )
-        state = RecordingRoutingState(RoutingSnapshot(3, None))
         processor = ScriptedProcessor(processor_batch)
         egress_queue = CompletingEgressQueue()
 
         with pytest.raises(asyncio.CancelledError):
             await aismixer.processor_stage_loop(
-                FiniteQueue(frame),
+                FiniteQueue(work_item),
                 egress_queue,
-                routing_state=state,
                 processor=processor,
-                legacy_target_ids=(),
             )
 
-        assert state.snapshot_calls == 1
         assert len(processor.calls) == 1
+        assert processor.calls[0][0] is work_item.frame
+        assert processor.calls[0][1] is work_item.snapshot
         assert len(egress_queue.batches) == 1
         envelope = egress_queue.batches[0]
         assert envelope.output_batch is processor_batch
@@ -544,7 +686,9 @@ def test_processor_does_not_run_ahead_while_first_batch_is_unacknowledged():
         try:
             await forwarder.first_send_started.wait()
             assert [call[0] for call in processor.calls] == [first_frame]
-            assert ingress_queue.qsize() == 1
+            # Snapshot binding is allowed to consume raw ingress ahead of the
+            # processor's egress-completion barrier.
+            assert ingress_queue.qsize() == 0
         finally:
             await cancel_task(task)
 
@@ -637,24 +781,54 @@ def test_first_send_failure_preserves_effects_and_prevents_later_work():
         assert forwarder.events == [
             ("numeric", (0,), b"first\r\n")
         ]
-        assert ingress_queue.qsize() == 1
+        assert ingress_queue.qsize() == 0
 
     asyncio.run(scenario())
 
 
-def test_routing_replacement_while_blocked_affects_only_the_next_frame():
+@pytest.mark.parametrize("disable_routing", [False, True])
+def test_routing_change_affects_only_later_handoffs_while_blocked(
+    disable_routing,
+):
     async def scenario():
-        first_table = empty_routing_table()
-        second_table = empty_routing_table()
-        state = RoutingState(first_table)
         first_frame = make_frame("first")
         second_frame = make_frame("second")
+        third_frame = make_frame("third")
+        source_ids = tuple(
+            frame.source_id
+            for frame in (first_frame, second_frame, third_frame)
+        )
+        first_table = routing_table_for_sources(
+            "udp:first-target",
+            3,
+            *source_ids,
+        )
+        second_table = (
+            None
+            if disable_routing
+            else routing_table_for_sources(
+                "udp:second-target",
+                7,
+                *source_ids,
+            )
+        )
+        state = WaitableRoutingState(first_table)
+        first_bound = asyncio.Event()
+        second_bound = asyncio.Event()
+        third_bound = asyncio.Event()
+        state.add_snapshot_events(first_bound, second_bound, third_bound)
         second_call = asyncio.Event()
+        third_call = asyncio.Event()
         processor = ScriptedProcessor(
             output_batch(output("first", 0)),
             output_batch(output("second", 0)),
+            output_batch(output("third", 0)),
         )
-        processor.add_call_events(asyncio.Event(), second_call)
+        processor.add_call_events(
+            asyncio.Event(),
+            second_call,
+            third_call,
+        )
         ingress_queue = asyncio.Queue()
         await ingress_queue.put(first_frame)
         await ingress_queue.put(second_frame)
@@ -665,29 +839,47 @@ def test_routing_replacement_while_blocked_affects_only_the_next_frame():
                 asyncio.Queue(maxsize=1),
                 routing_state=state,
                 processor=processor,
-                legacy_target_ids=(),
+                legacy_target_ids=(9, 4),
                 output_forwarder=forwarder,
             )
         )
         try:
             await forwarder.first_send_started.wait()
+            await asyncio.wait_for(second_bound.wait(), timeout=1.0)
+            assert first_bound.is_set()
             assert len(processor.calls) == 1
+            assert ingress_queue.qsize() == 0
+
             state.replace(second_table)
+            await ingress_queue.put(third_frame)
+            await asyncio.wait_for(third_bound.wait(), timeout=1.0)
             assert len(processor.calls) == 1
 
             forwarder.release_first_send.set()
-            await second_call.wait()
+            await asyncio.wait_for(second_call.wait(), timeout=1.0)
+            await asyncio.wait_for(third_call.wait(), timeout=1.0)
         finally:
             await cancel_task(task)
 
         first_snapshot = processor.calls[0][1]
         second_snapshot = processor.calls[1][1]
+        third_snapshot = processor.calls[2][1]
         assert first_snapshot.routing_generation == 0
         assert first_snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
-        assert first_snapshot.target_ids == ()
-        assert second_snapshot.routing_generation == 1
+        assert first_snapshot.target_ids == (3,)
+        assert second_snapshot.routing_generation == 0
         assert second_snapshot.deduplication_mode is DeduplicationMode.PER_TARGET
-        assert second_snapshot.target_ids == ()
+        assert second_snapshot.target_ids == (3,)
+        assert third_snapshot.routing_generation == 1
+        assert third_snapshot.deduplication_mode is (
+            DeduplicationMode.GLOBAL
+            if disable_routing
+            else DeduplicationMode.PER_TARGET
+        )
+        assert third_snapshot.target_ids == (
+            (9, 4) if disable_routing else (7,)
+        )
+        assert state.snapshot_calls == 3
 
     asyncio.run(scenario())
 
@@ -844,11 +1036,11 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
         assert egress_factory.args == (egress_queue, output_forwarder)
         assert isinstance(ingress_queue, asyncio.Queue)
         assert isinstance(egress_queue, asyncio.Queue)
-        assert processor_factory.keywords == {
+        assert fan_in_factory.keywords == {
             "routing_state": state,
-            "processor": processor,
             "legacy_target_ids": (0, 1),
         }
+        assert processor_factory.keywords == {"processor": processor}
         assert egress_factory.keywords == {
             "debug": False,
             "timestamp": aismixer.ts,

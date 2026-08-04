@@ -10,6 +10,7 @@ from core.data_plane import (
     DeduplicationMode,
     OutputBatch,
     ProcessingSnapshot,
+    ProcessingWorkItem,
     ProcessorOutput,
     ProcessorResetReport,
 )
@@ -181,6 +182,77 @@ def test_processing_snapshot_rejects_duplicate_target_ids():
             deduplication_mode=DeduplicationMode.PER_TARGET,
             target_ids=(2, 1, 2),
         )
+
+
+def test_processing_work_item_is_frozen_slotted_and_holds_exact_contracts():
+    frame = make_frame()
+    snapshot = ProcessingSnapshot(
+        routing_generation=7,
+        deduplication_mode=DeduplicationMode.PER_TARGET,
+        target_ids=(2, 0),
+    )
+    work_item = ProcessingWorkItem(frame=frame, snapshot=snapshot)
+
+    with pytest.raises(FrozenInstanceError):
+        work_item.frame = make_frame()
+    with pytest.raises(FrozenInstanceError):
+        work_item.snapshot = ProcessingSnapshot(
+            routing_generation=8,
+            deduplication_mode=DeduplicationMode.GLOBAL,
+            target_ids=(),
+        )
+
+    assert not hasattr(work_item, "__dict__")
+    assert tuple(field.name for field in fields(work_item)) == (
+        "frame",
+        "snapshot",
+    )
+    assert work_item.frame is frame
+    assert work_item.snapshot is snapshot
+    for forbidden_attribute in (
+        "routing_state",
+        "routing_table",
+        "forwarder",
+        "target_names",
+        "transport_callback",
+        "completion",
+    ):
+        assert not hasattr(work_item, forbidden_attribute)
+
+
+@pytest.mark.parametrize("invalid_frame", [None, object(), b"frame", ()])
+def test_processing_work_item_rejects_invalid_frames(invalid_frame):
+    snapshot = ProcessingSnapshot(
+        routing_generation=0,
+        deduplication_mode=DeduplicationMode.GLOBAL,
+        target_ids=(),
+    )
+
+    with pytest.raises(TypeError, match="frame must be an IngressFrame"):
+        ProcessingWorkItem(frame=invalid_frame, snapshot=snapshot)
+
+
+@pytest.mark.parametrize("invalid_snapshot", [None, object(), b"snapshot", ()])
+def test_processing_work_item_rejects_invalid_snapshots(invalid_snapshot):
+    with pytest.raises(
+        TypeError,
+        match="snapshot must be a ProcessingSnapshot",
+    ):
+        ProcessingWorkItem(frame=make_frame(), snapshot=invalid_snapshot)
+
+
+def test_processing_work_item_requires_both_contracts():
+    frame = make_frame()
+    snapshot = ProcessingSnapshot(
+        routing_generation=0,
+        deduplication_mode=DeduplicationMode.GLOBAL,
+        target_ids=(),
+    )
+
+    with pytest.raises(TypeError):
+        ProcessingWorkItem(frame=frame)
+    with pytest.raises(TypeError):
+        ProcessingWorkItem(snapshot=snapshot)
 
 
 def test_processor_output_is_frozen_slotted_and_has_no_runtime_objects():
