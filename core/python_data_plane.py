@@ -18,7 +18,7 @@ from core.ingress_frame import IngressFrame
 from core.output_builder import build_output_bytes
 from core.parsed_sentence import parse_frame_sentences, parse_leading_s_value
 from core.s_policy import choose_s_value_from_candidates
-from core.state.s_cache import touch_s
+from core.state.s_cache import SourceState
 from core.target_identity import EgressTargetId
 from dedup import Deduplicator
 
@@ -32,6 +32,21 @@ class _ProcessingConfig:
     gid_digits: int
 
 
+class _TouchSOperationSourceState:
+    """Adapt the repository's legacy callback injection to source state."""
+
+    __slots__ = ("_operation",)
+
+    def __init__(
+        self,
+        operation: Callable[[str | None], None],
+    ) -> None:
+        self._operation = operation
+
+    def touch_s(self, s_value: str | None) -> None:
+        self._operation(s_value)
+
+
 def _generate_numeric_gid_fixed(digits: int) -> str:
     """Return a cryptographically secure fixed-width numeric group ID."""
 
@@ -42,9 +57,10 @@ def _generate_numeric_gid_fixed(digits: int) -> str:
 class PythonDataPlaneProcessor:
     """Long-lived Python reference processor for one serial runtime consumer.
 
-    One instance exclusively owns its assembler, deduplicator, and multipart
-    metadata. Calls are intentionally synchronous and must be serialized by
-    orchestration; this class adds no locking or worker lifecycle.
+    One instance exclusively owns its assembler, deduplicator, source state,
+    and multipart metadata. Calls are intentionally synchronous and must be
+    serialized by orchestration; this class adds no locking or worker
+    lifecycle.
     """
 
     __slots__ = (
@@ -53,7 +69,7 @@ class PythonDataPlaneProcessor:
         "_deduplicator",
         "_wall_clock",
         "_gid_generator",
-        "_touch_s",
+        "_source_state",
         "_multipart_s_ctx",
         "_multipart_c_ctx",
         "_multipart_gid_ctx",
@@ -71,6 +87,7 @@ class PythonDataPlaneProcessor:
         deduplicator: Deduplicator | None = None,
         wall_clock: Callable[[], float] | None = None,
         gid_generator: Callable[[int], str] | None = None,
+        source_state: SourceState | None = None,
         touch_s_operation: Callable[[str | None], None] | None = None,
     ) -> None:
         self._config = _ProcessingConfig(
@@ -96,7 +113,18 @@ class PythonDataPlaneProcessor:
             if gid_generator is None
             else gid_generator
         )
-        self._touch_s = touch_s if touch_s_operation is None else touch_s_operation
+        if source_state is not None and touch_s_operation is not None:
+            raise TypeError(
+                "source_state and touch_s_operation are mutually exclusive"
+            )
+        if touch_s_operation is not None:
+            self._source_state = _TouchSOperationSourceState(
+                touch_s_operation
+            )
+        else:
+            self._source_state = (
+                SourceState() if source_state is None else source_state
+            )
         self._multipart_s_ctx: dict[AssemblyKey, str] = {}
         self._multipart_c_ctx: dict[AssemblyKey, int] = {}
         self._multipart_gid_ctx: dict[AssemblyKey, frozenset[str]] = {}
@@ -280,7 +308,7 @@ class PythonDataPlaneProcessor:
                     leading_s,
                     frame.remote_ip,
                 )
-                self._touch_s(s_value)
+                self._source_state.touch_s(s_value)
 
                 if total_parts > 1 or tag_single:
                     g_triplet = (

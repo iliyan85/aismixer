@@ -1,5 +1,7 @@
 import inspect
 
+import pytest
+
 import core.python_data_plane as python_data_plane_module
 from assembler import AIVDMAssembler
 from core.data_plane import (
@@ -11,6 +13,7 @@ from core.data_plane import (
 )
 from core.ingress_frame import IngressFrame
 from core.python_data_plane import PythonDataPlaneProcessor
+from core.state.s_cache import SourceState
 from dedup import Deduplicator
 
 
@@ -76,7 +79,6 @@ def make_processor(**overrides):
         "station_id": "test_station",
         "wall_clock": lambda: WALL_TIME,
         "gid_generator": lambda _digits: "999999",
-        "touch_s_operation": lambda _s_value: None,
     }
     arguments.update(overrides)
     return PythonDataPlaneProcessor(**arguments)
@@ -434,6 +436,78 @@ def test_single_sentence_deduplication_is_retained_across_calls():
     assert deduplicator.stats().duplicates == 1
 
 
+def test_default_processors_do_not_share_deduplication_state():
+    first_processor = PythonDataPlaneProcessor()
+    second_processor = PythonDataPlaneProcessor()
+    frame = make_frame(SENTENCE)
+    snapshot = make_snapshot()
+
+    assert len(process_outputs(first_processor, frame, snapshot)) == 1
+    assert len(process_outputs(second_processor, frame, snapshot)) == 1
+    assert process_outputs(first_processor, frame, snapshot) == ()
+    assert process_outputs(second_processor, frame, snapshot) == ()
+    assert first_processor._deduplicator is not second_processor._deduplicator
+
+
+def test_default_processors_cannot_complete_each_others_multipart_groups():
+    first_processor = PythonDataPlaneProcessor()
+    second_processor = PythonDataPlaneProcessor()
+    first = make_multipart_sentence(1, "first")
+    second = make_multipart_sentence(2, "second")
+    snapshot = make_snapshot()
+
+    assert process_outputs(
+        first_processor,
+        make_frame(first),
+        snapshot,
+    ) == ()
+    assert process_outputs(
+        second_processor,
+        make_frame(second),
+        snapshot,
+    ) == ()
+    assert first_processor._assembler.stats().current_fragments == 1
+    assert second_processor._assembler.stats().current_fragments == 1
+
+    assert len(
+        process_outputs(
+            first_processor,
+            make_frame(second),
+            snapshot,
+        )
+    ) == 2
+    assert len(
+        process_outputs(
+            second_processor,
+            make_frame(first),
+            snapshot,
+        )
+    ) == 2
+
+
+def test_default_processors_do_not_share_source_state_activity():
+    first_processor = PythonDataPlaneProcessor()
+    second_processor = PythonDataPlaneProcessor()
+
+    assert len(
+        process_outputs(
+            first_processor,
+            make_frame(SENTENCE),
+            make_snapshot(),
+        )
+    ) == 1
+
+    first_source_state = first_processor._source_state
+    second_source_state = second_processor._source_state
+    assert isinstance(first_source_state, SourceState)
+    assert isinstance(second_source_state, SourceState)
+    assert first_source_state is not second_source_state
+    assert first_source_state._s_cache.contains("mixstation_1")
+    assert "mixstation_1" in first_source_state._per_s_state
+    assert not second_source_state._s_cache.contains("mixstation_1")
+    assert "mixstation_1" not in second_source_state._per_s_state
+
+
 def test_assembler_state_is_retained_across_process_calls():
     assembler = AIVDMAssembler(clock=lambda: 0.0)
     processor = make_processor(assembler=assembler)
@@ -728,6 +802,31 @@ def test_injected_gid_generator_receives_digits_once_and_reuses_gid():
     assert leading_tag_content(outputs[1].message) == "g:2-2-654321"
 
 
+def test_injected_source_state_receives_each_emitted_sentence_only():
+    class RecordingSourceState:
+        def __init__(self):
+            self.touched_s_values = []
+
+        def touch_s(self, s_value):
+            self.touched_s_values.append(s_value)
+
+    source_state = RecordingSourceState()
+    processor = make_processor(source_state=source_state)
+    first = make_multipart_sentence(1, "first")
+    second = make_multipart_sentence(2, "second")
+    snapshot = make_snapshot()
+
+    assert process_outputs(processor, make_frame(first), snapshot) == ()
+    outputs = process_outputs(processor, make_frame(second), snapshot)
+
+    assert len(outputs) == 2
+    assert processor._source_state is source_state
+    assert source_state.touched_s_values == [
+        "test_station",
+        "test_station",
+    ]
+
+
 def test_injected_touch_s_operation_observes_each_emitted_sentence_only():
     touched_s_values = []
     processor = make_processor(
@@ -745,6 +844,17 @@ def test_injected_touch_s_operation_observes_each_emitted_sentence_only():
     assert process_outputs(processor, make_frame(first), snapshot) == ()
     assert process_outputs(processor, make_frame(second), snapshot) == ()
     assert touched_s_values == ["test_station", "test_station"]
+
+
+def test_source_state_and_touch_callback_are_mutually_exclusive():
+    with pytest.raises(
+        TypeError,
+        match="source_state and touch_s_operation are mutually exclusive",
+    ):
+        make_processor(
+            source_state=SourceState(),
+            touch_s_operation=lambda _s_value: None,
+        )
 
 
 def test_routing_generation_change_does_not_reset_deduplication():

@@ -316,6 +316,8 @@ async def run_aismixer_main(
             self.close_count += 1
 
     forwarder = FakeForwarder()
+    processor = object()
+    processor_factory_calls = []
     builder_calls = []
     supervisor_called = {
         "value": False,
@@ -325,6 +327,10 @@ async def run_aismixer_main(
     def fake_builder(config, state, target_id_by_name):
         builder_calls.append((config, state, target_id_by_name))
         return control_server
+
+    def fake_create_data_plane_processor():
+        processor_factory_calls.append(None)
+        return processor
 
     async def fake_supervise_named_tasks(task_specs):
         observer["supervisor_called"] = True
@@ -338,6 +344,11 @@ async def run_aismixer_main(
     monkeypatch.setattr(aismixer, "config", {"control": None})
     monkeypatch.setattr(aismixer, "routing_state", routing_state)
     monkeypatch.setattr(aismixer, "forwarder", forwarder)
+    monkeypatch.setattr(
+        aismixer,
+        "create_data_plane_processor",
+        fake_create_data_plane_processor,
+    )
     monkeypatch.setattr(aismixer, "build_optional_routing_control_server", fake_builder)
     monkeypatch.setattr(
         aismixer,
@@ -353,6 +364,8 @@ async def run_aismixer_main(
         "routing_state": routing_state,
         "forwarder": forwarder,
         "forwarder_close_count": forwarder.close_count,
+        "processor": processor,
+        "processor_factory_calls": processor_factory_calls,
     }
 
 
@@ -376,9 +389,10 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
     egress_factory = specs["egress-stage"].coroutine_factory
     assert processor_factory.keywords == {
         "routing_state": result["routing_state"],
-        "processor": aismixer.data_plane_processor,
+        "processor": result["processor"],
         "legacy_target_ids": result["forwarder"].all_target_ids,
     }
+    assert result["processor_factory_calls"] == [None]
     assert egress_factory.args[1] is result["forwarder"]
     assert egress_factory.keywords == {
         "debug": aismixer.DEBUG,
@@ -499,12 +513,18 @@ def _configure_main_lifecycle_test(
 ):
     state = RoutingState()
     output_forwarder = _MainTestForwarder()
+    processor = object()
 
     monkeypatch.setattr(aismixer, "SEC_INPUTS", list(sec_inputs))
     monkeypatch.setattr(aismixer, "UDP_INPUTS", list(udp_inputs))
     monkeypatch.setattr(aismixer, "config", {"control": None})
     monkeypatch.setattr(aismixer, "routing_state", state)
     monkeypatch.setattr(aismixer, "forwarder", output_forwarder)
+    monkeypatch.setattr(
+        aismixer,
+        "create_data_plane_processor",
+        lambda: processor,
+    )
     monkeypatch.setattr(
         aismixer,
         "create_udp_listener_socket",
@@ -522,7 +542,7 @@ def _configure_main_lifecycle_test(
             supervisor,
         )
 
-    return state, output_forwarder
+    return state, output_forwarder, processor
 
 
 def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
@@ -533,7 +553,7 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         async def fake_supervisor(task_specs):
             supervision_calls.append(tuple(task_specs))
 
-        state, output_forwarder = _configure_main_lifecycle_test(
+        state, output_forwarder, processor = _configure_main_lifecycle_test(
             monkeypatch,
             sec_inputs=(
                 {
@@ -585,7 +605,7 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         assert processor_factory.func is aismixer.processor_stage_loop
         assert processor_factory.keywords == {
             "routing_state": state,
-            "processor": aismixer.data_plane_processor,
+            "processor": processor,
             "legacy_target_ids": output_forwarder.all_target_ids,
         }
         assert egress_factory.func is aismixer.egress_stage_loop
@@ -608,7 +628,7 @@ def test_partial_listener_startup_failure_closes_started_resources(monkeypatch):
             nonlocal supervisor_called
             supervisor_called = True
 
-        _, output_forwarder = _configure_main_lifecycle_test(
+        _, output_forwarder, _ = _configure_main_lifecycle_test(
             monkeypatch,
             udp_inputs=(
                 {
@@ -648,7 +668,7 @@ def test_runtime_failure_closes_each_main_resource_exactly_once(monkeypatch):
         async def failing_supervisor(_task_specs):
             raise failure
 
-        _, output_forwarder = _configure_main_lifecycle_test(
+        _, output_forwarder, _ = _configure_main_lifecycle_test(
             monkeypatch,
             udp_inputs=(
                 {

@@ -10,6 +10,7 @@ from core.data_plane import (
     ProcessorOutput,
 )
 from core.ingress_frame import IngressFrame
+from core.python_data_plane import PythonDataPlaneProcessor
 from core.routing import RoutingTable
 from core.routing_state import RoutingSnapshot, RoutingState
 
@@ -170,13 +171,58 @@ async def cancel_task(task):
         await task
 
 
+def test_runtime_module_has_no_import_time_processor_instance():
+    assert "data_plane_processor" not in vars(aismixer)
+    assert not any(
+        isinstance(value, PythonDataPlaneProcessor)
+        for value in vars(aismixer).values()
+    )
+
+
+def test_processor_factory_uses_current_runtime_configuration(monkeypatch):
+    processor = object()
+    constructor_calls = []
+
+    def fake_processor_constructor(**kwargs):
+        constructor_calls.append(kwargs)
+        return processor
+
+    monkeypatch.setattr(
+        aismixer,
+        "PythonDataPlaneProcessor",
+        fake_processor_constructor,
+    )
+    monkeypatch.setattr(aismixer, "STATION_ID", "runtime-station")
+    monkeypatch.setattr(aismixer, "C_PRESERVE_INGRESS_C", False)
+    monkeypatch.setattr(aismixer, "G_PRESERVE_INGRESS_GID", False)
+    monkeypatch.setattr(aismixer, "G_ALWAYS_TAG_SINGLE", True)
+    monkeypatch.setattr(aismixer, "G_ID_DIGITS", 6)
+
+    assert aismixer.create_data_plane_processor() is processor
+    assert constructor_calls == [
+        {
+            "station_id": "runtime-station",
+            "preserve_ingress_c": False,
+            "preserve_ingress_gid": False,
+            "always_tag_single": True,
+            "gid_digits": 6,
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     ("operation", "required_arguments"),
     [
-        (aismixer.processor_stage_loop, {}),
+        (
+            aismixer.processor_stage_loop,
+            {"processor": object()},
+        ),
         (
             aismixer._run_runtime_stages,
-            {"output_forwarder": object()},
+            {
+                "processor": object(),
+                "output_forwarder": object(),
+            },
         ),
     ],
 )
@@ -190,6 +236,39 @@ def test_runtime_orchestration_requires_explicit_legacy_target_ids(
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is inspect.Parameter.empty
     with pytest.raises(TypeError, match="legacy_target_ids"):
+        operation(
+            object(),
+            object(),
+            **required_arguments,
+        )
+
+
+@pytest.mark.parametrize(
+    ("operation", "required_arguments"),
+    [
+        (
+            aismixer.processor_stage_loop,
+            {"legacy_target_ids": ()},
+        ),
+        (
+            aismixer._run_runtime_stages,
+            {
+                "legacy_target_ids": (),
+                "output_forwarder": object(),
+            },
+        ),
+    ],
+)
+def test_runtime_orchestration_requires_explicit_processor(
+    operation,
+    required_arguments,
+):
+    operation_signature = inspect.signature(operation)
+    parameter = operation_signature.parameters["processor"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+    with pytest.raises(TypeError, match="processor"):
         operation(
             object(),
             object(),
@@ -680,12 +759,13 @@ def test_cancellation_resolves_active_acknowledgement_and_stage_tasks():
     asyncio.run(scenario())
 
 
-def test_main_wires_module_processor_and_forwarder_into_runtime_stages(
+def test_main_constructs_one_processor_and_wires_runtime_stages(
     monkeypatch,
 ):
     async def scenario():
         state = RoutingState()
         processor = object()
+        processor_factory_calls = []
 
         class MainForwarder:
             target_ids = ("udp:target",)
@@ -711,13 +791,21 @@ def test_main_wires_module_processor_and_forwarder_into_runtime_stages(
         async def fake_supervise_named_tasks(task_specs):
             supervision_calls.append(tuple(task_specs))
 
+        def fake_create_data_plane_processor():
+            processor_factory_calls.append(None)
+            return processor
+
         monkeypatch.setattr(aismixer, "SEC_INPUTS", [])
         monkeypatch.setattr(aismixer, "UDP_INPUTS", [])
         monkeypatch.setattr(aismixer, "config", {"control": None})
         monkeypatch.setattr(aismixer, "routing_state", state)
-        monkeypatch.setattr(aismixer, "data_plane_processor", processor)
         monkeypatch.setattr(aismixer, "forwarder", output_forwarder)
         monkeypatch.setattr(aismixer, "DEBUG", False)
+        monkeypatch.setattr(
+            aismixer,
+            "create_data_plane_processor",
+            fake_create_data_plane_processor,
+        )
         monkeypatch.setattr(
             aismixer,
             "build_optional_routing_control_server",
@@ -731,6 +819,7 @@ def test_main_wires_module_processor_and_forwarder_into_runtime_stages(
 
         await aismixer.main()
 
+        assert processor_factory_calls == [None]
         assert builder_calls == [
             ({"control": None}, state, {"udp:target": 1})
         ]

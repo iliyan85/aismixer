@@ -114,13 +114,18 @@ initial_routing_table = load_optional_routing_table(
     forwarder.target_id_by_name,
 )
 routing_state = RoutingState(initial_routing_table)
-data_plane_processor = PythonDataPlaneProcessor(
-    station_id=STATION_ID,
-    preserve_ingress_c=C_PRESERVE_INGRESS_C,
-    preserve_ingress_gid=G_PRESERVE_INGRESS_GID,
-    always_tag_single=G_ALWAYS_TAG_SINGLE,
-    gid_digits=G_ID_DIGITS,
-)
+
+
+def create_data_plane_processor() -> PythonDataPlaneProcessor:
+    """Create the processor owned by one production runtime invocation."""
+
+    return PythonDataPlaneProcessor(
+        station_id=STATION_ID,
+        preserve_ingress_c=C_PRESERVE_INGRESS_C,
+        preserve_ingress_gid=G_PRESERVE_INGRESS_GID,
+        always_tag_single=G_ALWAYS_TAG_SINGLE,
+        gid_digits=G_ID_DIGITS,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,16 +235,11 @@ async def processor_stage_loop(
     egress_queue,
     *,
     routing_state=None,
-    processor=None,
+    processor,
     legacy_target_ids,
 ):
     """Process one accepted frame and await its egress completion barrier."""
 
-    active_processor = (
-        data_plane_processor
-        if processor is None
-        else processor
-    )
     if not isinstance(legacy_target_ids, (str, bytes)):
         legacy_target_ids = tuple(legacy_target_ids)
 
@@ -270,7 +270,7 @@ async def processor_stage_loop(
                 target_ids=routing_table.match_target_ids(frame.source_id),
             )
 
-        output_batch = active_processor.process(frame, processing_snapshot)
+        output_batch = processor.process(frame, processing_snapshot)
         if not output_batch.outputs:
             continue
 
@@ -334,7 +334,7 @@ async def _run_runtime_stages(
     egress_queue,
     *,
     routing_state=None,
-    processor=None,
+    processor,
     legacy_target_ids,
     output_forwarder,
     debug=False,
@@ -407,6 +407,7 @@ async def handle_socket(
 
 
 async def main():
+    processor = create_data_plane_processor()
     input_queues = []
     processor_queue = asyncio.Queue()
     egress_queue = asyncio.Queue(maxsize=1)
@@ -509,7 +510,7 @@ async def main():
                         processor_queue,
                         egress_queue,
                         routing_state=routing_state,
-                        processor=data_plane_processor,
+                        processor=processor,
                         legacy_target_ids=forwarder.all_target_ids,
                     ),
                 ),
