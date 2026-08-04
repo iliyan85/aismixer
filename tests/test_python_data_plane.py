@@ -10,6 +10,7 @@ from core.data_plane import (
     OutputBatch,
     ProcessingSnapshot,
     ProcessorOutput,
+    ProcessorResetReport,
 )
 from core.ingress_frame import IngressFrame
 from core.python_data_plane import PythonDataPlaneProcessor
@@ -153,11 +154,27 @@ class RecordingDeduplicator:
         return True
 
 
+class RecordingSourceState(SourceState):
+    def __init__(self):
+        super().__init__()
+        self.touched_s_values = []
+        self.reset_calls = 0
+
+    def touch_s(self, s_value):
+        self.touched_s_values.append(s_value)
+        super().touch_s(s_value)
+
+    def reset(self):
+        self.reset_calls += 1
+        return super().reset()
+
+
 def test_processor_satisfies_synchronous_protocol_without_asyncio_dependency():
     processor = make_processor()
 
     assert isinstance(processor, DataPlaneProcessor)
     assert not inspect.iscoroutinefunction(processor.process)
+    assert not inspect.iscoroutinefunction(processor.reset)
     assert "asyncio" not in vars(python_data_plane_module)
     assert "RoutingTable" not in vars(python_data_plane_module)
     process_source = inspect.getsource(PythonDataPlaneProcessor.process)
@@ -803,13 +820,6 @@ def test_injected_gid_generator_receives_digits_once_and_reuses_gid():
 
 
 def test_injected_source_state_receives_each_emitted_sentence_only():
-    class RecordingSourceState:
-        def __init__(self):
-            self.touched_s_values = []
-
-        def touch_s(self, s_value):
-            self.touched_s_values.append(s_value)
-
     source_state = RecordingSourceState()
     processor = make_processor(source_state=source_state)
     first = make_multipart_sentence(1, "first")
@@ -825,36 +835,315 @@ def test_injected_source_state_receives_each_emitted_sentence_only():
         "test_station",
         "test_station",
     ]
+    report = processor.reset()
+    assert report.source_entries_discarded == 1
+    assert source_state.reset_calls == 1
+    assert source_state._per_s_state == {}
 
 
-def test_injected_touch_s_operation_observes_each_emitted_sentence_only():
-    touched_s_values = []
-    processor = make_processor(
-        touch_s_operation=touched_s_values.append,
+def test_callback_only_source_state_compatibility_is_removed():
+    parameters = inspect.signature(PythonDataPlaneProcessor).parameters
+
+    assert "touch_s_operation" not in parameters
+    assert "_TouchSOperationSourceState" not in vars(
+        python_data_plane_module
     )
-    first = make_multipart_sentence(1, "first")
-    second = make_multipart_sentence(2, "second")
+
+
+def test_reset_orders_owned_state_and_reports_orphan_contexts():
+    events = []
+
+    class ResetAssembler:
+        def reset(self):
+            events.append("assembler")
+            return ("group-a", "group-b")
+
+    class ResetDeduplicator:
+        def reset(self):
+            events.append("deduplicator")
+            return 3
+
+    class ResetSourceState:
+        def reset(self):
+            events.append("source-state")
+            return 4
+
+    class ResetContext(dict):
+        def __init__(self, name, count):
+            super().__init__((index, index) for index in range(count))
+            self._name = name
+
+        def clear(self):
+            events.append(self._name)
+            super().clear()
+
+    processor = make_processor(
+        assembler=ResetAssembler(),
+        deduplicator=ResetDeduplicator(),
+        source_state=ResetSourceState(),
+    )
+    processor._multipart_s_ctx = ResetContext("multipart-s", 5)
+    processor._multipart_c_ctx = ResetContext("multipart-c", 6)
+    processor._multipart_gid_ctx = ResetContext("multipart-gid", 7)
+
+    report = processor.reset()
+
+    assert report == ProcessorResetReport(
+        assembler_groups_discarded=2,
+        dedup_entries_discarded=3,
+        source_entries_discarded=4,
+        multipart_s_contexts_discarded=5,
+        multipart_c_contexts_discarded=6,
+        multipart_gid_contexts_discarded=7,
+    )
+    assert events == [
+        "assembler",
+        "deduplicator",
+        "source-state",
+        "multipart-s",
+        "multipart-c",
+        "multipart-gid",
+    ]
+    assert processor._multipart_s_ctx == {}
+    assert processor._multipart_c_ctx == {}
+    assert processor._multipart_gid_ctx == {}
+
+
+def test_reset_preserves_owned_component_identity_config_and_counters():
+    assembler_clock = MutableClock()
+    dedup_clock = MutableClock()
+    assembler = AIVDMAssembler(
+        timeout=7.5,
+        clock=assembler_clock,
+        max_fragments_per_group=4,
+        max_pending_groups=3,
+    )
+    deduplicator = Deduplicator(
+        ttl=30,
+        clock=dedup_clock,
+        max_entries=4,
+    )
+    source_state = SourceState(
+        ttl_seconds=60,
+        max_entries=5,
+        sweep_every_seconds=2,
+        ops_per_sweep=7,
+    )
+    wall_clock_observations = []
+    gid_digits_observed = []
+
+    def wall_clock():
+        wall_clock_observations.append(WALL_TIME)
+        return WALL_TIME
+
+    def gid_generator(digits):
+        gid_digits_observed.append(digits)
+        return "777777"
+
+    processor = make_processor(
+        station_id="",
+        always_tag_single=True,
+        gid_digits=6,
+        assembler=assembler,
+        deduplicator=deduplicator,
+        source_state=source_state,
+        wall_clock=wall_clock,
+        gid_generator=gid_generator,
+    )
+    processor_identity = id(processor)
+    processing_config = processor._config
     snapshot = make_snapshot()
+    pending_first = make_multipart_sentence(
+        1,
+        "pending-first",
+        sequence="4",
+    )
+    pending_second = make_multipart_sentence(
+        2,
+        "pending-second",
+        sequence="4",
+    )
+    tagged_pending_first = (
+        "\\s:pending,c:123,g:1-2-444*00\\" + pending_first
+    )
 
-    assert process_outputs(processor, make_frame(first), snapshot) == ()
-    outputs = process_outputs(processor, make_frame(second), snapshot)
-    assert len(outputs) == 2
-    assert touched_s_values == ["test_station", "test_station"]
-
-    assert process_outputs(processor, make_frame(first), snapshot) == ()
-    assert process_outputs(processor, make_frame(second), snapshot) == ()
-    assert touched_s_values == ["test_station", "test_station"]
-
-
-def test_source_state_and_touch_callback_are_mutually_exclusive():
-    with pytest.raises(
-        TypeError,
-        match="source_state and touch_s_operation are mutually exclusive",
-    ):
-        make_processor(
-            source_state=SourceState(),
-            touch_s_operation=lambda _s_value: None,
+    assert len(
+        process_outputs(
+            processor,
+            make_frame(SENTENCE, alias_for_s="source-one"),
+            snapshot,
         )
+    ) == 1
+    assert len(
+        process_outputs(
+            processor,
+            make_frame(SECOND_SENTENCE, alias_for_s="source-two"),
+            snapshot,
+        )
+    ) == 1
+    assert process_outputs(
+        processor,
+        make_frame(SENTENCE, alias_for_s="source-one"),
+        snapshot,
+    ) == ()
+    assert process_outputs(
+        processor,
+        make_frame(tagged_pending_first),
+        snapshot,
+    ) == ()
+
+    report = processor.reset()
+
+    assert report == ProcessorResetReport(
+        assembler_groups_discarded=1,
+        dedup_entries_discarded=2,
+        source_entries_discarded=2,
+        multipart_s_contexts_discarded=1,
+        multipart_c_contexts_discarded=1,
+        multipart_gid_contexts_discarded=1,
+    )
+    assert id(processor) == processor_identity
+    assert processor._config is processing_config
+    assert processor._assembler is assembler
+    assert processor._deduplicator is deduplicator
+    assert processor._source_state is source_state
+    assert processor._wall_clock is wall_clock
+    assert processor._gid_generator is gid_generator
+    assert assembler.timeout == 7.5
+    assert assembler._clock is assembler_clock
+    assert assembler.max_fragments_per_group == 4
+    assert assembler.max_pending_groups == 3
+    assembler_stats = assembler.stats()
+    assert assembler_stats.pending == 1
+    assert assembler_stats.reset_discarded == 1
+    assert assembler_stats.resets == 1
+    assert assembler_stats.current_groups == 0
+    assert assembler_stats.current_fragments == 0
+    assert assembler_stats.peak_groups == 1
+    assert assembler_stats.peak_fragments == 1
+    assert deduplicator.ttl == 30
+    assert deduplicator._clock is dedup_clock
+    assert deduplicator.max_entries == 4
+    dedup_stats = deduplicator.stats()
+    assert dedup_stats.accepted == 2
+    assert dedup_stats.duplicates == 1
+    assert dedup_stats.resets == 1
+    assert dedup_stats.current_entries == 0
+    assert dedup_stats.peak_entries == 2
+    assert source_state._s_cache._ttl_ns == 60_000_000_000
+    assert source_state._s_cache._max_entries == 5
+    assert source_state._s_cache._sweep_every_ns == 2_000_000_000
+    assert source_state._s_cache._ops_per_sweep == 7
+    assert source_state._per_s_state == {}
+    assert processor._multipart_s_ctx == {}
+    assert processor._multipart_c_ctx == {}
+    assert processor._multipart_gid_ctx == {}
+
+    # Deduplication admits the pre-reset sentence again using preserved
+    # station/TAG configuration and deterministic helpers.
+    wall_clock_calls_before_reuse = len(wall_clock_observations)
+    gid_calls_before_reuse = len(gid_digits_observed)
+    reused_single_outputs = process_outputs(
+        processor,
+        make_frame(SENTENCE, alias_for_s="source-one"),
+        snapshot,
+    )
+    assert len(reused_single_outputs) == 1
+    assert leading_tag_content(reused_single_outputs[0].message) == (
+        f"c:{WALL_TIME},s:source_one,g:1-1-777777"
+    )
+    assert len(wall_clock_observations) == wall_clock_calls_before_reuse + 1
+    assert len(gid_digits_observed) == gid_calls_before_reuse + 1
+    assert gid_digits_observed[-1] == 6
+    # A pre-reset first fragment cannot combine with this continuation.
+    assert process_outputs(
+        processor,
+        make_frame(pending_second),
+        snapshot,
+    ) == ()
+    assert len(
+        process_outputs(
+            processor,
+            make_frame(tagged_pending_first),
+            snapshot,
+        )
+    ) == 2
+
+
+def test_repeated_empty_reset_reports_zero_and_advances_owner_counters():
+    processor = make_processor()
+    empty_report = ProcessorResetReport(
+        assembler_groups_discarded=0,
+        dedup_entries_discarded=0,
+        source_entries_discarded=0,
+        multipart_s_contexts_discarded=0,
+        multipart_c_contexts_discarded=0,
+        multipart_gid_contexts_discarded=0,
+    )
+
+    assert processor.reset() == empty_report
+    assert processor.reset() == empty_report
+    assert processor._assembler.stats().resets == 2
+    assert processor._assembler.stats().reset_discarded == 0
+    assert processor._deduplicator.stats().resets == 2
+
+
+@pytest.mark.parametrize(
+    ("failing_owner", "expected_calls"),
+    [
+        ("assembler", ["assembler"]),
+        ("deduplicator", ["assembler", "deduplicator"]),
+        (
+            "source-state",
+            ["assembler", "deduplicator", "source-state"],
+        ),
+    ],
+)
+def test_reset_owner_failure_propagates_without_running_later_owners(
+    failing_owner,
+    expected_calls,
+):
+    calls = []
+
+    class FailingAssembler:
+        def reset(self):
+            calls.append("assembler")
+            if failing_owner == "assembler":
+                raise RuntimeError("assembler reset failed")
+            return ()
+
+    class FailingDeduplicator:
+        def reset(self):
+            calls.append("deduplicator")
+            if failing_owner == "deduplicator":
+                raise RuntimeError("deduplicator reset failed")
+            return 0
+
+    class FailingSourceState:
+        def reset(self):
+            calls.append("source-state")
+            if failing_owner == "source-state":
+                raise RuntimeError("source-state reset failed")
+            return 0
+
+    processor = make_processor(
+        assembler=FailingAssembler(),
+        deduplicator=FailingDeduplicator(),
+        source_state=FailingSourceState(),
+    )
+    processor._multipart_s_ctx["orphan-s"] = "value"
+    processor._multipart_c_ctx["orphan-c"] = 1
+    processor._multipart_gid_ctx["orphan-gid"] = frozenset(("1",))
+
+    with pytest.raises(RuntimeError, match=f"{failing_owner} reset failed"):
+        processor.reset()
+
+    assert calls == expected_calls
+    assert processor._multipart_s_ctx == {"orphan-s": "value"}
+    assert processor._multipart_c_ctx == {"orphan-c": 1}
+    assert processor._multipart_gid_ctx == {
+        "orphan-gid": frozenset(("1",))
+    }
 
 
 def test_routing_generation_change_does_not_reset_deduplication():

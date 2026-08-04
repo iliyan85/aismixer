@@ -107,6 +107,37 @@ class OutputBatch:
         object.__setattr__(self, "outputs", outputs)
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessorResetReport:
+    """Counts of processor-owned live state discarded by one reset call."""
+
+    assembler_groups_discarded: int
+    dedup_entries_discarded: int
+    source_entries_discarded: int
+    multipart_s_contexts_discarded: int
+    multipart_c_contexts_discarded: int
+    multipart_gid_contexts_discarded: int
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "assembler_groups_discarded",
+            "dedup_entries_discarded",
+            "source_entries_discarded",
+            "multipart_s_contexts_discarded",
+            "multipart_c_contexts_discarded",
+            "multipart_gid_contexts_discarded",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    f"{field_name} must be a non-negative integer."
+                )
+            if value < 0:
+                raise ValueError(
+                    f"{field_name} must be a non-negative integer."
+                )
+
+
 def _validate_numeric_target_ids(
     target_ids: Iterable[EgressTargetId],
 ) -> None:
@@ -123,11 +154,22 @@ def _validate_numeric_target_ids(
 
 @runtime_checkable
 class DataPlaneProcessor(Protocol):
-    """Synchronous processing boundary, independent of forwarding transports."""
+    """Synchronous processing lifecycle independent of forwarding transports.
+
+    Instances are usable immediately and require no asynchronous start, stop,
+    or close operation. The owner must serialize calls to ``process()`` and
+    ``reset()``; implementations are not required to make concurrent calls
+    safe.
+    """
 
     def process(
         self,
         frame: IngressFrame,
         snapshot: ProcessingSnapshot,
     ) -> OutputBatch:
+        ...
+
+    def reset(self) -> ProcessorResetReport:
+        """Synchronously discard live state while retaining configuration."""
+
         ...

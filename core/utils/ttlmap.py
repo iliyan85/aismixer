@@ -45,6 +45,27 @@ class TTLMap:
 
     def __len__(self) -> int: return len(self._d)
 
+    def clear(self) -> int:
+        """Discard all live entries and expiry records, preserving config.
+
+        The eviction callback is invoked exactly once for each key that is
+        live when the clear begins. Stale expiry-queue records do not produce
+        callbacks.
+        """
+        live_keys = tuple(self._d)
+        removed = len(live_keys)
+
+        self._d.clear()
+        self._q.clear()
+        self._ops = 0
+        self._last_sweep_ns = _MONO()
+
+        if self._on_evict:
+            for key in live_keys:
+                self._on_evict(key)
+
+        return removed
+
     # --- вътрешно ---
     def _maybe_sweep(self, now_ns: int) -> None:
         self._ops += 1

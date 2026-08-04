@@ -13,6 +13,7 @@ from core.data_plane import (
     OutputBatch,
     ProcessingSnapshot,
     ProcessorOutput,
+    ProcessorResetReport,
 )
 from core.ingress_frame import IngressFrame
 from core.output_builder import build_output_bytes
@@ -32,21 +33,6 @@ class _ProcessingConfig:
     gid_digits: int
 
 
-class _TouchSOperationSourceState:
-    """Adapt the repository's legacy callback injection to source state."""
-
-    __slots__ = ("_operation",)
-
-    def __init__(
-        self,
-        operation: Callable[[str | None], None],
-    ) -> None:
-        self._operation = operation
-
-    def touch_s(self, s_value: str | None) -> None:
-        self._operation(s_value)
-
-
 def _generate_numeric_gid_fixed(digits: int) -> str:
     """Return a cryptographically secure fixed-width numeric group ID."""
 
@@ -58,9 +44,10 @@ class PythonDataPlaneProcessor:
     """Long-lived Python reference processor for one serial runtime consumer.
 
     One instance exclusively owns its assembler, deduplicator, source state,
-    and multipart metadata. Calls are intentionally synchronous and must be
-    serialized by orchestration; this class adds no locking or worker
-    lifecycle.
+    and multipart metadata. Injected mutable components become lifecycle-owned
+    by that processor and must not be shared or reset externally. Calls to
+    ``process()`` and ``reset()`` are intentionally synchronous and must be
+    serialized by the owner; this class adds no locking or worker lifecycle.
     """
 
     __slots__ = (
@@ -88,7 +75,6 @@ class PythonDataPlaneProcessor:
         wall_clock: Callable[[], float] | None = None,
         gid_generator: Callable[[int], str] | None = None,
         source_state: SourceState | None = None,
-        touch_s_operation: Callable[[str | None], None] | None = None,
     ) -> None:
         self._config = _ProcessingConfig(
             station_id=station_id,
@@ -113,18 +99,9 @@ class PythonDataPlaneProcessor:
             if gid_generator is None
             else gid_generator
         )
-        if source_state is not None and touch_s_operation is not None:
-            raise TypeError(
-                "source_state and touch_s_operation are mutually exclusive"
-            )
-        if touch_s_operation is not None:
-            self._source_state = _TouchSOperationSourceState(
-                touch_s_operation
-            )
-        else:
-            self._source_state = (
-                SourceState() if source_state is None else source_state
-            )
+        self._source_state = (
+            SourceState() if source_state is None else source_state
+        )
         self._multipart_s_ctx: dict[AssemblyKey, str] = {}
         self._multipart_c_ctx: dict[AssemblyKey, int] = {}
         self._multipart_gid_ctx: dict[AssemblyKey, frozenset[str]] = {}
@@ -341,6 +318,39 @@ class PythonDataPlaneProcessor:
                 self._discard_multipart_contexts((outcome.group_key,))
 
         return OutputBatch(outputs=tuple(outputs))
+
+    def reset(self) -> ProcessorResetReport:
+        """Reset assembler, deduplicator, source state, then metadata.
+
+        Configuration, injected helpers, and component lifetime statistics
+        remain owned by this processor and are preserved.
+        """
+
+        assembler_groups_discarded = len(self._assembler.reset())
+        dedup_entries_discarded = self._deduplicator.reset()
+        source_entries_discarded = self._source_state.reset()
+
+        multipart_s_contexts_discarded = len(self._multipart_s_ctx)
+        self._multipart_s_ctx.clear()
+        multipart_c_contexts_discarded = len(self._multipart_c_ctx)
+        self._multipart_c_ctx.clear()
+        multipart_gid_contexts_discarded = len(self._multipart_gid_ctx)
+        self._multipart_gid_ctx.clear()
+
+        return ProcessorResetReport(
+            assembler_groups_discarded=assembler_groups_discarded,
+            dedup_entries_discarded=dedup_entries_discarded,
+            source_entries_discarded=source_entries_discarded,
+            multipart_s_contexts_discarded=(
+                multipart_s_contexts_discarded
+            ),
+            multipart_c_contexts_discarded=(
+                multipart_c_contexts_discarded
+            ),
+            multipart_gid_contexts_discarded=(
+                multipart_gid_contexts_discarded
+            ),
+        )
 
     def _discard_multipart_contexts(
         self,

@@ -37,5 +37,13 @@ class SourceState:
             if s_value not in self._per_s_state:
                 self._per_s_state[s_value] = {}
 
+    def reset(self) -> int:
+        """Discard live source activity and associated per-source state."""
+        discarded = self._s_cache.clear()
+        # Clear defensively in case associated state has become orphaned from
+        # the live TTL mapping.
+        self._per_s_state.clear()
+        return discarded
+
     def _on_s_evict(self, s_key: str) -> None:
         self._per_s_state.pop(s_key, None)

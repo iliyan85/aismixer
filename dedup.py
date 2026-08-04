@@ -74,10 +74,12 @@ class Deduplicator:
                 del self.cache[key]
                 self._expired += 1
 
-    def reset(self):
+    def reset(self) -> int:
+        discarded = len(self.cache)
         self.cache.clear()
         self._expiry_index.clear()
         self._resets += 1
+        return discarded
 
     def stats(self):
         return DedupStats(

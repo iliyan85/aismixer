@@ -322,7 +322,7 @@ def test_reset_clears_global_scoped_string_and_tuple_entries():
     assert len(deduplicator.cache) == 3
     assert len(deduplicator._expiry_index) == 3
 
-    assert deduplicator.reset() is None
+    assert deduplicator.reset() == 3
     assert deduplicator.cache == {}
     assert not deduplicator._expiry_index
 
@@ -335,8 +335,8 @@ def test_reset_is_safe_when_empty_and_preserves_configuration():
     clock = FakeClock()
     deduplicator = Deduplicator(ttl=30, clock=clock)
 
-    assert deduplicator.reset() is None
-    assert deduplicator.reset() is None
+    assert deduplicator.reset() == 0
+    assert deduplicator.reset() == 0
 
     calls_before_observation = clock.calls
 
@@ -350,6 +350,22 @@ def test_reset_is_safe_when_empty_and_preserves_configuration():
     clock.now = 1030.0
 
     assert deduplicator.is_unique("message")
+
+
+def test_reset_counts_live_entries_not_stale_expiry_records():
+    deduplicator = Deduplicator()
+    assert deduplicator.is_unique("stale")
+    stale_key = next(iter(deduplicator.cache))
+    deduplicator.cache.pop(stale_key)
+    assert deduplicator.is_unique("live")
+    assert len(deduplicator.cache) == 1
+    assert len(deduplicator._expiry_index) == 2
+
+    assert deduplicator.reset() == 1
+    assert deduplicator.cache == {}
+    assert not deduplicator._expiry_index
+    assert deduplicator.stats().resets == 1
+    assert deduplicator.is_unique("live")
 
 
 def test_max_entries_none_preserves_unbounded_behavior():
@@ -681,7 +697,7 @@ def test_reset_preserves_cumulative_statistics_and_capacity():
         peak_entries=2,
     )
 
-    assert deduplicator.reset() is None
+    assert deduplicator.reset() == 1
     assert deduplicator.cache == {}
     assert not deduplicator._expiry_index
     assert_stats(
@@ -694,7 +710,7 @@ def test_reset_preserves_cumulative_statistics_and_capacity():
         peak_entries=2,
     )
 
-    assert deduplicator.reset() is None
+    assert deduplicator.reset() == 0
     assert_stats(
         deduplicator,
         accepted=3,

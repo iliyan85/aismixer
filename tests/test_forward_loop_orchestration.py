@@ -11,6 +11,7 @@ from core.data_plane import (
 from core.ingress_frame import IngressFrame
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.routing_state import RoutingSnapshot
+from core.state.s_cache import SourceState
 from dedup import Deduplicator
 
 
@@ -85,6 +86,16 @@ class CompletionRecordingProcessor:
         self.outputs = outputs
         self.completed = True
         return outputs
+
+
+class RecordingSourceState(SourceState):
+    def __init__(self, touched_s_values):
+        super().__init__()
+        self._touched_s_values = touched_s_values
+
+    def touch_s(self, s_value):
+        self._touched_s_values.append(s_value)
+        super().touch_s(s_value)
 
 
 class RecordingForwarder:
@@ -175,6 +186,7 @@ def make_boundary_processor():
     gid_observations = []
     gid_values = iter(("111111", "222222"))
     deduplicator = Deduplicator(clock=lambda: 0.0)
+    source_state = RecordingSourceState(touched_s_values)
 
     def wall_clock():
         value = next(clock_values)
@@ -194,7 +206,7 @@ def make_boundary_processor():
             deduplicator=deduplicator,
             wall_clock=wall_clock,
             gid_generator=generate_gid,
-            touch_s_operation=touched_s_values.append,
+            source_state=source_state,
         )
     )
     return (

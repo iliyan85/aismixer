@@ -1,3 +1,4 @@
+import ast
 import inspect
 from dataclasses import FrozenInstanceError, fields
 
@@ -10,12 +11,23 @@ from core.data_plane import (
     OutputBatch,
     ProcessingSnapshot,
     ProcessorOutput,
+    ProcessorResetReport,
 )
 from core.ingress_frame import IngressFrame
 
 
 class _BytesSubclass(bytes):
     pass
+
+
+RESET_REPORT_FIELDS = (
+    "assembler_groups_discarded",
+    "dedup_entries_discarded",
+    "source_entries_discarded",
+    "multipart_s_contexts_discarded",
+    "multipart_c_contexts_discarded",
+    "multipart_gid_contexts_discarded",
+)
 
 
 def make_frame() -> IngressFrame:
@@ -347,10 +359,94 @@ def test_output_batch_rejects_non_processor_output_elements(outputs):
         OutputBatch(outputs=outputs)
 
 
+def test_processor_reset_report_is_frozen_slotted_and_count_only():
+    report = ProcessorResetReport(
+        assembler_groups_discarded=1,
+        dedup_entries_discarded=2,
+        source_entries_discarded=3,
+        multipart_s_contexts_discarded=4,
+        multipart_c_contexts_discarded=5,
+        multipart_gid_contexts_discarded=6,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        report.assembler_groups_discarded = 7
+
+    assert not hasattr(report, "__dict__")
+    assert tuple(field.name for field in fields(report)) == RESET_REPORT_FIELDS
+    assert tuple(getattr(report, name) for name in RESET_REPORT_FIELDS) == (
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    )
+
+
+@pytest.mark.parametrize("field_name", RESET_REPORT_FIELDS)
+@pytest.mark.parametrize(
+    ("value", "exception"),
+    [
+        (True, TypeError),
+        (1.0, TypeError),
+        ("1", TypeError),
+        (None, TypeError),
+        (object(), TypeError),
+        (-1, ValueError),
+    ],
+)
+def test_processor_reset_report_rejects_invalid_counts(
+    field_name,
+    value,
+    exception,
+):
+    values = {name: 0 for name in RESET_REPORT_FIELDS}
+    values[field_name] = value
+
+    with pytest.raises(exception, match=field_name):
+        ProcessorResetReport(**values)
+
+
+def test_data_plane_contract_has_no_runtime_or_transport_dependencies():
+    tree = ast.parse(inspect.getsource(data_plane_module))
+    imported_modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_modules.add(node.module)
+
+    forbidden_modules = (
+        "aismixer",
+        "asyncio",
+        "core.routing",
+        "core.routing_state",
+        "core.runtime_routing",
+        "forwarder",
+        "queue",
+        "socket",
+    )
+    for forbidden_module in forbidden_modules:
+        assert not any(
+            imported_module == forbidden_module
+            or imported_module.startswith(f"{forbidden_module}.")
+            for imported_module in imported_modules
+        )
+
+
 def test_minimal_synchronous_fake_satisfies_processor_protocol():
     output = ProcessorOutput(
         message=b"formatted message\r\n",
         target_ids=(),
+    )
+    reset_report = ProcessorResetReport(
+        assembler_groups_discarded=0,
+        dedup_entries_discarded=0,
+        source_entries_discarded=0,
+        multipart_s_contexts_discarded=0,
+        multipart_c_contexts_discarded=0,
+        multipart_gid_contexts_discarded=0,
     )
 
     class FakeProcessor:
@@ -358,6 +454,9 @@ def test_minimal_synchronous_fake_satisfies_processor_protocol():
             assert frame is expected_frame
             assert snapshot is expected_snapshot
             return OutputBatch(outputs=(output,))
+
+        def reset(self):
+            return reset_report
 
     expected_frame = make_frame()
     expected_snapshot = ProcessingSnapshot(
@@ -369,7 +468,19 @@ def test_minimal_synchronous_fake_satisfies_processor_protocol():
 
     assert isinstance(processor, DataPlaneProcessor)
     assert not inspect.iscoroutinefunction(processor.process)
+    assert not inspect.iscoroutinefunction(processor.reset)
+    assert not inspect.iscoroutinefunction(DataPlaneProcessor.process)
+    assert not inspect.iscoroutinefunction(DataPlaneProcessor.reset)
     batch = processor.process(expected_frame, expected_snapshot)
     assert type(batch) is OutputBatch
     assert batch.outputs == (output,)
     assert batch.outputs[0] is output
+    assert processor.reset() is reset_report
+
+
+def test_process_only_object_does_not_satisfy_processor_protocol():
+    class ProcessOnly:
+        def process(self, frame, snapshot):
+            return OutputBatch(outputs=())
+
+    assert not isinstance(ProcessOnly(), DataPlaneProcessor)
