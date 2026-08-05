@@ -13,6 +13,7 @@ from core.data_plane import (
     ProcessorResetReport,
 )
 from core.ingress_frame import IngressFrame
+from core.metrics import ProcessorMetricsSnapshot
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.state.s_cache import SourceState
 from dedup import Deduplicator
@@ -83,6 +84,24 @@ def make_processor(**overrides):
     }
     arguments.update(overrides)
     return PythonDataPlaneProcessor(**arguments)
+
+
+def make_metrics_snapshot(**overrides):
+    values = {
+        "process_calls": 0,
+        "process_completed": 0,
+        "process_failed": 0,
+        "process_in_flight": 0,
+        "outputless_calls": 0,
+        "output_batches": 0,
+        "output_messages": 0,
+        "reset_calls": 0,
+        "reset_completed": 0,
+        "reset_failed": 0,
+        "reset_in_flight": 0,
+    }
+    values.update(overrides)
+    return ProcessorMetricsSnapshot(**values)
 
 
 def process_batch(processor, frame, snapshot):
@@ -175,11 +194,147 @@ def test_processor_satisfies_synchronous_protocol_without_asyncio_dependency():
     assert isinstance(processor, DataPlaneProcessor)
     assert not inspect.iscoroutinefunction(processor.process)
     assert not inspect.iscoroutinefunction(processor.reset)
+    assert not inspect.iscoroutinefunction(processor.metrics_snapshot)
+    assert not inspect.iscoroutinefunction(
+        DataPlaneProcessor.metrics_snapshot
+    )
     assert "asyncio" not in vars(python_data_plane_module)
     assert "RoutingTable" not in vars(python_data_plane_module)
-    process_source = inspect.getsource(PythonDataPlaneProcessor.process)
+    process_source = inspect.getsource(PythonDataPlaneProcessor._process_impl)
     assert "routing_table" not in process_source
     assert ".match(" not in process_source
+
+
+def test_fresh_processor_metrics_are_all_zero():
+    processor = make_processor()
+
+    assert processor.metrics_snapshot() == make_metrics_snapshot()
+
+
+def test_process_metrics_accumulate_outputless_batches_and_messages():
+    processor = make_processor()
+    snapshot = make_snapshot()
+
+    assert process_outputs(
+        processor,
+        make_frame("not an AIS sentence"),
+        snapshot,
+    ) == ()
+    assert processor.metrics_snapshot() == make_metrics_snapshot(
+        process_calls=1,
+        process_completed=1,
+        outputless_calls=1,
+    )
+
+    assert len(process_outputs(processor, make_frame(SENTENCE), snapshot)) == 1
+    assert processor.metrics_snapshot() == make_metrics_snapshot(
+        process_calls=2,
+        process_completed=2,
+        outputless_calls=1,
+        output_batches=1,
+        output_messages=1,
+    )
+
+    first = make_multipart_sentence(1, "first")
+    second = make_multipart_sentence(2, "second")
+    assert process_outputs(processor, make_frame(first), snapshot) == ()
+    assert len(process_outputs(processor, make_frame(second), snapshot)) == 2
+    assert processor.metrics_snapshot() == make_metrics_snapshot(
+        process_calls=4,
+        process_completed=4,
+        outputless_calls=2,
+        output_batches=2,
+        output_messages=3,
+    )
+
+
+def test_process_in_flight_is_visible_during_successful_reentrant_observation():
+    observed = []
+
+    class ObservingDeduplicator:
+        def is_unique(self, _message, scope=None):
+            assert scope is None
+            observed.append(processor.metrics_snapshot())
+            return True
+
+    processor = make_processor(deduplicator=ObservingDeduplicator())
+
+    assert len(
+        process_outputs(processor, make_frame(SENTENCE), make_snapshot())
+    ) == 1
+
+    assert observed == [
+        make_metrics_snapshot(
+            process_calls=1,
+            process_in_flight=1,
+        )
+    ]
+    assert processor.metrics_snapshot() == make_metrics_snapshot(
+        process_calls=1,
+        process_completed=1,
+        output_batches=1,
+        output_messages=1,
+    )
+
+
+def test_process_failure_preserves_identity_and_clears_in_flight():
+    class ProcessingFailure(BaseException):
+        pass
+
+    failure = ProcessingFailure("processing failed")
+    observed = []
+
+    class FailingDeduplicator:
+        def is_unique(self, _message, scope=None):
+            assert scope is None
+            observed.append(processor.metrics_snapshot())
+            raise failure
+
+    processor = make_processor(deduplicator=FailingDeduplicator())
+
+    with pytest.raises(ProcessingFailure) as exc_info:
+        processor.process(make_frame(SENTENCE), make_snapshot())
+
+    assert exc_info.value is failure
+    assert observed == [
+        make_metrics_snapshot(
+            process_calls=1,
+            process_in_flight=1,
+        )
+    ]
+    assert processor.metrics_snapshot() == make_metrics_snapshot(
+        process_calls=1,
+        process_failed=1,
+    )
+
+
+def test_repeated_metrics_snapshots_do_not_mutate_processing_state():
+    processor = make_processor()
+    snapshot = make_snapshot()
+    first = make_multipart_sentence(1, "first")
+    second = make_multipart_sentence(2, "second")
+    tagged_first = tag_block("s:pending,c:123,g:1-2-444") + first
+
+    assert process_outputs(processor, make_frame(tagged_first), snapshot) == ()
+    assembler_before = processor._assembler.stats()
+    contexts_before = (
+        dict(processor._multipart_s_ctx),
+        dict(processor._multipart_c_ctx),
+        dict(processor._multipart_gid_ctx),
+    )
+
+    first_snapshot = processor.metrics_snapshot()
+    second_snapshot = processor.metrics_snapshot()
+
+    assert first_snapshot == second_snapshot
+    assert first_snapshot is not second_snapshot
+    assert processor._assembler.stats() == assembler_before
+    assert (
+        processor._multipart_s_ctx,
+        processor._multipart_c_ctx,
+        processor._multipart_gid_ctx,
+    ) == contexts_before
+    assert len(process_outputs(processor, make_frame(second), snapshot)) == 2
 
 
 def test_exact_single_sentence_global_output_uses_snapshot_targets():
@@ -273,7 +428,7 @@ def test_routed_no_match_does_not_invoke_builder(monkeypatch):
 
 
 def test_processor_delegates_framing_and_encoding_to_output_builder():
-    process_source = inspect.getsource(PythonDataPlaneProcessor.process)
+    process_source = inspect.getsource(PythonDataPlaneProcessor._process_impl)
 
     assert "build_output_bytes(" in process_source
     assert "wrap_with_meta" not in process_source
@@ -1086,6 +1241,105 @@ def test_repeated_empty_reset_reports_zero_and_advances_owner_counters():
     assert processor._assembler.stats().resets == 2
     assert processor._assembler.stats().reset_discarded == 0
     assert processor._deduplicator.stats().resets == 2
+
+
+def test_reset_metrics_accumulate_without_clearing_process_metrics():
+    processor = make_processor()
+    snapshot = make_snapshot()
+
+    assert len(process_outputs(processor, make_frame(SENTENCE), snapshot)) == 1
+
+    first_report = processor.reset()
+    second_report = processor.reset()
+
+    assert first_report == ProcessorResetReport(
+        assembler_groups_discarded=0,
+        dedup_entries_discarded=1,
+        source_entries_discarded=1,
+        multipart_s_contexts_discarded=0,
+        multipart_c_contexts_discarded=0,
+        multipart_gid_contexts_discarded=0,
+    )
+    assert second_report == ProcessorResetReport(
+        assembler_groups_discarded=0,
+        dedup_entries_discarded=0,
+        source_entries_discarded=0,
+        multipart_s_contexts_discarded=0,
+        multipart_c_contexts_discarded=0,
+        multipart_gid_contexts_discarded=0,
+    )
+    assert processor.metrics_snapshot() == make_metrics_snapshot(
+        process_calls=1,
+        process_completed=1,
+        output_batches=1,
+        output_messages=1,
+        reset_calls=2,
+        reset_completed=2,
+    )
+
+    assert len(process_outputs(processor, make_frame(SENTENCE), snapshot)) == 1
+    assert processor.metrics_snapshot() == make_metrics_snapshot(
+        process_calls=2,
+        process_completed=2,
+        output_batches=2,
+        output_messages=2,
+        reset_calls=2,
+        reset_completed=2,
+    )
+
+
+def test_reset_failure_preserves_identity_and_clears_in_flight():
+    class ResetFailure(BaseException):
+        pass
+
+    failure = ResetFailure("reset failed")
+    observed = []
+
+    class FailingAssembler:
+        def reset(self):
+            observed.append(processor.metrics_snapshot())
+            raise failure
+
+    processor = make_processor(assembler=FailingAssembler())
+
+    with pytest.raises(ResetFailure) as exc_info:
+        processor.reset()
+
+    assert exc_info.value is failure
+    assert observed == [
+        make_metrics_snapshot(
+            reset_calls=1,
+            reset_in_flight=1,
+        )
+    ]
+    assert processor.metrics_snapshot() == make_metrics_snapshot(
+        reset_calls=1,
+        reset_failed=1,
+    )
+
+
+def test_processor_metrics_are_isolated_per_instance():
+    first_processor = make_processor()
+
+    assert len(
+        process_outputs(
+            first_processor,
+            make_frame(SENTENCE),
+            make_snapshot(),
+        )
+    ) == 1
+    first_processor.reset()
+    second_processor = make_processor()
+
+    assert first_processor.metrics_snapshot() == make_metrics_snapshot(
+        process_calls=1,
+        process_completed=1,
+        output_batches=1,
+        output_messages=1,
+        reset_calls=1,
+        reset_completed=1,
+    )
+    assert second_processor.metrics_snapshot() == make_metrics_snapshot()
 
 
 @pytest.mark.parametrize(

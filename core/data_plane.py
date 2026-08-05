@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from core.ingress_frame import IngressFrame
+from core.metrics import ProcessorMetricsSnapshot
 from core.target_identity import EgressTargetId
 
 
@@ -185,5 +186,10 @@ class DataPlaneProcessor(Protocol):
 
     def reset(self) -> ProcessorResetReport:
         """Synchronously discard live state while retaining configuration."""
+
+        ...
+
+    def metrics_snapshot(self) -> ProcessorMetricsSnapshot:
+        """Return immutable lifetime metrics without changing processor state."""
 
         ...

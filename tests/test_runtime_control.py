@@ -8,6 +8,7 @@ import aismixer
 from assembler import AIVDMAssembler
 from core.data_plane import DeduplicationMode
 from core.event import IngressEvent
+from core.metrics import EgressMetricsSnapshot, QueueMetricsSnapshot
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.routing_control_protocol import ROUTING_CONTROL_PROTOCOL_VERSION
 from core.routing_control_unix import RoutingControlUnixServer
@@ -37,6 +38,34 @@ unix_socket_test = pytest.mark.skipif(
     not HAS_UNIX_SOCKETS,
     reason="Unix-domain asyncio sockets are not supported on this platform.",
 )
+
+
+def empty_queue_metrics(name, capacity):
+    return QueueMetricsSnapshot(
+        name=name,
+        capacity=capacity,
+        depth=0,
+        peak_depth=0,
+        enqueued=0,
+        dequeued=0,
+        put_waits=0,
+        current_put_waiters=0,
+    )
+
+
+def empty_egress_metrics():
+    return EgressMetricsSnapshot(
+        batches_started=0,
+        batches_completed=0,
+        batches_failed=0,
+        batches_cancelled=0,
+        active_batches=0,
+        outputs_started=0,
+        outputs_completed=0,
+        outputs_failed=0,
+        outputs_cancelled=0,
+        active_outputs=0,
+    )
 
 
 def enabled_config(**unix_overrides):
@@ -401,18 +430,31 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
         processing_queue.maxsize
         == aismixer.DEFAULT_PROCESSING_QUEUE_MAXSIZE
     )
+    assert processing_queue.metrics_snapshot() == empty_queue_metrics(
+        "processing",
+        aismixer.DEFAULT_PROCESSING_QUEUE_MAXSIZE,
+    )
     assert processor_factory.args[0] is processing_queue
     assert processor_factory.keywords == {
         "processor": result["processor"],
     }
     assert result["processor_factory_calls"] == [None]
     assert egress_factory.args[1] is result["forwarder"]
+    egress_metrics = egress_factory.keywords["metrics"]
+    assert isinstance(egress_metrics, aismixer._EgressMetrics)
+    assert egress_metrics.metrics_snapshot() == empty_egress_metrics()
     assert egress_factory.keywords == {
         "debug": aismixer.DEBUG,
         "timestamp": aismixer.ts,
+        "metrics": egress_metrics,
     }
     assert processor_factory.args[1] is egress_factory.args[0]
-    assert egress_factory.args[0].maxsize == 1
+    egress_queue = egress_factory.args[0]
+    assert isinstance(egress_queue, aismixer._ObservedQueue)
+    assert egress_queue.metrics_snapshot() == empty_queue_metrics(
+        "egress",
+        1,
+    )
     assert result["forwarder_close_count"] == 1
 
 
@@ -651,9 +693,18 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         ) + tuple(factory.args[1] for factory in udp_factories)
         assert len({id(queue) for queue in input_queues}) == 4
         assert all(
-            isinstance(queue, asyncio.Queue)
+            isinstance(queue, aismixer._ObservedQueue)
             and queue.maxsize == aismixer.DEFAULT_INGRESS_QUEUE_MAXSIZE
             for queue in input_queues
+        )
+        assert tuple(
+            queue.metrics_snapshot() for queue in input_queues
+        ) == tuple(
+            empty_queue_metrics(
+                spec.name,
+                aismixer.DEFAULT_INGRESS_QUEUE_MAXSIZE,
+            )
+            for spec in specs[:4]
         )
         assert fan_in_factory.func is aismixer.ingress_fan_in_loop
         assert fan_in_factory.args[0] == input_queues
@@ -670,6 +721,10 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
             processing_queue.maxsize
             == aismixer.DEFAULT_PROCESSING_QUEUE_MAXSIZE
         )
+        assert processing_queue.metrics_snapshot() == empty_queue_metrics(
+            "processing",
+            aismixer.DEFAULT_PROCESSING_QUEUE_MAXSIZE,
+        )
         assert processor_factory.func is aismixer.processor_stage_loop
         assert processor_factory.args[0] is processing_queue
         assert processor_factory.keywords == {
@@ -677,8 +732,21 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         }
         assert egress_factory.func is aismixer.egress_stage_loop
         assert egress_factory.args[1] is output_forwarder
-        assert processor_factory.args[1] is egress_factory.args[0]
-        assert egress_factory.args[0].maxsize == 1
+        egress_queue = egress_factory.args[0]
+        assert processor_factory.args[1] is egress_queue
+        assert isinstance(egress_queue, aismixer._ObservedQueue)
+        assert egress_queue.metrics_snapshot() == empty_queue_metrics(
+            "egress",
+            1,
+        )
+        egress_metrics = egress_factory.keywords["metrics"]
+        assert isinstance(egress_metrics, aismixer._EgressMetrics)
+        assert egress_metrics.metrics_snapshot() == empty_egress_metrics()
+        assert egress_factory.keywords == {
+            "debug": aismixer.DEBUG,
+            "timestamp": aismixer.ts,
+            "metrics": egress_metrics,
+        }
         assert first_udp_socket.close_count == 1
         assert second_udp_socket.close_count == 1
         assert output_forwarder.close_count == 1
@@ -726,10 +794,28 @@ def test_main_accepts_explicit_capacities_with_isolated_input_queues(
         udp_queue = specs[1].coroutine_factory.args[1]
         fan_in_factory = specs[2].coroutine_factory
         processor_factory = specs[3].coroutine_factory
+        egress_factory = specs[4].coroutine_factory
 
         assert secure_queue is not udp_queue
-        assert secure_queue.maxsize == 1
-        assert udp_queue.maxsize == 1
+        assert isinstance(secure_queue, aismixer._ObservedQueue)
+        assert isinstance(udp_queue, aismixer._ObservedQueue)
+        assert secure_queue.metrics_snapshot() == empty_queue_metrics(
+            "udpsec-ingress:0:secure_station",
+            1,
+        )
+        assert udp_queue.metrics_snapshot() == empty_queue_metrics(
+            "udp-ingress:0:plain_station",
+            1,
+        )
+        egress_queue = egress_factory.args[0]
+        assert isinstance(egress_queue, aismixer._ObservedQueue)
+        assert egress_queue.metrics_snapshot() == empty_queue_metrics(
+            "egress",
+            1,
+        )
+        egress_metrics = egress_factory.keywords["metrics"]
+        assert isinstance(egress_metrics, aismixer._EgressMetrics)
+        assert egress_metrics.metrics_snapshot() == empty_egress_metrics()
         secure_queue.put_nowait(object())
         blocked_secure_put = asyncio.create_task(
             secure_queue.put(object())
@@ -747,7 +833,10 @@ def test_main_accepts_explicit_capacities_with_isolated_input_queues(
         assert secure_queue.full()
 
         processing_queue = fan_in_factory.args[1]
-        assert processing_queue.maxsize == 2
+        assert processing_queue.metrics_snapshot() == empty_queue_metrics(
+            "processing",
+            2,
+        )
         assert processor_factory.args[0] is processing_queue
 
     asyncio.run(scenario())

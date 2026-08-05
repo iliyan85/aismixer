@@ -16,6 +16,7 @@ from core.data_plane import (
     ProcessorResetReport,
 )
 from core.ingress_frame import IngressFrame
+from core.metrics import ProcessorMetricsSnapshot
 from core.output_builder import build_output_bytes
 from core.parsed_sentence import parse_frame_sentences, parse_leading_s_value
 from core.s_policy import choose_s_value_from_candidates
@@ -60,6 +61,17 @@ class PythonDataPlaneProcessor:
         "_multipart_s_ctx",
         "_multipart_c_ctx",
         "_multipart_gid_ctx",
+        "_process_calls",
+        "_process_completed",
+        "_process_failed",
+        "_process_in_flight",
+        "_outputless_calls",
+        "_output_batches",
+        "_output_messages",
+        "_reset_calls",
+        "_reset_completed",
+        "_reset_failed",
+        "_reset_in_flight",
     )
 
     def __init__(
@@ -105,6 +117,17 @@ class PythonDataPlaneProcessor:
         self._multipart_s_ctx: dict[AssemblyKey, str] = {}
         self._multipart_c_ctx: dict[AssemblyKey, int] = {}
         self._multipart_gid_ctx: dict[AssemblyKey, frozenset[str]] = {}
+        self._process_calls = 0
+        self._process_completed = 0
+        self._process_failed = 0
+        self._process_in_flight = 0
+        self._outputless_calls = 0
+        self._output_batches = 0
+        self._output_messages = 0
+        self._reset_calls = 0
+        self._reset_completed = 0
+        self._reset_failed = 0
+        self._reset_in_flight = 0
 
     def process(
         self,
@@ -112,6 +135,32 @@ class PythonDataPlaneProcessor:
         snapshot: ProcessingSnapshot,
     ) -> OutputBatch:
         """Process one accepted frame without performing transport I/O."""
+
+        self._process_calls += 1
+        self._process_in_flight += 1
+        try:
+            output_batch = self._process_impl(frame, snapshot)
+        except BaseException:
+            self._process_failed += 1
+            raise
+        else:
+            self._process_completed += 1
+            output_count = len(output_batch.outputs)
+            if output_count:
+                self._output_batches += 1
+                self._output_messages += output_count
+            else:
+                self._outputless_calls += 1
+            return output_batch
+        finally:
+            self._process_in_flight -= 1
+
+    def _process_impl(
+        self,
+        frame: IngressFrame,
+        snapshot: ProcessingSnapshot,
+    ) -> OutputBatch:
+        """Run the existing Python processing algorithm."""
 
         deduplication_mode = snapshot.deduplication_mode
         route_target_ids = snapshot.target_ids
@@ -326,6 +375,22 @@ class PythonDataPlaneProcessor:
         remain owned by this processor and are preserved.
         """
 
+        self._reset_calls += 1
+        self._reset_in_flight += 1
+        try:
+            report = self._reset_impl()
+        except BaseException:
+            self._reset_failed += 1
+            raise
+        else:
+            self._reset_completed += 1
+            return report
+        finally:
+            self._reset_in_flight -= 1
+
+    def _reset_impl(self) -> ProcessorResetReport:
+        """Run the existing ordered reset implementation."""
+
         assembler_groups_discarded = len(self._assembler.reset())
         dedup_entries_discarded = self._deduplicator.reset()
         source_entries_discarded = self._source_state.reset()
@@ -350,6 +415,23 @@ class PythonDataPlaneProcessor:
             multipart_gid_contexts_discarded=(
                 multipart_gid_contexts_discarded
             ),
+        )
+
+    def metrics_snapshot(self) -> ProcessorMetricsSnapshot:
+        """Return fresh immutable lifetime metrics for this processor."""
+
+        return ProcessorMetricsSnapshot(
+            process_calls=self._process_calls,
+            process_completed=self._process_completed,
+            process_failed=self._process_failed,
+            process_in_flight=self._process_in_flight,
+            outputless_calls=self._outputless_calls,
+            output_batches=self._output_batches,
+            output_messages=self._output_messages,
+            reset_calls=self._reset_calls,
+            reset_completed=self._reset_completed,
+            reset_failed=self._reset_failed,
+            reset_in_flight=self._reset_in_flight,
         )
 
     def _discard_multipart_contexts(

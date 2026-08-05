@@ -18,6 +18,7 @@ from core.ingress_frame import (
     coerce_ingress_frame,
     frame_from_udp_datagram,
 )
+from core.metrics import EgressMetricsSnapshot, QueueMetricsSnapshot
 from core.network_policy import NetworkPolicy, compile_ingress_policy
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.runtime_control import build_optional_routing_control_server
@@ -160,10 +161,160 @@ def _validate_queue_capacity(capacity, *, name):
     return capacity
 
 
+class _ObservedQueue(asyncio.Queue):
+    """Bounded asyncio queue with per-instance lifetime counters."""
+
+    def __init__(self, *, name, maxsize):
+        maxsize = _validate_queue_capacity(maxsize, name="maxsize")
+        initial_snapshot = QueueMetricsSnapshot(
+            name=name,
+            capacity=maxsize,
+            depth=0,
+            peak_depth=0,
+            enqueued=0,
+            dequeued=0,
+            put_waits=0,
+            current_put_waiters=0,
+        )
+        super().__init__(maxsize=maxsize)
+        self._metrics_name = initial_snapshot.name
+        self._peak_depth = 0
+        self._enqueued = 0
+        self._dequeued = 0
+        self._put_waits = 0
+        self._current_put_waiters = 0
+
+    def put_nowait(self, item):
+        """Insert immediately and count only successful insertions."""
+
+        super().put_nowait(item)
+        self._enqueued += 1
+        self._peak_depth = max(self._peak_depth, self.qsize())
+
+    async def put(self, item):
+        """Insert, recording one capacity wait when initially full."""
+
+        waited_for_capacity = self.full()
+        if waited_for_capacity:
+            self._put_waits += 1
+            self._current_put_waiters += 1
+        try:
+            await super().put(item)
+        finally:
+            if waited_for_capacity:
+                self._current_put_waiters -= 1
+
+    def get_nowait(self):
+        """Remove immediately and count only successful removals."""
+
+        item = super().get_nowait()
+        self._dequeued += 1
+        return item
+
+    def metrics_snapshot(self) -> QueueMetricsSnapshot:
+        """Return fresh immutable lifetime metrics without altering the queue."""
+
+        return QueueMetricsSnapshot(
+            name=self._metrics_name,
+            capacity=self.maxsize,
+            depth=self.qsize(),
+            peak_depth=self._peak_depth,
+            enqueued=self._enqueued,
+            dequeued=self._dequeued,
+            put_waits=self._put_waits,
+            current_put_waiters=self._current_put_waiters,
+        )
+
+
+class _EgressMetrics:
+    """Own lifetime counters for one local egress-stage lifecycle."""
+
+    __slots__ = (
+        "_batches_started",
+        "_batches_completed",
+        "_batches_failed",
+        "_batches_cancelled",
+        "_active_batches",
+        "_outputs_started",
+        "_outputs_completed",
+        "_outputs_failed",
+        "_outputs_cancelled",
+        "_active_outputs",
+    )
+
+    def __init__(self):
+        self._batches_started = 0
+        self._batches_completed = 0
+        self._batches_failed = 0
+        self._batches_cancelled = 0
+        self._active_batches = 0
+        self._outputs_started = 0
+        self._outputs_completed = 0
+        self._outputs_failed = 0
+        self._outputs_cancelled = 0
+        self._active_outputs = 0
+
+    def batch_started(self):
+        self._batches_started += 1
+        self._active_batches += 1
+
+    def batch_completed(self):
+        self._batches_completed += 1
+        self._active_batches -= 1
+
+    def batch_failed(self):
+        self._batches_failed += 1
+        self._active_batches -= 1
+
+    def batch_cancelled(self):
+        self._batches_cancelled += 1
+        self._active_batches -= 1
+
+    def output_started(self):
+        self._outputs_started += 1
+        self._active_outputs += 1
+
+    def output_completed(self):
+        self._outputs_completed += 1
+        self._active_outputs -= 1
+
+    def output_failed(self):
+        self._outputs_failed += 1
+        self._active_outputs -= 1
+
+    def output_cancelled(self):
+        self._outputs_cancelled += 1
+        self._active_outputs -= 1
+
+    def metrics_snapshot(self) -> EgressMetricsSnapshot:
+        """Return fresh immutable local-operation metrics."""
+
+        return EgressMetricsSnapshot(
+            batches_started=self._batches_started,
+            batches_completed=self._batches_completed,
+            batches_failed=self._batches_failed,
+            batches_cancelled=self._batches_cancelled,
+            active_batches=self._active_batches,
+            outputs_started=self._outputs_started,
+            outputs_completed=self._outputs_completed,
+            outputs_failed=self._outputs_failed,
+            outputs_cancelled=self._outputs_cancelled,
+            active_outputs=self._active_outputs,
+        )
+
+
 class _BoundedProcessingQueue:
     """Own a bounded work queue and its matching admission permits."""
 
-    __slots__ = ("_slots", "_work_queue")
+    __slots__ = (
+        "_slots",
+        "_work_queue",
+        "_peak_depth",
+        "_enqueued",
+        "_dequeued",
+        "_put_waits",
+        "_current_put_waiters",
+    )
 
     def __init__(self, maxsize):
         maxsize = _validate_queue_capacity(
@@ -172,6 +323,11 @@ class _BoundedProcessingQueue:
         )
         self._work_queue = asyncio.Queue(maxsize=maxsize)
         self._slots = asyncio.BoundedSemaphore(maxsize)
+        self._peak_depth = 0
+        self._enqueued = 0
+        self._dequeued = 0
+        self._put_waits = 0
+        self._current_put_waiters = 0
 
     @property
     def maxsize(self):
@@ -183,7 +339,15 @@ class _BoundedProcessingQueue:
     async def admit(self, work_item_factory):
         """Wait for capacity, then synchronously bind and enqueue one item."""
 
-        await self._slots.acquire()
+        waited_for_capacity = self._slots.locked()
+        if waited_for_capacity:
+            self._put_waits += 1
+            self._current_put_waiters += 1
+        try:
+            await self._slots.acquire()
+        finally:
+            if waited_for_capacity:
+                self._current_put_waiters -= 1
         try:
             work_item = work_item_factory()
             if not isinstance(work_item, ProcessingWorkItem):
@@ -191,6 +355,8 @@ class _BoundedProcessingQueue:
                     "work_item_factory must return a ProcessingWorkItem"
                 )
             self._work_queue.put_nowait(work_item)
+            self._enqueued += 1
+            self._peak_depth = max(self._peak_depth, self.qsize())
         except BaseException:
             self._slots.release()
             raise
@@ -199,8 +365,23 @@ class _BoundedProcessingQueue:
         """Dequeue one item and immediately return its queue-slot permit."""
 
         work_item = await self._work_queue.get()
+        self._dequeued += 1
         self._slots.release()
         return work_item
+
+    def metrics_snapshot(self) -> QueueMetricsSnapshot:
+        """Return fresh immutable admission-queue lifetime metrics."""
+
+        return QueueMetricsSnapshot(
+            name="processing",
+            capacity=self.maxsize,
+            depth=self.qsize(),
+            peak_depth=self._peak_depth,
+            enqueued=self._enqueued,
+            dequeued=self._dequeued,
+            put_waits=self._put_waits,
+            current_put_waiters=self._current_put_waiters,
+        )
 
 
 async def _cancel_and_await_tasks(tasks):
@@ -394,39 +575,55 @@ async def egress_stage_loop(
     *,
     debug=False,
     timestamp=None,
+    metrics=None,
 ):
     """Dispatch complete processor batches sequentially in output order."""
 
     active_timestamp = ts if timestamp is None else timestamp
+    active_metrics = _EgressMetrics() if metrics is None else metrics
     while True:
         batch = await egress_queue.get()
+        active_metrics.batch_started()
         try:
             for output in batch.output_batch.outputs:
-                if debug:
-                    message = output.message
-                    if message.endswith(b"\r\n"):
-                        message = message[:-2]
-                    display_message = message.decode(
-                        "utf-8",
-                        errors="replace",
-                    )
-                    print(
-                        f"{active_timestamp()} OUTPUT => {display_message}"
-                    )
+                active_metrics.output_started()
+                try:
+                    if debug:
+                        message = output.message
+                        if message.endswith(b"\r\n"):
+                            message = message[:-2]
+                        display_message = message.decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+                        print(
+                            f"{active_timestamp()} OUTPUT => {display_message}"
+                        )
 
-                await output_forwarder.send_to_ids(
-                    output.target_ids,
-                    output.message,
-                )
+                    await output_forwarder.send_to_ids(
+                        output.target_ids,
+                        output.message,
+                    )
+                except asyncio.CancelledError:
+                    active_metrics.output_cancelled()
+                    raise
+                except BaseException:
+                    active_metrics.output_failed()
+                    raise
+                else:
+                    active_metrics.output_completed()
         except asyncio.CancelledError:
+            active_metrics.batch_cancelled()
             if not batch.completion.done():
                 batch.completion.cancel()
             raise
         except BaseException as exc:
+            active_metrics.batch_failed()
             if not batch.completion.done():
                 batch.completion.set_exception(exc)
             raise
         else:
+            active_metrics.batch_completed()
             if not batch.completion.done():
                 batch.completion.set_result(None)
 
@@ -442,10 +639,14 @@ async def _run_runtime_stages(
     debug=False,
     timestamp=None,
     processing_queue_maxsize=DEFAULT_PROCESSING_QUEUE_MAXSIZE,
+    egress_metrics=None,
 ):
     """Run one ingress binding, processor, and egress lifecycle."""
 
     processing_queue = _BoundedProcessingQueue(processing_queue_maxsize)
+    active_egress_metrics = (
+        _EgressMetrics() if egress_metrics is None else egress_metrics
+    )
 
     await _supervise_named_tasks(
         (
@@ -476,6 +677,7 @@ async def _run_runtime_stages(
                     output_forwarder,
                     debug=debug,
                     timestamp=timestamp,
+                    metrics=active_egress_metrics,
                 ),
             ),
         )
@@ -531,7 +733,8 @@ async def main(
     processor_queue = _BoundedProcessingQueue(processing_queue_maxsize)
     processor = create_data_plane_processor()
     input_queues = []
-    egress_queue = asyncio.Queue(maxsize=1)
+    egress_queue = _ObservedQueue(name="egress", maxsize=1)
+    egress_metrics = _EgressMetrics()
     runtime_task_specs = []
     udp_sockets = []
     sec_input_policies = compile_input_policies(SEC_INPUTS, "sec_inputs")
@@ -552,21 +755,25 @@ async def main(
         for index, (entry, ingress_policy) in enumerate(
             zip(SEC_INPUTS, sec_input_policies)
         ):
-            q = asyncio.Queue(maxsize=ingress_queue_maxsize)
-            input_queues.append(q)
             ip = entry["listen_ip"]
             port = entry["listen_port"]
+            task_name = _ingress_task_name(
+                "udpsec",
+                index,
+                entry,
+                ip,
+                port,
+            )
+            q = _ObservedQueue(
+                name=task_name,
+                maxsize=ingress_queue_maxsize,
+            )
+            input_queues.append(q)
             sec_id = entry.get("id")
             print(f"{ts()} Secure listening on {format_source(ip, port)}")
             runtime_task_specs.append(
                 _RuntimeTaskSpec(
-                    name=_ingress_task_name(
-                        "udpsec",
-                        index,
-                        entry,
-                        ip,
-                        port,
-                    ),
+                    name=task_name,
                     coroutine_factory=partial(
                         secure_server,
                         q,
@@ -582,10 +789,20 @@ async def main(
         for index, (entry, ingress_policy) in enumerate(
             zip(UDP_INPUTS, udp_input_policies)
         ):
-            q = asyncio.Queue(maxsize=ingress_queue_maxsize)
-            input_queues.append(q)
             ip = entry["listen_ip"]
             port = entry["listen_port"]
+            task_name = _ingress_task_name(
+                "udp",
+                index,
+                entry,
+                ip,
+                port,
+            )
+            q = _ObservedQueue(
+                name=task_name,
+                maxsize=ingress_queue_maxsize,
+            )
+            input_queues.append(q)
             sock = create_udp_listener_socket(ip, reuse_address=True)
             udp_sockets.append(sock)
             sock.bind((ip, port))
@@ -595,13 +812,7 @@ async def main(
             fixed_alias = entry.get("id")
             runtime_task_specs.append(
                 _RuntimeTaskSpec(
-                    name=_ingress_task_name(
-                        "udp",
-                        index,
-                        entry,
-                        ip,
-                        port,
-                    ),
+                    name=task_name,
                     coroutine_factory=partial(
                         handle_socket,
                         sock,
@@ -643,6 +854,7 @@ async def main(
                         forwarder,
                         debug=DEBUG,
                         timestamp=ts,
+                        metrics=egress_metrics,
                     ),
                 ),
             )

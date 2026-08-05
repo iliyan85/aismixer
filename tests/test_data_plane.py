@@ -15,6 +15,7 @@ from core.data_plane import (
     ProcessorResetReport,
 )
 from core.ingress_frame import IngressFrame
+from core.metrics import ProcessorMetricsSnapshot
 
 
 class _BytesSubclass(bytes):
@@ -520,6 +521,19 @@ def test_minimal_synchronous_fake_satisfies_processor_protocol():
         multipart_c_contexts_discarded=0,
         multipart_gid_contexts_discarded=0,
     )
+    metrics = ProcessorMetricsSnapshot(
+        process_calls=0,
+        process_completed=0,
+        process_failed=0,
+        process_in_flight=0,
+        outputless_calls=0,
+        output_batches=0,
+        output_messages=0,
+        reset_calls=0,
+        reset_completed=0,
+        reset_failed=0,
+        reset_in_flight=0,
+    )
 
     class FakeProcessor:
         def process(self, frame, snapshot):
@@ -529,6 +543,9 @@ def test_minimal_synchronous_fake_satisfies_processor_protocol():
 
         def reset(self):
             return reset_report
+
+        def metrics_snapshot(self):
+            return metrics
 
     expected_frame = make_frame()
     expected_snapshot = ProcessingSnapshot(
@@ -541,18 +558,26 @@ def test_minimal_synchronous_fake_satisfies_processor_protocol():
     assert isinstance(processor, DataPlaneProcessor)
     assert not inspect.iscoroutinefunction(processor.process)
     assert not inspect.iscoroutinefunction(processor.reset)
+    assert not inspect.iscoroutinefunction(processor.metrics_snapshot)
     assert not inspect.iscoroutinefunction(DataPlaneProcessor.process)
     assert not inspect.iscoroutinefunction(DataPlaneProcessor.reset)
+    assert not inspect.iscoroutinefunction(
+        DataPlaneProcessor.metrics_snapshot
+    )
     batch = processor.process(expected_frame, expected_snapshot)
     assert type(batch) is OutputBatch
     assert batch.outputs == (output,)
     assert batch.outputs[0] is output
     assert processor.reset() is reset_report
+    assert processor.metrics_snapshot() is metrics
 
 
-def test_process_only_object_does_not_satisfy_processor_protocol():
-    class ProcessOnly:
+def test_process_reset_only_object_does_not_satisfy_processor_protocol():
+    class ProcessResetOnly:
         def process(self, frame, snapshot):
             return OutputBatch(outputs=())
 
-    assert not isinstance(ProcessOnly(), DataPlaneProcessor)
+        def reset(self):
+            return None
+
+    assert not isinstance(ProcessResetOnly(), DataPlaneProcessor)

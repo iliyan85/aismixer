@@ -219,6 +219,44 @@ def test_runtime_module_has_no_import_time_processor_instance():
     )
 
 
+def test_egress_metrics_snapshots_are_fresh_and_owners_are_isolated():
+    first = aismixer._EgressMetrics()
+    second = aismixer._EgressMetrics()
+
+    fresh = first.metrics_snapshot()
+    repeated_fresh = first.metrics_snapshot()
+    assert fresh == repeated_fresh
+    assert fresh is not repeated_fresh
+    assert fresh.batches_started == 0
+    assert fresh.batches_completed == 0
+    assert fresh.batches_failed == 0
+    assert fresh.batches_cancelled == 0
+    assert fresh.active_batches == 0
+    assert fresh.outputs_started == 0
+    assert fresh.outputs_completed == 0
+    assert fresh.outputs_failed == 0
+    assert fresh.outputs_cancelled == 0
+    assert fresh.active_outputs == 0
+
+    first.batch_started()
+    first.output_started()
+    active = first.metrics_snapshot()
+    assert active.batches_started == 1
+    assert active.active_batches == 1
+    assert active.outputs_started == 1
+    assert active.active_outputs == 1
+    assert second.metrics_snapshot() == fresh
+
+    first.output_completed()
+    first.batch_completed()
+    completed = first.metrics_snapshot()
+    assert completed.batches_completed == 1
+    assert completed.active_batches == 0
+    assert completed.outputs_completed == 1
+    assert completed.active_outputs == 0
+    assert second.metrics_snapshot() == fresh
+
+
 def test_processor_factory_uses_current_runtime_configuration(monkeypatch):
     processor = object()
     constructor_calls = []
@@ -670,8 +708,13 @@ def test_egress_dispatches_batch_sequentially_in_tuple_order():
         queue = asyncio.Queue()
         await queue.put(aismixer._EgressBatch(processor_batch, completion))
         forwarder = GatedForwarder()
+        metrics = aismixer._EgressMetrics()
         task = asyncio.create_task(
-            aismixer.egress_stage_loop(queue, forwarder)
+            aismixer.egress_stage_loop(
+                queue,
+                forwarder,
+                metrics=metrics,
+            )
         )
         try:
             await forwarder.first_send_started.wait()
@@ -679,9 +722,17 @@ def test_egress_dispatches_batch_sequentially_in_tuple_order():
                 ("numeric", (0,), b"first\r\n")
             ]
             assert not completion.done()
+            active = metrics.metrics_snapshot()
+            assert active.batches_started == 1
+            assert active.batches_completed == 0
+            assert active.active_batches == 1
+            assert active.outputs_started == 1
+            assert active.outputs_completed == 0
+            assert active.active_outputs == 1
 
             forwarder.release_first_send.set()
             await completion
+            assert completion.result() is None
         finally:
             await cancel_task(task)
 
@@ -689,6 +740,89 @@ def test_egress_dispatches_batch_sequentially_in_tuple_order():
             ("numeric", (0,), b"first\r\n"),
             ("numeric", (2, 1), b"second\r\n"),
         ]
+        completed = metrics.metrics_snapshot()
+        assert completed.batches_started == 1
+        assert completed.batches_completed == 1
+        assert completed.batches_failed == 0
+        assert completed.batches_cancelled == 0
+        assert completed.active_batches == 0
+        assert completed.outputs_started == 2
+        assert completed.outputs_completed == 2
+        assert completed.outputs_failed == 0
+        assert completed.outputs_cancelled == 0
+        assert completed.active_outputs == 0
+
+    asyncio.run(scenario())
+
+
+def test_egress_failure_counts_only_started_output_and_preserves_completion():
+    async def scenario():
+        failure = RuntimeError("local send failed")
+        processor_batch = output_batch(
+            output("failing", 0),
+            output("not-started", 1),
+        )
+        completion = asyncio.get_running_loop().create_future()
+        queue = asyncio.Queue()
+        await queue.put(aismixer._EgressBatch(processor_batch, completion))
+        metrics = aismixer._EgressMetrics()
+
+        class FailingForwarder(RecordingForwarder):
+            async def send_to_ids(self, target_ids, message):
+                self.events.append(("numeric", tuple(target_ids), message))
+                raise failure
+
+        forwarder = FailingForwarder()
+        task = asyncio.create_task(
+            aismixer.egress_stage_loop(
+                queue,
+                forwarder,
+                metrics=metrics,
+            )
+        )
+
+        with pytest.raises(RuntimeError) as caught:
+            await task
+
+        assert caught.value is failure
+        assert completion.done()
+        assert not completion.cancelled()
+        assert completion.exception() is failure
+        assert forwarder.events == [
+            ("numeric", (0,), b"failing\r\n")
+        ]
+        failed = metrics.metrics_snapshot()
+        assert failed.batches_started == 1
+        assert failed.batches_completed == 0
+        assert failed.batches_failed == 1
+        assert failed.batches_cancelled == 0
+        assert failed.active_batches == 0
+        assert failed.outputs_started == 1
+        assert failed.outputs_completed == 0
+        assert failed.outputs_failed == 1
+        assert failed.outputs_cancelled == 0
+        assert failed.active_outputs == 0
+
+    asyncio.run(scenario())
+
+
+def test_idle_egress_cancellation_does_not_count_batch_or_output():
+    async def scenario():
+        queue = RecordingGetQueue()
+        metrics = aismixer._EgressMetrics()
+        initial = metrics.metrics_snapshot()
+        task = asyncio.create_task(
+            aismixer.egress_stage_loop(
+                queue,
+                RecordingForwarder(),
+                metrics=metrics,
+            )
+        )
+
+        await asyncio.wait_for(queue.get_started.wait(), timeout=1.0)
+        assert metrics.metrics_snapshot() == initial
+        await cancel_task(task)
+        assert metrics.metrics_snapshot() == initial
 
     asyncio.run(scenario())
 
@@ -1163,6 +1297,7 @@ def test_cancellation_resolves_active_acknowledgement_and_stage_tasks():
         egress_queue = RecordingEgressQueue()
         processor = ScriptedProcessor(output_batch(output("first", 0)))
         forwarder = GatedForwarder()
+        metrics = aismixer._EgressMetrics()
         task = asyncio.create_task(
             aismixer._run_runtime_stages(
                 ingress_queue,
@@ -1170,6 +1305,7 @@ def test_cancellation_resolves_active_acknowledgement_and_stage_tasks():
                 processor=processor,
                 legacy_target_ids=(),
                 output_forwarder=forwarder,
+                egress_metrics=metrics,
             )
         )
         await ingress_queue.put(make_frame("cancel"))
@@ -1180,6 +1316,15 @@ def test_cancellation_resolves_active_acknowledgement_and_stage_tasks():
         assert not batch.completion.done()
         assert processor.task is not None
         assert forwarder.task is not None
+        active = metrics.metrics_snapshot()
+        assert active.batches_started == 1
+        assert active.batches_completed == 0
+        assert active.batches_cancelled == 0
+        assert active.active_batches == 1
+        assert active.outputs_started == 1
+        assert active.outputs_completed == 0
+        assert active.outputs_cancelled == 0
+        assert active.active_outputs == 1
 
         await cancel_task(task)
 
@@ -1189,6 +1334,17 @@ def test_cancellation_resolves_active_acknowledgement_and_stage_tasks():
         assert forwarder.task.cancelled()
         assert batch.completion.done()
         assert batch.completion.cancelled()
+        cancelled = metrics.metrics_snapshot()
+        assert cancelled.batches_started == 1
+        assert cancelled.batches_completed == 0
+        assert cancelled.batches_failed == 0
+        assert cancelled.batches_cancelled == 1
+        assert cancelled.active_batches == 0
+        assert cancelled.outputs_started == 1
+        assert cancelled.outputs_completed == 0
+        assert cancelled.outputs_failed == 0
+        assert cancelled.outputs_cancelled == 1
+        assert cancelled.active_outputs == 0
 
     asyncio.run(scenario())
 
@@ -1200,6 +1356,8 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
         state = RoutingState()
         processor = object()
         processor_factory_calls = []
+        metrics_type = aismixer._EgressMetrics
+        metrics_instances = []
 
         class MainForwarder:
             target_ids = ("udp:target",)
@@ -1229,6 +1387,11 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
             processor_factory_calls.append(None)
             return processor
 
+        def fake_egress_metrics_constructor():
+            metrics = metrics_type()
+            metrics_instances.append(metrics)
+            return metrics
+
         monkeypatch.setattr(aismixer, "SEC_INPUTS", [])
         monkeypatch.setattr(aismixer, "UDP_INPUTS", [])
         monkeypatch.setattr(aismixer, "config", {"control": None})
@@ -1239,6 +1402,11 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
             aismixer,
             "create_data_plane_processor",
             fake_create_data_plane_processor,
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "_EgressMetrics",
+            fake_egress_metrics_constructor,
         )
         monkeypatch.setattr(
             aismixer,
@@ -1254,6 +1422,7 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
         await aismixer.main()
 
         assert processor_factory_calls == [None]
+        assert len(metrics_instances) == 1
         assert builder_calls == [
             ({"control": None}, state, {"udp:target": 1})
         ]
@@ -1284,8 +1453,12 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
             processing_queue.maxsize
             == aismixer.DEFAULT_PROCESSING_QUEUE_MAXSIZE
         )
-        assert isinstance(egress_queue, asyncio.Queue)
+        assert isinstance(egress_queue, aismixer._ObservedQueue)
         assert egress_queue.maxsize == 1
+        egress_queue_metrics = egress_queue.metrics_snapshot()
+        assert egress_queue_metrics.name == "egress"
+        assert egress_queue_metrics.capacity == 1
+        assert egress_queue_metrics.depth == 0
         assert fan_in_factory.keywords == {
             "routing_state": state,
             "legacy_target_ids": (0, 1),
@@ -1294,7 +1467,10 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
         assert egress_factory.keywords == {
             "debug": False,
             "timestamp": aismixer.ts,
+            "metrics": metrics_instances[0],
         }
+        assert type(metrics_instances[0]) is metrics_type
+        assert metrics_instances[0].metrics_snapshot().batches_started == 0
         assert output_forwarder.close_calls == 1
 
     asyncio.run(scenario())
