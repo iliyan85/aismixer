@@ -1,9 +1,9 @@
-"""Runtime integration helpers for optional routing control.
+"""Runtime integration helpers for optional local control.
 
 The Unix routing-control server is explicit opt-in runtime infrastructure. This
 module parses the optional ``control.unix`` configuration and can build the
-process-local control stack without starting the listener or touching the
-filesystem.
+process-local routing and statistics control stack without starting the
+listener or touching the filesystem.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from core.routing_control import RoutingControlService
 from core.routing_control_protocol import RoutingControlProtocol
 from core.routing_control_unix import RoutingControlUnixServer
 from core.routing_state import RoutingState
+from core.runtime_statistics import RuntimeStatisticsSource
 from core.target_identity import EgressTargetId
 
 
@@ -39,7 +40,7 @@ _ServiceFactory: TypeAlias = Callable[
     [RoutingState, Mapping[str, EgressTargetId]],
     object,
 ]
-_ProtocolFactory: TypeAlias = Callable[[object], object]
+_ProtocolFactory: TypeAlias = Callable[[object, RuntimeStatisticsSource], object]
 _ServerFactory: TypeAlias = Callable[..., object]
 _OCTAL_MODE_RE = re.compile(r"^[0-7]{3,4}$")
 
@@ -101,6 +102,7 @@ def build_optional_routing_control_server(
     config: Mapping[str, object],
     routing_state: RoutingState,
     target_id_by_name: Mapping[str, EgressTargetId],
+    statistics_provider: RuntimeStatisticsSource | None = None,
     *,
     service_factory: _ServiceFactory = RoutingControlService,
     protocol_factory: _ProtocolFactory = RoutingControlProtocol,
@@ -111,9 +113,13 @@ def build_optional_routing_control_server(
     settings = load_optional_routing_control_unix_settings(config)
     if settings is None:
         return None
+    if statistics_provider is None:
+        raise TypeError(
+            "statistics_provider is required when routing control is enabled."
+        )
 
     service = service_factory(routing_state, target_id_by_name)
-    protocol = protocol_factory(service)
+    protocol = protocol_factory(service, statistics_provider)
     return server_factory(
         protocol,
         settings.socket_path,

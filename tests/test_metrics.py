@@ -6,6 +6,7 @@ from core.metrics import (
     EgressMetricsSnapshot,
     ProcessorMetricsSnapshot,
     QueueMetricsSnapshot,
+    RuntimeStatisticsSnapshot,
 )
 
 
@@ -44,6 +45,13 @@ EGRESS_FIELDS = (
     "outputs_failed",
     "outputs_cancelled",
     "active_outputs",
+)
+RUNTIME_STATISTICS_FIELDS = (
+    "ingress_queues",
+    "processing_queue",
+    "processor",
+    "egress_queue",
+    "egress_operations",
 )
 INVALID_NUMERIC_VALUES = (
     pytest.param(True, id="true-bool"),
@@ -103,6 +111,18 @@ def egress_snapshot(**overrides):
     }
     values.update(overrides)
     return EgressMetricsSnapshot(**values)
+
+
+def runtime_statistics_snapshot(**overrides):
+    values = {
+        "ingress_queues": (queue_snapshot(),),
+        "processing_queue": queue_snapshot(name="processing"),
+        "processor": processor_snapshot(),
+        "egress_queue": queue_snapshot(name="egress"),
+        "egress_operations": egress_snapshot(),
+    }
+    values.update(overrides)
+    return RuntimeStatisticsSnapshot(**values)
 
 
 def assert_frozen_slotted(snapshot, expected_fields, field_name):
@@ -320,6 +340,81 @@ def test_egress_metrics_snapshot_accepts_all_zero_lifetime_state():
     assert all(getattr(snapshot, name) == 0 for name in EGRESS_FIELDS)
 
 
+def test_runtime_statistics_snapshot_is_frozen_slotted_and_preserves_fields():
+    first_ingress = queue_snapshot(name="udpsec-ingress:0:secure-a")
+    second_ingress = queue_snapshot(name="udp-ingress:0:station-a")
+    processing = queue_snapshot(name="processing")
+    processor = processor_snapshot()
+    egress_queue = queue_snapshot(name="egress")
+    egress_operations = egress_snapshot()
+
+    snapshot = RuntimeStatisticsSnapshot(
+        ingress_queues=(first_ingress, second_ingress),
+        processing_queue=processing,
+        processor=processor,
+        egress_queue=egress_queue,
+        egress_operations=egress_operations,
+    )
+
+    assert (
+        tuple(field.name for field in fields(snapshot))
+        == RUNTIME_STATISTICS_FIELDS
+    )
+    assert not hasattr(snapshot, "__dict__")
+    assert snapshot.ingress_queues == (first_ingress, second_ingress)
+    assert snapshot.processing_queue is processing
+    assert snapshot.processor is processor
+    assert snapshot.egress_queue is egress_queue
+    assert snapshot.egress_operations is egress_operations
+
+    with pytest.raises(FrozenInstanceError):
+        snapshot.processor = processor_snapshot()
+
+
+def test_runtime_statistics_snapshot_normalizes_ingress_iterable_to_tuple():
+    ordered = (
+        queue_snapshot(name="udpsec-ingress:0:secure-a"),
+        queue_snapshot(name="udp-ingress:0:station-a"),
+    )
+
+    snapshot = runtime_statistics_snapshot(
+        ingress_queues=(queue for queue in ordered),
+    )
+
+    assert isinstance(snapshot.ingress_queues, tuple)
+    assert snapshot.ingress_queues == ordered
+    assert snapshot.ingress_queues[0] is ordered[0]
+    assert snapshot.ingress_queues[1] is ordered[1]
+
+
+def test_runtime_statistics_snapshot_accepts_empty_ingress_collection():
+    snapshot = runtime_statistics_snapshot(ingress_queues=[])
+
+    assert snapshot.ingress_queues == ()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"ingress_queues": object()}, "ingress_queues"),
+        (
+            {"ingress_queues": (queue_snapshot(), object())},
+            "ingress_queues",
+        ),
+        ({"processing_queue": object()}, "processing_queue"),
+        ({"processor": object()}, "processor"),
+        ({"egress_queue": object()}, "egress_queue"),
+        ({"egress_operations": object()}, "egress_operations"),
+    ],
+)
+def test_runtime_statistics_snapshot_rejects_invalid_component_types(
+    overrides,
+    message,
+):
+    with pytest.raises(TypeError, match=message):
+        runtime_statistics_snapshot(**overrides)
+
+
 def test_metric_contract_fields_do_not_claim_downstream_delivery():
     field_names = {
         field_name
@@ -327,6 +422,7 @@ def test_metric_contract_fields_do_not_claim_downstream_delivery():
             QueueMetricsSnapshot,
             ProcessorMetricsSnapshot,
             EgressMetricsSnapshot,
+            RuntimeStatisticsSnapshot,
         )
         for field_name in (
             field.name for field in fields(snapshot_type)

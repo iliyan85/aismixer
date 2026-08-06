@@ -22,6 +22,7 @@ from core.metrics import EgressMetricsSnapshot, QueueMetricsSnapshot
 from core.network_policy import NetworkPolicy, compile_ingress_policy
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.runtime_control import build_optional_routing_control_server
+from core.runtime_statistics import RuntimeStatisticsProvider
 from core.runtime_routing import load_optional_routing_table
 from core.routing_state import RoutingState
 from core.source_identity import build_udp_source_id
@@ -739,18 +740,10 @@ async def main(
     udp_sockets = []
     sec_input_policies = compile_input_policies(SEC_INPUTS, "sec_inputs")
     udp_input_policies = compile_input_policies(UDP_INPUTS, "udp_inputs")
-    control_server = build_optional_routing_control_server(
-        config,
-        routing_state,
-        forwarder.target_id_by_name,
-    )
+    control_server = None
     control_server_started = False
 
     try:
-        if control_server is not None:
-            await control_server.start()
-            control_server_started = True
-
         # Secure входове
         for index, (entry, ingress_policy) in enumerate(
             zip(SEC_INPUTS, sec_input_policies)
@@ -824,6 +817,24 @@ async def main(
                 )
             )
 
+        ingress_queues = tuple(input_queues)
+        statistics_provider = RuntimeStatisticsProvider(
+            ingress_queues=ingress_queues,
+            processing_queue=processor_queue,
+            processor=processor,
+            egress_queue=egress_queue,
+            egress_operations=egress_metrics,
+        )
+        control_server = build_optional_routing_control_server(
+            config,
+            routing_state,
+            forwarder.target_id_by_name,
+            statistics_provider,
+        )
+        if control_server is not None:
+            await control_server.start()
+            control_server_started = True
+
         # Ingress fan-in + processor + egress
         runtime_task_specs.extend(
             (
@@ -831,7 +842,7 @@ async def main(
                     name="ingress-fan-in",
                     coroutine_factory=partial(
                         ingress_fan_in_loop,
-                        tuple(input_queues),
+                        ingress_queues,
                         processor_queue,
                         routing_state=routing_state,
                         legacy_target_ids=forwarder.all_target_ids,

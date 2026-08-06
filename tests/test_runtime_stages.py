@@ -1374,9 +1374,14 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
         supervision_calls = []
         builder_calls = []
 
-        def fake_builder(config, routing_state, target_id_by_name):
+        def fake_builder(
+            config,
+            routing_state,
+            target_id_by_name,
+            statistics,
+        ):
             builder_calls.append(
-                (config, routing_state, target_id_by_name)
+                (config, routing_state, target_id_by_name, statistics)
             )
             return None
 
@@ -1423,9 +1428,12 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
 
         assert processor_factory_calls == [None]
         assert len(metrics_instances) == 1
-        assert builder_calls == [
-            ({"control": None}, state, {"udp:target": 1})
-        ]
+        assert len(builder_calls) == 1
+        assert builder_calls[0][:3] == (
+            {"control": None},
+            state,
+            {"udp:target": 1},
+        )
         assert len(supervision_calls) == 1
         specs = {spec.name: spec for spec in supervision_calls[0]}
         assert tuple(specs) == (
@@ -1443,6 +1451,12 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
         assert processor_factory.func is aismixer.processor_stage_loop
         assert processor_factory.args[0] is processing_queue
         egress_queue = processor_factory.args[1]
+        statistics = builder_calls[0][3]
+        assert statistics.ingress_queues == ()
+        assert statistics.processing_queue is processing_queue
+        assert statistics.processor is processor
+        assert statistics.egress_queue is egress_queue
+        assert statistics.egress_operations is metrics_instances[0]
         assert egress_factory.func is aismixer.egress_stage_loop
         assert egress_factory.args == (egress_queue, output_forwarder)
         assert isinstance(

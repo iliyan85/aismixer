@@ -435,9 +435,14 @@ def routing_section():
     }
 
 
+class UnusedStatisticsSource:
+    def snapshot(self):
+        raise AssertionError("statistics must not be pulled by routing tests")
+
+
 def make_control_protocol():
     service = RoutingControlService(RoutingState(), {"udp:a": 0})
-    return RoutingControlProtocol(service)
+    return RoutingControlProtocol(service, UnusedStatisticsSource())
 
 
 @unix_socket_test

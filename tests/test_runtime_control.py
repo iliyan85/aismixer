@@ -228,10 +228,24 @@ def test_disabled_builder_returns_none_without_constructing_stack():
     )
 
 
+def test_enabled_builder_requires_statistics_before_constructing_stack():
+    def fail_service_factory(_routing_state, _target_id_by_name):
+        raise AssertionError("service must not be constructed")
+
+    with pytest.raises(TypeError, match="statistics_provider"):
+        build_optional_routing_control_server(
+            enabled_config(),
+            RoutingState(),
+            {"udp:a": 0},
+            service_factory=fail_service_factory,
+        )
+
+
 def test_enabled_builder_wires_stack_without_starting_server():
     calls = {}
     routing_state = RoutingState()
     target_id_by_name = {"udp:a": 7}
+    statistics = object()
 
     class FakeServer:
         def __init__(self, protocol, socket_path, *, max_request_bytes, socket_mode):
@@ -245,8 +259,8 @@ def test_enabled_builder_wires_stack_without_starting_server():
         calls["service"] = (state, supplied_target_id_by_name)
         return "service"
 
-    def protocol_factory(service):
-        calls["protocol"] = service
+    def protocol_factory(service, supplied_statistics):
+        calls["protocol"] = (service, supplied_statistics)
         return "protocol"
 
     server = build_optional_routing_control_server(
@@ -257,6 +271,7 @@ def test_enabled_builder_wires_stack_without_starting_server():
         ),
         routing_state,
         target_id_by_name,
+        statistics,
         service_factory=service_factory,
         protocol_factory=protocol_factory,
         server_factory=FakeServer,
@@ -265,7 +280,7 @@ def test_enabled_builder_wires_stack_without_starting_server():
     assert isinstance(server, FakeServer)
     assert server.start_count == 0
     assert calls["service"] == (routing_state, target_id_by_name)
-    assert calls["protocol"] == "service"
+    assert calls["protocol"] == ("service", statistics)
     assert calls["server"] == ("protocol", "/tmp/control.sock", 1234, 0o600)
 
 
@@ -275,10 +290,12 @@ def test_builder_stack_updates_supplied_routing_state_without_real_socket():
             self.protocol = protocol
 
     routing_state = RoutingState()
+    statistics = object()
     server = build_optional_routing_control_server(
         enabled_config(socket_path="/tmp/control.sock"),
         routing_state,
         {"udp:a": 0},
+        statistics,
         server_factory=CapturingServer,
     )
 
@@ -355,8 +372,8 @@ async def run_aismixer_main(
         "specs": (),
     }
 
-    def fake_builder(config, state, target_id_by_name):
-        builder_calls.append((config, state, target_id_by_name))
+    def fake_builder(config, state, target_id_by_name, statistics):
+        builder_calls.append((config, state, target_id_by_name, statistics))
         return control_server
 
     def fake_create_data_plane_processor():
@@ -397,6 +414,7 @@ async def run_aismixer_main(
         "forwarder_close_count": forwarder.close_count,
         "processor": processor,
         "processor_factory_calls": processor_factory_calls,
+        "statistics": builder_calls[0][3],
     }
 
 
@@ -404,7 +422,12 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
     result = asyncio.run(run_aismixer_main(monkeypatch, control_server=None))
 
     assert result["builder_calls"] == [
-        ({"control": None}, result["routing_state"], {"udp:a": 0})
+        (
+            {"control": None},
+            result["routing_state"],
+            {"udp:a": 0},
+            result["statistics"],
+        )
     ]
     assert result["supervisor_called"]["value"] is True
     specs = {
@@ -455,6 +478,12 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
         "egress",
         1,
     )
+    statistics = result["statistics"]
+    assert statistics.ingress_queues == ()
+    assert statistics.processing_queue is processing_queue
+    assert statistics.processor is result["processor"]
+    assert statistics.egress_queue is egress_queue
+    assert statistics.egress_operations is egress_metrics
     assert result["forwarder_close_count"] == 1
 
 
@@ -605,6 +634,7 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         first_udp_socket = _MainTestSocket()
         second_udp_socket = _MainTestSocket()
         supervision_calls = []
+        builder_calls = []
 
         async def fake_supervisor(task_specs):
             supervision_calls.append(tuple(task_specs))
@@ -637,6 +667,18 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
             ),
             sockets=(first_udp_socket, second_udp_socket),
             supervisor=fake_supervisor,
+        )
+
+        def capture_builder(config, supplied_state, target_ids, statistics):
+            builder_calls.append(
+                (config, supplied_state, target_ids, statistics)
+            )
+            return None
+
+        monkeypatch.setattr(
+            aismixer,
+            "build_optional_routing_control_server",
+            capture_builder,
         )
 
         await aismixer.main()
@@ -747,6 +789,18 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
             "timestamp": aismixer.ts,
             "metrics": egress_metrics,
         }
+        assert len(builder_calls) == 1
+        assert builder_calls[0][:3] == (
+            {"control": None},
+            state,
+            output_forwarder.target_id_by_name,
+        )
+        statistics = builder_calls[0][3]
+        assert statistics.ingress_queues == input_queues
+        assert statistics.processing_queue is processing_queue
+        assert statistics.processor is processor
+        assert statistics.egress_queue is egress_queue
+        assert statistics.egress_operations is egress_metrics
         assert first_udp_socket.close_count == 1
         assert second_udp_socket.close_count == 1
         assert output_forwarder.close_count == 1
@@ -878,8 +932,91 @@ def test_partial_listener_startup_failure_closes_started_resources(monkeypatch):
         assert supervisor_called is False
         assert first_socket.close_count == 1
         assert second_socket.close_count == 1
+        assert control_server.start_count == 0
+        assert control_server.close_count == 0
+        assert output_forwarder.close_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_control_builder_failure_after_listener_setup_closes_resources(
+    monkeypatch,
+):
+    async def scenario():
+        udp_socket = _MainTestSocket()
+        failure = RuntimeError("control build failed")
+        supervisor_called = False
+
+        async def fake_supervisor(_task_specs):
+            nonlocal supervisor_called
+            supervisor_called = True
+
+        _, output_forwarder, _ = _configure_main_lifecycle_test(
+            monkeypatch,
+            udp_inputs=(
+                {
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10110,
+                },
+            ),
+            sockets=(udp_socket,),
+            supervisor=fake_supervisor,
+        )
+
+        def failing_builder(*_args):
+            raise failure
+
+        monkeypatch.setattr(
+            aismixer,
+            "build_optional_routing_control_server",
+            failing_builder,
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await aismixer.main()
+
+        assert excinfo.value is failure
+        assert supervisor_called is False
+        assert udp_socket.close_count == 1
+        assert output_forwarder.close_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_control_start_failure_after_listener_setup_closes_resources(
+    monkeypatch,
+):
+    async def scenario():
+        control_server = FakeControlServer(
+            start_exc=PermissionError("bind denied")
+        )
+        udp_socket = _MainTestSocket()
+        supervisor_called = False
+
+        async def fake_supervisor(_task_specs):
+            nonlocal supervisor_called
+            supervisor_called = True
+
+        _, output_forwarder, _ = _configure_main_lifecycle_test(
+            monkeypatch,
+            udp_inputs=(
+                {
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10110,
+                },
+            ),
+            sockets=(udp_socket,),
+            control_server=control_server,
+            supervisor=fake_supervisor,
+        )
+
+        with pytest.raises(PermissionError, match="bind denied"):
+            await aismixer.main()
+
+        assert supervisor_called is False
+        assert udp_socket.close_count == 1
         assert control_server.start_count == 1
-        assert control_server.close_count == 1
+        assert control_server.close_count == 0
         assert output_forwarder.close_count == 1
 
     asyncio.run(scenario())
@@ -1012,6 +1149,7 @@ def test_runtime_control_unix_stack_updates_staged_routing(
             config,
             routing_state,
             fake_forwarder.target_id_by_name,
+            object(),
         )
         assert isinstance(server, RoutingControlUnixServer)
 

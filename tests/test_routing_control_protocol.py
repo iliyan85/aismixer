@@ -2,6 +2,12 @@ import json
 
 import pytest
 
+from core.metrics import (
+    EgressMetricsSnapshot,
+    ProcessorMetricsSnapshot,
+    QueueMetricsSnapshot,
+    RuntimeStatisticsSnapshot,
+)
 from core.routing_control import (
     RoutingCandidateConfigError,
     RoutingControlService,
@@ -14,6 +20,7 @@ from core.routing_control_protocol import (
     ERROR_STALE_GENERATION,
     ERROR_UNKNOWN_METHOD,
     ERROR_UNSUPPORTED_VERSION,
+    METHOD_RUNTIME_STATISTICS,
     ROUTING_CONTROL_PROTOCOL_VERSION,
     RoutingControlProtocol,
     build_error_response,
@@ -29,6 +36,74 @@ TARGET_ID_BY_NAME = {
     "udp:b": 1,
     "udp:c": 2,
 }
+
+
+def queue_metrics(
+    name,
+    *,
+    capacity=1,
+    depth=0,
+    peak_depth=0,
+    enqueued=0,
+    dequeued=0,
+    put_waits=0,
+    current_put_waiters=0,
+):
+    return QueueMetricsSnapshot(
+        name=name,
+        capacity=capacity,
+        depth=depth,
+        peak_depth=peak_depth,
+        enqueued=enqueued,
+        dequeued=dequeued,
+        put_waits=put_waits,
+        current_put_waiters=current_put_waiters,
+    )
+
+
+def zero_runtime_statistics_snapshot():
+    return RuntimeStatisticsSnapshot(
+        ingress_queues=(),
+        processing_queue=queue_metrics("processing", capacity=1024),
+        processor=ProcessorMetricsSnapshot(
+            process_calls=0,
+            process_completed=0,
+            process_failed=0,
+            process_in_flight=0,
+            outputless_calls=0,
+            output_batches=0,
+            output_messages=0,
+            reset_calls=0,
+            reset_completed=0,
+            reset_failed=0,
+            reset_in_flight=0,
+        ),
+        egress_queue=queue_metrics("egress", capacity=1),
+        egress_operations=EgressMetricsSnapshot(
+            batches_started=0,
+            batches_completed=0,
+            batches_failed=0,
+            batches_cancelled=0,
+            active_batches=0,
+            outputs_started=0,
+            outputs_completed=0,
+            outputs_failed=0,
+            outputs_cancelled=0,
+            active_outputs=0,
+        ),
+    )
+
+
+class RecordingStatisticsSource:
+    def __init__(self, snapshot=None):
+        self._snapshot = (
+            zero_runtime_statistics_snapshot() if snapshot is None else snapshot
+        )
+        self.snapshot_calls = 0
+
+    def snapshot(self):
+        self.snapshot_calls += 1
+        return self._snapshot
 
 
 def routing_section(routes=None, zones=None):
@@ -60,9 +135,12 @@ def make_service(initial_section=None):
     return state, RoutingControlService(state, TARGET_ID_BY_NAME)
 
 
-def make_protocol(initial_section=None):
+def make_protocol(initial_section=None, statistics=None):
     state, service = make_service(initial_section)
-    return state, RoutingControlProtocol(service)
+    statistics = (
+        RecordingStatisticsSource() if statistics is None else statistics
+    )
+    return state, RoutingControlProtocol(service, statistics)
 
 
 def status_request(request_id="req-1"):
@@ -70,6 +148,14 @@ def status_request(request_id="req-1"):
         "version": ROUTING_CONTROL_PROTOCOL_VERSION,
         "request_id": request_id,
         "method": "routing.status",
+    }
+
+
+def runtime_statistics_request(request_id="req-1"):
+    return {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": request_id,
+        "method": METHOD_RUNTIME_STATISTICS,
     }
 
 
@@ -105,6 +191,307 @@ def assert_error(response, code, request_id="req-1"):
     assert response["request_id"] == request_id
     assert response["ok"] is False
     assert response["error"]["code"] == code
+
+
+def test_runtime_statistics_request_has_exact_no_params_shape():
+    assert runtime_statistics_request("stats-1") == {
+        "version": 1,
+        "request_id": "stats-1",
+        "method": "runtime.statistics",
+    }
+
+
+@pytest.mark.parametrize("params", [{}, None, [], {"extra": True}])
+def test_runtime_statistics_rejects_any_params_without_pulling(params):
+    statistics = RecordingStatisticsSource()
+    _state, protocol = make_protocol(statistics=statistics)
+    request = runtime_statistics_request()
+    request["params"] = params
+
+    response = protocol.handle_request(request)
+
+    assert_error(response, ERROR_INVALID_REQUEST)
+    assert response["error"]["message"] == (
+        "Method 'runtime.statistics' does not accept params."
+    )
+    assert statistics.snapshot_calls == 0
+
+
+def test_runtime_statistics_serializes_exact_all_zero_result_and_calls_once():
+    class RoutingServiceMustNotBeCalled:
+        def status(self):
+            raise AssertionError("routing service must not be called")
+
+        def replace_from_config(self, routing_config, expected_generation=None):
+            raise AssertionError("routing service must not be called")
+
+        def disable(self, expected_generation=None):
+            raise AssertionError("routing service must not be called")
+
+    statistics = RecordingStatisticsSource()
+    protocol = RoutingControlProtocol(
+        RoutingServiceMustNotBeCalled(),
+        statistics,
+    )
+
+    response = parse_response(
+        protocol.handle_json(json.dumps(runtime_statistics_request("stats-zero")))
+    )
+
+    assert statistics.snapshot_calls == 1
+    assert response == {
+        "version": 1,
+        "request_id": "stats-zero",
+        "ok": True,
+        "result": {
+            "ingress_queues": [],
+            "processing_queue": {
+                "name": "processing",
+                "capacity": 1024,
+                "depth": 0,
+                "peak_depth": 0,
+                "enqueued": 0,
+                "dequeued": 0,
+                "put_waits": 0,
+                "current_put_waiters": 0,
+            },
+            "processor": {
+                "process_calls": 0,
+                "process_completed": 0,
+                "process_failed": 0,
+                "process_in_flight": 0,
+                "outputless_calls": 0,
+                "output_batches": 0,
+                "output_messages": 0,
+                "reset_calls": 0,
+                "reset_completed": 0,
+                "reset_failed": 0,
+                "reset_in_flight": 0,
+            },
+            "egress_queue": {
+                "name": "egress",
+                "capacity": 1,
+                "depth": 0,
+                "peak_depth": 0,
+                "enqueued": 0,
+                "dequeued": 0,
+                "put_waits": 0,
+                "current_put_waiters": 0,
+            },
+            "egress_operations": {
+                "batches_started": 0,
+                "batches_completed": 0,
+                "batches_failed": 0,
+                "batches_cancelled": 0,
+                "active_batches": 0,
+                "outputs_started": 0,
+                "outputs_completed": 0,
+                "outputs_failed": 0,
+                "outputs_cancelled": 0,
+                "active_outputs": 0,
+            },
+        },
+    }
+
+
+def test_runtime_statistics_serializes_populated_snapshot_in_ingress_order():
+    snapshot = RuntimeStatisticsSnapshot(
+        ingress_queues=(
+            queue_metrics(
+                "udp-ingress:0:station-a",
+                capacity=8,
+                depth=2,
+                peak_depth=5,
+                enqueued=10,
+                dequeued=8,
+                put_waits=3,
+                current_put_waiters=1,
+            ),
+            queue_metrics(
+                "udpsec-ingress:0:station-b",
+                capacity=4,
+                depth=0,
+                peak_depth=4,
+                enqueued=7,
+                dequeued=7,
+                put_waits=2,
+            ),
+        ),
+        processing_queue=queue_metrics(
+            "processing",
+            capacity=16,
+            depth=3,
+            peak_depth=9,
+            enqueued=20,
+            dequeued=17,
+            put_waits=4,
+            current_put_waiters=2,
+        ),
+        processor=ProcessorMetricsSnapshot(
+            process_calls=10,
+            process_completed=8,
+            process_failed=1,
+            process_in_flight=1,
+            outputless_calls=3,
+            output_batches=5,
+            output_messages=12,
+            reset_calls=4,
+            reset_completed=2,
+            reset_failed=1,
+            reset_in_flight=1,
+        ),
+        egress_queue=queue_metrics(
+            "egress",
+            capacity=1,
+            depth=1,
+            peak_depth=1,
+            enqueued=6,
+            dequeued=5,
+            put_waits=2,
+            current_put_waiters=1,
+        ),
+        egress_operations=EgressMetricsSnapshot(
+            batches_started=9,
+            batches_completed=5,
+            batches_failed=1,
+            batches_cancelled=1,
+            active_batches=2,
+            outputs_started=12,
+            outputs_completed=7,
+            outputs_failed=2,
+            outputs_cancelled=1,
+            active_outputs=2,
+        ),
+    )
+    statistics = RecordingStatisticsSource(snapshot)
+    _state, protocol = make_protocol(statistics=statistics)
+
+    response = protocol.handle_request(runtime_statistics_request("stats-full"))
+
+    assert statistics.snapshot_calls == 1
+    assert response == {
+        "version": 1,
+        "request_id": "stats-full",
+        "ok": True,
+        "result": {
+            "ingress_queues": [
+                {
+                    "name": "udp-ingress:0:station-a",
+                    "capacity": 8,
+                    "depth": 2,
+                    "peak_depth": 5,
+                    "enqueued": 10,
+                    "dequeued": 8,
+                    "put_waits": 3,
+                    "current_put_waiters": 1,
+                },
+                {
+                    "name": "udpsec-ingress:0:station-b",
+                    "capacity": 4,
+                    "depth": 0,
+                    "peak_depth": 4,
+                    "enqueued": 7,
+                    "dequeued": 7,
+                    "put_waits": 2,
+                    "current_put_waiters": 0,
+                },
+            ],
+            "processing_queue": {
+                "name": "processing",
+                "capacity": 16,
+                "depth": 3,
+                "peak_depth": 9,
+                "enqueued": 20,
+                "dequeued": 17,
+                "put_waits": 4,
+                "current_put_waiters": 2,
+            },
+            "processor": {
+                "process_calls": 10,
+                "process_completed": 8,
+                "process_failed": 1,
+                "process_in_flight": 1,
+                "outputless_calls": 3,
+                "output_batches": 5,
+                "output_messages": 12,
+                "reset_calls": 4,
+                "reset_completed": 2,
+                "reset_failed": 1,
+                "reset_in_flight": 1,
+            },
+            "egress_queue": {
+                "name": "egress",
+                "capacity": 1,
+                "depth": 1,
+                "peak_depth": 1,
+                "enqueued": 6,
+                "dequeued": 5,
+                "put_waits": 2,
+                "current_put_waiters": 1,
+            },
+            "egress_operations": {
+                "batches_started": 9,
+                "batches_completed": 5,
+                "batches_failed": 1,
+                "batches_cancelled": 1,
+                "active_batches": 2,
+                "outputs_started": 12,
+                "outputs_completed": 7,
+                "outputs_failed": 2,
+                "outputs_cancelled": 1,
+                "active_outputs": 2,
+            },
+        },
+    }
+
+
+def test_routing_methods_do_not_pull_runtime_statistics():
+    statistics = RecordingStatisticsSource()
+    _state, protocol = make_protocol(statistics=statistics)
+
+    status = protocol.handle_request(status_request("status"))
+    replace = protocol.handle_request(replace_request("replace"))
+    disable = protocol.handle_request(disable_request("disable"))
+
+    assert status["ok"] is True
+    assert replace["ok"] is True
+    assert disable["ok"] is True
+    assert statistics.snapshot_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("raw_request", "error_code"),
+    [
+        (
+            {
+                "version": 2,
+                "request_id": "stats-version",
+                "method": "runtime.statistics",
+            },
+            ERROR_UNSUPPORTED_VERSION,
+        ),
+        (
+            {
+                "version": 1,
+                "request_id": "stats-unknown",
+                "method": "runtime.statistics.extra",
+            },
+            ERROR_UNKNOWN_METHOD,
+        ),
+    ],
+)
+def test_runtime_statistics_keeps_version_and_unknown_method_compatibility(
+    raw_request,
+    error_code,
+):
+    statistics = RecordingStatisticsSource()
+    _state, protocol = make_protocol(statistics=statistics)
+
+    response = protocol.handle_request(raw_request)
+
+    assert ROUTING_CONTROL_PROTOCOL_VERSION == 1
+    assert_error(response, error_code, request_id=raw_request["request_id"])
+    assert statistics.snapshot_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -449,7 +836,7 @@ def test_unexpected_replace_exception_is_not_mislabeled_as_invalid_config(except
         def replace_from_config(self, routing_config, expected_generation=None):
             raise exception
 
-    protocol = RoutingControlProtocol(BrokenService())
+    protocol = RoutingControlProtocol(BrokenService(), RecordingStatisticsSource())
 
     with pytest.raises(type(exception), match="programming defect"):
         protocol.handle_request(replace_request())
@@ -460,7 +847,10 @@ def test_candidate_config_error_maps_to_invalid_routing_config():
         def replace_from_config(self, routing_config, expected_generation=None):
             raise RoutingCandidateConfigError("invalid candidate")
 
-    protocol = RoutingControlProtocol(InvalidCandidateService())
+    protocol = RoutingControlProtocol(
+        InvalidCandidateService(),
+        RecordingStatisticsSource(),
+    )
 
     response = protocol.handle_request(replace_request(request_id="req-candidate"))
 
@@ -486,7 +876,10 @@ def test_replace_response_uses_returned_status_without_extra_status_lookup():
                 target_ids=("udp:a",),
             )
 
-    protocol = RoutingControlProtocol(ReplaceOnlyService())
+    protocol = RoutingControlProtocol(
+        ReplaceOnlyService(),
+        RecordingStatisticsSource(),
+    )
 
     response = protocol.handle_request(replace_request())
 
@@ -507,7 +900,10 @@ def test_disable_response_uses_returned_status_without_extra_status_lookup():
                 target_ids=(),
             )
 
-    protocol = RoutingControlProtocol(DisableOnlyService())
+    protocol = RoutingControlProtocol(
+        DisableOnlyService(),
+        RecordingStatisticsSource(),
+    )
 
     response = protocol.handle_request(disable_request())
 

@@ -1,9 +1,9 @@
-"""Thin command-line client for the local routing-control Unix socket.
+"""Thin command-line client for the local control Unix socket.
 
 aismixerctl constructs versioned routing-control protocol requests, sends one
-request per Unix-domain NDJSON connection, and prints the structured protocol
-response. It does not compile, validate, or install routing tables; all routing
-semantics remain server-side.
+request per Unix-domain NDJSON connection, and preserves structured responses
+in one-shot mode. The interactive shell renders successful runtime statistics
+as tables. Routing semantics remain server-side.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import yaml
 from core.routing_control_protocol import (
     METHOD_DISABLE,
     METHOD_REPLACE,
+    METHOD_RUNTIME_STATISTICS,
     METHOD_STATUS,
     ROUTING_CONTROL_PROTOCOL_VERSION,
 )
@@ -86,6 +87,15 @@ def build_status_request(request_id: str) -> dict[str, object]:
         "version": ROUTING_CONTROL_PROTOCOL_VERSION,
         "request_id": request_id,
         "method": METHOD_STATUS,
+    }
+
+
+def build_runtime_statistics_request(request_id: str) -> dict[str, object]:
+    _validate_request_id(request_id)
+    return {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": request_id,
+        "method": METHOD_RUNTIME_STATISTICS,
     }
 
 
@@ -232,6 +242,7 @@ def dispatch_command(
     generated_request_id: Callable[[], str] | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
+    interactive: bool = False,
 ) -> int:
     """Build, send, and render one remote command for either interface."""
 
@@ -251,11 +262,15 @@ def dispatch_command(
                 request,
             )
         )
-        output = format_response(response, pretty=pretty)
         if response["ok"] is True:
+            if interactive and _is_statistics_command(args):
+                output = format_runtime_statistics(response["result"])
+            else:
+                output = format_response(response, pretty=pretty)
             output_stream.write(output)
             return EXIT_OK
 
+        output = format_response(response, pretty=pretty)
         error_stream.write(output)
         return EXIT_PROTOCOL_ERROR
     except KeyboardInterrupt:
@@ -278,7 +293,10 @@ def dispatch_command(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="aismixerctl")
+    parser = argparse.ArgumentParser(
+        prog="aismixerctl",
+        epilog="Use 'show statistics' to inspect runtime statistics.",
+    )
     parser.add_argument(
         "--socket",
         dest="socket_path",
@@ -293,7 +311,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_shell_parser() -> argparse.ArgumentParser:
-    parser = _InteractiveArgumentParser(prog="aismixerctl")
+    parser = _InteractiveArgumentParser(
+        prog="aismixerctl",
+        epilog="Use 'show statistics' to inspect runtime statistics.",
+    )
     subparsers = _add_remote_command_parsers(parser, required=True)
     subparsers.add_parser("help")
     subparsers.add_parser("exit")
@@ -322,6 +343,19 @@ def _add_remote_command_parsers(
         "--expected-generation",
         type=_parse_expected_generation,
         dest="expected_generation",
+    )
+
+    show_parser = subparsers.add_parser(
+        "show",
+        help="show runtime information (for example: show statistics)",
+    )
+    show_subparsers = show_parser.add_subparsers(
+        dest="show_command",
+        required=True,
+    )
+    show_subparsers.add_parser(
+        "statistics",
+        help="show runtime statistics",
     )
 
     return subparsers
@@ -412,6 +446,7 @@ def run_interactive_shell(
                     generated_request_id=generated_request_id,
                     stdout=output_stream,
                     stderr=error_stream,
+                    interactive=True,
                 )
             except KeyboardInterrupt:
                 _write_shell_newline(output_stream)
@@ -443,7 +478,15 @@ def resolve_history_path(
 def completion_candidates(line: str, text: str) -> tuple[str, ...]:
     """Return basic command or option completions for the current shell line."""
 
-    commands = ("status", "replace", "disable", "help", "exit", "quit")
+    commands = (
+        "status",
+        "replace",
+        "disable",
+        "show",
+        "help",
+        "exit",
+        "quit",
+    )
     stripped = line.lstrip()
     words = stripped.split()
     completing_command = not words or (
@@ -455,6 +498,11 @@ def completion_candidates(line: str, text: str) -> tuple[str, ...]:
         candidates = ("--file", "--expected-generation")
     elif words[0] == "disable":
         candidates = ("--expected-generation",)
+    elif words[0] == "show" and (
+        len(words) == 1
+        or (len(words) == 2 and not stripped[-1:].isspace())
+    ):
+        candidates = ("statistics",)
     else:
         candidates = ()
     return tuple(candidate for candidate in candidates if candidate.startswith(text))
@@ -567,6 +615,8 @@ def _write_shell_newline(output_stream: TextIO) -> None:
 def build_request_from_args(args: argparse.Namespace, request_id: str) -> dict[str, object]:
     if args.command == "status":
         return build_status_request(request_id)
+    if args.command == "show" and args.show_command == "statistics":
+        return build_runtime_statistics_request(request_id)
     if args.command == "disable":
         return build_disable_request(
             request_id,
@@ -580,6 +630,219 @@ def build_request_from_args(args: argparse.Namespace, request_id: str) -> dict[s
             expected_generation=args.expected_generation,
         )
     raise AssertionError(f"Unsupported aismixerctl command: {args.command}")
+
+
+def _is_statistics_command(args: argparse.Namespace) -> bool:
+    return (
+        args.command == "show"
+        and getattr(args, "show_command", None) == "statistics"
+    )
+
+
+_QUEUE_RESULT_FIELDS = (
+    "name",
+    "capacity",
+    "depth",
+    "peak_depth",
+    "enqueued",
+    "dequeued",
+    "put_waits",
+    "current_put_waiters",
+)
+_QUEUE_HEADERS = (
+    "NAME",
+    "CAPACITY",
+    "DEPTH",
+    "PEAK",
+    "ENQUEUED",
+    "DEQUEUED",
+    "PUT WAITS",
+    "WAITERS",
+)
+_PROCESSOR_RESULT_FIELDS = (
+    "process_calls",
+    "process_completed",
+    "process_failed",
+    "process_in_flight",
+    "outputless_calls",
+    "output_batches",
+    "output_messages",
+    "reset_calls",
+    "reset_completed",
+    "reset_failed",
+    "reset_in_flight",
+)
+_EGRESS_RESULT_FIELDS = (
+    "batches_started",
+    "batches_completed",
+    "batches_failed",
+    "batches_cancelled",
+    "active_batches",
+    "outputs_started",
+    "outputs_completed",
+    "outputs_failed",
+    "outputs_cancelled",
+    "active_outputs",
+)
+_STATISTICS_RESULT_FIELDS = (
+    "ingress_queues",
+    "processing_queue",
+    "processor",
+    "egress_queue",
+    "egress_operations",
+)
+
+
+def format_runtime_statistics(result: object) -> str:
+    """Render one successful statistics result as deterministic ASCII tables."""
+
+    statistics = _require_exact_statistics_mapping(
+        result,
+        _STATISTICS_RESULT_FIELDS,
+        "runtime statistics result",
+    )
+    ingress_value = statistics["ingress_queues"]
+    if (
+        not isinstance(ingress_value, Sequence)
+        or isinstance(ingress_value, (str, bytes, bytearray))
+    ):
+        raise RoutingControlResponseError(
+            "Runtime statistics ingress_queues field is invalid."
+        )
+
+    ingress_rows = tuple(
+        _queue_table_row(queue, f"ingress_queues[{index}]")
+        for index, queue in enumerate(ingress_value)
+    )
+    processing_row = _queue_table_row(
+        statistics["processing_queue"],
+        "processing_queue",
+    )
+    egress_row = _queue_table_row(
+        statistics["egress_queue"],
+        "egress_queue",
+    )
+
+    processor = _require_counter_mapping(
+        statistics["processor"],
+        _PROCESSOR_RESULT_FIELDS,
+        "processor",
+    )
+    processor_rows = tuple(
+        (field_name, str(processor[field_name]))
+        for field_name in _PROCESSOR_RESULT_FIELDS
+    )
+
+    egress = _require_counter_mapping(
+        statistics["egress_operations"],
+        _EGRESS_RESULT_FIELDS,
+        "egress_operations",
+    )
+    egress_rows = (
+        (
+            "BATCHES",
+            str(egress["batches_started"]),
+            str(egress["batches_completed"]),
+            str(egress["batches_failed"]),
+            str(egress["batches_cancelled"]),
+            str(egress["active_batches"]),
+        ),
+        (
+            "OUTPUTS",
+            str(egress["outputs_started"]),
+            str(egress["outputs_completed"]),
+            str(egress["outputs_failed"]),
+            str(egress["outputs_cancelled"]),
+            str(egress["active_outputs"]),
+        ),
+    )
+
+    sections = (
+        "Ingress queues\n" + _format_ascii_table(_QUEUE_HEADERS, ingress_rows),
+        "Processing queue\n"
+        + _format_ascii_table(_QUEUE_HEADERS, (processing_row,)),
+        "Processor\n"
+        + _format_ascii_table(("METRIC", "VALUE"), processor_rows),
+        "Egress queue\n" + _format_ascii_table(_QUEUE_HEADERS, (egress_row,)),
+        "Local egress operations\n"
+        + _format_ascii_table(
+            ("TYPE", "STARTED", "COMPLETED", "FAILED", "CANCELLED", "ACTIVE"),
+            egress_rows,
+        ),
+    )
+    return "\n\n".join(sections) + "\n"
+
+
+def _queue_table_row(value: object, description: str) -> tuple[str, ...]:
+    queue = _require_exact_statistics_mapping(
+        value,
+        _QUEUE_RESULT_FIELDS,
+        description,
+    )
+    name = queue["name"]
+    if not isinstance(name, str) or not name:
+        raise RoutingControlResponseError(
+            f"Runtime statistics {description} name is invalid."
+        )
+    for field_name in _QUEUE_RESULT_FIELDS[1:]:
+        _require_counter(queue[field_name], f"{description}.{field_name}")
+    return tuple(str(queue[field_name]) for field_name in _QUEUE_RESULT_FIELDS)
+
+
+def _require_counter_mapping(
+    value: object,
+    fields: tuple[str, ...],
+    description: str,
+) -> Mapping[str, object]:
+    mapping = _require_exact_statistics_mapping(value, fields, description)
+    for field_name in fields:
+        _require_counter(mapping[field_name], f"{description}.{field_name}")
+    return mapping
+
+
+def _require_exact_statistics_mapping(
+    value: object,
+    fields: tuple[str, ...],
+    description: str,
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or set(value) != set(fields):
+        raise RoutingControlResponseError(
+            f"Runtime statistics {description} fields are invalid."
+        )
+    return value
+
+
+def _require_counter(value: object, description: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RoutingControlResponseError(
+            f"Runtime statistics {description} is invalid."
+        )
+
+
+def _format_ascii_table(
+    headers: tuple[str, ...],
+    rows: Sequence[tuple[str, ...]],
+) -> str:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        if len(row) != len(headers):
+            raise AssertionError("table row width does not match its headers")
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+
+    header_line = "  ".join(
+        header.ljust(widths[index])
+        for index, header in enumerate(headers)
+    ).rstrip()
+    separator = "  ".join("-" * width for width in widths)
+    data_lines = tuple(
+        "  ".join(
+            value.ljust(widths[index]) if index == 0 else value.rjust(widths[index])
+            for index, value in enumerate(row)
+        ).rstrip()
+        for row in rows
+    )
+    return "\n".join((header_line, separator, *data_lines))
 
 
 def format_response(response: Mapping[str, object], *, pretty: bool = False) -> str:

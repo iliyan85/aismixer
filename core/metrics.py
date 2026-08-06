@@ -179,3 +179,42 @@ class EgressMetricsSnapshot:
                 "outputs_started must equal completed, failed, cancelled, "
                 "and active outputs."
             )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeStatisticsSnapshot:
+    """One immutable pull of the runtime's existing metric owners."""
+
+    ingress_queues: tuple[QueueMetricsSnapshot, ...]
+    processing_queue: QueueMetricsSnapshot
+    processor: ProcessorMetricsSnapshot
+    egress_queue: QueueMetricsSnapshot
+    egress_operations: EgressMetricsSnapshot
+
+    def __post_init__(self) -> None:
+        try:
+            ingress_queues = tuple(self.ingress_queues)
+        except TypeError as exc:
+            raise TypeError(
+                "ingress_queues must be an iterable of QueueMetricsSnapshot."
+            ) from exc
+        object.__setattr__(self, "ingress_queues", ingress_queues)
+
+        for index, snapshot in enumerate(ingress_queues):
+            if not isinstance(snapshot, QueueMetricsSnapshot):
+                raise TypeError(
+                    "ingress_queues entries must be QueueMetricsSnapshot "
+                    f"instances; entry {index} is invalid."
+                )
+
+        expected_types = (
+            ("processing_queue", QueueMetricsSnapshot),
+            ("processor", ProcessorMetricsSnapshot),
+            ("egress_queue", QueueMetricsSnapshot),
+            ("egress_operations", EgressMetricsSnapshot),
+        )
+        for field_name, expected_type in expected_types:
+            if not isinstance(getattr(self, field_name), expected_type):
+                raise TypeError(
+                    f"{field_name} must be a {expected_type.__name__}."
+                )

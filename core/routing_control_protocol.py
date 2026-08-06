@@ -1,9 +1,10 @@
-"""Versioned JSON protocol for routing control requests.
+"""Versioned JSON protocol for local runtime control requests.
 
 The protocol is transport-neutral: sockets, CLIs, HTTP handlers, and future
 peer transports should provide framing separately and delegate decoded messages
-to this module. Version 1 validates request envelopes, delegates operations to
-RoutingControlService, and never compiles routing tables in the protocol layer.
+to this module. Version 1 validates request envelopes, delegates routing
+operations to RoutingControlService, and pulls statistics from an explicitly
+injected runtime provider. It never compiles routing tables in this layer.
 """
 
 from __future__ import annotations
@@ -13,12 +14,19 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from core.metrics import (
+    EgressMetricsSnapshot,
+    ProcessorMetricsSnapshot,
+    QueueMetricsSnapshot,
+    RuntimeStatisticsSnapshot,
+)
 from core.routing_control import (
     RoutingCandidateConfigError,
     RoutingControlService,
     RoutingControlStatus,
 )
 from core.routing_state import StaleRoutingGenerationError
+from core.runtime_statistics import RuntimeStatisticsSource
 
 
 ROUTING_CONTROL_PROTOCOL_VERSION = 1
@@ -33,6 +41,7 @@ ERROR_STALE_GENERATION = "stale_generation"
 METHOD_STATUS = "routing.status"
 METHOD_REPLACE = "routing.replace"
 METHOD_DISABLE = "routing.disable"
+METHOD_RUNTIME_STATISTICS = "runtime.statistics"
 
 
 class MalformedJsonError(ValueError):
@@ -105,8 +114,13 @@ class RoutingControlProtocol:
     over routing compilation, target validation, or generation ownership.
     """
 
-    def __init__(self, service: RoutingControlService):
+    def __init__(
+        self,
+        service: RoutingControlService,
+        statistics_provider: RuntimeStatisticsSource,
+    ):
         self._service = service
+        self._statistics_provider = statistics_provider
 
     def handle_json(self, data: bytes | str) -> bytes:
         """Handle one unframed JSON message and return response bytes."""
@@ -137,6 +151,13 @@ class RoutingControlProtocol:
             )
 
         validated = _coerce_validated_request(request)
+
+        if validated.method == METHOD_RUNTIME_STATISTICS:
+            snapshot = self._statistics_provider.snapshot()
+            return _success_response(
+                validated.request_id,
+                _runtime_statistics_result(snapshot),
+            )
 
         if validated.method == METHOD_STATUS:
             status = self._service.status()
@@ -225,17 +246,22 @@ def _validate_request_schema(request: Mapping[str, object]) -> _RequestError | N
             ERROR_INVALID_REQUEST,
             "Request field 'method' must be a non-empty string.",
         )
-    if method not in {METHOD_STATUS, METHOD_REPLACE, METHOD_DISABLE}:
+    if method not in {
+        METHOD_STATUS,
+        METHOD_REPLACE,
+        METHOD_DISABLE,
+        METHOD_RUNTIME_STATISTICS,
+    }:
         return _RequestError(
             ERROR_UNKNOWN_METHOD,
             f"Unknown routing control method: {method}.",
         )
 
-    if method == METHOD_STATUS:
+    if method in {METHOD_STATUS, METHOD_RUNTIME_STATISTICS}:
         if "params" in request:
             return _RequestError(
                 ERROR_INVALID_REQUEST,
-                "Method 'routing.status' does not accept params.",
+                f"Method {method!r} does not accept params.",
             )
         return None
 
@@ -395,6 +421,77 @@ def _status_result(status: RoutingControlStatus) -> dict[str, object]:
         "zone_names": list(status.zone_names),
         "route_names": list(status.route_names),
         "target_ids": list(status.target_ids),
+    }
+
+
+def _runtime_statistics_result(
+    snapshot: RuntimeStatisticsSnapshot,
+) -> dict[str, object]:
+    """Serialize the stable public result without dataclass introspection."""
+
+    if not isinstance(snapshot, RuntimeStatisticsSnapshot):
+        raise TypeError(
+            "statistics provider must return a RuntimeStatisticsSnapshot."
+        )
+    return {
+        "ingress_queues": [
+            _queue_metrics_result(queue) for queue in snapshot.ingress_queues
+        ],
+        "processing_queue": _queue_metrics_result(snapshot.processing_queue),
+        "processor": _processor_metrics_result(snapshot.processor),
+        "egress_queue": _queue_metrics_result(snapshot.egress_queue),
+        "egress_operations": _egress_metrics_result(
+            snapshot.egress_operations
+        ),
+    }
+
+
+def _queue_metrics_result(snapshot: QueueMetricsSnapshot) -> dict[str, object]:
+    return {
+        "name": snapshot.name,
+        "capacity": snapshot.capacity,
+        "depth": snapshot.depth,
+        "peak_depth": snapshot.peak_depth,
+        "enqueued": snapshot.enqueued,
+        "dequeued": snapshot.dequeued,
+        "put_waits": snapshot.put_waits,
+        "current_put_waiters": snapshot.current_put_waiters,
+    }
+
+
+def _processor_metrics_result(
+    snapshot: ProcessorMetricsSnapshot,
+) -> dict[str, object]:
+    return {
+        "process_calls": snapshot.process_calls,
+        "process_completed": snapshot.process_completed,
+        "process_failed": snapshot.process_failed,
+        "process_in_flight": snapshot.process_in_flight,
+        "outputless_calls": snapshot.outputless_calls,
+        "output_batches": snapshot.output_batches,
+        "output_messages": snapshot.output_messages,
+        "reset_calls": snapshot.reset_calls,
+        "reset_completed": snapshot.reset_completed,
+        "reset_failed": snapshot.reset_failed,
+        "reset_in_flight": snapshot.reset_in_flight,
+    }
+
+
+def _egress_metrics_result(
+    snapshot: EgressMetricsSnapshot,
+) -> dict[str, object]:
+    # These are local egress operations, not remote-delivery confirmations.
+    return {
+        "batches_started": snapshot.batches_started,
+        "batches_completed": snapshot.batches_completed,
+        "batches_failed": snapshot.batches_failed,
+        "batches_cancelled": snapshot.batches_cancelled,
+        "active_batches": snapshot.active_batches,
+        "outputs_started": snapshot.outputs_started,
+        "outputs_completed": snapshot.outputs_completed,
+        "outputs_failed": snapshot.outputs_failed,
+        "outputs_cancelled": snapshot.outputs_cancelled,
+        "active_outputs": snapshot.active_outputs,
     }
 
 

@@ -7,6 +7,7 @@ import pytest
 import aismixerctl
 from core.routing_control_protocol import (
     ERROR_STALE_GENERATION,
+    METHOD_RUNTIME_STATISTICS,
     ROUTING_CONTROL_PROTOCOL_VERSION,
 )
 from core.routing_control_unix_client import (
@@ -40,6 +41,94 @@ def success_response(request_id="req-1"):
             "route_names": [],
             "target_ids": [],
         },
+    }
+
+
+def queue_statistics(name, *, capacity, depth, peak_depth, enqueued, dequeued):
+    return {
+        "name": name,
+        "capacity": capacity,
+        "depth": depth,
+        "peak_depth": peak_depth,
+        "enqueued": enqueued,
+        "dequeued": dequeued,
+        "put_waits": 2,
+        "current_put_waiters": 1,
+    }
+
+
+def statistics_result(ingress_queues=None):
+    if ingress_queues is None:
+        ingress_queues = [
+            queue_statistics(
+                "udp-ingress:0:station-a",
+                capacity=1024,
+                depth=2,
+                peak_depth=4,
+                enqueued=10,
+                dequeued=8,
+            ),
+            queue_statistics(
+                "udpsec-ingress:1:station-b",
+                capacity=512,
+                depth=1,
+                peak_depth=3,
+                enqueued=7,
+                dequeued=6,
+            ),
+        ]
+    return {
+        "ingress_queues": list(ingress_queues),
+        "processing_queue": queue_statistics(
+            "processing",
+            capacity=256,
+            depth=1,
+            peak_depth=5,
+            enqueued=14,
+            dequeued=13,
+        ),
+        "processor": {
+            "process_calls": 13,
+            "process_completed": 11,
+            "process_failed": 1,
+            "process_in_flight": 1,
+            "outputless_calls": 2,
+            "output_batches": 9,
+            "output_messages": 17,
+            "reset_calls": 3,
+            "reset_completed": 2,
+            "reset_failed": 0,
+            "reset_in_flight": 1,
+        },
+        "egress_queue": queue_statistics(
+            "egress",
+            capacity=128,
+            depth=2,
+            peak_depth=6,
+            enqueued=9,
+            dequeued=7,
+        ),
+        "egress_operations": {
+            "batches_started": 9,
+            "batches_completed": 7,
+            "batches_failed": 1,
+            "batches_cancelled": 0,
+            "active_batches": 1,
+            "outputs_started": 17,
+            "outputs_completed": 14,
+            "outputs_failed": 1,
+            "outputs_cancelled": 1,
+            "active_outputs": 1,
+        },
+    }
+
+
+def statistics_response(request_id="req-1", *, ingress_queues=None):
+    return {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": request_id,
+        "ok": True,
+        "result": statistics_result(ingress_queues),
     }
 
 
@@ -211,6 +300,30 @@ def test_status_request_shape():
         "version": ROUTING_CONTROL_PROTOCOL_VERSION,
         "request_id": "req-1",
         "method": "routing.status",
+    }
+
+
+def test_runtime_statistics_request_shape():
+    assert aismixerctl.build_runtime_statistics_request("req-1") == {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": "req-1",
+        "method": METHOD_RUNTIME_STATISTICS,
+    }
+
+
+@pytest.mark.parametrize(
+    "parser_factory",
+    [aismixerctl.build_parser, aismixerctl.build_shell_parser],
+)
+def test_show_statistics_uses_shared_nested_parser(parser_factory):
+    args = parser_factory().parse_args(["show", "statistics"])
+
+    assert args.command == "show"
+    assert args.show_command == "statistics"
+    assert aismixerctl.build_request_from_args(args, "req-1") == {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": "req-1",
+        "method": METHOD_RUNTIME_STATISTICS,
     }
 
 
@@ -386,6 +499,81 @@ def test_main_status_uses_default_socket_path_without_socket_option(capsys):
         )
     ]
     assert json.loads(captured.out)["ok"] is True
+
+
+def test_main_show_statistics_uses_compact_json_and_exact_request(capsys):
+    FakeClient.response = statistics_response("statistics-1")
+
+    rc = aismixerctl.main(
+        ["--request-id", "statistics-1", "show", "statistics"],
+        client_factory=FakeClient,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == aismixerctl.EXIT_OK
+    assert FakeClient.calls == [
+        (
+            aismixerctl.DEFAULT_SOCKET_PATH,
+            {
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+                "request_id": "statistics-1",
+                "method": METHOD_RUNTIME_STATISTICS,
+            },
+        )
+    ]
+    assert captured.out == (
+        json.dumps(
+            statistics_response("statistics-1"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    assert captured.err == ""
+
+
+def test_main_show_statistics_pretty_json(capsys):
+    FakeClient.response = statistics_response("statistics-1")
+
+    rc = aismixerctl.main(
+        ["--pretty", "--request-id", "statistics-1", "show", "statistics"],
+        client_factory=FakeClient,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == aismixerctl.EXIT_OK
+    assert captured.out == (
+        json.dumps(
+            statistics_response("statistics-1"),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    assert captured.err == ""
+
+
+def test_main_show_statistics_preserves_custom_socket(capsys):
+    FakeClient.response = statistics_response("statistics-1")
+
+    rc = aismixerctl.main(
+        [
+            "--socket",
+            "/custom/control.sock",
+            "--request-id",
+            "statistics-1",
+            "show",
+            "statistics",
+        ],
+        client_factory=FakeClient,
+    )
+
+    assert rc == aismixerctl.EXIT_OK
+    assert FakeClient.calls[0][0] == "/custom/control.sock"
+    assert FakeClient.calls[0][1]["method"] == METHOD_RUNTIME_STATISTICS
+    assert json.loads(capsys.readouterr().out) == statistics_response("statistics-1")
 
 
 def test_explicit_socket_overrides_default_socket_path(capsys):
@@ -657,8 +845,9 @@ def test_shell_help_and_empty_lines_are_local(tmp_path):
     assert rc == aismixerctl.EXIT_OK
     assert len(input_func.prompts) == 4
     assert FakeClient.calls == []
-    for command in ("status", "replace", "disable", "help", "exit", "quit"):
+    for command in ("status", "replace", "disable", "show", "help", "exit", "quit"):
         assert command in stdout
+    assert "show statistics" in " ".join(stdout.split())
     assert stderr == ""
 
 
@@ -760,6 +949,217 @@ def test_one_shot_and_shell_commands_call_shared_dispatcher(monkeypatch, tmp_pat
     assert len(dispatch_calls) > calls_after_one_shot
     assert stderr.getvalue() == ""
     assert shell_stderr == ""
+
+
+def test_one_shot_and_shell_statistics_call_shared_dispatcher(monkeypatch, tmp_path):
+    original_dispatch = aismixerctl.dispatch_command
+    dispatch_calls = []
+
+    def recording_dispatch(*args, **kwargs):
+        dispatch_calls.append((args, kwargs))
+        return original_dispatch(*args, **kwargs)
+
+    monkeypatch.setattr(aismixerctl, "dispatch_command", recording_dispatch)
+    FakeClient.response = statistics_response("statistics-1")
+
+    one_shot_rc = aismixerctl.main(
+        ["--request-id", "statistics-1", "show", "statistics"],
+        client_factory=FakeClient,
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+    shell_rc, _input_func, shell_stdout, shell_stderr = run_shell(
+        tmp_path,
+        ["show statistics", "exit"],
+        generated_request_id=lambda: "statistics-1",
+    )
+
+    assert one_shot_rc == aismixerctl.EXIT_OK
+    assert shell_rc == aismixerctl.EXIT_OK
+    assert [
+        (
+            call_args[0].command,
+            call_args[0].show_command,
+            call_kwargs.get("interactive", False),
+        )
+        for call_args, call_kwargs in dispatch_calls
+    ] == [
+        ("show", "statistics", False),
+        ("show", "statistics", True),
+    ]
+    assert shell_stdout.startswith("Ingress queues\n")
+    assert shell_stderr == ""
+
+
+def test_shell_statistics_uses_fresh_request_ids(tmp_path):
+    calls = []
+
+    class StatisticsClient:
+        def __init__(self, socket_path):
+            self.socket_path = socket_path
+
+        async def request(self, request):
+            calls.append((self.socket_path, request))
+            return statistics_response(request["request_id"])
+
+    request_ids = iter(["statistics-1", "statistics-2"])
+    rc, _input_func, stdout, stderr = run_shell(
+        tmp_path,
+        ["show statistics", "show statistics", "exit"],
+        client_factory=StatisticsClient,
+        generated_request_id=lambda: next(request_ids),
+    )
+
+    assert rc == aismixerctl.EXIT_OK
+    assert [request["request_id"] for _path, request in calls] == [
+        "statistics-1",
+        "statistics-2",
+    ]
+    assert [request["method"] for _path, request in calls] == [
+        METHOD_RUNTIME_STATISTICS,
+        METHOD_RUNTIME_STATISTICS,
+    ]
+    assert stdout.count("Ingress queues\n") == 2
+    assert stderr == ""
+
+
+def test_interactive_statistics_table_has_all_sections_and_fields(tmp_path):
+    FakeClient.response = statistics_response("statistics-1")
+
+    rc, _input_func, stdout, stderr = run_shell(
+        tmp_path,
+        ["show statistics", "exit"],
+        generated_request_id=lambda: "statistics-1",
+    )
+
+    assert rc == aismixerctl.EXIT_OK
+    section_names = (
+        "Ingress queues",
+        "Processing queue",
+        "Processor",
+        "Egress queue",
+        "Local egress operations",
+    )
+    assert [stdout.index(section) for section in section_names] == sorted(
+        stdout.index(section) for section in section_names
+    )
+    for heading in (
+        "NAME",
+        "CAPACITY",
+        "DEPTH",
+        "PEAK",
+        "ENQUEUED",
+        "DEQUEUED",
+        "PUT WAITS",
+        "WAITERS",
+        "METRIC",
+        "VALUE",
+        "STARTED",
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "ACTIVE",
+    ):
+        assert heading in stdout
+    for field in statistics_result()["processor"]:
+        assert field in stdout
+    for queue_name in (
+        "udp-ingress:0:station-a",
+        "udpsec-ingress:1:station-b",
+        "processing",
+        "egress",
+    ):
+        assert queue_name in stdout
+    assert stdout.index("udp-ingress:0:station-a") < stdout.index(
+        "udpsec-ingress:1:station-b"
+    )
+    assert "BATCHES" in stdout
+    assert "OUTPUTS" in stdout
+    assert "delivered" not in stdout.lower()
+    assert not stdout.lstrip().startswith("{")
+    assert stdout == stdout.rstrip("\n") + "\n"
+    assert stderr == ""
+
+
+def test_interactive_statistics_zero_ingress_queues_render_cleanly(tmp_path):
+    FakeClient.response = statistics_response("statistics-1", ingress_queues=[])
+
+    rc, _input_func, stdout, stderr = run_shell(
+        tmp_path,
+        ["show statistics", "exit"],
+        generated_request_id=lambda: "statistics-1",
+    )
+
+    ingress_section = stdout.split("\n\n", 1)[0].splitlines()
+    assert rc == aismixerctl.EXIT_OK
+    assert ingress_section[0] == "Ingress queues"
+    assert "NAME" in ingress_section[1]
+    assert len(ingress_section) == 3
+    assert "Processing queue" in stdout
+    assert stdout == stdout.rstrip("\n") + "\n"
+    assert stderr == ""
+
+
+def test_interactive_statistics_ignores_pretty_for_table_output(tmp_path):
+    FakeClient.response = statistics_response("statistics-1")
+
+    plain_rc, _input_func, plain_stdout, plain_stderr = run_shell(
+        tmp_path,
+        ["show statistics", "exit"],
+        generated_request_id=lambda: "statistics-1",
+    )
+    pretty_rc, _input_func, pretty_stdout, pretty_stderr = run_shell(
+        tmp_path,
+        ["show statistics", "exit"],
+        argv=["--pretty"],
+        generated_request_id=lambda: "statistics-1",
+    )
+
+    assert plain_rc == pretty_rc == aismixerctl.EXIT_OK
+    assert plain_stdout == pretty_stdout
+    assert plain_stderr == pretty_stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("first_outcome", "expected_error"),
+    [
+        (RoutingControlConnectionError("connection failed"), "connection failed"),
+        (server_error_response("statistics-1"), '"ok":false'),
+    ],
+)
+def test_shell_statistics_errors_return_to_prompt(
+    tmp_path,
+    first_outcome,
+    expected_error,
+):
+    outcomes = [first_outcome, statistics_response("statistics-2")]
+    calls = []
+
+    class RecoveringStatisticsClient:
+        def __init__(self, socket_path):
+            self.socket_path = socket_path
+
+        async def request(self, request):
+            calls.append((self.socket_path, request))
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    request_ids = iter(["statistics-1", "statistics-2"])
+    rc, input_func, stdout, stderr = run_shell(
+        tmp_path,
+        ["show statistics", "show statistics", "exit"],
+        client_factory=RecoveringStatisticsClient,
+        generated_request_id=lambda: next(request_ids),
+    )
+
+    assert rc == aismixerctl.EXIT_OK
+    assert len(input_func.prompts) == 3
+    assert len(calls) == 2
+    assert stdout.startswith("Ingress queues\n")
+    assert expected_error in stderr
+    assert "Traceback" not in stderr
 
 
 def test_shell_parse_and_argument_errors_return_to_prompt(tmp_path):
@@ -1080,10 +1480,61 @@ def test_basic_completion_candidates():
         candidate.rstrip()
         for candidate in aismixerctl.completion_candidates("disable --e", "--e")
     }
+    show_candidates = {
+        candidate.rstrip()
+        for candidate in aismixerctl.completion_candidates("sh", "sh")
+    }
+    statistics_candidates = {
+        candidate.rstrip()
+        for candidate in aismixerctl.completion_candidates("show st", "st")
+    }
 
-    assert {"status", "replace", "disable", "help", "exit", "quit"} <= (
+    assert {"status", "replace", "disable", "show", "help", "exit", "quit"} <= (
         command_candidates
     )
     assert status_candidates == {"status"}
     assert {"--file", "--expected-generation"} <= replace_options
     assert "--expected-generation" in disable_options
+    assert show_candidates == {"show"}
+    assert statistics_candidates == {"statistics"}
+    assert aismixerctl.completion_candidates("show ", "") == ("statistics",)
+    assert aismixerctl.completion_candidates("show statistics ", "") == ()
+
+
+def test_one_shot_and_nested_help_include_show_statistics(capsys):
+    assert aismixerctl.main(["--help"]) == aismixerctl.EXIT_OK
+    top_level_help = capsys.readouterr().out
+
+    assert aismixerctl.main(["show", "--help"]) == aismixerctl.EXIT_OK
+    nested_help = capsys.readouterr().out
+
+    assert "show statistics" in top_level_help
+    assert "statistics" in nested_help
+
+
+def test_interactive_help_contains_literal_show_statistics():
+    assert "show statistics" in aismixerctl.build_shell_parser().format_help()
+
+
+@pytest.mark.parametrize(
+    "filter_tokens",
+    [
+        ["inputs"],
+        ["outputs"],
+        ["input", "station-a"],
+        ["output", "target-a"],
+    ],
+)
+def test_show_statistics_rejects_future_filter_forms(
+    filter_tokens,
+    capsys,
+):
+    rc = aismixerctl.main(
+        ["show", "statistics", *filter_tokens],
+        client_factory=FakeClient,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == aismixerctl.EXIT_USAGE_OR_INPUT
+    assert FakeClient.calls == []
+    assert "unrecognized arguments" in captured.err
