@@ -18,6 +18,7 @@ from core.ingress_frame import (
 from core.network_policy import NetworkPolicy
 from core.routing import RoutingTable
 from core.routing_state import RoutingSnapshot, RoutingState
+from core.runtime_statistics import InputTrafficMetrics
 from dedup import Deduplicator
 
 
@@ -265,6 +266,7 @@ class RecordingRoutingState:
 def test_handle_socket_creates_ingress_frame_with_udp_source_id(monkeypatch):
     queue = _FakeQueue()
     packet = ("\u2003" + SENTENCE + "\u00a0").encode("utf-8")
+    traffic = InputTrafficMetrics("udp-ingress:0:balchik_roof", "udp")
     fake_loop = _OnePacketLoop(
         (packet, ("192.0.2.10", 17778))
     )
@@ -279,6 +281,7 @@ def test_handle_socket_creates_ingress_frame_with_udp_source_id(monkeypatch):
                 queue,
                 fixed_alias="balchik_roof",
                 alias_map={"192.0.2.10": "dock_gate"},
+                input_traffic=traffic,
             )
         )
 
@@ -293,6 +296,12 @@ def test_handle_socket_creates_ingress_frame_with_udp_source_id(monkeypatch):
     assert frame.payload == SENTENCE.encode("utf-8")
     assert frame.text_mode is PayloadTextMode.UTF8_IGNORE
     assert decode_frame_slice(frame, 0, len(frame.payload)) == SENTENCE
+    assert traffic.input_traffic_snapshot().transport_packets == 1
+    assert traffic.input_traffic_snapshot().transport_bytes == len(packet)
+    assert traffic.input_traffic_snapshot().accepted_frames == 1
+    assert traffic.input_traffic_snapshot().payload_bytes == len(
+        frame.payload
+    )
 
 
 def test_handle_socket_allows_packet_matching_ingress_policy(monkeypatch):
@@ -389,9 +398,9 @@ def test_handle_socket_enqueues_frame_when_datagram_normalizes_empty(
 
 def test_handle_socket_denied_packet_does_not_decode_or_enqueue(monkeypatch):
     queue = _FakeQueue()
-    fake_loop = _OnePacketLoop(
-        (SENTENCE.encode(), ("192.0.2.10", 17778))
-    )
+    packet = SENTENCE.encode()
+    fake_loop = _OnePacketLoop((packet, ("192.0.2.10", 17778)))
+    traffic = InputTrafficMetrics("udp-ingress:0:denied", "udp")
     policy = NetworkPolicy.from_entries(
         ["198.51.100.0/24"],
         context="udp_inputs[0].allow_from",
@@ -419,10 +428,54 @@ def test_handle_socket_denied_packet_does_not_decode_or_enqueue(monkeypatch):
                 queue,
                 alias_map={"192.0.2.10": "dock_gate"},
                 ingress_policy=policy,
+                input_traffic=traffic,
             )
         )
 
     assert queue.items == []
+    snapshot = traffic.input_traffic_snapshot()
+    assert snapshot.transport_packets == 1
+    assert snapshot.transport_bytes == len(packet)
+    assert snapshot.accepted_frames == 0
+    assert snapshot.payload_bytes == 0
+
+
+@pytest.mark.parametrize(
+    "queue_failure",
+    [
+        pytest.param(RuntimeError("queue failed"), id="failed"),
+        pytest.param(asyncio.CancelledError(), id="cancelled"),
+    ],
+)
+def test_handle_socket_does_not_accept_frame_when_queue_put_exits_by_exception(
+    monkeypatch,
+    queue_failure,
+):
+    packet = (" \t" + SENTENCE + "\r\n").encode()
+    fake_loop = _OnePacketLoop((packet, ("192.0.2.10", 17778)))
+    traffic = InputTrafficMetrics("udp-ingress:0:queue-failure", "udp")
+
+    class FailingQueue:
+        async def put(self, _frame):
+            raise queue_failure
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(type(queue_failure)):
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                FailingQueue(),
+                input_traffic=traffic,
+            )
+        )
+
+    snapshot = traffic.input_traffic_snapshot()
+    assert snapshot.transport_packets == 1
+    assert snapshot.transport_bytes == len(packet)
+    assert snapshot.accepted_frames == 0
+    assert snapshot.payload_bytes == 0
 
 
 def test_handle_socket_empty_ingress_policy_drops_all_packets(monkeypatch):

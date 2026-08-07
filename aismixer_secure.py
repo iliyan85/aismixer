@@ -841,6 +841,7 @@ async def _secure_server_loop(
     sec_input_id=None,
     ingress_policy=None,
     *,
+    input_traffic=None,
     state=None,
     wall_clock=None,
     monotonic_clock=None,
@@ -857,6 +858,8 @@ async def _secure_server_loop(
 
     while True:
         data, addr = await loop.sock_recvfrom(sock, 8192)
+        if input_traffic is not None:
+            input_traffic.transport_received(data)
         source_ip = addr[0]
         if not policy.allows(source_ip):
             continue
@@ -1095,6 +1098,8 @@ async def _secure_server_loop(
                 )
                 if frame is not None:
                     await queue.put(frame)
+                    if input_traffic is not None:
+                        input_traffic.frame_accepted(frame.payload)
 
                 if DEBUG:
                     print(
@@ -1113,6 +1118,7 @@ async def secure_server(
     sec_input_id=None,
     ingress_policy=None,
     *,
+    input_traffic=None,
     state=None,
     wall_clock=None,
     monotonic_clock=None,
@@ -1128,6 +1134,7 @@ async def secure_server(
             port,
             sec_input_id=sec_input_id,
             ingress_policy=ingress_policy,
+            input_traffic=input_traffic,
             state=state,
             wall_clock=wall_clock,
             monotonic_clock=monotonic_clock,

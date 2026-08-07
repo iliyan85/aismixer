@@ -5,6 +5,7 @@ import socket
 import pytest
 
 import forwarder as forwarder_module
+from core.metrics import OutputTrafficMetricsSnapshot
 from forwarder import (
     Forwarder,
     ForwarderConfigError,
@@ -20,6 +21,9 @@ class _FakeTransport:
         self.closed = False
 
     def sendto(self, data):
+        failure = self.loop.send_errors.get(self.remote_addr)
+        if failure is not None:
+            raise failure
         self.sent.append(data)
         self.loop.sends.append((self.remote_addr, data, self))
 
@@ -32,6 +36,7 @@ class _FakeLoop:
         self.created = []
         self.sends = []
         self.endpoint_kwargs = []
+        self.send_errors = {}
 
     async def create_datagram_endpoint(
         self,
@@ -79,6 +84,28 @@ def _targets():
     ]
 
 
+def _output_snapshot(target_id, name, **overrides):
+    values = {
+        "target_id": target_id,
+        "name": name,
+        "dispatch_attempts": 0,
+        "dispatch_completed": 0,
+        "dispatch_failed": 0,
+        "messages": 0,
+        "bytes": 0,
+    }
+    values.update(overrides)
+    return OutputTrafficMetricsSnapshot(**values)
+
+
+def _zero_output_snapshots():
+    return (
+        _output_snapshot(0, None),
+        _output_snapshot(1, "udp:aishub"),
+        _output_snapshot(2, "udp:local_debug"),
+    )
+
+
 def test_send_broadcasts_to_legacy_and_named_entries(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder(_targets())
@@ -92,6 +119,32 @@ def test_send_broadcasts_to_legacy_and_named_entries(monkeypatch):
         (("127.0.0.1", 19001), b"message"),
     ]
     assert all(data is payload for _addr, data, _transport in loop.sends)
+    assert forwarder.output_traffic_snapshot() == (
+        _output_snapshot(
+            0,
+            None,
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(payload),
+        ),
+        _output_snapshot(
+            1,
+            "udp:aishub",
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(payload),
+        ),
+        _output_snapshot(
+            2,
+            "udp:local_debug",
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(payload),
+        ),
+    )
 
 
 def test_forwarder_contains_no_encoding_operation():
@@ -131,6 +184,7 @@ def test_send_apis_reject_non_exact_bytes_before_transport_creation(
     assert loop.created == []
     assert loop.sends == []
     assert forwarder.transports == {}
+    assert forwarder.output_traffic_snapshot() == _zero_output_snapshots()
 
 
 def test_target_ids_returns_only_explicit_ids_in_declaration_order():
@@ -166,6 +220,13 @@ def test_empty_forwarder_has_empty_numeric_target_registry():
     assert forwarder.all_target_ids == ()
     assert forwarder.target_ids == ()
     assert dict(forwarder.target_id_by_name) == {}
+    assert forwarder.output_traffic_snapshot() == ()
+
+
+def test_zero_output_traffic_snapshot_includes_every_target_in_numeric_order():
+    forwarder = Forwarder(_targets())
+
+    assert forwarder.output_traffic_snapshot() == _zero_output_snapshots()
 
 
 def test_entries_without_id_remain_valid_for_legacy_broadcast(monkeypatch):
@@ -192,6 +253,18 @@ def test_send_to_sends_only_requested_targets(monkeypatch):
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19001), b"targeted")
     ]
+    assert forwarder.output_traffic_snapshot() == (
+        _output_snapshot(0, None),
+        _output_snapshot(1, "udp:aishub"),
+        _output_snapshot(
+            2,
+            "udp:local_debug",
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(b"targeted"),
+        ),
+    )
 
 
 def test_send_to_preserves_requested_order(monkeypatch):
@@ -228,6 +301,25 @@ def test_send_to_deduplicates_repeated_target_ids_by_first_occurrence(monkeypatc
         (("127.0.0.1", 19001), b"deduped"),
         (("192.0.2.20", 10110), b"deduped"),
     ]
+    assert forwarder.output_traffic_snapshot() == (
+        _output_snapshot(0, None),
+        _output_snapshot(
+            1,
+            "udp:aishub",
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(b"deduped"),
+        ),
+        _output_snapshot(
+            2,
+            "udp:local_debug",
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(b"deduped"),
+        ),
+    )
 
 
 def test_send_to_rejects_unknown_target_id(monkeypatch):
@@ -240,6 +332,7 @@ def test_send_to_rejects_unknown_target_id(monkeypatch):
         )
 
     assert loop.sends == []
+    assert forwarder.output_traffic_snapshot() == _zero_output_snapshots()
 
 
 def test_send_to_preserves_partial_send_behavior_for_later_unknown_target(
@@ -259,6 +352,18 @@ def test_send_to_preserves_partial_send_behavior_for_later_unknown_target(
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("192.0.2.20", 10110), b"partial")
     ]
+    assert forwarder.output_traffic_snapshot() == (
+        _output_snapshot(0, None),
+        _output_snapshot(
+            1,
+            "udp:aishub",
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(b"partial"),
+        ),
+        _output_snapshot(2, "udp:local_debug"),
+    )
 
 
 def test_duplicate_configured_ids_are_rejected():
@@ -325,6 +430,18 @@ def test_send_to_ids_supports_unnamed_destination(monkeypatch):
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19000), b"unnamed")
     ]
+    assert forwarder.output_traffic_snapshot() == (
+        _output_snapshot(
+            0,
+            None,
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(b"unnamed"),
+        ),
+        _output_snapshot(1, "udp:aishub"),
+        _output_snapshot(2, "udp:local_debug"),
+    )
 
 
 def test_send_to_ids_preserves_requested_order(monkeypatch):
@@ -346,14 +463,30 @@ def test_send_to_ids_deduplicates_by_first_occurrence(monkeypatch):
     loop = _patch_forwarder_loop(monkeypatch)
     forwarder = Forwarder(_targets())
     requested_ids = (target_id for target_id in (2, 0, 2, 1, 0))
+    payload = b"deduped"
 
-    real_asyncio.run(forwarder.send_to_ids(requested_ids, b"deduped"))
+    real_asyncio.run(forwarder.send_to_ids(requested_ids, payload))
 
     assert [(addr, data) for addr, data, _ in loop.sends] == [
         (("127.0.0.1", 19001), b"deduped"),
         (("127.0.0.1", 19000), b"deduped"),
         (("192.0.2.20", 10110), b"deduped"),
     ]
+    assert forwarder.output_traffic_snapshot() == tuple(
+        _output_snapshot(
+            target_id,
+            name,
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(payload),
+        )
+        for target_id, name in (
+            (0, None),
+            (1, "udp:aishub"),
+            (2, "udp:local_debug"),
+        )
+    )
 
 
 def test_send_to_ids_reuses_transport_cache(monkeypatch):
@@ -386,6 +519,99 @@ def test_send_to_ids_keeps_shared_endpoint_target_ids_distinct(monkeypatch):
     ]
     assert all(data is payload for _addr, data, _transport in loop.sends)
     assert [addr for addr, _ in loop.created] == [("192.0.2.20", 10110)]
+    assert forwarder.output_traffic_snapshot() == (
+        _output_snapshot(
+            0,
+            "udp:first",
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(payload),
+        ),
+        _output_snapshot(
+            1,
+            "udp:second",
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(payload),
+        ),
+    )
+
+
+def test_dispatch_failure_is_accounted_per_target_and_remains_fail_fast(
+    monkeypatch,
+):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+    failure = RuntimeError("local send failed")
+    loop.send_errors[("192.0.2.20", 10110)] = failure
+    payload = b"partial"
+
+    with pytest.raises(RuntimeError, match="local send failed") as exc_info:
+        real_asyncio.run(forwarder.send(payload))
+
+    assert exc_info.value is failure
+    assert [(addr, data) for addr, data, _ in loop.sends] == [
+        (("127.0.0.1", 19000), payload)
+    ]
+    assert forwarder.output_traffic_snapshot() == (
+        _output_snapshot(
+            0,
+            None,
+            dispatch_attempts=1,
+            dispatch_completed=1,
+            messages=1,
+            bytes=len(payload),
+        ),
+        _output_snapshot(
+            1,
+            "udp:aishub",
+            dispatch_attempts=1,
+            dispatch_failed=1,
+        ),
+        _output_snapshot(2, "udp:local_debug"),
+    )
+
+
+def test_output_traffic_snapshot_is_fresh_and_does_not_reset_counters(
+    monkeypatch,
+):
+    _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder(_targets())
+    payloads = (b"one", b"second")
+
+    initial = forwarder.output_traffic_snapshot()
+    repeated_initial = forwarder.output_traffic_snapshot()
+    real_asyncio.run(forwarder.send_to_ids((1,), payloads[0]))
+    real_asyncio.run(forwarder.send_to_ids((1,), payloads[1]))
+    first_counted = forwarder.output_traffic_snapshot()
+    repeated_counted = forwarder.output_traffic_snapshot()
+
+    assert initial == repeated_initial == _zero_output_snapshots()
+    assert initial is not repeated_initial
+    assert all(
+        first is not second
+        for first, second in zip(initial, repeated_initial)
+    )
+    expected_counted = (
+        _output_snapshot(0, None),
+        _output_snapshot(
+            1,
+            "udp:aishub",
+            dispatch_attempts=2,
+            dispatch_completed=2,
+            messages=2,
+            bytes=sum(len(payload) for payload in payloads),
+        ),
+        _output_snapshot(2, "udp:local_debug"),
+    )
+    assert first_counted == repeated_counted == expected_counted
+    assert first_counted is not repeated_counted
+    assert all(
+        first is not second
+        for first, second in zip(first_counted, repeated_counted)
+    )
 
 
 def test_send_to_ids_empty_input_sends_nothing(monkeypatch):
@@ -396,6 +622,7 @@ def test_send_to_ids_empty_input_sends_nothing(monkeypatch):
 
     assert loop.sends == []
     assert loop.created == []
+    assert forwarder.output_traffic_snapshot() == _zero_output_snapshots()
 
 
 @pytest.mark.parametrize("invalid_target_id", [True, False, "1", 1.0, None, object()])
@@ -413,6 +640,7 @@ def test_send_to_ids_rejects_non_integer_target_ids_before_sending(
 
     assert loop.sends == []
     assert loop.created == []
+    assert forwarder.output_traffic_snapshot() == _zero_output_snapshots()
 
 
 @pytest.mark.parametrize("invalid_target_id", [-1, 3])
@@ -433,6 +661,7 @@ def test_send_to_ids_rejects_unknown_integer_ids_before_sending(
 
     assert loop.sends == []
     assert loop.created == []
+    assert forwarder.output_traffic_snapshot() == _zero_output_snapshots()
 
 
 def test_source_ip_is_copied_into_immutable_target_entry():

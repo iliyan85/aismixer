@@ -4,6 +4,8 @@ import pytest
 
 from core.metrics import (
     EgressMetricsSnapshot,
+    InputTrafficMetricsSnapshot,
+    OutputTrafficMetricsSnapshot,
     ProcessorMetricsSnapshot,
     QueueMetricsSnapshot,
     RuntimeStatisticsSnapshot,
@@ -46,6 +48,25 @@ EGRESS_FIELDS = (
     "outputs_cancelled",
     "active_outputs",
 )
+INPUT_TRAFFIC_FIELDS = (
+    "name",
+    "kind",
+    "transport_packets",
+    "transport_bytes",
+    "accepted_frames",
+    "payload_bytes",
+)
+INPUT_TRAFFIC_NUMERIC_FIELDS = INPUT_TRAFFIC_FIELDS[2:]
+OUTPUT_TRAFFIC_FIELDS = (
+    "target_id",
+    "name",
+    "dispatch_attempts",
+    "dispatch_completed",
+    "dispatch_failed",
+    "messages",
+    "bytes",
+)
+OUTPUT_TRAFFIC_NUMERIC_FIELDS = OUTPUT_TRAFFIC_FIELDS[2:]
 RUNTIME_STATISTICS_FIELDS = (
     "ingress_queues",
     "processing_queue",
@@ -123,6 +144,33 @@ def runtime_statistics_snapshot(**overrides):
     }
     values.update(overrides)
     return RuntimeStatisticsSnapshot(**values)
+
+
+def input_traffic_snapshot(**overrides):
+    values = {
+        "name": "udp-ingress:0:station-a",
+        "kind": "udp",
+        "transport_packets": 10,
+        "transport_bytes": 2400,
+        "accepted_frames": 8,
+        "payload_bytes": 600,
+    }
+    values.update(overrides)
+    return InputTrafficMetricsSnapshot(**values)
+
+
+def output_traffic_snapshot(**overrides):
+    values = {
+        "target_id": 1,
+        "name": "udp:aishub",
+        "dispatch_attempts": 10,
+        "dispatch_completed": 8,
+        "dispatch_failed": 1,
+        "messages": 8,
+        "bytes": 720,
+    }
+    values.update(overrides)
+    return OutputTrafficMetricsSnapshot(**values)
 
 
 def assert_frozen_slotted(snapshot, expected_fields, field_name):
@@ -340,6 +388,161 @@ def test_egress_metrics_snapshot_accepts_all_zero_lifetime_state():
     assert all(getattr(snapshot, name) == 0 for name in EGRESS_FIELDS)
 
 
+def test_input_traffic_snapshot_is_frozen_slotted_and_preserves_values():
+    snapshot = input_traffic_snapshot()
+
+    assert_frozen_slotted(
+        snapshot,
+        INPUT_TRAFFIC_FIELDS,
+        "transport_packets",
+    )
+    assert tuple(getattr(snapshot, name) for name in INPUT_TRAFFIC_FIELDS) == (
+        "udp-ingress:0:station-a",
+        "udp",
+        10,
+        2400,
+        8,
+        600,
+    )
+
+
+@pytest.mark.parametrize("kind", ["udp", "udpsec"])
+def test_input_traffic_snapshot_accepts_supported_kinds_at_zero(kind):
+    snapshot = input_traffic_snapshot(
+        kind=kind,
+        transport_packets=0,
+        transport_bytes=0,
+        accepted_frames=0,
+        payload_bytes=0,
+    )
+
+    assert snapshot.kind == kind
+    assert all(
+        getattr(snapshot, field_name) == 0
+        for field_name in INPUT_TRAFFIC_NUMERIC_FIELDS
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "exception"),
+    [
+        ("", ValueError),
+        (None, TypeError),
+        (1, TypeError),
+        (True, TypeError),
+        (b"input", TypeError),
+    ],
+)
+def test_input_traffic_snapshot_rejects_invalid_names(name, exception):
+    with pytest.raises(exception, match="name"):
+        input_traffic_snapshot(name=name)
+
+
+@pytest.mark.parametrize(
+    ("kind", "exception"),
+    [
+        ("sec", ValueError),
+        ("", ValueError),
+        (None, TypeError),
+        (1, TypeError),
+    ],
+)
+def test_input_traffic_snapshot_rejects_invalid_kinds(kind, exception):
+    with pytest.raises(exception, match="kind"):
+        input_traffic_snapshot(kind=kind)
+
+
+@pytest.mark.parametrize("field_name", INPUT_TRAFFIC_NUMERIC_FIELDS)
+@pytest.mark.parametrize("value", INVALID_NUMERIC_VALUES)
+def test_input_traffic_snapshot_rejects_non_integer_counters(
+    field_name,
+    value,
+):
+    with pytest.raises(TypeError, match=field_name):
+        input_traffic_snapshot(**{field_name: value})
+
+
+@pytest.mark.parametrize("field_name", INPUT_TRAFFIC_NUMERIC_FIELDS)
+def test_input_traffic_snapshot_rejects_negative_counters(field_name):
+    with pytest.raises(ValueError, match=field_name):
+        input_traffic_snapshot(**{field_name: -1})
+
+
+def test_output_traffic_snapshot_is_frozen_slotted_and_preserves_values():
+    snapshot = output_traffic_snapshot()
+
+    assert_frozen_slotted(snapshot, OUTPUT_TRAFFIC_FIELDS, "dispatch_attempts")
+    assert tuple(getattr(snapshot, name) for name in OUTPUT_TRAFFIC_FIELDS) == (
+        1,
+        "udp:aishub",
+        10,
+        8,
+        1,
+        8,
+        720,
+    )
+
+
+def test_output_traffic_snapshot_accepts_unnamed_zero_target():
+    snapshot = output_traffic_snapshot(
+        target_id=0,
+        name=None,
+        dispatch_attempts=0,
+        dispatch_completed=0,
+        dispatch_failed=0,
+        messages=0,
+        bytes=0,
+    )
+
+    assert snapshot.target_id == 0
+    assert snapshot.name is None
+    assert all(
+        getattr(snapshot, field_name) == 0
+        for field_name in OUTPUT_TRAFFIC_NUMERIC_FIELDS
+    )
+
+
+@pytest.mark.parametrize("target_id", [True, False, 1.0, "1", None])
+def test_output_traffic_snapshot_rejects_non_integer_target_ids(target_id):
+    with pytest.raises(TypeError, match="target_id"):
+        output_traffic_snapshot(target_id=target_id)
+
+
+def test_output_traffic_snapshot_rejects_negative_target_id():
+    with pytest.raises(ValueError, match="target_id"):
+        output_traffic_snapshot(target_id=-1)
+
+
+@pytest.mark.parametrize(
+    ("name", "exception"),
+    [
+        ("", ValueError),
+        (1, TypeError),
+        (True, TypeError),
+        (b"udp:aishub", TypeError),
+    ],
+)
+def test_output_traffic_snapshot_rejects_invalid_names(name, exception):
+    with pytest.raises(exception, match="name"):
+        output_traffic_snapshot(name=name)
+
+
+@pytest.mark.parametrize("field_name", OUTPUT_TRAFFIC_NUMERIC_FIELDS)
+@pytest.mark.parametrize("value", INVALID_NUMERIC_VALUES)
+def test_output_traffic_snapshot_rejects_non_integer_counters(
+    field_name,
+    value,
+):
+    with pytest.raises(TypeError, match=field_name):
+        output_traffic_snapshot(**{field_name: value})
+
+
+@pytest.mark.parametrize("field_name", OUTPUT_TRAFFIC_NUMERIC_FIELDS)
+def test_output_traffic_snapshot_rejects_negative_counters(field_name):
+    with pytest.raises(ValueError, match=field_name):
+        output_traffic_snapshot(**{field_name: -1})
+
+
 def test_runtime_statistics_snapshot_is_frozen_slotted_and_preserves_fields():
     first_ingress = queue_snapshot(name="udpsec-ingress:0:secure-a")
     second_ingress = queue_snapshot(name="udp-ingress:0:station-a")
@@ -422,6 +625,8 @@ def test_metric_contract_fields_do_not_claim_downstream_delivery():
             QueueMetricsSnapshot,
             ProcessorMetricsSnapshot,
             EgressMetricsSnapshot,
+            InputTrafficMetricsSnapshot,
+            OutputTrafficMetricsSnapshot,
             RuntimeStatisticsSnapshot,
         )
         for field_name in (

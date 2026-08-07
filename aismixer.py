@@ -22,7 +22,7 @@ from core.metrics import EgressMetricsSnapshot, QueueMetricsSnapshot
 from core.network_policy import NetworkPolicy, compile_ingress_policy
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.runtime_control import build_optional_routing_control_server
-from core.runtime_statistics import RuntimeStatisticsProvider
+from core.runtime_statistics import InputTrafficMetrics, RuntimeStatisticsProvider
 from core.runtime_routing import load_optional_routing_table
 from core.routing_state import RoutingState
 from core.source_identity import build_udp_source_id
@@ -691,11 +691,15 @@ async def handle_socket(
     fixed_alias=None,
     alias_map=None,
     ingress_policy=None,
+    *,
+    input_traffic=None,
 ):
     loop = asyncio.get_running_loop()
     policy = ingress_policy or NetworkPolicy.unrestricted()
     while True:
         data, addr = await loop.sock_recvfrom(sock, 8192)
+        if input_traffic is not None:
+            input_traffic.transport_received(data)
         source_ip, source_port = addr[:2]
         if not policy.allows(source_ip):
             continue
@@ -720,6 +724,8 @@ async def handle_socket(
             print(f"{ts()} INPUT {source_fmt} => {normalized_text}")
 
         await queue.put(frame)
+        if input_traffic is not None:
+            input_traffic.frame_accepted(frame.payload)
 
 
 async def main(
@@ -734,6 +740,7 @@ async def main(
     processor_queue = _BoundedProcessingQueue(processing_queue_maxsize)
     processor = create_data_plane_processor()
     input_queues = []
+    input_traffic = []
     egress_queue = _ObservedQueue(name="egress", maxsize=1)
     egress_metrics = _EgressMetrics()
     runtime_task_specs = []
@@ -762,6 +769,8 @@ async def main(
                 maxsize=ingress_queue_maxsize,
             )
             input_queues.append(q)
+            traffic = InputTrafficMetrics(task_name, "udpsec")
+            input_traffic.append(traffic)
             sec_id = entry.get("id")
             print(f"{ts()} Secure listening on {format_source(ip, port)}")
             runtime_task_specs.append(
@@ -774,6 +783,7 @@ async def main(
                         port,
                         sec_input_id=sec_id,
                         ingress_policy=ingress_policy,
+                        input_traffic=traffic,
                     ),
                 )
             )
@@ -796,6 +806,8 @@ async def main(
                 maxsize=ingress_queue_maxsize,
             )
             input_queues.append(q)
+            traffic = InputTrafficMetrics(task_name, "udp")
+            input_traffic.append(traffic)
             sock = create_udp_listener_socket(ip, reuse_address=True)
             udp_sockets.append(sock)
             sock.bind((ip, port))
@@ -813,6 +825,7 @@ async def main(
                         fixed_alias,
                         alias_map=UDP_ALIAS_MAP if not fixed_alias else None,
                         ingress_policy=ingress_policy,
+                        input_traffic=traffic,
                     ),
                 )
             )
@@ -824,6 +837,8 @@ async def main(
             processor=processor,
             egress_queue=egress_queue,
             egress_operations=egress_metrics,
+            input_traffic=input_traffic,
+            output_traffic=forwarder,
         )
         control_server = build_optional_routing_control_server(
             config,

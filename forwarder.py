@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Iterable, Mapping
 
+from core.metrics import OutputTrafficMetricsSnapshot
 from core.target_identity import EgressTargetId, build_udp_target_id
 
 
@@ -14,6 +15,62 @@ class _UdpDestination:
     port: int
     source_ip: str | None = None
     family: int = socket.AF_UNSPEC
+
+
+class _OutputTrafficMetrics:
+    """Own lifetime local-dispatch counters for one numeric target."""
+
+    __slots__ = (
+        "_target_id",
+        "_name",
+        "_dispatch_attempts",
+        "_dispatch_completed",
+        "_dispatch_failed",
+        "_messages",
+        "_bytes",
+    )
+
+    def __init__(self, target_id: EgressTargetId, name: str | None) -> None:
+        initial = OutputTrafficMetricsSnapshot(
+            target_id=target_id,
+            name=name,
+            dispatch_attempts=0,
+            dispatch_completed=0,
+            dispatch_failed=0,
+            messages=0,
+            bytes=0,
+        )
+        self._target_id = initial.target_id
+        self._name = initial.name
+        self._dispatch_attempts = 0
+        self._dispatch_completed = 0
+        self._dispatch_failed = 0
+        self._messages = 0
+        self._bytes = 0
+
+    def dispatch_started(self) -> None:
+        self._dispatch_attempts += 1
+
+    def dispatch_completed(self, message: bytes) -> None:
+        """Account a locally returned send, without implying remote receipt."""
+
+        self._dispatch_completed += 1
+        self._messages += 1
+        self._bytes += len(message)
+
+    def dispatch_failed(self) -> None:
+        self._dispatch_failed += 1
+
+    def snapshot(self) -> OutputTrafficMetricsSnapshot:
+        return OutputTrafficMetricsSnapshot(
+            target_id=self._target_id,
+            name=self._name,
+            dispatch_attempts=self._dispatch_attempts,
+            dispatch_completed=self._dispatch_completed,
+            dispatch_failed=self._dispatch_failed,
+            messages=self._messages,
+            bytes=self._bytes,
+        )
 
 
 class ForwarderConfigError(ValueError):
@@ -46,6 +103,15 @@ class Forwarder:
 
         self._target_id_by_name = MappingProxyType(target_id_by_name)
         self._target_ids = tuple(target_id_by_name)
+        target_name_by_id: list[str | None] = [
+            None for _target_id in self._all_target_ids
+        ]
+        for target_name, target_id in target_id_by_name.items():
+            target_name_by_id[target_id] = target_name
+        self._output_traffic = tuple(
+            _OutputTrafficMetrics(target_id, target_name_by_id[target_id])
+            for target_id in self._all_target_ids
+        )
         self.transports = {}
 
     @property
@@ -59,6 +125,13 @@ class Forwarder:
     @property
     def target_id_by_name(self) -> Mapping[str, EgressTargetId]:
         return self._target_id_by_name
+
+    def output_traffic_snapshot(
+        self,
+    ) -> tuple[OutputTrafficMetricsSnapshot, ...]:
+        """Return fresh per-target local-dispatch snapshots in numeric order."""
+
+        return tuple(metrics.snapshot() for metrics in self._output_traffic)
 
     async def _ensure_transport(self, loop, destination):
         key = _transport_cache_key(destination)
@@ -101,11 +174,27 @@ class Forwarder:
     ) -> None:
         loop = asyncio.get_running_loop()
         for target_id in target_ids:
+            await self._dispatch_to_id(loop, target_id, message)
+
+    async def _dispatch_to_id(
+        self,
+        loop,
+        target_id: EgressTargetId,
+        message: bytes,
+    ) -> None:
+        metrics = self._output_traffic[target_id]
+        metrics.dispatch_started()
+        try:
             await self._send_to_destination(
                 loop,
                 self._destinations[target_id],
                 message,
             )
+        except BaseException:
+            metrics.dispatch_failed()
+            raise
+        else:
+            metrics.dispatch_completed(message)
 
     async def send(self, message: bytes) -> None:
         message = _validate_payload(message)
@@ -142,8 +231,7 @@ class Forwarder:
                 raise UnknownForwarderTargetError(
                     f"Unknown UDP forwarder target ID: {target_id}"
                 ) from exc
-            destination = self._destinations[numeric_target_id]
-            await self._send_to_destination(loop, destination, message)
+            await self._dispatch_to_id(loop, numeric_target_id, message)
 
 
 def _validate_payload(message: object) -> bytes:

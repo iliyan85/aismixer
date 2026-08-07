@@ -484,6 +484,8 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
     assert statistics.processor is result["processor"]
     assert statistics.egress_queue is egress_queue
     assert statistics.egress_operations is egress_metrics
+    assert statistics.input_traffic == ()
+    assert statistics.output_traffic is result["forwarder"]
     assert result["forwarder_close_count"] == 1
 
 
@@ -733,7 +735,12 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         input_queues = tuple(
             factory.args[0] for factory in secure_factories
         ) + tuple(factory.args[1] for factory in udp_factories)
+        input_traffic = tuple(
+            factory.keywords["input_traffic"]
+            for factory in secure_factories + udp_factories
+        )
         assert len({id(queue) for queue in input_queues}) == 4
+        assert len({id(owner) for owner in input_traffic}) == 4
         assert all(
             isinstance(queue, aismixer._ObservedQueue)
             and queue.maxsize == aismixer.DEFAULT_INGRESS_QUEUE_MAXSIZE
@@ -747,6 +754,25 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
                 aismixer.DEFAULT_INGRESS_QUEUE_MAXSIZE,
             )
             for spec in specs[:4]
+        )
+        traffic_snapshots = tuple(
+            owner.input_traffic_snapshot() for owner in input_traffic
+        )
+        assert tuple(snapshot.name for snapshot in traffic_snapshots) == tuple(
+            spec.name for spec in specs[:4]
+        )
+        assert tuple(snapshot.kind for snapshot in traffic_snapshots) == (
+            "udpsec",
+            "udpsec",
+            "udp",
+            "udp",
+        )
+        assert all(
+            snapshot.transport_packets == 0
+            and snapshot.transport_bytes == 0
+            and snapshot.accepted_frames == 0
+            and snapshot.payload_bytes == 0
+            for snapshot in traffic_snapshots
         )
         assert fan_in_factory.func is aismixer.ingress_fan_in_loop
         assert fan_in_factory.args[0] == input_queues
@@ -801,6 +827,9 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         assert statistics.processor is processor
         assert statistics.egress_queue is egress_queue
         assert statistics.egress_operations is egress_metrics
+        assert statistics.input_traffic == input_traffic
+        assert statistics.input_traffic_snapshot() == traffic_snapshots
+        assert statistics.output_traffic is output_forwarder
         assert first_udp_socket.close_count == 1
         assert second_udp_socket.close_count == 1
         assert output_forwarder.close_count == 1

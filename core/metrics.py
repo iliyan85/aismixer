@@ -182,6 +182,80 @@ class EgressMetricsSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class InputTrafficMetricsSnapshot:
+    """Lifetime transport and admitted-payload counters for one input."""
+
+    name: str
+    kind: str
+    transport_packets: int
+    transport_bytes: int
+    accepted_frames: int
+    payload_bytes: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise TypeError("name must be a non-empty string.")
+        if not self.name:
+            raise ValueError("name must be a non-empty string.")
+        if not isinstance(self.kind, str):
+            raise TypeError("kind must be 'udp' or 'udpsec'.")
+        if self.kind not in {"udp", "udpsec"}:
+            raise ValueError("kind must be 'udp' or 'udpsec'.")
+
+        for field_name in (
+            "transport_packets",
+            "transport_bytes",
+            "accepted_frames",
+            "payload_bytes",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field_name} must be an integer.")
+            if value < 0:
+                raise ValueError(f"{field_name} must be non-negative.")
+
+
+@dataclass(frozen=True, slots=True)
+class OutputTrafficMetricsSnapshot:
+    """Lifetime local-dispatch counters for one numeric output target."""
+
+    target_id: int
+    name: str | None
+    dispatch_attempts: int
+    dispatch_completed: int
+    dispatch_failed: int
+    messages: int
+    bytes: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.target_id, bool) or not isinstance(
+            self.target_id, int
+        ):
+            raise TypeError("target_id must be an integer.")
+        if self.target_id < 0:
+            raise ValueError("target_id must be non-negative.")
+
+        if self.name is not None:
+            if not isinstance(self.name, str):
+                raise TypeError("name must be a non-empty string or None.")
+            if not self.name:
+                raise ValueError("name must be a non-empty string or None.")
+
+        for field_name in (
+            "dispatch_attempts",
+            "dispatch_completed",
+            "dispatch_failed",
+            "messages",
+            "bytes",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field_name} must be an integer.")
+            if value < 0:
+                raise ValueError(f"{field_name} must be non-negative.")
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeStatisticsSnapshot:
     """One immutable pull of the runtime's existing metric owners."""
 

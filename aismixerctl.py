@@ -25,6 +25,8 @@ from core.routing_control_protocol import (
     METHOD_DISABLE,
     METHOD_REPLACE,
     METHOD_RUNTIME_STATISTICS,
+    METHOD_RUNTIME_STATISTICS_INPUTS,
+    METHOD_RUNTIME_STATISTICS_OUTPUTS,
     METHOD_STATUS,
     ROUTING_CONTROL_PROTOCOL_VERSION,
 )
@@ -49,6 +51,12 @@ _HISTORY_DIRECTORY = "aismixer"
 _HISTORY_FILENAME = "aismixerctl_history"
 _HISTORY_LENGTH = 1000
 _AUTO_READLINE = object()
+_STATISTICS_HELP = (
+    "Statistics commands:\n"
+    "  show statistics\n"
+    "  show statistics inputs [INPUT]\n"
+    "  show statistics outputs [OUTPUT]"
+)
 
 
 class AismixerCtlInputError(ValueError):
@@ -97,6 +105,47 @@ def build_runtime_statistics_request(request_id: str) -> dict[str, object]:
         "request_id": request_id,
         "method": METHOD_RUNTIME_STATISTICS,
     }
+
+
+def build_runtime_statistics_inputs_request(
+    request_id: str,
+    input_name: str | None = None,
+) -> dict[str, object]:
+    _validate_request_id(request_id)
+    request: dict[str, object] = {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": request_id,
+        "method": METHOD_RUNTIME_STATISTICS_INPUTS,
+    }
+    if input_name is not None:
+        if not isinstance(input_name, str) or not input_name:
+            raise AismixerCtlInputError(
+                "Input statistics filter must be a non-empty string."
+            )
+        request["params"] = {"input": input_name}
+    return request
+
+
+def build_runtime_statistics_outputs_request(
+    request_id: str,
+    output: str | None = None,
+) -> dict[str, object]:
+    _validate_request_id(request_id)
+    request: dict[str, object] = {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": request_id,
+        "method": METHOD_RUNTIME_STATISTICS_OUTPUTS,
+    }
+    if output is not None:
+        if not isinstance(output, str) or not output:
+            raise AismixerCtlInputError(
+                "Output statistics filter must be a non-empty string."
+            )
+        if output.isdecimal():
+            request["params"] = {"target_id": int(output)}
+        else:
+            request["params"] = {"name": output}
+    return request
 
 
 def build_disable_request(
@@ -264,7 +313,10 @@ def dispatch_command(
         )
         if response["ok"] is True:
             if interactive and _is_statistics_command(args):
-                output = format_runtime_statistics(response["result"])
+                output = _format_interactive_statistics(
+                    args,
+                    response["result"],
+                )
             else:
                 output = format_response(response, pretty=pretty)
             output_stream.write(output)
@@ -295,7 +347,8 @@ def dispatch_command(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aismixerctl",
-        epilog="Use 'show statistics' to inspect runtime statistics.",
+        epilog=_STATISTICS_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--socket",
@@ -313,7 +366,8 @@ def build_parser() -> argparse.ArgumentParser:
 def build_shell_parser() -> argparse.ArgumentParser:
     parser = _InteractiveArgumentParser(
         prog="aismixerctl",
-        epilog="Use 'show statistics' to inspect runtime statistics.",
+        epilog=_STATISTICS_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = _add_remote_command_parsers(parser, required=True)
     subparsers.add_parser("help")
@@ -353,9 +407,30 @@ def _add_remote_command_parsers(
         dest="show_command",
         required=True,
     )
-    show_subparsers.add_parser(
+    statistics_parser = show_subparsers.add_parser(
         "statistics",
         help="show runtime statistics",
+    )
+    statistics_subparsers = statistics_parser.add_subparsers(
+        dest="statistics_command",
+    )
+    inputs_parser = statistics_subparsers.add_parser(
+        "inputs",
+        help="show per-input transport and accepted-frame traffic",
+    )
+    inputs_parser.add_argument(
+        "input_filter",
+        nargs="?",
+        metavar="INPUT",
+    )
+    outputs_parser = statistics_subparsers.add_parser(
+        "outputs",
+        help="show per-output local dispatch traffic",
+    )
+    outputs_parser.add_argument(
+        "output_filter",
+        nargs="?",
+        metavar="OUTPUT",
     )
 
     return subparsers
@@ -503,6 +578,11 @@ def completion_candidates(line: str, text: str) -> tuple[str, ...]:
         or (len(words) == 2 and not stripped[-1:].isspace())
     ):
         candidates = ("statistics",)
+    elif words[:2] == ["show", "statistics"] and (
+        len(words) == 2
+        or (len(words) == 3 and not stripped[-1:].isspace())
+    ):
+        candidates = ("inputs", "outputs")
     else:
         candidates = ()
     return tuple(candidate for candidate in candidates if candidate.startswith(text))
@@ -616,6 +696,17 @@ def build_request_from_args(args: argparse.Namespace, request_id: str) -> dict[s
     if args.command == "status":
         return build_status_request(request_id)
     if args.command == "show" and args.show_command == "statistics":
+        statistics_command = getattr(args, "statistics_command", None)
+        if statistics_command == "inputs":
+            return build_runtime_statistics_inputs_request(
+                request_id,
+                args.input_filter,
+            )
+        if statistics_command == "outputs":
+            return build_runtime_statistics_outputs_request(
+                request_id,
+                args.output_filter,
+            )
         return build_runtime_statistics_request(request_id)
     if args.command == "disable":
         return build_disable_request(
@@ -637,6 +728,18 @@ def _is_statistics_command(args: argparse.Namespace) -> bool:
         args.command == "show"
         and getattr(args, "show_command", None) == "statistics"
     )
+
+
+def _format_interactive_statistics(
+    args: argparse.Namespace,
+    result: object,
+) -> str:
+    statistics_command = getattr(args, "statistics_command", None)
+    if statistics_command == "inputs":
+        return format_runtime_statistics_inputs(result)
+    if statistics_command == "outputs":
+        return format_runtime_statistics_outputs(result)
+    return format_runtime_statistics(result)
 
 
 _QUEUE_RESULT_FIELDS = (
@@ -690,6 +793,40 @@ _STATISTICS_RESULT_FIELDS = (
     "processor",
     "egress_queue",
     "egress_operations",
+)
+_INPUT_TRAFFIC_RESULT_FIELDS = (
+    "name",
+    "kind",
+    "transport_packets",
+    "transport_bytes",
+    "accepted_frames",
+    "payload_bytes",
+)
+_INPUT_TRAFFIC_HEADERS = (
+    "INPUT",
+    "KIND",
+    "TRANSPORT PACKETS",
+    "TRANSPORT BYTES",
+    "ACCEPTED FRAMES",
+    "PAYLOAD BYTES",
+)
+_OUTPUT_TRAFFIC_RESULT_FIELDS = (
+    "target_id",
+    "name",
+    "dispatch_attempts",
+    "dispatch_completed",
+    "dispatch_failed",
+    "messages",
+    "bytes",
+)
+_OUTPUT_TRAFFIC_HEADERS = (
+    "TARGET ID",
+    "NAME",
+    "ATTEMPTS",
+    "COMPLETED",
+    "FAILED",
+    "MESSAGES",
+    "BYTES",
 )
 
 
@@ -771,6 +908,106 @@ def format_runtime_statistics(result: object) -> str:
         ),
     )
     return "\n\n".join(sections) + "\n"
+
+
+def format_runtime_statistics_inputs(result: object) -> str:
+    """Render detailed per-input traffic as one deterministic ASCII table."""
+
+    statistics = _require_exact_statistics_mapping(
+        result,
+        ("inputs",),
+        "input traffic result",
+    )
+    inputs = _require_statistics_sequence(
+        statistics["inputs"],
+        "input traffic inputs",
+    )
+    rows = tuple(
+        _input_traffic_table_row(value, f"inputs[{index}]")
+        for index, value in enumerate(inputs)
+    )
+    return _format_ascii_table(_INPUT_TRAFFIC_HEADERS, rows) + "\n"
+
+
+def _input_traffic_table_row(
+    value: object,
+    description: str,
+) -> tuple[str, ...]:
+    row = _require_exact_statistics_mapping(
+        value,
+        _INPUT_TRAFFIC_RESULT_FIELDS,
+        description,
+    )
+    name = row["name"]
+    if not isinstance(name, str) or not name:
+        raise RoutingControlResponseError(
+            f"Runtime statistics {description} name is invalid."
+        )
+    kind = row["kind"]
+    if not isinstance(kind, str) or kind not in {"udp", "udpsec"}:
+        raise RoutingControlResponseError(
+            f"Runtime statistics {description} kind is invalid."
+        )
+    for field_name in _INPUT_TRAFFIC_RESULT_FIELDS[2:]:
+        _require_counter(row[field_name], f"{description}.{field_name}")
+    return tuple(str(row[field_name]) for field_name in _INPUT_TRAFFIC_RESULT_FIELDS)
+
+
+def format_runtime_statistics_outputs(result: object) -> str:
+    """Render detailed per-output local traffic as one ASCII table."""
+
+    statistics = _require_exact_statistics_mapping(
+        result,
+        ("outputs",),
+        "output traffic result",
+    )
+    outputs = _require_statistics_sequence(
+        statistics["outputs"],
+        "output traffic outputs",
+    )
+    rows = tuple(
+        _output_traffic_table_row(value, f"outputs[{index}]")
+        for index, value in enumerate(outputs)
+    )
+    return _format_ascii_table(_OUTPUT_TRAFFIC_HEADERS, rows) + "\n"
+
+
+def _output_traffic_table_row(
+    value: object,
+    description: str,
+) -> tuple[str, ...]:
+    row = _require_exact_statistics_mapping(
+        value,
+        _OUTPUT_TRAFFIC_RESULT_FIELDS,
+        description,
+    )
+    _require_counter(row["target_id"], f"{description}.target_id")
+    name = row["name"]
+    if name is not None and (not isinstance(name, str) or not name):
+        raise RoutingControlResponseError(
+            f"Runtime statistics {description} name is invalid."
+        )
+    for field_name in _OUTPUT_TRAFFIC_RESULT_FIELDS[2:]:
+        _require_counter(row[field_name], f"{description}.{field_name}")
+    return (
+        str(row["target_id"]),
+        "-" if name is None else name,
+        *(str(row[field_name]) for field_name in _OUTPUT_TRAFFIC_RESULT_FIELDS[2:]),
+    )
+
+
+def _require_statistics_sequence(
+    value: object,
+    description: str,
+) -> Sequence[object]:
+    if not isinstance(value, Sequence) or isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        raise RoutingControlResponseError(
+            f"Runtime statistics {description} field is invalid."
+        )
+    return value
 
 
 def _queue_table_row(value: object, description: str) -> tuple[str, ...]:

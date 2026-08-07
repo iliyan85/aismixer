@@ -16,6 +16,8 @@ from typing import Any
 
 from core.metrics import (
     EgressMetricsSnapshot,
+    InputTrafficMetricsSnapshot,
+    OutputTrafficMetricsSnapshot,
     ProcessorMetricsSnapshot,
     QueueMetricsSnapshot,
     RuntimeStatisticsSnapshot,
@@ -42,6 +44,8 @@ METHOD_STATUS = "routing.status"
 METHOD_REPLACE = "routing.replace"
 METHOD_DISABLE = "routing.disable"
 METHOD_RUNTIME_STATISTICS = "runtime.statistics"
+METHOD_RUNTIME_STATISTICS_INPUTS = "runtime.statistics.inputs"
+METHOD_RUNTIME_STATISTICS_OUTPUTS = "runtime.statistics.outputs"
 
 
 class MalformedJsonError(ValueError):
@@ -159,6 +163,35 @@ class RoutingControlProtocol:
                 _runtime_statistics_result(snapshot),
             )
 
+        if validated.method == METHOD_RUNTIME_STATISTICS_INPUTS:
+            snapshots = self._statistics_provider.input_traffic_snapshot()
+            params = validated.params or {}
+            input_name = params.get("input")
+            assert input_name is None or isinstance(input_name, str)
+            return _success_response(
+                validated.request_id,
+                _runtime_statistics_inputs_result(
+                    snapshots,
+                    input_name=input_name,
+                ),
+            )
+
+        if validated.method == METHOD_RUNTIME_STATISTICS_OUTPUTS:
+            snapshots = self._statistics_provider.output_traffic_snapshot()
+            params = validated.params or {}
+            target_id = params.get("target_id")
+            name = params.get("name")
+            assert target_id is None or isinstance(target_id, int)
+            assert name is None or isinstance(name, str)
+            return _success_response(
+                validated.request_id,
+                _runtime_statistics_outputs_result(
+                    snapshots,
+                    target_id=target_id,
+                    name=name,
+                ),
+            )
+
         if validated.method == METHOD_STATUS:
             status = self._service.status()
             return _success_response(
@@ -251,6 +284,8 @@ def _validate_request_schema(request: Mapping[str, object]) -> _RequestError | N
         METHOD_REPLACE,
         METHOD_DISABLE,
         METHOD_RUNTIME_STATISTICS,
+        METHOD_RUNTIME_STATISTICS_INPUTS,
+        METHOD_RUNTIME_STATISTICS_OUTPUTS,
     }:
         return _RequestError(
             ERROR_UNKNOWN_METHOD,
@@ -264,6 +299,12 @@ def _validate_request_schema(request: Mapping[str, object]) -> _RequestError | N
                 f"Method {method!r} does not accept params.",
             )
         return None
+
+    if method == METHOD_RUNTIME_STATISTICS_INPUTS:
+        return _validate_runtime_statistics_inputs_params(request)
+
+    if method == METHOD_RUNTIME_STATISTICS_OUTPUTS:
+        return _validate_runtime_statistics_outputs_params(request)
 
     if method == METHOD_REPLACE:
         if "params" not in request:
@@ -285,6 +326,85 @@ def _validate_request_schema(request: Mapping[str, object]) -> _RequestError | N
             allowed_fields={"expected_generation"},
             method=METHOD_DISABLE,
         )
+    return None
+
+
+def _validate_runtime_statistics_inputs_params(
+    request: Mapping[str, object],
+) -> _RequestError | None:
+    if "params" not in request:
+        return None
+    params = request["params"]
+    if not isinstance(params, Mapping):
+        return _RequestError(
+            ERROR_INVALID_REQUEST,
+            f"Method {METHOD_RUNTIME_STATISTICS_INPUTS!r} params must be an object.",
+        )
+
+    error = _validate_params_fields(
+        params,
+        allowed_fields={"input"},
+        method=METHOD_RUNTIME_STATISTICS_INPUTS,
+    )
+    if error is not None:
+        return error
+
+    if "input" in params:
+        input_name = params["input"]
+        if not isinstance(input_name, str) or not input_name:
+            return _RequestError(
+                ERROR_INVALID_REQUEST,
+                "Param 'input' must be a non-empty string.",
+            )
+    return None
+
+
+def _validate_runtime_statistics_outputs_params(
+    request: Mapping[str, object],
+) -> _RequestError | None:
+    if "params" not in request:
+        return None
+    params = request["params"]
+    if not isinstance(params, Mapping):
+        return _RequestError(
+            ERROR_INVALID_REQUEST,
+            f"Method {METHOD_RUNTIME_STATISTICS_OUTPUTS!r} params must be an object.",
+        )
+
+    error = _validate_params_fields(
+        params,
+        allowed_fields={"target_id", "name"},
+        method=METHOD_RUNTIME_STATISTICS_OUTPUTS,
+    )
+    if error is not None:
+        return error
+
+    if "target_id" in params and "name" in params:
+        return _RequestError(
+            ERROR_INVALID_REQUEST,
+            f"Method {METHOD_RUNTIME_STATISTICS_OUTPUTS!r} params must not "
+            "contain both 'target_id' and 'name'.",
+        )
+
+    if "target_id" in params:
+        target_id = params["target_id"]
+        if (
+            isinstance(target_id, bool)
+            or not isinstance(target_id, int)
+            or target_id < 0
+        ):
+            return _RequestError(
+                ERROR_INVALID_REQUEST,
+                "Param 'target_id' must be a non-negative integer.",
+            )
+
+    if "name" in params:
+        name = params["name"]
+        if not isinstance(name, str) or not name:
+            return _RequestError(
+                ERROR_INVALID_REQUEST,
+                "Param 'name' must be a non-empty string.",
+            )
     return None
 
 
@@ -443,6 +563,74 @@ def _runtime_statistics_result(
         "egress_operations": _egress_metrics_result(
             snapshot.egress_operations
         ),
+    }
+
+
+def _runtime_statistics_inputs_result(
+    snapshots: tuple[InputTrafficMetricsSnapshot, ...],
+    *,
+    input_name: str | None,
+) -> dict[str, object]:
+    rows = tuple(_input_traffic_metrics_result(snapshot) for snapshot in snapshots)
+    return {
+        "inputs": [
+            row
+            for row in rows
+            if input_name is None or row["name"] == input_name
+        ]
+    }
+
+
+def _input_traffic_metrics_result(
+    snapshot: InputTrafficMetricsSnapshot,
+) -> dict[str, object]:
+    if not isinstance(snapshot, InputTrafficMetricsSnapshot):
+        raise TypeError(
+            "statistics provider must return InputTrafficMetricsSnapshot "
+            "instances."
+        )
+    return {
+        "name": snapshot.name,
+        "kind": snapshot.kind,
+        "transport_packets": snapshot.transport_packets,
+        "transport_bytes": snapshot.transport_bytes,
+        "accepted_frames": snapshot.accepted_frames,
+        "payload_bytes": snapshot.payload_bytes,
+    }
+
+
+def _runtime_statistics_outputs_result(
+    snapshots: tuple[OutputTrafficMetricsSnapshot, ...],
+    *,
+    target_id: int | None,
+    name: str | None,
+) -> dict[str, object]:
+    rows = tuple(_output_traffic_metrics_result(snapshot) for snapshot in snapshots)
+    if target_id is not None:
+        rows = tuple(row for row in rows if row["target_id"] == target_id)
+    elif name is not None:
+        rows = tuple(row for row in rows if row["name"] == name)
+    return {"outputs": list(rows)}
+
+
+def _output_traffic_metrics_result(
+    snapshot: OutputTrafficMetricsSnapshot,
+) -> dict[str, object]:
+    if not isinstance(snapshot, OutputTrafficMetricsSnapshot):
+        raise TypeError(
+            "statistics provider must return OutputTrafficMetricsSnapshot "
+            "instances."
+        )
+    # Completion records only a successful local dispatch operation. UDP does
+    # not acknowledge remote receipt or downstream processing.
+    return {
+        "target_id": snapshot.target_id,
+        "name": snapshot.name,
+        "dispatch_attempts": snapshot.dispatch_attempts,
+        "dispatch_completed": snapshot.dispatch_completed,
+        "dispatch_failed": snapshot.dispatch_failed,
+        "messages": snapshot.messages,
+        "bytes": snapshot.bytes,
     }
 
 

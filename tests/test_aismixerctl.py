@@ -8,6 +8,8 @@ import aismixerctl
 from core.routing_control_protocol import (
     ERROR_STALE_GENERATION,
     METHOD_RUNTIME_STATISTICS,
+    METHOD_RUNTIME_STATISTICS_INPUTS,
+    METHOD_RUNTIME_STATISTICS_OUTPUTS,
     ROUTING_CONTROL_PROTOCOL_VERSION,
 )
 from core.routing_control_unix_client import (
@@ -129,6 +131,72 @@ def statistics_response(request_id="req-1", *, ingress_queues=None):
         "request_id": request_id,
         "ok": True,
         "result": statistics_result(ingress_queues),
+    }
+
+
+def input_traffic_result(inputs=None):
+    if inputs is None:
+        inputs = [
+            {
+                "name": "udp-ingress:0:station-a",
+                "kind": "udp",
+                "transport_packets": 100,
+                "transport_bytes": 24000,
+                "accepted_frames": 96,
+                "payload_bytes": 7200,
+            },
+            {
+                "name": "udpsec-ingress:1:station-b",
+                "kind": "udpsec",
+                "transport_packets": 50,
+                "transport_bytes": 12000,
+                "accepted_frames": 40,
+                "payload_bytes": 3000,
+            },
+        ]
+    return {"inputs": list(inputs)}
+
+
+def input_traffic_response(request_id="req-1", *, inputs=None):
+    return {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": request_id,
+        "ok": True,
+        "result": input_traffic_result(inputs),
+    }
+
+
+def output_traffic_result(outputs=None):
+    if outputs is None:
+        outputs = [
+            {
+                "target_id": 0,
+                "name": None,
+                "dispatch_attempts": 10,
+                "dispatch_completed": 10,
+                "dispatch_failed": 0,
+                "messages": 10,
+                "bytes": 900,
+            },
+            {
+                "target_id": 1,
+                "name": "udp:aishub",
+                "dispatch_attempts": 25,
+                "dispatch_completed": 24,
+                "dispatch_failed": 1,
+                "messages": 24,
+                "bytes": 2160,
+            },
+        ]
+    return {"outputs": list(outputs)}
+
+
+def output_traffic_response(request_id="req-1", *, outputs=None):
+    return {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": request_id,
+        "ok": True,
+        "result": output_traffic_result(outputs),
     }
 
 
@@ -311,6 +379,47 @@ def test_runtime_statistics_request_shape():
     }
 
 
+def test_runtime_statistics_inputs_request_shapes():
+    assert aismixerctl.build_runtime_statistics_inputs_request("req-1") == {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": "req-1",
+        "method": METHOD_RUNTIME_STATISTICS_INPUTS,
+    }
+    assert aismixerctl.build_runtime_statistics_inputs_request(
+        "req-1",
+        "udp-ingress:0:station-a",
+    ) == {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": "req-1",
+        "method": METHOD_RUNTIME_STATISTICS_INPUTS,
+        "params": {"input": "udp-ingress:0:station-a"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_params"),
+    [
+        (None, None),
+        ("1", {"target_id": 1}),
+        ("001", {"target_id": 1}),
+        ("udp:aishub", {"name": "udp:aishub"}),
+        ("-1", {"name": "-1"}),
+    ],
+)
+def test_runtime_statistics_outputs_request_shapes(output, expected_params):
+    request = aismixerctl.build_runtime_statistics_outputs_request(
+        "req-1",
+        output,
+    )
+
+    assert request == {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": "req-1",
+        "method": METHOD_RUNTIME_STATISTICS_OUTPUTS,
+        **({} if expected_params is None else {"params": expected_params}),
+    }
+
+
 @pytest.mark.parametrize(
     "parser_factory",
     [aismixerctl.build_parser, aismixerctl.build_shell_parser],
@@ -325,6 +434,45 @@ def test_show_statistics_uses_shared_nested_parser(parser_factory):
         "request_id": "req-1",
         "method": METHOD_RUNTIME_STATISTICS,
     }
+
+
+@pytest.mark.parametrize(
+    ("tokens", "method", "params"),
+    [
+        (["inputs"], METHOD_RUNTIME_STATISTICS_INPUTS, None),
+        (
+            ["inputs", "udp-ingress:0:station-a"],
+            METHOD_RUNTIME_STATISTICS_INPUTS,
+            {"input": "udp-ingress:0:station-a"},
+        ),
+        (["outputs"], METHOD_RUNTIME_STATISTICS_OUTPUTS, None),
+        (["outputs", "1"], METHOD_RUNTIME_STATISTICS_OUTPUTS, {"target_id": 1}),
+        (
+            ["outputs", "udp:aishub"],
+            METHOD_RUNTIME_STATISTICS_OUTPUTS,
+            {"name": "udp:aishub"},
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "parser_factory",
+    [aismixerctl.build_parser, aismixerctl.build_shell_parser],
+)
+def test_detailed_statistics_uses_shared_nested_parser(
+    parser_factory,
+    tokens,
+    method,
+    params,
+):
+    args = parser_factory().parse_args(["show", "statistics", *tokens])
+
+    request = aismixerctl.build_request_from_args(args, "req-1")
+
+    assert request["method"] == method
+    if params is None:
+        assert "params" not in request
+    else:
+        assert request["params"] == params
 
 
 def test_default_socket_path_is_operational_runtime_socket():
@@ -574,6 +722,105 @@ def test_main_show_statistics_preserves_custom_socket(capsys):
     assert FakeClient.calls[0][0] == "/custom/control.sock"
     assert FakeClient.calls[0][1]["method"] == METHOD_RUNTIME_STATISTICS
     assert json.loads(capsys.readouterr().out) == statistics_response("statistics-1")
+
+
+@pytest.mark.parametrize(
+    ("command", "response", "method", "params"),
+    [
+        (
+            ["show", "statistics", "inputs"],
+            input_traffic_response("traffic-1"),
+            METHOD_RUNTIME_STATISTICS_INPUTS,
+            None,
+        ),
+        (
+            [
+                "show",
+                "statistics",
+                "inputs",
+                "udp-ingress:0:station-a",
+            ],
+            input_traffic_response("traffic-1"),
+            METHOD_RUNTIME_STATISTICS_INPUTS,
+            {"input": "udp-ingress:0:station-a"},
+        ),
+        (
+            ["show", "statistics", "outputs"],
+            output_traffic_response("traffic-1"),
+            METHOD_RUNTIME_STATISTICS_OUTPUTS,
+            None,
+        ),
+        (
+            ["show", "statistics", "outputs", "1"],
+            output_traffic_response("traffic-1"),
+            METHOD_RUNTIME_STATISTICS_OUTPUTS,
+            {"target_id": 1},
+        ),
+        (
+            ["show", "statistics", "outputs", "udp:aishub"],
+            output_traffic_response("traffic-1"),
+            METHOD_RUNTIME_STATISTICS_OUTPUTS,
+            {"name": "udp:aishub"},
+        ),
+    ],
+)
+def test_main_detailed_statistics_uses_compact_json_and_exact_request(
+    command,
+    response,
+    method,
+    params,
+    capsys,
+):
+    FakeClient.response = response
+
+    rc = aismixerctl.main(
+        ["--request-id", "traffic-1", *command],
+        client_factory=FakeClient,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == aismixerctl.EXIT_OK
+    request = FakeClient.calls[0][1]
+    assert request["method"] == method
+    if params is None:
+        assert "params" not in request
+    else:
+        assert request["params"] == params
+    assert captured.out == (
+        json.dumps(
+            response,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    assert captured.err == ""
+
+
+def test_main_detailed_statistics_pretty_json(capsys):
+    response = output_traffic_response("traffic-1")
+    FakeClient.response = response
+
+    rc = aismixerctl.main(
+        [
+            "--pretty",
+            "--request-id",
+            "traffic-1",
+            "show",
+            "statistics",
+            "outputs",
+        ],
+        client_factory=FakeClient,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == aismixerctl.EXIT_OK
+    assert captured.out == (
+        json.dumps(response, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n"
+    )
+    assert captured.err == ""
 
 
 def test_explicit_socket_overrides_default_socket_path(capsys):
@@ -1120,6 +1367,178 @@ def test_interactive_statistics_ignores_pretty_for_table_output(tmp_path):
     assert plain_stderr == pretty_stderr == ""
 
 
+def test_interactive_input_statistics_table_is_transport_and_payload_explicit(
+    tmp_path,
+):
+    FakeClient.response = input_traffic_response("traffic-1")
+
+    rc, _input_func, stdout, stderr = run_shell(
+        tmp_path,
+        ["show statistics inputs", "exit"],
+        generated_request_id=lambda: "traffic-1",
+    )
+
+    assert rc == aismixerctl.EXIT_OK
+    for heading in (
+        "INPUT",
+        "KIND",
+        "TRANSPORT PACKETS",
+        "TRANSPORT BYTES",
+        "ACCEPTED FRAMES",
+        "PAYLOAD BYTES",
+    ):
+        assert heading in stdout
+    assert stdout.index("udp-ingress:0:station-a") < stdout.index(
+        "udpsec-ingress:1:station-b"
+    )
+    assert not stdout.lstrip().startswith("{")
+    assert stdout == stdout.rstrip("\n") + "\n"
+    assert stderr == ""
+
+
+def test_interactive_output_statistics_table_uses_local_completion_terms(
+    tmp_path,
+):
+    FakeClient.response = output_traffic_response("traffic-1")
+
+    rc, _input_func, stdout, stderr = run_shell(
+        tmp_path,
+        ["show statistics outputs", "exit"],
+        generated_request_id=lambda: "traffic-1",
+    )
+
+    assert rc == aismixerctl.EXIT_OK
+    for heading in (
+        "TARGET ID",
+        "NAME",
+        "ATTEMPTS",
+        "COMPLETED",
+        "FAILED",
+        "MESSAGES",
+        "BYTES",
+    ):
+        assert heading in stdout
+    rows = stdout.splitlines()[2:]
+    assert rows[0].split()[:2] == ["0", "-"]
+    assert rows[1].split()[:2] == ["1", "udp:aishub"]
+    for forbidden in ("delivered", "received", "acknowledged"):
+        assert forbidden not in stdout.lower()
+    assert not stdout.lstrip().startswith("{")
+    assert stdout == stdout.rstrip("\n") + "\n"
+    assert stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("command", "response", "expected_params", "heading"),
+    [
+        (
+            "show statistics inputs udp-ingress:0:station-a",
+            input_traffic_response(
+                "traffic-1",
+                inputs=input_traffic_result()["inputs"][:1],
+            ),
+            {"input": "udp-ingress:0:station-a"},
+            "TRANSPORT PACKETS",
+        ),
+        (
+            "show statistics outputs 1",
+            output_traffic_response(
+                "traffic-1",
+                outputs=output_traffic_result()["outputs"][1:],
+            ),
+            {"target_id": 1},
+            "ATTEMPTS",
+        ),
+        (
+            "show statistics outputs udp:aishub",
+            output_traffic_response(
+                "traffic-1",
+                outputs=output_traffic_result()["outputs"][1:],
+            ),
+            {"name": "udp:aishub"},
+            "ATTEMPTS",
+        ),
+    ],
+)
+def test_interactive_detailed_statistics_filter_uses_same_table_shape(
+    tmp_path,
+    command,
+    response,
+    expected_params,
+    heading,
+):
+    FakeClient.response = response
+
+    rc, _input_func, stdout, stderr = run_shell(
+        tmp_path,
+        [command, "exit"],
+        generated_request_id=lambda: "traffic-1",
+    )
+
+    assert rc == aismixerctl.EXIT_OK
+    assert FakeClient.calls[0][1]["params"] == expected_params
+    assert heading in stdout
+    assert len(stdout.splitlines()) == 3
+    assert stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("command", "response", "first_heading"),
+    [
+        (
+            "show statistics inputs udp-ingress:9:unknown",
+            input_traffic_response("traffic-1", inputs=[]),
+            "INPUT",
+        ),
+        (
+            "show statistics outputs 9",
+            output_traffic_response("traffic-1", outputs=[]),
+            "TARGET ID",
+        ),
+    ],
+)
+def test_interactive_detailed_statistics_zero_match_renders_cleanly(
+    tmp_path,
+    command,
+    response,
+    first_heading,
+):
+    FakeClient.response = response
+
+    rc, _input_func, stdout, stderr = run_shell(
+        tmp_path,
+        [command, "exit"],
+        generated_request_id=lambda: "traffic-1",
+    )
+
+    assert rc == aismixerctl.EXIT_OK
+    lines = stdout.splitlines()
+    assert first_heading in lines[0]
+    assert len(lines) == 2
+    assert stdout == stdout.rstrip("\n") + "\n"
+    assert stderr == ""
+
+
+def test_interactive_detailed_statistics_ignores_pretty(tmp_path):
+    FakeClient.response = output_traffic_response("traffic-1")
+
+    plain_rc, _input_func, plain_stdout, plain_stderr = run_shell(
+        tmp_path,
+        ["show statistics outputs", "exit"],
+        generated_request_id=lambda: "traffic-1",
+    )
+    pretty_rc, _input_func, pretty_stdout, pretty_stderr = run_shell(
+        tmp_path,
+        ["show statistics outputs", "exit"],
+        argv=["--pretty"],
+        generated_request_id=lambda: "traffic-1",
+    )
+
+    assert plain_rc == pretty_rc == aismixerctl.EXIT_OK
+    assert plain_stdout == pretty_stdout
+    assert plain_stderr == pretty_stderr == ""
+
+
 @pytest.mark.parametrize(
     ("first_outcome", "expected_error"),
     [
@@ -1488,6 +1907,13 @@ def test_basic_completion_candidates():
         candidate.rstrip()
         for candidate in aismixerctl.completion_candidates("show st", "st")
     }
+    traffic_candidates = {
+        candidate.rstrip()
+        for candidate in aismixerctl.completion_candidates(
+            "show statistics ",
+            "",
+        )
+    }
 
     assert {"status", "replace", "disable", "show", "help", "exit", "quit"} <= (
         command_candidates
@@ -1497,8 +1923,16 @@ def test_basic_completion_candidates():
     assert "--expected-generation" in disable_options
     assert show_candidates == {"show"}
     assert statistics_candidates == {"statistics"}
+    assert traffic_candidates == {"inputs", "outputs"}
     assert aismixerctl.completion_candidates("show ", "") == ("statistics",)
-    assert aismixerctl.completion_candidates("show statistics ", "") == ()
+    assert aismixerctl.completion_candidates(
+        "show statistics in",
+        "in",
+    ) == ("inputs",)
+    assert aismixerctl.completion_candidates(
+        "show statistics inputs ",
+        "",
+    ) == ()
 
 
 def test_one_shot_and_nested_help_include_show_statistics(capsys):
@@ -1508,24 +1942,37 @@ def test_one_shot_and_nested_help_include_show_statistics(capsys):
     assert aismixerctl.main(["show", "--help"]) == aismixerctl.EXIT_OK
     nested_help = capsys.readouterr().out
 
+    assert aismixerctl.main(
+        ["show", "statistics", "--help"]
+    ) == aismixerctl.EXIT_OK
+    statistics_help = capsys.readouterr().out
+
     assert "show statistics" in top_level_help
+    assert "show statistics inputs [INPUT]" in top_level_help
+    assert "show statistics outputs [OUTPUT]" in top_level_help
     assert "statistics" in nested_help
+    assert "inputs" in statistics_help
+    assert "outputs" in statistics_help
 
 
 def test_interactive_help_contains_literal_show_statistics():
-    assert "show statistics" in aismixerctl.build_shell_parser().format_help()
+    help_text = aismixerctl.build_shell_parser().format_help()
+
+    assert "show statistics" in help_text
+    assert "show statistics inputs [INPUT]" in help_text
+    assert "show statistics outputs [OUTPUT]" in help_text
 
 
 @pytest.mark.parametrize(
     "filter_tokens",
     [
-        ["inputs"],
-        ["outputs"],
         ["input", "station-a"],
         ["output", "target-a"],
+        ["inputs", "station-a", "extra"],
+        ["outputs", "target-a", "extra"],
     ],
 )
-def test_show_statistics_rejects_future_filter_forms(
+def test_show_statistics_rejects_invalid_filter_forms(
     filter_tokens,
     capsys,
 ):
@@ -1537,4 +1984,4 @@ def test_show_statistics_rejects_future_filter_forms(
     captured = capsys.readouterr()
     assert rc == aismixerctl.EXIT_USAGE_OR_INPUT
     assert FakeClient.calls == []
-    assert "unrecognized arguments" in captured.err
+    assert captured.err

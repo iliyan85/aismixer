@@ -4,6 +4,8 @@ import pytest
 
 from core.metrics import (
     EgressMetricsSnapshot,
+    InputTrafficMetricsSnapshot,
+    OutputTrafficMetricsSnapshot,
     ProcessorMetricsSnapshot,
     QueueMetricsSnapshot,
     RuntimeStatisticsSnapshot,
@@ -21,6 +23,8 @@ from core.routing_control_protocol import (
     ERROR_UNKNOWN_METHOD,
     ERROR_UNSUPPORTED_VERSION,
     METHOD_RUNTIME_STATISTICS,
+    METHOD_RUNTIME_STATISTICS_INPUTS,
+    METHOD_RUNTIME_STATISTICS_OUTPUTS,
     ROUTING_CONTROL_PROTOCOL_VERSION,
     RoutingControlProtocol,
     build_error_response,
@@ -95,15 +99,27 @@ def zero_runtime_statistics_snapshot():
 
 
 class RecordingStatisticsSource:
-    def __init__(self, snapshot=None):
+    def __init__(self, snapshot=None, *, inputs=(), outputs=()):
         self._snapshot = (
             zero_runtime_statistics_snapshot() if snapshot is None else snapshot
         )
+        self._inputs = tuple(inputs)
+        self._outputs = tuple(outputs)
         self.snapshot_calls = 0
+        self.input_traffic_snapshot_calls = 0
+        self.output_traffic_snapshot_calls = 0
 
     def snapshot(self):
         self.snapshot_calls += 1
         return self._snapshot
+
+    def input_traffic_snapshot(self):
+        self.input_traffic_snapshot_calls += 1
+        return self._inputs
+
+    def output_traffic_snapshot(self):
+        self.output_traffic_snapshot_calls += 1
+        return self._outputs
 
 
 def routing_section(routes=None, zones=None):
@@ -157,6 +173,28 @@ def runtime_statistics_request(request_id="req-1"):
         "request_id": request_id,
         "method": METHOD_RUNTIME_STATISTICS,
     }
+
+
+def runtime_statistics_inputs_request(request_id="req-1", params=None):
+    request = {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": request_id,
+        "method": METHOD_RUNTIME_STATISTICS_INPUTS,
+    }
+    if params is not None:
+        request["params"] = params
+    return request
+
+
+def runtime_statistics_outputs_request(request_id="req-1", params=None):
+    request = {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": request_id,
+        "method": METHOD_RUNTIME_STATISTICS_OUTPUTS,
+    }
+    if params is not None:
+        request["params"] = params
+    return request
 
 
 def replace_request(request_id="req-1", section=None, expected_generation=None):
@@ -445,6 +483,260 @@ def test_runtime_statistics_serializes_populated_snapshot_in_ingress_order():
     }
 
 
+def test_runtime_statistics_inputs_serializes_ordered_snapshots_and_calls_once():
+    statistics = RecordingStatisticsSource(
+        inputs=(
+            InputTrafficMetricsSnapshot(
+                name="udp-ingress:0:station-a",
+                kind="udp",
+                transport_packets=100,
+                transport_bytes=24000,
+                accepted_frames=96,
+                payload_bytes=7200,
+            ),
+            InputTrafficMetricsSnapshot(
+                name="udpsec-ingress:1:station-b",
+                kind="udpsec",
+                transport_packets=50,
+                transport_bytes=12000,
+                accepted_frames=40,
+                payload_bytes=3000,
+            ),
+        )
+    )
+    _state, protocol = make_protocol(statistics=statistics)
+
+    response = protocol.handle_request(
+        runtime_statistics_inputs_request("inputs-all")
+    )
+
+    assert statistics.input_traffic_snapshot_calls == 1
+    assert statistics.snapshot_calls == 0
+    assert statistics.output_traffic_snapshot_calls == 0
+    assert response == {
+        "version": 1,
+        "request_id": "inputs-all",
+        "ok": True,
+        "result": {
+            "inputs": [
+                {
+                    "name": "udp-ingress:0:station-a",
+                    "kind": "udp",
+                    "transport_packets": 100,
+                    "transport_bytes": 24000,
+                    "accepted_frames": 96,
+                    "payload_bytes": 7200,
+                },
+                {
+                    "name": "udpsec-ingress:1:station-b",
+                    "kind": "udpsec",
+                    "transport_packets": 50,
+                    "transport_bytes": 12000,
+                    "accepted_frames": 40,
+                    "payload_bytes": 3000,
+                },
+            ]
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("input_name", "expected_names"),
+    [
+        ("udpsec-ingress:1:station-b", ["udpsec-ingress:1:station-b"]),
+        ("udp-ingress:9:unknown", []),
+    ],
+)
+def test_runtime_statistics_inputs_filters_to_zero_or_one_match(
+    input_name,
+    expected_names,
+):
+    statistics = RecordingStatisticsSource(
+        inputs=(
+            InputTrafficMetricsSnapshot(
+                "udp-ingress:0:station-a", "udp", 1, 2, 1, 2
+            ),
+            InputTrafficMetricsSnapshot(
+                "udpsec-ingress:1:station-b", "udpsec", 3, 4, 1, 2
+            ),
+        )
+    )
+    _state, protocol = make_protocol(statistics=statistics)
+
+    response = protocol.handle_request(
+        runtime_statistics_inputs_request(
+            params={"input": input_name},
+        )
+    )
+
+    assert [row["name"] for row in response["result"]["inputs"]] == expected_names
+    assert statistics.input_traffic_snapshot_calls == 1
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        None,
+        [],
+        "input",
+        {"input": ""},
+        {"input": 1},
+        {"input": True},
+        {"unknown": "value"},
+        {"input": "udp-ingress:0:station-a", "unknown": "value"},
+    ],
+)
+def test_runtime_statistics_inputs_rejects_invalid_params_without_pulling(params):
+    statistics = RecordingStatisticsSource()
+    _state, protocol = make_protocol(statistics=statistics)
+    request = runtime_statistics_inputs_request()
+    request["params"] = params
+
+    response = protocol.handle_request(request)
+
+    assert_error(response, ERROR_INVALID_REQUEST)
+    assert statistics.input_traffic_snapshot_calls == 0
+
+
+def test_runtime_statistics_inputs_accepts_empty_params_object():
+    statistics = RecordingStatisticsSource()
+    _state, protocol = make_protocol(statistics=statistics)
+
+    response = protocol.handle_request(
+        runtime_statistics_inputs_request(params={})
+    )
+
+    assert response["ok"] is True
+    assert response["result"] == {"inputs": []}
+    assert statistics.input_traffic_snapshot_calls == 1
+
+
+def test_runtime_statistics_outputs_serializes_ordered_snapshots_and_calls_once():
+    statistics = RecordingStatisticsSource(
+        outputs=(
+            OutputTrafficMetricsSnapshot(0, None, 10, 10, 0, 10, 900),
+            OutputTrafficMetricsSnapshot(
+                1,
+                "udp:aishub",
+                25,
+                24,
+                1,
+                24,
+                2160,
+            ),
+        )
+    )
+    _state, protocol = make_protocol(statistics=statistics)
+
+    response = protocol.handle_request(
+        runtime_statistics_outputs_request("outputs-all")
+    )
+
+    assert statistics.output_traffic_snapshot_calls == 1
+    assert statistics.snapshot_calls == 0
+    assert statistics.input_traffic_snapshot_calls == 0
+    assert response == {
+        "version": 1,
+        "request_id": "outputs-all",
+        "ok": True,
+        "result": {
+            "outputs": [
+                {
+                    "target_id": 0,
+                    "name": None,
+                    "dispatch_attempts": 10,
+                    "dispatch_completed": 10,
+                    "dispatch_failed": 0,
+                    "messages": 10,
+                    "bytes": 900,
+                },
+                {
+                    "target_id": 1,
+                    "name": "udp:aishub",
+                    "dispatch_attempts": 25,
+                    "dispatch_completed": 24,
+                    "dispatch_failed": 1,
+                    "messages": 24,
+                    "bytes": 2160,
+                },
+            ]
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("params", "expected_target_ids"),
+    [
+        ({"target_id": 1}, [1]),
+        ({"name": "udp:aishub"}, [1]),
+        ({"target_id": 9}, []),
+        ({"name": "udp:unknown"}, []),
+    ],
+)
+def test_runtime_statistics_outputs_filters_by_numeric_id_or_name(
+    params,
+    expected_target_ids,
+):
+    statistics = RecordingStatisticsSource(
+        outputs=(
+            OutputTrafficMetricsSnapshot(0, None, 0, 0, 0, 0, 0),
+            OutputTrafficMetricsSnapshot(
+                1, "udp:aishub", 1, 1, 0, 1, 90
+            ),
+        )
+    )
+    _state, protocol = make_protocol(statistics=statistics)
+
+    response = protocol.handle_request(
+        runtime_statistics_outputs_request(params=params)
+    )
+
+    assert [
+        row["target_id"] for row in response["result"]["outputs"]
+    ] == expected_target_ids
+    assert statistics.output_traffic_snapshot_calls == 1
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        None,
+        [],
+        "output",
+        {"target_id": -1},
+        {"target_id": True},
+        {"target_id": 1.0},
+        {"name": ""},
+        {"name": 1},
+        {"target_id": 1, "name": "udp:aishub"},
+        {"unknown": "value"},
+    ],
+)
+def test_runtime_statistics_outputs_rejects_invalid_params_without_pulling(params):
+    statistics = RecordingStatisticsSource()
+    _state, protocol = make_protocol(statistics=statistics)
+    request = runtime_statistics_outputs_request()
+    request["params"] = params
+
+    response = protocol.handle_request(request)
+
+    assert_error(response, ERROR_INVALID_REQUEST)
+    assert statistics.output_traffic_snapshot_calls == 0
+
+
+def test_runtime_statistics_outputs_accepts_empty_params_object():
+    statistics = RecordingStatisticsSource()
+    _state, protocol = make_protocol(statistics=statistics)
+
+    response = protocol.handle_request(
+        runtime_statistics_outputs_request(params={})
+    )
+
+    assert response["ok"] is True
+    assert response["result"] == {"outputs": []}
+    assert statistics.output_traffic_snapshot_calls == 1
+
+
 def test_routing_methods_do_not_pull_runtime_statistics():
     statistics = RecordingStatisticsSource()
     _state, protocol = make_protocol(statistics=statistics)
@@ -457,6 +749,8 @@ def test_routing_methods_do_not_pull_runtime_statistics():
     assert replace["ok"] is True
     assert disable["ok"] is True
     assert statistics.snapshot_calls == 0
+    assert statistics.input_traffic_snapshot_calls == 0
+    assert statistics.output_traffic_snapshot_calls == 0
 
 
 @pytest.mark.parametrize(
