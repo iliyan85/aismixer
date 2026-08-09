@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | Platformă de procesare și rutare a fluxurilor AIS</title>
   <link rel="canonical" href="https://aismixer.net/ro/">
-  <meta name="description" content="AISMixer procesează și rutează fluxuri AIS NMEA 0183 cu cicluri deterministe și UDPSEC cu ECDHE autentificat, chei direcționale și stare locală limitată.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183, procesarea fluxurilor AIS, rutare logică, UDPSEC, ECDHE autentificat, nmea_sproxy, AIVDM, AIVDO, aismixerctl, date maritime">
+  <meta name="description" content="AISMixer procesează și rutează logic fluxuri AIS NMEA 0183 cu etape cu capacitate finită, observabilitate runtime locală procesului prin aismixerctl și UDPSEC cu ECDHE autentificat.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, procesarea fluxurilor AIS, rutare logică, observabilitate runtime, UDPSEC, ECDHE autentificat, nmea_sproxy, AIVDM, AIVDO, aismixerctl, date maritime">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | Platformă de procesare și rutare a fluxurilor AIS">
-  <meta property="og:description" content="Procesare deterministă AIS NMEA 0183, rutare logică și UDPSEC cu ECDHE autentificat și stare locală limitată.">
+  <meta property="og:description" content="Procesare AIS deterministă și rutare logică, cu etape cu capacitate finită, observabilitate runtime locală procesului și UDPSEC cu ECDHE autentificat.">
   <meta property="og:url" content="https://aismixer.net/ro/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,7 +28,7 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | Platformă de procesare și rutare a fluxurilor AIS">
-  <meta name="twitter:description" content="Procesare AIS deterministă · Rutare logică · UDPSEC cu ECDHE autentificat">
+  <meta name="twitter:description" content="Procesare AIS · Rutare logică · Observabilitate runtime · UDPSEC cu ECDHE autentificat">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="Prezentare generală a platformei AISMixer pentru procesarea și rutarea fluxurilor AIS">
 
@@ -48,7 +48,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
-    "description": "Platformă open-source pentru procesare deterministă AIS NMEA 0183, rutare logică și transport UDPSEC cu ECDHE autentificat și stare locală limitată.",
+    "description": "Platformă open-source pentru procesare deterministă AIS NMEA 0183, rutare logică, etape cu capacitate finită, observabilitate runtime locală procesului și UDPSEC cu ECDHE autentificat.",
     "url": "https://aismixer.net/ro/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -68,7 +68,7 @@
     ],
     "inLanguage": "ro",
     "isAccessibleForFree": true,
-    "keywords": ["AIS NMEA 0183", "procesarea fluxurilor", "rutare logică", "UDPSEC", "ECDHE autentificat", "nmea_sproxy", "AIVDM", "AIVDO"]
+    "keywords": ["AIS NMEA 0183", "procesarea fluxurilor", "rutare logică", "observabilitate runtime", "aismixerctl", "UDPSEC", "ECDHE autentificat", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -178,63 +178,74 @@
       </div>
     </section>
 
+    <section id="explainer" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Prezentare vizuală pe scurt</p>
+        <h2>Cum funcționează AISMixer</h2>
+        <p class="section-intro">Un scurt tur vizual de la mai multe surse AIS, prin asamblare, deduplicare, gestionarea metadatelor TAG și rutare logică, până la ieșirile selectate, inclusiv <span class="kbd">nmea_sproxy</span> și UDPSEC. Materialul video este în limba engleză.</p>
+      </div>
+      <div class="video-frame">
+        <iframe src="https://www.youtube-nocookie.com/embed/c7a7Q6vpxkA" title="Cum procesează și rutează AISMixer fluxurile AIS — explicație video în limba engleză" loading="lazy" allow="encrypted-media; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+      </div>
+    </section>
+
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Fundamentul planului de date din campaniile D–E</p>
-        <h2>Etape explicite, rezultate imuabile și egress numeric unificat</h2>
-        <p class="section-intro">Cadrele ingress imuabile trec prin etape explicite într-un singur proces. Fiecare cadru acceptat primește un singur <span class="kbd">ProcessingSnapshot</span>, iar <span class="kbd">PythonDataPlaneProcessor</span> returnează un <span class="kbd">OutputBatch</span> ordonat ale cărui elemente <span class="kbd">ProcessorOutput</span> conțin octeții exacți și ID-uri numerice explicite ale destinațiilor. Egress folosește o singură cale numerică de expediere, iar implementarea Python rămâne unicul procesor de producție și de referință. Regulile exacte și cazurile marginale rămân în contractul comportamental normativ.</p>
+        <p class="eyebrow">Fundament al planului de date din campaniile C–F, pregătit pentru o implementare nativă</p>
+        <h2>Procesare explicită, etape cu capacitate finită și egress unificat</h2>
+        <p class="section-intro">Ingress-ul imuabil la nivel de octeți trece prin etape explicite, cu capacitate finită, într-un singur proces. După ce devine disponibilă capacitatea comună de procesare, fiecare cadru admis este asociat unui singur <span class="kbd">ProcessingSnapshot</span> și procesat de <span class="kbd">PythonDataPlaneProcessor</span>, care deține starea instanței și rămâne unicul procesor actual de producție și de referință. Acesta returnează un <span class="kbd">OutputBatch</span> imuabil și ordonat, ale cărui valori <span class="kbd">ProcessorOutput</span> transportă octeții exacți și ID-urile numerice ale destinațiilor prin handoff-ul egress cu capacitate finită.</p>
       </div>
-      <div class="pipeline representation-pipeline" role="group" aria-label="Etapele actuale ale planului de date din campaniile D–E">
+      <div class="pipeline representation-pipeline" role="group" aria-label="Etapele implementate ale planului de date de producție din campaniile C–F">
         <div class="pipeline-node">
           <strong>Producători UDP / UDPSEC</strong>
-          <span><span class="kbd">IngressFrame</span> imuabil</span>
+          <span>Coadă privată limitată cu <span class="kbd">IngressFrame</span> pentru fiecare intrare</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Fan-in ingress</strong>
-          <span>Transportă elementele cozilor fără parsare sau rutare</span>
+          <strong>Admitere limitată la procesare</strong>
+          <span>Backpressure, apoi asocierea unui singur <span class="kbd">ProcessingSnapshot</span></span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong><span class="kbd">PythonDataPlaneProcessor</span></strong>
-          <span>Un <span class="kbd">ProcessingSnapshot</span> și o invocare sincronă pentru fiecare cadru acceptat</span>
+          <strong><span class="kbd">PythonDataPlaneProcessor</span> cu stare proprie</strong>
+          <span>Scanarea octeților, asamblare, politica TAG și deduplicare</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong><span class="kbd">OutputBatch</span> ordonat</strong>
-          <span><span class="kbd">ProcessorOutput</span> cu octeți exacți și ID-uri numerice explicite ale destinațiilor</span>
+          <strong>Handoff limitat al unui <span class="kbd">OutputBatch</span> ordonat</strong>
+          <span>Octeți exacți și destinații numerice explicite</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Egress numeric unificat către destinații UDP</strong>
-          <span>Expediere secvențială prin <span class="kbd">send_to_ids()</span></span>
+          <strong>Egress UDP unificat</strong>
+          <span>Expediere locală secvențială prin <span class="kbd">send_to_ids()</span></span>
         </div>
       </div>
       <div class="grid state-grid">
         <article class="card">
           <div class="icons" aria-hidden="true">🚪</div>
           <h3>Limită ingress imuabilă</h3>
-          <p>Producătorii UDP și UDPSEC integrați creează obiecte <span class="kbd">IngressFrame</span> imuabile. Obiectele legacy <span class="kbd">IngressEvent</span> valide trec printr-un singur adaptor de compatibilitate; elementele nevalide sau nesuportate sunt respinse înaintea preluării snapshot-ului de rutare și a invocării procesorului.</p>
+          <p>Producătorii UDP și UDPSEC integrați creează obiecte <span class="kbd">IngressFrame</span> imuabile la nivel de octeți. Scanarea bytes-native și metadatele <span class="kbd">ParsedSentence</span> parsate o singură dată transportă informațiile despre fragmente și TAG în procesare, fără extragere repetată.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧾</div>
-          <h3>Un cadru, un <span class="kbd">ProcessingSnapshot</span></h3>
-          <p>Fiecare cadru acceptat primește exact un <span class="kbd">ProcessingSnapshot</span>. Numele configurate ale destinațiilor rămân interfața pentru operatori, în timp ce potrivirea din calea de producție folosește un plan numeric precompilat, bazat numai pe destinații, și păstrează ordinea acestora.</p>
+          <h3>Asocierea snapshot-ului după obținerea capacității</h3>
+          <p>Capacitatea de procesare este obținută înainte ca un singur <span class="kbd">ProcessingSnapshot</span> imuabil să fie asociat cadrului. Lucrul admis păstrează acel snapshot; cadrele care încă așteaptă capacitate pot observa o înlocuire ulterioară a rutării, locală procesului.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
-          <h3>Rezultat <span class="kbd">OutputBatch</span> ordonat</h3>
-          <p><span class="kbd">DataPlaneProcessor</span> returnează un <span class="kbd">OutputBatch</span>, iar <span class="kbd">PythonDataPlaneProcessor</span> rămâne unica implementare de producție și de referință. Fiecare <span class="kbd">ProcessorOutput</span> conține ID-uri numerice explicite și ordonate ale destinațiilor.</p>
+          <h3>Procesor Python cu stare proprie</h3>
+          <p>O singură instanță <span class="kbd">PythonDataPlaneProcessor</span> cu durată lungă de viață deține starea mutabilă pentru asamblare, deduplicare, surse, metadate multipart și metricile procesorului. În prezent nu există procesor nativ sau binding-uri.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
-          <h3>Octeți exacți și o singură codificare</h3>
-          <p>Fiecare propoziție NMEA emisă devine un singur payload exact și imuabil de tip <span class="kbd">bytes</span>. Codificarea UTF-8 are loc o singură dată pentru fiecare propoziție emisă, iar fragmentele multipart rămân payload-uri separate.</p>
+          <h3>Octeți exacți în rezultate ordonate</h3>
+          <p>Fiecare propoziție NMEA emisă este codificată UTF-8 o singură dată și devine un payload exact și imuabil într-un <span class="kbd">OutputBatch</span> ordonat. Fiecare <span class="kbd">ProcessorOutput</span> conține ID-uri numerice explicite ale destinațiilor; fragmentele multipart rămân payload-uri separate.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⏱️</div>
-          <h3>Barieră de finalizare ordonată</h3>
-          <p>Procesarea completă a cadrului precedă prima expediere. Pentru un <span class="kbd">OutputBatch</span> nevid, procesarea cadrului următor așteaptă până când expedierea egress secvențială se încheie fără eroare; aceasta nu reprezintă livrare tranzacțională și nu oferă rollback.</p>
+          <h3>Backpressure și finalizare ordonată</h3>
+          <p>Când o limită ingress privată, o limită comună de procesare sau limita egress atinge capacitatea, execuția așteaptă în loc să elimine elementul din coadă. Un lot nevid împiedică procesarea cadrelor următoare până la finalizarea expedierii locale secvențiale. Aceasta nu oferă persistență sau confirmarea livrării la distanță, iar UDP rămâne un transport cu pierderi.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧭</div>
@@ -274,60 +285,48 @@
         </article>
         <article class="card state-card">
           <div class="icons" aria-hidden="true">📊</div>
-          <h3>Stare observabilă</h3>
-          <p>Starea deduplicării, asamblării și securității expune statistici imuabile, valabile la momentul citirii, pentru inspecție și teste de regresie. Citirea unui snapshot nu execută curățarea și nu modifică un snapshot anterior.</p>
-          <p>Aceasta este o bază pentru conformitate diferențială viitoare, nu un sistem complet de monitorizare sau de export Prometheus.</p>
+          <h3>Stare observabilă a componentelor și runtime-ului</h3>
+          <p>Proprietarii stării de deduplicare, asamblare și securitate expun snapshot-uri interne și imuabile ale ciclului de viață. Runtime-ul oferă separat vizualizări pull-based proaspete asupra cozilor, activității procesorului și egress-ului și traficului de intrare și de ieșire. Citirea oricărui tip de snapshot nu modifică starea procesării.</p>
+          <p>Aceste vizualizări sunt locale procesului și nepersistente; nu reprezintă metrici distribuite sau un sistem de export Prometheus/time-series.</p>
         </article>
       </div>
       <p class="boundary-note"><strong>Locală prin proiectare.</strong> Această stare este nepersistentă și nu este partajată între procese. Runtime-ul actual supraveghează task-urile asyncio esențiale într-un singur proces; procesele coordonator/worker, IPC și sincronizarea stării între procese nu există încă.</p>
     </section>
 
-    <section id="native-foundation" class="section">
+    <section id="worker-readiness" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Semantică de referință și evoluție etapizată</p>
-        <h2>Un fundament de referință pregătit pentru implementare nativă</h2>
-        <p class="section-intro">Campania C a stabilit reprezentarea ingress imuabilă și bazată nativ pe octeți. Campania D a adăugat contractul sincron al procesorului și etapele explicite ale runtime-ului local unui singur proces. Campania E a completat fundamentul Python cu identitatea numerică a destinațiilor, rutarea numerică compilată, bazată numai pe destinații, octeți de ieșire exacți și imuabili, <span class="kbd">OutputBatch</span> și egress numeric unificat; <span class="kbd">PythonDataPlaneProcessor</span> rămâne unica implementare de producție și de referință.</p>
-      </div>
-      <div class="pipeline reference-pipeline" role="group" aria-label="Fundamentul implementat din campaniile C–E și viitoarea implementare diferențială">
-        <div class="pipeline-node">
-          <strong>Reprezentare ingress imuabilă</strong>
-          <span class="status-badge status-implemented">Implementată acum</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node">
-          <strong><span class="kbd">ProcessingSnapshot</span> și rutare numerică compilată</strong>
-          <span class="status-badge status-implemented">Implementate acum</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node">
-          <strong><span class="kbd">PythonDataPlaneProcessor</span> de referință</strong>
-          <span class="status-badge status-implemented">Implementat acum</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node">
-          <strong><span class="kbd">OutputBatch</span> ordonat cu octeți exacți</strong>
-          <span class="status-badge status-implemented">Implementat acum</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node pipeline-node-future">
-          <strong>Implementare diferențială / nativă viitoare</strong>
-          <span class="status-badge status-future">Procesorul nativ nu este implementat</span>
-        </div>
+        <p class="eyebrow">Campania F — implementată</p>
+        <h2>Limite pregătite pentru workeri într-un singur proces</h2>
+        <p class="section-intro">Campania F a finalizat limitele observabile și cu capacitate finită din jurul runtime-ului Python actual. Starea mutabilă de procesare are un proprietar explicit la nivel de instanță, lucrul este admis numai când există capacitate, iar statisticile pull-based proaspete fac vizibilă activitatea etapelor fără să o modifice.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
-          <h3>Implementat acum</h3>
-          <p>Fundamentul implementat include <span class="kbd">IngressFrame</span> imuabil, intervale de scanare bazate pe octeți și metadate <span class="kbd">ParsedSentence</span>. Fiecare cadru acceptat primește câte un <span class="kbd">ProcessingSnapshot</span>; când rutarea este activată, destinațiile sale provin din planul numeric compilat, bazat numai pe destinații. <span class="kbd">PythonDataPlaneProcessor</span> produce octeți de ieșire exacți și imuabili într-un <span class="kbd">OutputBatch</span> ordonat, cu ID-uri numerice explicite pentru fiecare <span class="kbd">ProcessorOutput</span>. Egress-ul de producție este unificat prin <span class="kbd">send_to_ids()</span>, iar supravegherea etapelor rămâne locală procesului.</p>
+          <div class="icons" aria-hidden="true">📥</div>
+          <h3>Ingress privat și limitat</h3>
+          <p>Fiecare intrare UDP sau UDPSEC configurată are propria coadă limitată, astfel încât elementele acumulate de o intrare să nu consume capacitatea privată a alteia.</p>
         </article>
         <article class="card">
-          <h3>Campania F — pregătirea pentru workeri</h3>
-          <p>Campania F va defini cozi cu capacitate limitată și o politică de backpressure, deținerea instanței procesorului, pregătirea ciclului de viață al workerilor și limita pentru metrici. Nu introduce prin ea însăși un coordonator, IPC, un runtime multiproces sau binding-uri native.</p>
+          <div class="icons" aria-hidden="true">🚦</div>
+          <h3>Admitere numai când există capacitate</h3>
+          <p>Admiterea comună la procesare are capacitate finită. Un cadru primește <span class="kbd">ProcessingSnapshot</span> imuabil numai după obținerea capacității, iar când capacitatea este atinsă, execuția așteaptă prin backpressure.</p>
         </article>
         <article class="card">
-          <h3>Arhitectură de procese și implementare nativă ulterioare</h3>
-          <p>Ulterior pot fi introduse un coordonator, procese worker dedicate pentru ingress și egress, supraveghere între procese, IPC, distribuirea snapshot-urilor de rutare, politici de repornire și recuperare, precum și un procesor nativ și binding-urile sale în spatele contractelor stabilite. Niciun procesor nativ nu este implementat, nu a fost ales niciun API sau ABI și nu se face nicio afirmație de performanță.</p>
+          <div class="icons" aria-hidden="true">🧭</div>
+          <h3>Stare deținută de instanța procesorului</h3>
+          <p>O singură instanță a procesorului deține starea mutabilă pentru asamblare, deduplicare, surse, metadate multipart și metricile procesorului, în spatele unei limite explicite a ciclului de viață.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📤</div>
+          <h3>Egress limitat și ordonat</h3>
+          <p>Un handoff limitat transportă fiecare <span class="kbd">OutputBatch</span> nevid către expedierea locală secvențială. Bariera de finalizare păstrează ordinea procesării, dar nu confirmă primirea la distanță.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📊</div>
+          <h3>Observabilitate runtime pull-based</h3>
+          <p>Snapshot-urile proaspete și imuabile acoperă starea cozilor și backpressure, activitatea procesorului și egress-ului, traficul de intrare brut și admis și mesajele și octeții pentru fiecare destinație.</p>
         </article>
       </div>
+      <p class="boundary-note"><strong>Pregătirea pentru workeri este implementată; procesele worker nu sunt.</strong> Serviciul actual folosește încă un singur proces cu etape asyncio supravegheate. Nu există un coordonator, procese worker ingress sau egress separate, multiprocessing, IPC, rutare sau agregare de metrici între procese ori repornire și recuperare automată a workerilor. În prezent nu există procesor nativ sau binding-uri.</p>
     </section>
 
     <section id="routing" class="section">
@@ -364,29 +363,39 @@
 
     <section id="runtime-control" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Controlul rutării la runtime</p>
-        <h2>Modificați rutele active fără a întrerupe planul de date</h2>
-        <p class="section-intro">Un plan de control local opțional, printr-un socket din domeniul Unix, expune operații concise de rutare prin comanda <span class="kbd">aismixerctl</span> instalată global.</p>
+        <p class="eyebrow">Control local și observabilitate runtime</p>
+        <h2>Controlați rutarea și inspectați activitatea runtime</h2>
+        <p class="section-intro">Planul local opțional de control, printr-un socket POSIX din domeniul Unix, oferă operații de rutare și statistici runtime read-only agregate, per intrare și per ieșire, prin comanda <span class="kbd">aismixerctl</span> instalată global. Rularea fără comandă deschide shell-ul interactiv pentru operator.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
-          <h3>Inspectați starea rutării</h3>
-          <p>Consultați generația activă, starea de activare, zonele logice, rutele ordonate și identitățile destinațiilor.</p>
+          <h3>Stare și modificări atomice ale rutării</h3>
+          <p>Inspectați generația activă, zonele, rutele și destinațiile; înlocuiți un snapshot validat sau dezactivați rutarea pentru a reveni la modul legacy broadcast. Verificările opționale ale generației resping actualizările învechite.</p>
         </article>
         <article class="card">
-          <div class="icons" aria-hidden="true">⚡</div>
-          <h3>Înlocuiți sau dezactivați atomic</h3>
-          <p>Validați candidatul complet înainte de a înlocui snapshot-ul imuabil de rutare sau de a reveni la modul legacy broadcast.</p>
+          <div class="icons" aria-hidden="true">📈</div>
+          <h3>Statistici runtime agregate</h3>
+          <p><span class="kbd">runtime.statistics</span> raportează starea cozilor limitate și backpressure, activitatea procesorului și activitatea egress-ului într-o singură interogare pull proaspătă și locală procesului.</p>
         </article>
         <article class="card">
-          <div class="icons" aria-hidden="true">🛡️</div>
-          <h3>Respingeți actualizările depășite</h3>
-          <p>Verificările opționale ale generației împiedică operatorul să suprascrie neintenționat o modificare de rutare mai nouă.</p>
+          <div class="icons" aria-hidden="true">📊</div>
+          <h3>Trafic de intrare și de ieșire</h3>
+          <p><span class="kbd">runtime.statistics.inputs</span> separă traficul de transport de cadrele acceptate. <span class="kbd">runtime.statistics.outputs</span> raportează expedierile locale, mesajele și octeții pentru fiecare destinație.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">⌨️</div>
+          <h3>Interactiv sau one-shot</h3>
+          <p>Shell-ul deschis fără comandă inițială oferă ajutor, tabele, istoric acolo unde este disponibil și aceleași operații de rutare și statistici păstrate pentru utilizarea one-shot cu JSON.</p>
         </article>
       </div>
+      <pre class="command-example" aria-label="Exemple de comenzi interactive aismixerctl"><code>aismixerctl&gt; status
+aismixerctl&gt; show statistics
+aismixerctl&gt; show statistics inputs
+aismixerctl&gt; show statistics outputs</code></pre>
       <div class="callout">
-        <p><strong>În mod intenționat local și limitat la proces.</strong> Rutele modificate la runtime nu persistă după repornire, fișierele de configurare nu sunt rescrise, iar adaptoarele ingress sau egress nu sunt create dinamic. Permisiunile socketului Unix reprezintă limita actuală de autorizare; nu există un token de control la nivelul aplicației.</p>
+        <p><strong>Limita statisticilor read-only.</strong> Statisticile sunt păstrate în memorie, sunt locale procesului, nepersistente și se resetează la repornire. Nu reprezintă istoric persistent, metrici distribuite sau un sistem Prometheus/time-series. Expedierea UDP locală reușită nu reprezintă confirmarea livrării la distanță.</p>
+        <p><strong>Control intenționat local.</strong> Rutele runtime nu persistă după repornire, fișierele de configurare nu sunt rescrise, iar adaptoarele nu sunt create dinamic. Permisiunile socketului Unix reprezintă limita actuală de autorizare; nu există token de control la nivelul aplicației.</p>
       </div>
     </section>
 
@@ -533,7 +542,7 @@
       <div class="section-heading">
         <p class="eyebrow">Instalare și operare</p>
         <h2>Un ciclu de viață Linux și systemd conceput pentru instalări reale</h2>
-        <p class="section-intro">Instalarea gestionată din depozit menține aliniate fișierele de runtime, starea operatorului, integrarea systemd și controlul local al rutării.</p>
+        <p class="section-intro">Instalarea gestionată din depozit menține aliniate fișierele de runtime, starea operatorului, integrarea systemd, controlul local al rutării și statisticile runtime read-only.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -553,8 +562,8 @@
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧰</div>
-          <h3>CLI global pentru rutare</h3>
-          <p>Fluxul de instalare plasează <span class="kbd">aismixerctl</span> în <span class="kbd">/usr/local/bin</span> pentru operații locale de rutare.</p>
+          <h3>CLI global pentru operatori</h3>
+          <p>Fluxul de instalare plasează <span class="kbd">aismixerctl</span> în <span class="kbd">/usr/local/bin</span> pentru rutare runtime locală și statistici read-only, inclusiv shell-ul interactiv deschis fără comandă inițială.</p>
         </article>
       </div>
     </section>
@@ -563,34 +572,28 @@
       <div class="section-heading">
         <p class="eyebrow">Documentație și starea proiectului</p>
         <h2>Funcționalitățile implementate sunt separate clar de pașii următori</h2>
-        <p class="section-intro">Wiki-ul este ghidul detaliat pentru arhitectură, configurare, rutare, securitate și operare. Roadmap-ul urmărește activitatea viitoare fără a promite termene.</p>
+        <p class="section-intro">Wiki-ul este ghidul detaliat pentru arhitectură, configurare, rutare, securitate și operare. Roadmap-ul separă fundamentul finalizat de activitatea viitoare fără a promite termene.</p>
       </div>
       <div class="status-grid">
         <article class="card status-card status-now">
           <h3 class="status-label">Implementat acum</h3>
           <ul class="list">
-            <li>Limită de producție imuabilă cu <span class="kbd">IngressFrame</span> și un singur adaptor păstrat pentru obiectele legacy <span class="kbd">IngressEvent</span>.</li>
-            <li>Scanare la nivel de octeți, intervale imuabile semi-deschise, parsarea unică a câmpurilor fragmentului NMEA și a metadatelor TAG și calea de producție prin intrarea parsată în modulul de asamblare.</li>
-            <li>Contractul explicit și sincron <span class="kbd">DataPlaneProcessor</span>, precum și <span class="kbd">PythonDataPlaneProcessor</span> ca unică implementare actuală de producție și referință.</li>
-            <li>Câte un <span class="kbd">ProcessingSnapshot</span> pentru fiecare cadru acceptat, rutare numerică compilată bazată numai pe destinații, ieșiri cu octeți exacți și imuabili într-un <span class="kbd">OutputBatch</span> ordonat, o singură codificare UTF-8 pentru fiecare propoziție emisă, ID-uri numerice explicite pentru fiecare <span class="kbd">ProcessorOutput</span> și egress numeric unificat prin <span class="kbd">send_to_ids()</span>.</li>
-            <li>Un singur fan-in ingress, etape explicite de procesare și egress ordonat, o barieră de finalizare pentru loturile nevide și supraveghere fail-fast locală procesului.</li>
-            <li>Rutare logică, zone și deduplicare separată pentru fiecare destinație.</li>
-            <li>Controlul rutării la runtime prin <span class="kbd">aismixerctl</span>.</li>
-            <li>Cicluri de viață deterministe pentru deduplicare, asamblare și TAG multipart.</li>
-            <li>Stare cu limite stricte pentru înregistrările anti-replay ale handshake-ului, sesiunile în așteptare și active și nonce-urile private ale fiecărei sesiuni.</li>
-            <li>Statistici imuabile ale stării și o referință comportamentală Python testată.</li>
-            <li>Controlul punctelor terminale și intrare de la receptoare fizice prin nmea_sproxy, inclusiv modul UDP simplu pe o rețea de încredere.</li>
-            <li><span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață și CLI-ul global de rutare.</li>
+            <li>Valori <span class="kbd">IngressFrame</span> imuabile la nivel de octeți, scanare bytes-native, metadate parsate o singură dată și <span class="kbd">PythonDataPlaneProcessor</span> ca unic procesor actual de producție și de referință.</li>
+            <li>Cozi ingress private și limitate, admitere comună și limitată la procesare, handoff egress limitat, backpressure, starea deținută de instanța procesorului și asocierea <span class="kbd">ProcessingSnapshot</span> la admitere.</li>
+            <li>Rutare compilată bazată numai pe destinații numerice, octeți exacți și imuabili codificați o singură dată pentru fiecare propoziție emisă, rezultate <span class="kbd">OutputBatch</span> ordonate și o barieră locală și ordonată de finalizare egress.</li>
+            <li>Zone logice și deduplicare per destinație, actualizări atomice ale rutării locale procesului, <span class="kbd">aismixerctl</span> interactiv și statistici read-only agregate, per intrare și per ieșire.</li>
+            <li>Asamblare multipart deterministă, gestionarea TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> și deduplicare globală sau per destinație.</li>
+            <li>UDPSEC cu ECDHE efemer P-256 autentificat, identități ECDSA P-256 pe termen lung, chei AES-GCM direcționale independente și stare securizată locală cu limite stricte.</li>
+            <li>Pentru fiecare proces sau instanță systemd <span class="kbd">nmea_sproxy</span>, o intrare UDP sau serială spre o ieșire UDPSEC ori o ieșire plain-UDP configurată explicit pentru o rețea de încredere, plus controale endpoint IPv4/IPv6.</li>
+            <li><span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață care gestionează privilegiile, păstrarea stării operatorului și CLI global pentru operatori.</li>
           </ul>
         </article>
         <article class="card status-card status-next">
           <h3 class="status-label">Activități planificate</h3>
           <ul class="list">
-            <li>Implementarea nativă, binding-urile și rularea testelor de conformitate diferențială rămân activități viitoare.</li>
-            <li>Stare suplimentară bazată pe octeți pentru modulul de asamblare, dincolo de limita actuală de compatibilitate Python cu șirurile.</li>
-            <li>Benchmark-uri și profilare înaintea oricărei afirmații de performanță.</li>
-            <li>Campania F va pregăti arhitectura pentru viitori workeri prin cozi cu capacitate limitată și o politică de backpressure, deținerea instanței procesorului, pregătirea ciclului de viață al workerilor și limita pentru metrici; nu va introduce procese coordonator, multiprocessing, IPC sau binding-uri native.</li>
-            <li>Arhitectura ulterioară poate adăuga un coordonator și procese worker dedicate pentru ingress și egress, supraveghere între procese, IPC, distribuirea snapshot-urilor de rutare, precum și politici de repornire și recuperare.</li>
+            <li>Un proces coordonator și procese worker ingress și egress reale și separate.</li>
+            <li>IPC, distribuirea snapshot-urilor de rutare și supravegherea între procese, politici de repornire și recuperare a workerilor și agregarea metricilor acolo unde este necesar.</li>
+            <li>Un viitor procesor nativ și binding-uri în spatele contractelor stabilite, cu verificare diferențială a conformității; în prezent nu există o astfel de implementare și nu se afirmă rezultate de performanță.</li>
             <li>O arhitectură mai largă pentru adaptoarele ingress și egress, dincolo de traseele UDP actuale.</li>
           </ul>
         </article>

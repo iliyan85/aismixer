@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | Обработка и маршрутизиране на AIS потоци</title>
   <link rel="canonical" href="https://aismixer.net/bg/">
-  <meta name="description" content="AISMixer обработва и маршрутизира AIS NMEA 0183 потоци с детерминирани жизнени цикли, логическа маршрутизация и автентикиран ECDHE UDPSEC транспорт с ограничено локално състояние.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183, детерминирана обработка на AIS потоци, логическо маршрутизиране, UDPSEC, ECDHE, nmea_sproxy, AIVDM, AIVDO, aismixerctl, морски данни">
+  <meta name="description" content="AISMixer обработва и маршрутизира логически AIS NMEA 0183 потоци с етапи с ограничен капацитет, локална за процеса runtime наблюдаемост чрез aismixerctl и автентикиран ECDHE UDPSEC.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, детерминирана обработка на AIS потоци, логическо маршрутизиране, runtime наблюдаемост, UDPSEC, автентикиран ECDHE, nmea_sproxy, AIVDM, AIVDO, aismixerctl, морски данни">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
-  <meta property="og:description" content="Детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, изрично локално състояние и автентикиран ECDHE UDPSEC транспорт.">
+  <meta property="og:description" content="Детерминирана обработка и логическо маршрутизиране на AIS с етапи с ограничен капацитет, локална за процеса runtime наблюдаемост и автентикиран ECDHE UDPSEC.">
   <meta property="og:url" content="https://aismixer.net/bg/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,7 +28,7 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
-  <meta name="twitter:description" content="Детерминирана AIS обработка · Изрично състояние · Логическо маршрутизиране · Автентикиран ECDHE UDPSEC">
+  <meta name="twitter:description" content="AIS обработка · Логическо маршрутизиране · Runtime наблюдаемост · Автентикиран ECDHE UDPSEC">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="Преглед на платформата AISMixer за обработка и маршрутизиране на AIS потоци">
 
@@ -48,7 +48,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
-    "description": "Платформа с отворен код за детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, изрично локално състояние и автентикиран ECDHE UDPSEC транспорт.",
+    "description": "Платформа с отворен код за детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, етапи с ограничен капацитет, локална за процеса runtime наблюдаемост и автентикиран ECDHE UDPSEC.",
     "url": "https://aismixer.net/bg/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -68,7 +68,7 @@
     ],
     "inLanguage": "bg",
     "isAccessibleForFree": true,
-    "keywords": ["AIS NMEA 0183", "детерминирана обработка на потоци", "логическо маршрутизиране", "UDPSEC", "ECDHE", "nmea_sproxy", "AIVDM", "AIVDO"]
+    "keywords": ["AIS NMEA 0183", "детерминирана обработка на потоци", "логическо маршрутизиране", "runtime наблюдаемост", "aismixerctl", "UDPSEC", "автентикиран ECDHE", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -177,63 +177,74 @@
       </div>
     </section>
 
+    <section id="explainer" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Кратък визуален преглед</p>
+        <h2>Как работи AISMixer</h2>
+        <p class="section-intro">Кратка визуална разходка от множество AIS източници през сглобяване, дедупликация, управление на TAG метаданните и логическо маршрутизиране до избрани изходи, включително <span class="kbd">nmea_sproxy</span> и UDPSEC. Видеото е на английски.</p>
+      </div>
+      <div class="video-frame">
+        <iframe src="https://www.youtube-nocookie.com/embed/c7a7Q6vpxkA" title="Как AISMixer обработва и маршрутизира AIS потоци — видео обяснение на английски" loading="lazy" allow="encrypted-media; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+      </div>
+    </section>
+
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Основи на data plane от кампании D–E</p>
-        <h2>Неизменяеми данни, изрично маршрутизиране и подреден egress</h2>
-        <p class="section-intro">Неизменяемите ingress кадри преминават през изрични етапи в рамките на един процес. Всеки приет кадър получава една <span class="kbd">ProcessingSnapshot</span>, а <span class="kbd">PythonDataPlaneProcessor</span> връща един подреден <span class="kbd">OutputBatch</span>. Всеки <span class="kbd">ProcessorOutput</span> носи точните неизменяеми байтове и изрични числови идентификатори на целите, а egress използва един унифициран числов път за изпращане. Python реализацията остава единственият продукционен и референтен процесор; точните правила за граничните случаи остават в нормативния договор за поведение.</p>
+        <p class="eyebrow">Основа на data plane от кампании C–F, подготвена за нативна реализация</p>
+        <h2>Изрична обработка, етапи с ограничен капацитет и унифициран egress</h2>
+        <p class="section-intro">Неизменяемият ingress на ниво байтове преминава през изрично определени етапи с ограничен капацитет в рамките на един процес. След като стане наличен споделен капацитет за обработка, всеки допуснат кадър се свързва с една <span class="kbd">ProcessingSnapshot</span> и се обработва от <span class="kbd">PythonDataPlaneProcessor</span>, който притежава състоянието на инстанцията и остава единственият текущ продукционен и референтен процесор. Той връща един подреден неизменяем <span class="kbd">OutputBatch</span>, чиито стойности <span class="kbd">ProcessorOutput</span> пренасят точните байтове и числовите идентификатори на целите през egress предаването с ограничен капацитет.</p>
       </div>
-      <div class="pipeline representation-pipeline" role="group" aria-label="Продукционен data-plane път през основата от кампании D–E">
+      <div class="pipeline representation-pipeline" role="group" aria-label="Реализирани продукционни data-plane етапи от кампании C–F">
         <div class="pipeline-node">
           <strong>UDP / UDPSEC производители</strong>
-          <span>Неизменяеми <span class="kbd">IngressFrame</span> обекти</span>
+          <span>Отделна ограничена опашка с <span class="kbd">IngressFrame</span> за всеки вход</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Ingress fan-in</strong>
-          <span>Пренася елементите без анализ или маршрутизиране</span>
+          <strong>Ограничено допускане до обработка</strong>
+          <span>Backpressure, след което се свързва една <span class="kbd">ProcessingSnapshot</span></span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong><span class="kbd">PythonDataPlaneProcessor</span></strong>
-          <span>Една <span class="kbd">ProcessingSnapshot</span> и едно синхронно извикване за всеки приет кадър</span>
+          <strong><span class="kbd">PythonDataPlaneProcessor</span> със собствено състояние</strong>
+          <span>Сканиране на байтове, сглобяване, TAG политика и дедупликация</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Подреден <span class="kbd">OutputBatch</span></strong>
-          <span>Точни неизменяеми байтове и изрични числови цели за всеки <span class="kbd">ProcessorOutput</span></span>
+          <strong>Ограничено предаване на подреден <span class="kbd">OutputBatch</span></strong>
+          <span>Точни байтове и изрични числови цели</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Унифициран числов egress към UDP цели</strong>
-          <span>Последователно изпращане чрез <span class="kbd">send_to_ids()</span></span>
+          <strong>Унифициран UDP egress</strong>
+          <span>Последователно локално изпращане чрез <span class="kbd">send_to_ids()</span></span>
         </div>
       </div>
       <div class="grid state-grid">
         <article class="card">
           <div class="icons" aria-hidden="true">🚪</div>
           <h3>Неизменяема ingress граница</h3>
-          <p>Вградените UDP и UDPSEC производители създават неизменяеми <span class="kbd">IngressFrame</span> обекти. Валидните наследени <span class="kbd">IngressEvent</span> обекти преминават през един адаптер за съвместимост. Невалидните събития за съвместимост и неподдържаните елементи се отхвърлят преди придобиването на моментна снимка на маршрутизацията и извикването на процесора.</p>
+          <p>Вградените UDP и UDPSEC производители създават неизменяеми <span class="kbd">IngressFrame</span> обекти на ниво байтове. Bytes-native сканирането и еднократно анализираните метаданни <span class="kbd">ParsedSentence</span> пренасят информацията за фрагментите и TAG метаданните към обработката без повторно извличане.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧾</div>
-          <h3>Един кадър, една <span class="kbd">ProcessingSnapshot</span></h3>
-          <p>Всеки приет кадър получава точно една неизменяема <span class="kbd">ProcessingSnapshot</span>. Конфигурираните външни имена на целите остават операторският интерфейс, докато продукционното съпоставяне използва предварително компилиран план само с числови цели и запазва техния ред.</p>
+          <h3>Обвързване на snapshot след осигурен капацитет</h3>
+          <p>Капацитетът за обработка се осигурява, преди една неизменяема <span class="kbd">ProcessingSnapshot</span> да бъде свързана с кадъра. Допуснатата работа запазва тази снимка; кадрите, които още чакат за капацитет, може да видят по-късна локална за процеса подмяна на маршрутизацията.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
-          <h3>Подреден резултат <span class="kbd">OutputBatch</span></h3>
-          <p><span class="kbd">DataPlaneProcessor</span> връща <span class="kbd">OutputBatch</span>, а <span class="kbd">PythonDataPlaneProcessor</span> остава единствената продукционна и референтна реализация. Всеки <span class="kbd">ProcessorOutput</span> съдържа изрични подредени числови идентификатори на цели.</p>
+          <h3>Python процесор със собствено състояние</h3>
+          <p>Една дългосрочно работеща инстанция на <span class="kbd">PythonDataPlaneProcessor</span> притежава изменяемото състояние на сглобяването, дедупликацията, източниците, multipart метаданните и процесорните метрики. Днес не съществуват нативен процесор или bindings.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
-          <h3>Точни байтове и еднократно кодиране</h3>
-          <p>Всяко изведено NMEA изречение се превръща в един точен неизменяем <span class="kbd">bytes</span> payload, като UTF-8 кодирането се извършва точно веднъж за изречение. Фрагментите на multipart съобщение остават отделни payload-и.</p>
+          <h3>Точни байтове в подредени резултати</h3>
+          <p>Всяко изведено NMEA изречение се кодира като UTF-8 веднъж и се превръща в един точен неизменяем payload в подреден <span class="kbd">OutputBatch</span>. Всеки <span class="kbd">ProcessorOutput</span> носи изрични числови идентификатори на целите; multipart фрагментите остават отделни payload-и.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⏱️</div>
-          <h3>Подредена бариера за завършване</h3>
-          <p>Цялата обработка на кадъра завършва преди първото egress изпращане. Непразният <span class="kbd">OutputBatch</span> спира обработката на следващ кадър, докато последователният egress завърши успешно; това не е потвърждение за мрежова доставка и не предоставя транзакционна семантика.</p>
+          <h3>Backpressure и подредено завършване</h3>
+          <p>Когато отделна ingress граница, споделена processing граница или egress граница достигне капацитета си, изпълнението изчаква, вместо да отхвърли елемента в опашката. Непразният пакет спира обработката на следващ кадър до завършването на последователното локално изпращане. Това не осигурява трайност или потвърждение за отдалечена доставка, а UDP остава транспорт със загуби.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧭</div>
@@ -273,60 +284,48 @@
         </article>
         <article class="card state-card">
           <div class="icons" aria-hidden="true">📊</div>
-          <h3>Наблюдаемо състояние</h3>
-          <p>Дедупликацията, сглобяването и защитеното състояние предоставят неизменяеми моментни статистики за проверка и регресионно тестване. Прочитането на моментна снимка не стартира почистване и не променя по-ранна снимка.</p>
-          <p>Това е основа за бъдеща диференциална проверка за съответствие, а не завършена система за наблюдение или изнасяне на метрики към Prometheus.</p>
+          <h3>Наблюдаемо компонентно и runtime състояние</h3>
+          <p>Собствениците на състоянието за дедупликация, сглобяване и сигурност предоставят неизменяеми вътрешни снимки на жизнения цикъл. Runtime-ът отделно предлага свежи pull-based изгледи към опашките, активността на процесора и egress етапа, както и входния и изходния трафик. Прочитането на който и да е вид снимка не променя състоянието на обработката.</p>
+          <p>Тези изгледи са локални за процеса и нетрайни; те не са разпределени метрики или система за изнасяне към Prometheus/time-series.</p>
         </article>
       </div>
       <p class="boundary-note"><strong>Локално по замисъл.</strong> Това състояние не се запазва трайно и не се споделя между процеси. Текущият runtime упражнява надзор над съществените asyncio задачи в рамките на един процес; coordinator/worker процеси, IPC и междупроцесна синхронизация на състоянието все още не съществуват.</p>
     </section>
 
-    <section id="native-foundation" class="section">
+    <section id="worker-readiness" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Референтна семантика и поетапно развитие</p>
-        <h2>Референтна основа, подготвена за бъдеща нативна реализация</h2>
-        <p class="section-intro">Campaign C установи неизменяемото bytes-native ingress представяне. Campaign D добави синхронния процесорен договор и изричните локални за процеса runtime етапи. Campaign E завърши числовата идентичност на целите, компилираната маршрутизация само към числови цели, точните неизменяеми изходни байтове, <span class="kbd">OutputBatch</span> и унифицирания числов egress. <span class="kbd">PythonDataPlaneProcessor</span> остава единственият продукционен и референтен процесор.</p>
-      </div>
-      <div class="pipeline reference-pipeline" role="group" aria-label="Реализирана основа от кампании C–E и бъдеща диференциална реализация">
-        <div class="pipeline-node">
-          <strong>Неизменяемо ingress представяне</strong>
-          <span class="status-badge status-implemented">Реализирано сега</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node">
-          <strong><span class="kbd">ProcessingSnapshot</span> и компилирана числова маршрутизация</strong>
-          <span class="status-badge status-implemented">Реализирано сега</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node">
-          <strong><span class="kbd">PythonDataPlaneProcessor</span> като референтна реализация</strong>
-          <span class="status-badge status-implemented">Реализирано сега</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node">
-          <strong>Неизменяем подреден <span class="kbd">OutputBatch</span> с точни байтове</strong>
-          <span class="status-badge status-implemented">Реализирано сега</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node pipeline-node-future">
-          <strong>Бъдеща диференциална реализация</strong>
-          <span class="status-badge status-future">Нативният процесор не е реализиран</span>
-        </div>
+        <p class="eyebrow">Campaign F — реализирана</p>
+        <h2>Граници, подготвени за worker архитектура в един процес</h2>
+        <p class="section-intro">Campaign F завърши ограничените и наблюдаеми граници около текущия Python runtime. Изменяемото състояние на обработката има изричен собственик на ниво инстанция, работата се допуска само при наличен капацитет, а свежата pull-based статистика прави активността на етапите видима, без да я променя.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
-          <h3>Реализирано сега</h3>
-          <p>Реализирани са неизменяемият <span class="kbd">IngressFrame</span>, bytes-native интервалите от сканирането и метаданните <span class="kbd">ParsedSentence</span>. Всеки приет кадър се свързва с една <span class="kbd">ProcessingSnapshot</span>; когато маршрутизацията е включена, целите в нея идват от компилирания план само с числови цели. Референтният <span class="kbd">PythonDataPlaneProcessor</span> създава точните неизменяеми изходни байтове в подреден <span class="kbd">OutputBatch</span> с изрични числови цели за всеки <span class="kbd">ProcessorOutput</span>. Продукционният egress следва един числов път чрез <span class="kbd">send_to_ids()</span>, а надзорът на етапите остава локален за процеса.</p>
+          <div class="icons" aria-hidden="true">📥</div>
+          <h3>Отделен ограничен ingress</h3>
+          <p>Всеки конфигуриран UDP или UDPSEC вход има собствена ограничена опашка, така че натрупаните елементи от един вход да не заемат отделния капацитет на друг.</p>
         </article>
         <article class="card">
-          <h3>Campaign F — готовност за worker граници</h3>
-          <p>Campaign F трябва да определи опашки с ограничен капацитет и политика за backpressure, собствеността върху процесорните инстанции, подготовката на worker жизнения цикъл и границата за метрики. Самата кампания няма да въвежда coordinator, IPC, многопроцесен runtime или нативни bindings.</p>
+          <div class="icons" aria-hidden="true">🚦</div>
+          <h3>Допускане само при наличен капацитет</h3>
+          <p>Споделеното допускане до обработка е ограничено. Кадърът получава своята неизменяема <span class="kbd">ProcessingSnapshot</span> едва след осигуряване на капацитет, а при достигане на капацитета изпълнението изчаква с backpressure.</p>
         </article>
         <article class="card">
-          <h3>По-късна процесна архитектура и нативна реализация</h3>
-          <p>По-късна работа включва coordinator, специализирани ingress и egress worker процеси, междупроцесен надзор, IPC, разпределение на routing snapshot-и, политика за рестарт и възстановяване и нативен процесор с bindings зад установените договори. Днес не съществува нативен процесор, не са избрани нативен API или ABI и не се прави твърдение за производителност.</p>
+          <div class="icons" aria-hidden="true">🧭</div>
+          <h3>Собственост на процесорната инстанция</h3>
+          <p>Една процесорна инстанция притежава изменяемото състояние на сглобяването, дедупликацията, източниците, multipart метаданните и процесорните метрики зад изрична граница на жизнения цикъл.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📤</div>
+          <h3>Ограничен подреден egress</h3>
+          <p>Ограничено предаване пренася всеки непразен <span class="kbd">OutputBatch</span> към последователно локално изпращане. Бариерата за завършване запазва реда на обработка, но не е потвърждение за отдалечено получаване.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📊</div>
+          <h3>Pull-based runtime наблюдаемост</h3>
+          <p>Свежите неизменяеми снимки обхващат състоянието на опашките и backpressure, активността на процесора и egress етапа, както и суровия и допуснатия входен трафик и съобщенията и байтовете за всяка цел.</p>
         </article>
       </div>
+      <p class="boundary-note"><strong>Готовността за worker архитектура е реализирана; worker процесите не са.</strong> Текущата услуга все още използва един процес с наблюдавани asyncio етапи. Няма coordinator процес, отделни ingress или egress worker процеси, multiprocessing, IPC, междупроцесна маршрутизация или агрегиране на метрики, нито автоматичен рестарт и възстановяване на worker процеси. Днес няма нативен процесор или bindings.</p>
     </section>
 
     <section id="routing" class="section">
@@ -363,29 +362,39 @@
 
     <section id="runtime-control" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Управление на маршрутизирането по време на работа</p>
-        <h2>Променяйте активните маршрути, без да прекъсвате слоя за данни</h2>
-        <p class="section-intro">Незадължителен локален управляващ слой през Unix-domain сокет предоставя кратки операции по маршрутизиране чрез глобално инсталираната команда <span class="kbd">aismixerctl</span>.</p>
+        <p class="eyebrow">Локално управление и runtime наблюдаемост</p>
+        <h2>Управлявайте маршрутизацията и наблюдавайте runtime активността</h2>
+        <p class="section-intro">Незадължителният локален управляващ слой през POSIX Unix-domain сокет предоставя операции по маршрутизиране и read-only агрегирана runtime статистика и статистика по входове и изходи чрез глобално инсталираната команда <span class="kbd">aismixerctl</span>. Стартирането без команда отваря интерактивната операторска обвивка.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
-          <h3>Състояние на маршрутизацията</h3>
-          <p>Показва активното поколение, дали маршрутизирането е включено, логическите зони, подредените маршрути и идентичностите на целите.</p>
+          <h3>Състояние и атомарни промени на маршрутизацията</h3>
+          <p>Проверявайте активното поколение, зоните, маршрутите и целите; заменете валидирана моментна снимка или изключете маршрутизацията, за да се върнете към наследения broadcast режим. Незадължителните проверки на поколението отхвърлят остарели промени.</p>
         </article>
         <article class="card">
-          <div class="icons" aria-hidden="true">⚡</div>
-          <h3>Атомарна подмяна или изключване</h3>
-          <p>Проверява пълната предложена конфигурация преди подмяната на неизменяемото моментно състояние на маршрутизацията или връщането към наследения broadcast режим.</p>
+          <div class="icons" aria-hidden="true">📈</div>
+          <h3>Агрегирана runtime статистика</h3>
+          <p><span class="kbd">runtime.statistics</span> отчита състоянието на ограничените опашки и backpressure, активността на процесора и активността на egress при едно свежо локално за процеса извличане.</p>
         </article>
         <article class="card">
-          <div class="icons" aria-hidden="true">🛡️</div>
-          <h3>Защита от остарели промени</h3>
-          <p>Незадължителната проверка на поколението не позволява неволно презаписване на по-нова промяна в маршрутизацията.</p>
+          <div class="icons" aria-hidden="true">📊</div>
+          <h3>Входен и изходен трафик</h3>
+          <p><span class="kbd">runtime.statistics.inputs</span> разграничава транспортния трафик от приетите кадри. <span class="kbd">runtime.statistics.outputs</span> отчита локалните изпращания, съобщенията и байтовете за всяка цел.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">⌨️</div>
+          <h3>Интерактивно или с еднократна команда</h3>
+          <p>Обвивката без начална команда предоставя помощ, таблици, история, когато е налична, и същите операции за маршрутизиране и статистика, запазени и за еднократно използване с JSON.</p>
         </article>
       </div>
+      <pre class="command-example" aria-label="Примерни интерактивни команди за aismixerctl"><code>aismixerctl&gt; status
+aismixerctl&gt; show statistics
+aismixerctl&gt; show statistics inputs
+aismixerctl&gt; show statistics outputs</code></pre>
       <div class="callout">
-        <p><strong>Умишлено локално и ограничено до текущия процес.</strong> Маршрутите по време на работа не се запазват след рестарт, конфигурационните файлове не се пренаписват, а входни или изходни адаптери не се създават динамично. Правата върху Unix сокета са текущата граница за оторизация; няма управляващ token на ниво приложение.</p>
+        <p><strong>Граница на read-only статистиката.</strong> Статистиката е в паметта, локална за процеса, нетрайна и се нулира при рестарт. Тя не е постоянна история, разпределени метрики или система за Prometheus/time-series. Успешното локално UDP изпращане не е потвърждение за доставка от отсрещната страна.</p>
+        <p><strong>Умишлено локално управление.</strong> Runtime маршрутите не се запазват след рестарт, конфигурационните файлове не се пренаписват, а адаптери не се създават динамично. Правата върху Unix сокета са текущата граница за оторизация; няма управляващ token на ниво приложение.</p>
       </div>
     </section>
 
@@ -532,7 +541,7 @@
       <div class="section-heading">
         <p class="eyebrow">Внедряване и експлоатация</p>
         <h2>Жизнен цикъл за Linux и systemd, създаден за реални инсталации</h2>
-        <p class="section-intro">Управляваното от хранилището внедряване поддържа съгласувани файловете за изпълнение, операторското състояние, интеграцията със systemd и локалното управление на маршрутизирането.</p>
+        <p class="section-intro">Управляваното от хранилището внедряване поддържа съгласувани файловете за изпълнение, операторското състояние, интеграцията със systemd, локалното управление на маршрутизацията и read-only runtime статистиката.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -552,8 +561,8 @@
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧰</div>
-          <h3>Глобален CLI за маршрутизация</h3>
-          <p>Инсталацията поставя <span class="kbd">aismixerctl</span> в <span class="kbd">/usr/local/bin</span> за локални операции по маршрутизация.</p>
+          <h3>Глобален операторски CLI</h3>
+          <p>Инсталацията поставя <span class="kbd">aismixerctl</span> в <span class="kbd">/usr/local/bin</span> за локална runtime маршрутизация и read-only статистика, включително интерактивната обвивка без начална команда.</p>
         </article>
       </div>
     </section>
@@ -562,34 +571,28 @@
       <div class="section-heading">
         <p class="eyebrow">Документация и състояние на проекта</p>
         <h2>Реализирана основа, ясно отделена от следващите стъпки</h2>
-        <p class="section-intro">Wiki е подробното ръководство за архитектура, конфигурация, маршрутизиране, сигурност и експлоатация. Roadmap проследява бъдещата работа без обещани срокове.</p>
+        <p class="section-intro">Wiki е подробното ръководство за архитектура, конфигурация, маршрутизиране, сигурност и експлоатация. Roadmap отделя завършената основа от бъдещата работа без обещани срокове.</p>
       </div>
       <div class="status-grid">
         <article class="card status-card status-now">
           <h3 class="status-label">Реализирано сега</h3>
           <ul class="list">
-            <li>Неизменяема продукционна граница с <span class="kbd">IngressFrame</span> и един запазен адаптер за наследени <span class="kbd">IngressEvent</span> обекти.</li>
-            <li>Сканиране на ниво байтове, неизменяеми полуотворени интервали, еднократен анализ на полетата на NMEA фрагмента и TAG метаданните и продукционен път през анализирания вход на модула за сглобяване.</li>
-            <li>Изричен синхронен договор <span class="kbd">DataPlaneProcessor</span> и <span class="kbd">PythonDataPlaneProcessor</span> като единствена текуща продукционна и референтна реализация.</li>
-            <li>Една <span class="kbd">ProcessingSnapshot</span> за всеки приет кадър, компилирана маршрутизация само към числови цели, подреден <span class="kbd">OutputBatch</span> с точни неизменяеми байтове и едно UTF-8 кодиране за всяко изведено изречение, изрични числови цели за всеки <span class="kbd">ProcessorOutput</span> и унифициран egress чрез <span class="kbd">send_to_ids()</span>.</li>
-            <li>Един ingress fan-in, изричен процесорен етап, подреден egress етап с бариера за завършване на непразните пакети и локален за процеса fail-fast надзор.</li>
-            <li>Логическа маршрутизация, зони и дедупликация по цели.</li>
-            <li>Управление на маршрутизирането по време на работа чрез <span class="kbd">aismixerctl</span>.</li>
-            <li>Детерминирани жизнени цикли за дедупликация, сглобяване и multipart TAG метаданни.</li>
-            <li>Твърдо ограничени записи за защита от повторение при handshake, чакащи и активни сесии и частно nonce състояние за всяка сесия.</li>
-            <li>Неизменяеми статистики на състоянието и тествана Python референция за поведението.</li>
-            <li>Контрол на крайните точки, вход от физически приемници през nmea_sproxy и доверен режим с некриптиран UDP.</li>
-            <li>systemd <span class="kbd">RuntimeDirectory</span>, скриптове за жизнения цикъл и глобален CLI за маршрутизиране.</li>
+            <li>Неизменяеми <span class="kbd">IngressFrame</span> стойности на ниво байтове, bytes-native сканиране, еднократно анализирани метаданни и <span class="kbd">PythonDataPlaneProcessor</span> като единствен текущ продукционен и референтен процесор.</li>
+            <li>Отделни ограничени ingress опашки, споделено ограничено допускане до обработка, ограничено egress предаване, backpressure, собственост на състоянието от процесорната инстанция и обвързване на <span class="kbd">ProcessingSnapshot</span> при допускане.</li>
+            <li>Компилирана маршрутизация само към числови цели, точни неизменяеми байтове с едно кодиране за всяко изведено изречение, подредени <span class="kbd">OutputBatch</span> резултати и подредена локална бариера за завършване на egress.</li>
+            <li>Логически зони и дедупликация по цели, атомарни локални за процеса промени на маршрутизацията, интерактивен <span class="kbd">aismixerctl</span> и read-only агрегирана статистика и статистика по входове и изходи.</li>
+            <li>Детерминирано multipart сглобяване, управление на TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> и глобална или отделна за всяка цел дедупликация.</li>
+            <li>Автентикиран ефемерен P-256 ECDHE UDPSEC, дългосрочни P-256 ECDSA идентичности, независими AES-GCM ключове за двете посоки и твърдо ограничено локално защитено състояние.</li>
+            <li>За всеки процес или systemd instance на <span class="kbd">nmea_sproxy</span> — един UDP или сериен вход към един UDPSEC или изрично конфигуриран plain-UDP изход за доверена мрежа, плюс IPv4/IPv6 контрол на крайните точки.</li>
+            <li>systemd <span class="kbd">RuntimeDirectory</span>, скриптове за жизнения цикъл, съобразени с наличните привилегии, запазено операторско състояние и глобален операторски CLI.</li>
           </ul>
         </article>
         <article class="card status-card status-next">
           <h3 class="status-label">Планирана работа</h3>
           <ul class="list">
-            <li>Нативна реализация, bindings и диференциално изпълнение за проверка на съответствието все още не съществуват.</li>
-            <li>По-нататъшно bytes-native състояние на модула за сглобяване отвъд оставащата Python граница за съвместимост с низове.</li>
-            <li>Бенчмаркове и профилиране преди твърдения за производителност.</li>
-            <li>Готовност за worker граници в Campaign F: опашки с ограничен капацитет и политика за backpressure, собственост на процесорните инстанции, подготовка на worker жизнения цикъл и граница за метрики — без coordinator, IPC, многопроцесен runtime или нативни bindings в самата кампания.</li>
-            <li>По-късна процесна архитектура: coordinator и специализирани ingress/egress worker процеси, междупроцесен надзор, IPC, разпределение на routing snapshot-и и политика за рестарт и възстановяване.</li>
+            <li>Координаторен процес и реални отделни ingress и egress worker процеси.</li>
+            <li>IPC, междупроцесно разпространение на routing snapshot-и и надзор, политика за рестарт и възстановяване на worker процесите и при нужда агрегиране на метрики.</li>
+            <li>Бъдещ нативен процесор и bindings зад установените договори с диференциална проверка за съответствие; днес такава реализация няма и не се твърдят резултати за производителност.</li>
             <li>По-широка архитектура за входни и изходни адаптери отвъд текущите UDP пътища.</li>
           </ul>
         </article>

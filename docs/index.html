@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | AIS Stream Processing and Routing Platform</title>
   <link rel="canonical" href="https://aismixer.net/">
-  <meta name="description" content="AISMixer processes and routes AIS NMEA 0183 streams with deterministic state, logical routing, and authenticated ECDHE UDPSEC session establishment.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183, AIS stream processing, logical routing, UDPSEC, authenticated ECDHE, nmea_sproxy, AIVDM, AIVDO, aismixerctl, maritime data">
+  <meta name="description" content="AISMixer processes and logically routes AIS NMEA 0183 streams with bounded stages, process-local runtime observability through aismixerctl, and authenticated ECDHE UDPSEC.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, AIS stream processing, logical routing, runtime observability, UDPSEC, authenticated ECDHE, nmea_sproxy, AIVDM, AIVDO, aismixerctl, maritime data">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | AIS Stream Processing and Routing Platform">
-  <meta property="og:description" content="Deterministic AIS processing, logical routing, and authenticated ECDHE UDPSEC with bounded pending and active session state.">
+  <meta property="og:description" content="Deterministic AIS processing and logical routing with bounded stages, process-local runtime observability, and authenticated ECDHE UDPSEC.">
   <meta property="og:url" content="https://aismixer.net/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,7 +28,7 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | AIS Stream Processing and Routing Platform">
-  <meta name="twitter:description" content="Deterministic AIS processing · Logical routing · Authenticated ECDHE UDPSEC">
+  <meta name="twitter:description" content="AIS processing · Logical routing · Runtime observability · Authenticated ECDHE UDPSEC">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="AISMixer AIS stream processing and routing platform overview">
 
@@ -48,7 +48,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
-    "description": "Open-source platform for deterministic AIS processing, logical routing, and authenticated ECDHE UDPSEC with bounded pending and active session state.",
+    "description": "Open-source platform for deterministic AIS processing, logical routing, bounded stages, process-local runtime observability, and authenticated ECDHE UDPSEC.",
     "url": "https://aismixer.net/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -68,7 +68,7 @@
     ],
     "inLanguage": "en",
     "isAccessibleForFree": true,
-    "keywords": ["AIS NMEA 0183", "stream processing", "logical routing", "UDPSEC", "authenticated ECDHE", "nmea_sproxy", "AIVDM", "AIVDO"]
+    "keywords": ["AIS NMEA 0183", "stream processing", "logical routing", "runtime observability", "aismixerctl", "UDPSEC", "authenticated ECDHE", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -177,63 +177,74 @@
       </div>
     </section>
 
+    <section id="explainer" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Project explainer</p>
+        <h2>How AISMixer works</h2>
+        <p class="section-intro">A short visual walkthrough from multiple AIS sources through assembly, deduplication, TAG handling, and logical routing to selected outputs, including <span class="kbd">nmea_sproxy</span> and UDPSEC. The explainer is in English.</p>
+      </div>
+      <div class="video-frame">
+        <iframe src="https://www.youtube-nocookie.com/embed/c7a7Q6vpxkA" title="How AISMixer processes and routes AIS streams — English explainer video" loading="lazy" allow="encrypted-media; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+      </div>
+    </section>
+
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Campaign D–E data-plane foundation</p>
-        <h2>Explicit processing, exact bytes, and unified egress</h2>
-        <p class="section-intro">Immutable ingress frames move through explicit single-process stages. Each accepted frame receives one <span class="kbd">ProcessingSnapshot</span>, and <span class="kbd">PythonDataPlaneProcessor</span>—the sole production and reference processor—returns one ordered <span class="kbd">OutputBatch</span>. Each <span class="kbd">ProcessorOutput</span> carries exact immutable bytes and explicit numeric target IDs for one unified egress path. Exact lifecycle rules and edge cases remain in the normative behavioural contract.</p>
+        <p class="eyebrow">Campaign C–F native-ready data-plane foundation</p>
+        <h2>Explicit processing, bounded stages, and unified egress</h2>
+        <p class="section-intro">Immutable bytes-based ingress moves through bounded, explicit single-process stages. After shared processing capacity becomes available, each admitted frame is bound to one <span class="kbd">ProcessingSnapshot</span> and handled by the instance-owned <span class="kbd">PythonDataPlaneProcessor</span>—the sole current production and reference processor. It returns one ordered immutable <span class="kbd">OutputBatch</span> whose <span class="kbd">ProcessorOutput</span> values carry exact bytes and numeric target IDs through the bounded egress handoff.</p>
       </div>
-      <div class="pipeline representation-pipeline" role="group" aria-label="Campaign D–E production data-plane stages">
+      <div class="pipeline representation-pipeline" role="group" aria-label="Implemented Campaign C–F production data-plane stages">
         <div class="pipeline-node">
           <strong>UDP / UDPSEC producers</strong>
-          <span>Immutable <span class="kbd">IngressFrame</span></span>
+          <span>Private bounded <span class="kbd">IngressFrame</span> queue per input</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Ingress fan-in</strong>
-          <span>Queue transport without parsing or routing</span>
+          <strong>Bounded processing admission</strong>
+          <span>Backpressure, then bind one <span class="kbd">ProcessingSnapshot</span></span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong><span class="kbd">PythonDataPlaneProcessor</span></strong>
-          <span>One <span class="kbd">ProcessingSnapshot</span> and one synchronous call per accepted frame</span>
+          <strong>Instance-owned <span class="kbd">PythonDataPlaneProcessor</span></strong>
+          <span>Bytes scan, assembly, TAG policy, and deduplication</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Ordered <span class="kbd">OutputBatch</span></strong>
-          <span>Exact bytes and explicit numeric targets per <span class="kbd">ProcessorOutput</span></span>
+          <strong>Bounded ordered <span class="kbd">OutputBatch</span> handoff</strong>
+          <span>Exact bytes and explicit numeric targets</span>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-node">
-          <strong>Unified numeric egress</strong>
-          <span>Sequential dispatch through <span class="kbd">send_to_ids()</span></span>
+          <strong>Unified UDP egress</strong>
+          <span>Sequential local dispatch through <span class="kbd">send_to_ids()</span></span>
         </div>
       </div>
       <div class="grid state-grid">
         <article class="card">
           <div class="icons" aria-hidden="true">🚪</div>
           <h3>Immutable ingress boundary</h3>
-          <p>Built-in UDP and UDPSEC producers create immutable <span class="kbd">IngressFrame</span> objects. Valid legacy <span class="kbd">IngressEvent</span> objects pass through one compatibility adapter; invalid or unsupported items are rejected before routing-snapshot acquisition and processor invocation.</p>
+          <p>Built-in UDP and UDPSEC producers create immutable bytes-based <span class="kbd">IngressFrame</span> objects. Bytes-native scanning and parse-once <span class="kbd">ParsedSentence</span> metadata carry fragment and TAG information into processing without repeated extraction.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧾</div>
-          <h3>One frame, one <span class="kbd">ProcessingSnapshot</span></h3>
-          <p>Each accepted frame receives exactly one immutable <span class="kbd">ProcessingSnapshot</span>. Configured external target names remain the operator interface, while production matching uses a precompiled numeric target-only plan and preserves target order.</p>
+          <h3>Capacity-safe snapshot admission</h3>
+          <p>Processing capacity is obtained before one immutable <span class="kbd">ProcessingSnapshot</span> is bound to the frame. Admitted work keeps that snapshot; frames still waiting for capacity may observe a later process-local routing replacement.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
-          <h3>Ordered <span class="kbd">OutputBatch</span> result</h3>
-          <p><span class="kbd">DataPlaneProcessor</span> returns <span class="kbd">OutputBatch</span>, and <span class="kbd">PythonDataPlaneProcessor</span> remains the sole production and reference implementation. Every <span class="kbd">ProcessorOutput</span> carries explicit ordered numeric target IDs.</p>
+          <h3>Instance-owned Python processor</h3>
+          <p>One long-lived <span class="kbd">PythonDataPlaneProcessor</span> owns mutable assembler, deduplication, source, multipart-metadata, and processor-metric state. No native processor or binding exists today.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧩</div>
-          <h3>Exact bytes and one encoding</h3>
-          <p>Each emitted NMEA sentence becomes one exact immutable <span class="kbd">bytes</span> payload and is encoded as UTF-8 once. Multipart fragments remain separate payloads; a group is never concatenated into one output.</p>
+          <h3>Exact bytes in ordered results</h3>
+          <p>Each emitted NMEA sentence is encoded as UTF-8 once and becomes one exact immutable payload in an ordered <span class="kbd">OutputBatch</span>. Every <span class="kbd">ProcessorOutput</span> carries explicit numeric target IDs; multipart fragments remain separate payloads.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">⏱️</div>
-          <h3>Ordered completion barrier</h3>
-          <p>Complete frame processing precedes the first egress dispatch. A non-empty <span class="kbd">OutputBatch</span> prevents later-frame processing until sequential dispatch returns without error; this is not a delivery acknowledgement or transaction and does not roll back completed processor effects.</p>
+          <h3>Backpressure and ordered completion</h3>
+          <p>A full private-ingress, shared-processing, or egress boundary waits instead of dropping its queued item. A non-empty batch prevents later-frame processing until sequential local dispatch completes. This is neither durability nor remote delivery acknowledgement, and UDP remains lossy.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧭</div>
@@ -273,60 +284,48 @@
         </article>
         <article class="card state-card">
           <div class="icons" aria-hidden="true">📊</div>
-          <h3>Observable state</h3>
-          <p>Deduplication, assembly, and secure state expose immutable point-in-time statistics for inspection and regression testing. Reading a snapshot does not run cleanup or alter an earlier snapshot.</p>
-          <p>This is a basis for future differential conformance, not a complete monitoring or Prometheus export system.</p>
+          <h3>Observable component and runtime state</h3>
+          <p>Deduplication, assembly, and secure owners expose immutable internal lifecycle snapshots. The runtime separately offers fresh pull-based views of queues, processor and egress activity, and input and output traffic. Reading either kind of snapshot does not mutate processing state.</p>
+          <p>These views are process-local and non-durable; they are not distributed metrics or a Prometheus/time-series export system.</p>
         </article>
       </div>
       <p class="boundary-note"><strong>Local by design.</strong> This state is non-durable and is not shared across processes. The current runtime supervises essential asyncio tasks within one process; coordinator/worker processes, IPC, and cross-process state synchronization do not exist yet.</p>
     </section>
 
-    <section id="native-foundation" class="section">
+    <section id="worker-readiness" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Reference semantics and staged evolution</p>
-        <h2>A native-ready reference foundation</h2>
-        <p class="section-intro">Campaign C established immutable bytes-native ingress. Campaign D added the synchronous processor contract and explicit process-local runtime stages. Campaign E completed numeric target identity, compiled target-only routing, exact immutable output bytes, <span class="kbd">OutputBatch</span>, and unified numeric egress. <span class="kbd">PythonDataPlaneProcessor</span> remains the sole production and reference implementation.</p>
-      </div>
-      <div class="pipeline reference-pipeline" role="group" aria-label="Implemented Campaign C–E foundation and future differential implementation">
-        <div class="pipeline-node">
-          <strong>Immutable ingress representation</strong>
-          <span class="status-badge status-implemented">Implemented now</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node">
-          <strong><span class="kbd">ProcessingSnapshot</span> and compiled numeric routing</strong>
-          <span class="status-badge status-implemented">Implemented now</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node">
-          <strong><span class="kbd">PythonDataPlaneProcessor</span> reference</strong>
-          <span class="status-badge status-implemented">Implemented now</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node">
-          <strong>Exact bytes in ordered <span class="kbd">OutputBatch</span></strong>
-          <span class="status-badge status-implemented">Implemented now</span>
-        </div>
-        <span class="pipeline-arrow" aria-hidden="true">→</span>
-        <div class="pipeline-node pipeline-node-future">
-          <strong>Future differential/native implementation</strong>
-          <span class="status-badge status-future">Native processor not implemented</span>
-        </div>
+        <p class="eyebrow">Campaign F — implemented</p>
+        <h2>Worker-ready boundaries in one process</h2>
+        <p class="section-intro">Campaign F completed bounded, observable boundaries around the current Python runtime. Mutable processing state has an explicit instance owner, work is admitted only when capacity is available, and fresh pull-based statistics make stage activity visible without changing it.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
-          <h3>Implemented now</h3>
-          <p>Immutable <span class="kbd">IngressFrame</span> values, bytes-native scan spans, and <span class="kbd">ParsedSentence</span> metadata form the ingress representation. Each accepted frame is paired with one <span class="kbd">ProcessingSnapshot</span>; when routing is enabled, its targets come from the compiled numeric target-only plan. <span class="kbd">PythonDataPlaneProcessor</span> produces exact immutable output bytes in an ordered <span class="kbd">OutputBatch</span> with explicit numeric target IDs on every <span class="kbd">ProcessorOutput</span>. Production egress is unified through <span class="kbd">send_to_ids()</span>, and stage supervision remains process-local.</p>
+          <div class="icons" aria-hidden="true">📥</div>
+          <h3>Private bounded ingress</h3>
+          <p>Every configured UDP or UDPSEC input has its own bounded queue, keeping one input’s queued backlog from consuming another input’s private capacity.</p>
         </article>
         <article class="card">
-          <h3>Campaign F — worker readiness</h3>
-          <p>Campaign F prepares future worker boundaries through bounded queues and backpressure policy, processor-instance ownership, worker lifecycle preparation, and a metrics boundary. It does not itself introduce coordinator processes, IPC, a multiprocess runtime, or native bindings.</p>
+          <div class="icons" aria-hidden="true">🚦</div>
+          <h3>Capacity-safe admission</h3>
+          <p>Shared processing admission is bounded. A frame receives its immutable <span class="kbd">ProcessingSnapshot</span> only after capacity is obtained, and a full stage waits with backpressure.</p>
         </article>
         <article class="card">
-          <h3>Later process architecture and native implementation</h3>
-          <p>Later work covers a coordinator, dedicated ingress and egress workers, cross-process supervision, IPC and routing-snapshot distribution, restart and recovery policy, and a native processor with bindings behind the established contracts. No native processor exists today, no native API or ABI has been selected, and no performance claim is made.</p>
+          <div class="icons" aria-hidden="true">🧭</div>
+          <h3>Processor-instance ownership</h3>
+          <p>One processor instance owns mutable assembly, deduplication, source, multipart-metadata, and processor-metric state behind an explicit lifecycle boundary.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📤</div>
+          <h3>Bounded ordered egress</h3>
+          <p>A bounded handoff carries each non-empty <span class="kbd">OutputBatch</span> to sequential local dispatch. The completion barrier preserves processing order but is not remote receipt.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📊</div>
+          <h3>Pull-based runtime observability</h3>
+          <p>Fresh immutable snapshots cover queue and backpressure state, processor and egress activity, raw and admitted input traffic, and per-target output messages and bytes.</p>
         </article>
       </div>
+      <p class="boundary-note"><strong>Worker Readiness is implemented; workers are not.</strong> The current service still has one process with supervised asyncio stages. There is no coordinator, separate ingress or egress worker process, multiprocessing, IPC, cross-process routing or metrics aggregation, or automatic worker restart and recovery. No native processor or bindings exist today.</p>
     </section>
 
     <section id="routing" class="section">
@@ -363,29 +362,39 @@
 
     <section id="runtime-control" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Runtime routing control</p>
-        <h2>Change active routes without interrupting the data plane</h2>
-        <p class="section-intro">An optional local Unix-domain control plane exposes concise routing operations through the globally installed <span class="kbd">aismixerctl</span> command.</p>
+        <p class="eyebrow">Local control and runtime observability</p>
+        <h2>Control routing and inspect runtime activity</h2>
+        <p class="section-intro">The optional local POSIX Unix-domain control plane exposes routing operations and read-only aggregate, per-input, and per-output runtime statistics through the globally installed <span class="kbd">aismixerctl</span> command. Running it without a command opens the interactive operator shell.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
           <div class="icons" aria-hidden="true">🔎</div>
-          <h3>Inspect routing status</h3>
-          <p>See the active generation, enabled state, logical zones, ordered routes, and target identities.</p>
+          <h3>Routing status and atomic changes</h3>
+          <p>Inspect the active generation, zones, routes, and targets; replace a validated snapshot or disable routing to return to legacy broadcast mode. Optional generation checks reject stale updates.</p>
         </article>
         <article class="card">
-          <div class="icons" aria-hidden="true">⚡</div>
-          <h3>Replace or disable atomically</h3>
-          <p>Validate a complete candidate before swapping the immutable routing snapshot, or return to legacy broadcast mode.</p>
+          <div class="icons" aria-hidden="true">📈</div>
+          <h3>Aggregate runtime statistics</h3>
+          <p><span class="kbd">runtime.statistics</span> reports bounded queue and backpressure state, processor activity, and egress activity in one fresh process-local pull.</p>
         </article>
         <article class="card">
-          <div class="icons" aria-hidden="true">🛡️</div>
-          <h3>Reject stale updates</h3>
-          <p>Optional generation checks prevent an operator from overwriting a newer routing change unintentionally.</p>
+          <div class="icons" aria-hidden="true">📊</div>
+          <h3>Input and output traffic</h3>
+          <p><span class="kbd">runtime.statistics.inputs</span> separates transport traffic from accepted frames. <span class="kbd">runtime.statistics.outputs</span> reports per-target local dispatches, messages, and bytes.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">⌨️</div>
+          <h3>Interactive or one-shot</h3>
+          <p>The no-command shell provides help, tables, history where available, and the same routing and statistics operations retained for one-shot JSON use.</p>
         </article>
       </div>
+      <pre class="command-example" aria-label="Example aismixerctl interactive commands"><code>aismixerctl&gt; status
+aismixerctl&gt; show statistics
+aismixerctl&gt; show statistics inputs
+aismixerctl&gt; show statistics outputs</code></pre>
       <div class="callout">
-        <p><strong>Deliberately local and process-scoped.</strong> Runtime routes are not persisted after restart, configuration files are not rewritten, and ingress or egress adapters are not created dynamically. Unix socket permissions are the current authorization boundary; there is no application-level control token.</p>
+        <p><strong>Read-only statistics boundary.</strong> Statistics are in-memory, process-local, non-durable, and reset at restart. They are not persistent history, distributed metrics, or a Prometheus/time-series system. Successful local UDP dispatch is not remote delivery acknowledgement.</p>
+        <p><strong>Deliberately local control.</strong> Runtime routes are not persisted after restart, configuration files are not rewritten, and adapters are not created dynamically. Unix socket permissions are the current authorization boundary; there is no application-level control token.</p>
       </div>
     </section>
 
@@ -532,7 +541,7 @@
       <div class="section-heading">
         <p class="eyebrow">Deployment and operations</p>
         <h2>A Linux and systemd lifecycle built for real installations</h2>
-        <p class="section-intro">The repository-managed deployment keeps runtime files, operator state, systemd integration, and local routing control aligned.</p>
+        <p class="section-intro">The repository-managed deployment keeps runtime files, operator state, systemd integration, local routing control, and read-only runtime statistics aligned.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -552,8 +561,8 @@
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🧰</div>
-          <h3>Global routing CLI</h3>
-          <p>The installed workflow places <span class="kbd">aismixerctl</span> in <span class="kbd">/usr/local/bin</span> for local routing operations.</p>
+          <h3>Global operator CLI</h3>
+          <p>The installed workflow places <span class="kbd">aismixerctl</span> in <span class="kbd">/usr/local/bin</span> for local runtime routing and read-only statistics, including the no-command interactive shell.</p>
         </article>
       </div>
     </section>
@@ -562,34 +571,28 @@
       <div class="section-heading">
         <p class="eyebrow">Documentation and project status</p>
         <h2>Implemented foundations, clearly separated from what comes next</h2>
-        <p class="section-intro">The Wiki is the detailed guide to architecture, configuration, routing, security, and operations. The Roadmap tracks future work without promising dates.</p>
+        <p class="section-intro">The Wiki is the detailed guide to architecture, configuration, routing, security, and operations. The Roadmap separates the completed baseline from future work without promising dates.</p>
       </div>
       <div class="status-grid">
         <article class="card status-card status-now">
           <h3 class="status-label">Implemented now</h3>
           <ul class="list">
-            <li>Immutable <span class="kbd">IngressFrame</span> production boundary with one retained legacy <span class="kbd">IngressEvent</span> adapter.</li>
-            <li>Bytes-native scanning, immutable half-open spans, parse-once fragment/TAG metadata, and the parsed assembler production path.</li>
-            <li>The synchronous <span class="kbd">DataPlaneProcessor</span> contract and <span class="kbd">PythonDataPlaneProcessor</span> as the sole production and reference implementation.</li>
-            <li>One <span class="kbd">ProcessingSnapshot</span> per accepted frame, compiled numeric target-only routing, exact immutable output bytes with one UTF-8 encoding per emitted sentence, ordered <span class="kbd">OutputBatch</span> results with explicit numeric targets, and unified egress through <span class="kbd">send_to_ids()</span>.</li>
-            <li>Explicit ingress fan-in, processor, and ordered egress stages with a completion barrier and process-local fail-fast task supervision.</li>
-            <li>Logical routing, zones, and target-scoped deduplication.</li>
-            <li>Runtime routing control with <span class="kbd">aismixerctl</span>.</li>
-            <li>Deterministic deduplication, assembly, and multipart TAG lifecycles.</li>
-            <li>Hard-bounded handshake replay, pending-session, active-session, and private per-session nonce state.</li>
-            <li>Immutable state statistics and a tested Python behavioural reference.</li>
-            <li>Endpoint controls, physical receiver input through nmea_sproxy, and trusted plain-UDP proxy mode.</li>
-            <li>systemd <span class="kbd">RuntimeDirectory</span>, lifecycle scripts, and the global routing CLI.</li>
+            <li>Immutable bytes-based <span class="kbd">IngressFrame</span> values, bytes-native scanning, parse-once metadata, and <span class="kbd">PythonDataPlaneProcessor</span> as the sole current production and reference processor.</li>
+            <li>Private bounded ingress queues, shared bounded processing admission, bounded egress handoff, backpressure, processor-instance state ownership, and admission-time <span class="kbd">ProcessingSnapshot</span> binding.</li>
+            <li>Compiled numeric target-only routing, exact immutable bytes encoded once per emitted sentence, ordered <span class="kbd">OutputBatch</span> results, and an ordered local egress completion barrier.</li>
+            <li>Logical zones and target-scoped deduplication, atomic process-local routing updates, interactive <span class="kbd">aismixerctl</span>, and read-only aggregate, per-input, and per-output statistics.</li>
+            <li>Deterministic multipart assembly, TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> handling, and global or target-scoped deduplication.</li>
+            <li>Authenticated ephemeral P-256 ECDHE UDPSEC, long-term P-256 ECDSA identities, independent directional AES-GCM keys, and hard-bounded local secure state.</li>
+            <li>One UDP or serial input to one UDPSEC or explicit trusted plain-UDP output per <span class="kbd">nmea_sproxy</span> process or systemd instance, plus IPv4/IPv6 endpoint controls.</li>
+            <li>systemd <span class="kbd">RuntimeDirectory</span>, privilege-aware lifecycle scripts, preserved operator state, and the global operator CLI.</li>
           </ul>
         </article>
         <article class="card status-card status-next">
           <h3 class="status-label">Planned work</h3>
           <ul class="list">
-            <li>A native implementation, bindings, and differential conformance execution; none exists today.</li>
-            <li>Further bytes-native assembler state beyond the current Python string compatibility boundary.</li>
-            <li>Benchmarks and profiling before any performance claim.</li>
-            <li>Campaign F worker readiness: bounded queues and backpressure policy, processor-instance ownership, worker lifecycle preparation, and a metrics boundary—without coordinator processes, IPC, multiprocessing, or native bindings in Campaign F itself.</li>
-            <li>Later process architecture: a coordinator and dedicated ingress/egress workers, cross-process supervision, IPC, routing-snapshot distribution, and restart and recovery policy.</li>
+            <li>A coordinator process and actual separate ingress and egress worker processes.</li>
+            <li>IPC, cross-process routing-snapshot distribution and supervision, worker restart and recovery policy, and metrics aggregation where required.</li>
+            <li>A future native processor and bindings behind the established contracts, with differential conformance; none exists today, and no performance result is claimed.</li>
             <li>A broader ingress and egress adapter architecture beyond the current UDP pathways.</li>
           </ul>
         </article>

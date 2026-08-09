@@ -396,6 +396,50 @@ a:focus-visible {
   font-size: 18px;
 }
 
+.video-frame {
+  width: 100%;
+  max-width: 880px;
+  min-width: 0;
+  margin: 0 auto;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--el);
+  box-shadow: var(--shadow);
+}
+
+.video-frame iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+.video-frame iframe:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+}
+
+.command-example {
+  width: fit-content;
+  max-width: 100%;
+  margin: 18px 0 0;
+  padding: 14px 16px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: color-mix(in oklab, var(--panel) 72%, var(--bg));
+  color: var(--text);
+  font: 14px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  white-space: pre;
+}
+
+.command-example code {
+  color: inherit;
+  font: inherit;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
