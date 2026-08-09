@@ -10,8 +10,10 @@ This document defines the currently tested Python processing contract for:
 - TAG metadata ownership;
 - deduplication;
 - secure-ingress local replay, session, and nonce state;
-- routing snapshot use; and
-- forwarding boundaries.
+- routing snapshot use;
+- processor and runtime-queue lifecycle;
+- forwarding boundaries; and
+- process-local runtime statistics.
 
 It is the reference contract for differential testing of a future native
 processor. It is not a full AIS protocol specification, a storage or analytics
@@ -20,22 +22,25 @@ specification, a spoof-detection specification, or a native ABI.
 ## 2. Ingress frame and compatibility-event boundary
 
 The built-in UDP and UDPSEC producers enqueue immutable `IngressFrame`
-instances. Ingress fan-in transports queue items unchanged and performs no
-conversion, validation, routing, or parsing. The processor stage accepts a
-direct frame by object identity and retains compatibility for `IngressEvent`
-through one adapter. A compatibility event's `raw_line` must satisfy
-`isinstance(raw_line, str)`, including subclasses; its explicit legacy-text
-mode preserves surrogate code points.
+instances. Each ingress fan-in reader dequeues one private-queue item and
+applies the single compatibility adapter before processing admission. A direct
+`IngressFrame` is retained by object identity. An `IngressEvent` is adapted to
+an `IngressFrame`; its `raw_line` must satisfy `isinstance(raw_line, str)`,
+including subclasses, and its explicit legacy-text mode preserves surrogate
+code points.
 
 After coercion, direct frames and adapted compatibility events enter one common
-frame-processing pipeline. There is no parallel legacy routing, scanning,
-parsing, assembly, metadata, deduplication, or forwarding path.
+frame-processing pipeline. Fan-in waits for processing capacity and then binds
+the frame and `ProcessingSnapshot` into a `ProcessingWorkItem`; the processor
+stage accepts that work item, not a raw frame or compatibility event. There is
+no parallel legacy routing, scanning, parsing, assembly, metadata,
+deduplication, or forwarding path.
 
 An invalid compatibility event or any unsupported queue-item type is ignored
-before routing, extraction, assembly, or deduplication, and later queued items
-must continue to be processed. In particular, a bare `bytes` or `str` queue
-item is not implicitly converted; bytes must already be owned by an
-`IngressFrame`.
+before processing admission, routing, extraction, assembly, or deduplication,
+and later queued items must continue to be processed. In particular, a bare
+`bytes` or `str` queue item is not implicitly converted; bytes must already be
+owned by an `IngressFrame`.
 
 UDP datagrams retain their historical full-datagram normalization: decode as
 UTF-8 with `errors="ignore"`, apply Python `str.strip()`, then encode the
@@ -440,14 +445,17 @@ written to routing configuration or control JSON, and may change after a
 restart when destination declaration order changes. Unnamed legacy
 destinations have numeric IDs even though they have no external routing name.
 
-When routing state is present, the processor stage acquires exactly one
-immutable routing snapshot per accepted or successfully coerced frame. If that
-snapshot contains a table, orchestration calls the numeric target-only matcher
-exactly once with `frame.source_id`. Unsupported queue items and invalid
-compatibility events acquire no snapshot and perform no match. All accepted
-sentences extracted from one frame use the same resolved numeric tuple. A
-routing-table replacement during processing affects the next accepted frame,
-not the frame already in progress.
+After processing capacity is acquired, ingress fan-in acquires exactly one
+immutable routing snapshot for the accepted or successfully coerced frame and
+immediately binds it into one `ProcessingWorkItem`. If that snapshot contains
+a table, orchestration calls the numeric target-only matcher exactly once with
+`frame.source_id`. Unsupported queue items and invalid compatibility events
+acquire no processing capacity, snapshot, or match. A frame still waiting for
+processing capacity has not captured routing state; once admitted, every
+accepted sentence extracted from that frame uses the one resolved numeric
+tuple even if the work item waits before processing. A routing-table
+replacement can therefore affect a frame that is still waiting for admission,
+but not a work item that has already been admitted and bound.
 
 The frozen, slotted processor view contains exactly:
 
@@ -482,8 +490,9 @@ unique first-occurrence tuple.
 `PythonDataPlaneProcessor.process(frame, snapshot)` completes synchronous
 processing of the entire accepted frame and constructs the complete returned
 `OutputBatch` before orchestration begins its first asynchronous egress send.
-The processor stage resolves the frame's target-only snapshot before this
-call. Parsing, assembly, multipart metadata observation and cleanup,
+The admitted `ProcessingWorkItem` already carries the frame's target-only
+snapshot before the processor stage dequeues it. Parsing, assembly, multipart
+metadata observation and cleanup,
 deduplication decisions, TAG formatting, wall-clock observations used for
 formatting, GID generation, and `touch_s` effects belonging to that frame
 therefore all occur before the first send begins.
@@ -570,31 +579,38 @@ ingress producers
     -> network forwarders
 ```
 
-The stages run in one process. Ingress fan-in preserves the established
-ordering into one processor-stage queue. Exactly one long-lived processor-stage
-consumer uses the runtime-owned, long-lived `PythonDataPlaneProcessor`, and
-exactly one long-lived egress-stage consumer dispatches its results. The egress
-stage performs no routing matching, parsing, assembly, multipart metadata work,
-deduplication, TAG construction, GID generation, or processor-state mutation.
+The stages run in one process. Each configured input has its own FIFO ingress
+queue and one fan-in reader; the order in which those readers successfully
+admit work establishes the order in the shared processor-stage queue. This is
+not a total arrival-order or fairness guarantee across inputs. Exactly one
+long-lived processor-stage consumer uses the runtime-owned, long-lived
+`PythonDataPlaneProcessor`, and exactly one long-lived egress-stage consumer
+dispatches its results. The egress stage performs no routing matching, parsing,
+assembly, multipart metadata work, deduplication, TAG construction, GID
+generation, or processor-state mutation.
 
-For each accepted frame, the processor stage coerces the queue item once,
-acquires exactly one routing snapshot, resolves exactly one target-only
-`ProcessingSnapshot`, calls the configured `DataPlaneProcessor` exactly once,
-and treats the complete returned `OutputBatch` as that frame's one ordered
-processor result. Unsupported queue items and invalid compatibility events are
-rejected before snapshot acquisition, target matching or processor invocation.
-An `OutputBatch` with no outputs completes locally because it has no egress
-work.
+For each supported frame, fan-in coerces the queue item once and, only after
+obtaining processing capacity, resolves exactly one target-only
+`ProcessingSnapshot` and constructs one immutable `ProcessingWorkItem`. The
+processor stage calls the configured `DataPlaneProcessor` exactly once for that
+work item and treats the complete returned `OutputBatch` as the frame's one
+ordered processor result. Unsupported queue items and invalid compatibility
+events are rejected before processing admission, snapshot acquisition, target
+matching, or processor invocation. An `OutputBatch` with no outputs completes
+locally because it has no egress work.
 
 After handing a non-empty batch to egress, the processor stage must await an
 explicit process-local completion acknowledgement. It must not consume or
 process the next ingress item until egress has dispatched the current batch's
 final output and acknowledged success. Removing a batch from an inter-stage
 queue does not satisfy this barrier. Thus processor work cannot run ahead
-across frames while prior egress is incomplete. After the barrier completes
-successfully, the next accepted frame acquires its own snapshot; a routing
-replacement while the prior batch is blocked can affect that next frame, but
-routing generation remains observational and cannot reset processor state.
+across frames while prior egress is incomplete. The barrier constrains
+processor execution, not fan-in admission: later work items may already be
+queued with their snapshots bound. After the barrier completes successfully,
+the processor stage dequeues the next admitted work item. A routing replacement
+while the prior batch is blocked affects only frames that have not yet been
+admitted and bound; routing generation remains observational and cannot reset
+processor state.
 
 If a processor call fails, no batch is handed to egress and the exception
 propagates through runtime lifecycle management. If egress fails, it signals
@@ -648,7 +664,211 @@ observed. If the processor directly invokes `cleanup_expired()` or
 External assembler callers are likewise responsible for consuming returned
 lifecycle keys to synchronize metadata they own.
 
-## 14. Explicit limitations and deferred decisions
+## 14. Campaign F worker-readiness runtime contract
+
+Campaign F establishes bounded, observable, process-local boundaries around
+the current Python runtime. It prepares those boundaries for later process
+separation; it does not create operating-system worker processes.
+
+### Bounded queues and processing admission
+
+One production `main()` invocation owns the following queue topology:
+
+- one private bounded ingress queue for every configured UDP or UDPSEC input,
+  with a default capacity of 1024 `IngressFrame` items per input;
+- one shared bounded processing-admission queue, with a default capacity of
+  1024 `ProcessingWorkItem` items; and
+- one bounded egress queue with capacity 1, whose private runtime items each
+  carry one `OutputBatch` and its process-local completion Future.
+
+All capacities count queue or work items, not payload bytes. A producer awaits
+its private ingress queue, each fan-in reader awaits processing admission, and
+the processor stage awaits egress-queue capacity. An operation that encounters
+a full stage queue waits and applies backpressure; these AISMixer queues do not
+implement a drop-on-full branch. That waiting supplies no network-delivery,
+durability, replay, or recovery guarantee. UDP can lose data outside these
+queues, and fail-fast shutdown does not replay queued work.
+
+Private ingress queues keep one input's queued backlog from consuming another
+input's private queue capacity. Each fan-in reader may nevertheless dequeue
+and hold one supported frame while waiting for shared processing capacity, and
+the held frame is not included in private queue depth. Reader scheduling and
+shared admission define no fairness or total arrival-order guarantee between
+inputs. This contract is separate from the bounded serial-input queue inside
+`nmea_sproxy`, whose overflow policy is not an AISMixer runtime-stage policy.
+
+Processing admission reserves a shared capacity permit before invoking the
+work-item factory. While a frame waits for that permit, no routing snapshot is
+read and no `ProcessingSnapshot` or `ProcessingWorkItem` exists for it. After
+the permit is granted, one routing snapshot is read, target matching is
+performed when routing is enabled, and the exact `IngressFrame` plus the
+resulting frozen `ProcessingSnapshot` are synchronously constructed as one
+frozen `ProcessingWorkItem`. Construction and immediate queue insertion have
+no asynchronous suspension point between them. Construction or insertion
+failure releases the reserved capacity; cancellation while waiting does not
+invoke the factory.
+
+The processing permit is released as soon as the processor stage dequeues the
+work item, before `process()` begins. Processing-queue depth therefore measures
+admitted queued work, not the active processor call. Fan-in can admit and bind
+later work while the processor stage is waiting for an earlier non-empty
+batch's egress completion. Once admitted, a work item's snapshot remains fixed;
+only a frame still waiting for capacity can observe a later routing
+replacement at its eventual admission.
+
+### Processor ownership, lifecycle, and reset
+
+Production constructs exactly one `PythonDataPlaneProcessor` inside each
+`main()` invocation and gives it to exactly one serial processor-stage
+consumer. There is no import-time global processor. Its assembler,
+deduplicator, `SourceState`, multipart `s`/`c`/`g` context maps, processing
+configuration, helper references, and processor counters belong exclusively
+to that processor instance. Injected mutable components become lifecycle-owned
+by the instance and must not be shared or reset externally. Other runtime
+owners—queues, routing state, forwarder, egress metrics, and the statistics
+provider—remain separate process-local components.
+
+`process()`, `reset()`, and `metrics_snapshot()` are synchronous. The owner
+must serialize `process()` and `reset()`; the processor adds no locking and has
+no asynchronous start, stop, close, or worker lifecycle.
+
+A successful `PythonDataPlaneProcessor.reset()` performs these steps in order:
+
+1. reset the assembler and count discarded pending groups;
+2. reset the deduplicator and count discarded live entries;
+3. reset `SourceState` and count discarded live source entries;
+4. count and clear the multipart `s` contexts;
+5. count and clear the multipart `c` contexts; and
+6. count and clear the multipart `g` contexts.
+
+It returns one immutable report with the exact shape:
+
+```text
+ProcessorResetReport(
+    assembler_groups_discarded: int,
+    dedup_entries_discarded: int,
+    source_entries_discarded: int,
+    multipart_s_contexts_discarded: int,
+    multipart_c_contexts_discarded: int,
+    multipart_gid_contexts_discarded: int,
+)
+```
+
+Reset retains the processor and owned-component identities, processing
+configuration, injected clocks and GID generator, configured TTLs and capacity
+limits, assembler and deduplicator cumulative and peak statistics, and all
+processor process/output/reset metrics. It does not drain stage queues, alter
+routing or forwarder state, clear queue or egress metrics, or replace the
+processor. Previously retained deduplication and multipart/source live state no
+longer affects later processing after a successful reset.
+
+Reset is ordered and fail-fast, not transactional. An exception stops later
+owners, preserves the effects of earlier successful steps, performs no
+rollback, propagates the original exception, increments `reset_failed`, and
+clears `reset_in_flight` in `finally`; no report is returned. A successful call
+increments `reset_completed`. Every call first increments `reset_calls` and
+`reset_in_flight`, including an empty successful reset. Production shutdown,
+routing changes, and the current control protocol do not invoke processor
+reset; it is an established lifecycle boundary, not an operator reset command.
+
+### Ordered processor-to-egress handoff and supervision
+
+The Campaign D ordered handoff remains in force. One serial processor call
+produces one complete immutable `OutputBatch`. An empty batch finishes locally.
+A non-empty batch is placed into the bounded egress queue and the processor
+stage waits for its completion Future. The single egress stage dispatches the
+batch's `ProcessorOutput` values sequentially in tuple order and acknowledges
+completion only after every awaited local `send_to_ids()` call returns.
+Processor execution of the next work item cannot begin before that
+acknowledgement, although later work may already have been admitted and bound.
+
+Egress failure stops later outputs in the batch and fails the completion
+barrier. Already completed processor effects and local sends are not rolled
+back, and later admitted work is not processed after fail-fast shutdown. Local
+send completion is neither remote receipt nor a delivery acknowledgement.
+
+Every UDP and UDPSEC producer, fan-in, processor-stage, and egress-stage task is
+an essential task in one process-local fail-fast supervision lifecycle; fan-in
+similarly owns its private readers. Failure, unexpected return, or unexpected
+cancellation terminates siblings and retrieves their outcomes. This is
+supervision of asyncio tasks in one service process. It supplies cleanup and
+termination, not a coordinator process, ingress or egress worker processes,
+IPC, cross-process routing-snapshot distribution, automatic worker restart,
+recovery, or replay.
+
+### Pull-based runtime statistics
+
+Runtime metric owners return new frozen, slotted snapshot values when pulled.
+The implemented categories and field meanings are:
+
+| Snapshot | Fields and normative meaning |
+|---|---|
+| Queue | `name`; item `capacity`; current and lifetime-high `depth` / `peak_depth`; successful `enqueued` / `dequeued`; historical put or admission attempts that initially encountered unavailable capacity in `put_waits`; and currently outstanding such waits in `current_put_waiters`. Cancelled waits remain historical but do not count as enqueues. |
+| Processor | `process_calls`, `process_completed`, `process_failed`, and current `process_in_flight`; successful zero-output `outputless_calls`; successful non-empty `output_batches`; total `ProcessorOutput` values in those batches as `output_messages`; and the corresponding `reset_calls`, `reset_completed`, `reset_failed`, and current `reset_in_flight`. Outputs count constructed processor results, not deliveries. |
+| Egress operation | `batches_started`, `batches_completed`, `batches_failed`, `batches_cancelled`, and current `active_batches`; plus `outputs_started`, `outputs_completed`, `outputs_failed`, `outputs_cancelled`, and current `active_outputs`. One output operation represents one `ProcessorOutput`, regardless of its target count. Outputless processor calls create no egress operation. |
+| Input traffic | Input `name` and `kind`; raw `transport_packets` / `transport_bytes` observed immediately after socket receive; and `accepted_frames` / `payload_bytes` counted only after a constructed frame has completed private ingress-queue admission. Transport counts can therefore include denied, malformed, handshake, or other non-frame UDP/UDPSEC datagrams. |
+| Output traffic | Numeric `target_id` and optional external `name`; per-target local `dispatch_attempts`, `dispatch_completed`, `dispatch_failed`, `messages`, and `bytes`. Every configured destination, including unnamed legacy destinations, has its own row in numeric order. Completion does not mean remote UDP receipt. |
+| Aggregate runtime | Ordered ingress-queue snapshots plus the processing queue, processor, egress queue, and egress-operation snapshots. Detailed input and output traffic are deliberately separate pulls, not aggregate fields. |
+
+For each selected target, `dispatch_attempts` increments before transport setup
+or send. Only a successful local return increments `dispatch_completed`,
+`messages`, and the exact payload `bytes`; any `BaseException` increments
+`dispatch_failed` and is re-raised. A cancellation during that per-target
+operation is therefore failed at the output-traffic layer, which has no
+cancelled field, while the separate egress-operation snapshot records the
+corresponding output and batch cancellation.
+
+The public snapshot field invariants include:
+
+- queue `enqueued - dequeued == depth`, with
+  `0 <= depth <= peak_depth <= capacity` and
+  `put_waits >= current_put_waiters`;
+- processor `process_calls == process_completed + process_failed +
+  process_in_flight`, `process_completed == outputless_calls +
+  output_batches`, and `output_messages >= output_batches`;
+- processor `reset_calls == reset_completed + reset_failed +
+  reset_in_flight`; and
+- egress batch and output `started` counts each equal their respective
+  completed, failed, cancelled, and active counts.
+
+Current depth, active-operation, in-flight, and current-waiter fields are
+gauges at observation time; the remaining counts and peaks are in-memory
+lifetime values of their owning component instance. Queue owners and the egress
+operation owner have no reset operation. Processor reset does not zero
+processor metrics or any other runtime owner's counters.
+
+Statistics are pull-based. Reading them creates fresh immutable internal
+snapshots and neither mutates processing state nor resets counters. The
+aggregate provider holds references to existing owners and pulls each one once
+in a fixed sequence; it is not a stop-the-world or transactionally atomic view
+across independently changing owners. Protocol serialization produces ordinary
+JSON values from those snapshots. Metrics are process-local and non-durable;
+restart begins new owner lifetimes. No Prometheus exporter, push or distributed
+collector, persistence layer, cross-process aggregation, rate calculation, or
+historical time series is implied.
+
+### Read-only local control exposure
+
+When the optional local version-1 control plane is enabled, it exposes three
+read-only protocol methods:
+
+| Protocol method | Parameters and result |
+|---|---|
+| `runtime.statistics` | `params` must be absent. One aggregate pull returns `ingress_queues`, `processing_queue`, `processor`, `egress_queue`, and `egress_operations`. |
+| `runtime.statistics.inputs` | `params` may be absent, empty, or exactly `{ "input": <non-empty string> }`. One detailed input-traffic pull returns `inputs` in runtime declaration order, optionally filtered by exact input name; no match returns an empty list. |
+| `runtime.statistics.outputs` | `params` may be absent, empty, or contain exactly one of non-negative integer `target_id` or non-empty string `name`. One detailed output-traffic pull returns `outputs` in numeric target order, optionally filtered by that exact value; no match returns an empty list. |
+
+These methods only read the injected statistics provider and cannot replace,
+disable, or otherwise mutate routing or data-plane state. Conversely, routing
+status and mutation methods do not pull statistics.
+
+`aismixerctl` presents these protocol methods as `show statistics`,
+`show statistics inputs [INPUT]`, and `show statistics outputs [OUTPUT]`.
+Those are CLI spellings, not additional protocol methods. One-shot CLI use
+prints the validated JSON response envelope; the interactive shell renders
+successful statistics results as tables.
+
+## 15. Explicit limitations and deferred decisions
 
 The following boundaries are compatibility limitations or deferred decisions,
 not additional guarantees:
@@ -665,7 +885,7 @@ not additional guarantees:
 6. Extraction checks checksum-field syntax but does not validate checksum
    arithmetic.
 
-## 15. Native implementation conformance
+## 16. Native implementation conformance
 
 A future native processor should be checked through differential tests against
 the Python reference for:
@@ -679,7 +899,7 @@ the Python reference for:
 
 Conformance does not define or require a C or C++ API or ABI.
 
-## 16. Campaign A baseline
+## 17. Campaign A baseline
 
 - Final branch: `main`.
 - Final full-suite result: `765 passed, 18 skipped in 10.30s` (783 collected).
@@ -691,7 +911,7 @@ Conformance does not define or require a C or C++ API or ABI.
 
 This contract was consolidated at the end of Campaign A.
 
-## 17. Campaign B closure baseline
+## 18. Campaign B closure baseline
 
 - Closure snapshot date: 2026-07-24.
 - Branch: `main`.
@@ -710,7 +930,7 @@ This contract was consolidated at the end of Campaign A.
 - This is a Campaign B closure snapshot, not a guarantee that future test
   counts will remain identical.
 
-## 18. Campaign C closure baseline
+## 19. Campaign C closure baseline
 
 - Closure snapshot date: 2026-07-25.
 - Branch: `main`.
@@ -737,7 +957,7 @@ This contract was consolidated at the end of Campaign A.
 - This is a Campaign C closure snapshot, not a guarantee that future test
   counts will remain identical.
 
-## 19. Campaign D closure baseline
+## 20. Campaign D closure baseline
 
 - Closure snapshot date: 2026-07-26.
 - Branch: `main`.
@@ -771,7 +991,7 @@ This contract was consolidated at the end of Campaign A.
 - This is a Campaign D closure snapshot, not a guarantee that future test
   counts will remain identical.
 
-## 20. Campaign E closure baseline
+## 21. Campaign E closure baseline
 
 - Closure snapshot date: 2026-07-30.
 - Branch: `main`.
@@ -805,3 +1025,31 @@ This contract was consolidated at the end of Campaign A.
   model.
 - This is a Campaign E closure snapshot, not a guarantee that future test
   counts will remain identical.
+
+## 22. Campaign F closure baseline
+
+- Closure snapshot date: 2026-08-09.
+- Branch: `main`.
+- Audited source commit:
+  `9f8b84d6304154d0570e28be75d26f64d3b83720` (`9f8b84d`,
+  `feat(control): add per-target traffic accounting`).
+- Environment: Python 3.14.7 and pytest 9.1.1 on Windows 11
+  (`Windows-11-10.0.26200-SP0`, AMD64, 64-bit).
+- Focused queue, runtime-stage, supervision, processor/reset, metrics,
+  statistics, control-protocol, CLI, forwarder, UDP, and UDPSEC result:
+  `877 passed, 1 skipped`.
+- Final full-suite result: `2514 passed, 18 skipped, 0 failed`
+  (2532 collected).
+- `git diff --check`: passed.
+- Campaign F establishes bounded process-local stage queues and backpressure,
+  admission-time `IngressFrame` / `ProcessingSnapshot` binding,
+  processor-instance state and reset ownership, ordered egress acknowledgement,
+  and immutable pull-based runtime statistics with input and output traffic
+  accounting.
+- The statistics protocol is read-only, process-local, and non-durable. Local
+  queue or dispatch completion is not a delivery guarantee.
+- Campaign F introduced no coordinator, ingress or egress worker process, IPC,
+  cross-process routing or metrics aggregation, automatic worker restart,
+  recovery protocol, native implementation, or bindings.
+- This documentation closure changes no Python or runtime behaviour and is not
+  a guarantee that future test counts will remain identical.

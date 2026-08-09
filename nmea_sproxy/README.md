@@ -2,8 +2,9 @@
 
 `nmea_sproxy` is a station-side network proxy. UDPSEC is AISMixer's
 authenticated encrypted UDP transport; it is not an external standardized
-protocol. UDPSEC remains the secure default and legacy behavior. Explicit plain
-UDP output is available only for trusted LAN/VPN compatibility deployments.
+protocol. UDPSEC remains the secure default and legacy behavior. Plain UDP
+output must be selected explicitly and is intended only for trusted LAN/VPN
+compatibility deployments.
 `nmea_sproxy` does not mix inputs, assemble multipart AIS, deduplicate, rewrite
 TAG metadata, route streams, or fan out to egress targets. AISMixer performs
 those jobs.
@@ -16,6 +17,67 @@ listen_ip/listen_port or input.type: serial -> remote_host/remote_port or output
 ```
 
 Run separate processes or systemd template instances for separate relations.
+
+## Quick Start
+
+From a fresh checkout, install the singleton and template systemd units with:
+
+```bash
+git clone https://github.com/iliyan85/aismixer
+cd aismixer
+chmod +x nmea_sproxy/install.sh nmea_sproxy/update.sh
+./nmea_sproxy/install.sh
+```
+
+The installer enables the singleton `nmea_sproxy.service`, but intentionally
+starts no service and enables no template instance. Before starting a UDPSEC
+relation, edit `/etc/nmea_sproxy/config.yaml`, copy the trusted AISMixer public
+key to `/etc/nmea_sproxy/keys/aismixer_public.pem`, and authorize the station
+public key in AISMixer as described in [Keys and trust
+setup](#keys-and-trust-setup).
+
+Start and inspect the singleton after configuration and trust setup:
+
+```bash
+sudo systemctl start nmea_sproxy.service
+sudo systemctl status nmea_sproxy.service
+```
+
+For a separate relation, copy and edit one configuration file and start one
+template instance. The instance name is an operator-chosen label:
+
+```bash
+sudo cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
+sudo systemctl enable --now nmea_sproxy@boat.service
+sudo systemctl status nmea_sproxy@boat.service
+```
+
+Each singleton or template instance still represents exactly one local input
+and one network output. A template-only deployment can disable the
+installer-enabled singleton after confirming that it is not needed:
+
+```bash
+sudo systemctl disable --now nmea_sproxy.service
+```
+
+The lifecycle scripts can run directly as root. From a non-root account they
+use `sudo` for privileged operations when it is available; root users can omit
+`sudo` from the `systemctl` examples. The updater installs new runtime and unit
+files but intentionally restarts nothing, so the operator must restart the
+singleton or each selected template instance. See [Update and
+uninstall](#update-and-uninstall) for the compact update flow.
+
+### Guide map
+
+- [Configuration](#configuration)
+- [UDP and serial local inputs](#local-input-modes)
+- [UDPSEC and plain UDP outputs](#output-modes)
+- [Network endpoint controls](#network-endpoint-controls)
+- [Singleton and template services](#systemd-services)
+- [Keys and trust setup](#keys-and-trust-setup)
+- [UDPSEC session lifecycle](#udpsec-session-lifecycle)
+- [Troubleshooting](#troubleshooting)
+- [Update and uninstall](#update-and-uninstall)
 
 ## UDPSEC behavior and limits
 
@@ -316,7 +378,7 @@ integration is provided by this installer; the systemd scripts are Linux-only.
 From the `nmea_sproxy` directory:
 
 ```bash
-sudo ./install.sh
+bash ./install.sh
 sudo systemctl start nmea_sproxy
 ```
 
@@ -327,8 +389,9 @@ The installer installs and enables `nmea_sproxy.service`, using:
 ```
 
 It does not start the service automatically.
-On Debian-family systems the installer checks for `python3-serial` along with
-the existing YAML, cryptography, and optional process-title dependencies.
+On Debian-family systems the installer requires `python3-serial`,
+`python3-yaml`, `python3-cryptography`, and `python3-setproctitle`. Manual mode
+can continue without changing the process title when `setproctitle` is absent.
 Future non-root service users would also need operating-system permission to
 open the serial device, for example through the appropriate device group.
 
@@ -355,8 +418,8 @@ sudo systemctl start nmea_sproxy@balchik_roof
 `boat`, `yacht`, and names such as `balchik_roof` are operator-chosen labels.
 They are not predefined or numbered instance names. Each instance config must
 define one local input, either the legacy UDP listener or an explicit serial
-input, and one remote AISMixer network endpoint using UDPSEC or explicit plain
-UDP.
+input, and one network output using UDPSEC to AISMixer or explicitly configured
+plain UDP to a compatible trusted-network consumer.
 
 The installer creates `/etc/nmea_sproxy/instances/` but does not create
 instance configs or enable template instances.
@@ -383,14 +446,16 @@ Plain UDP output does not load or require `station_private.pem` or
 
 ### Generation, preservation, and repair
 
-During `sudo ./install.sh`:
+During installation:
 
 - If both station key files are absent, a new station key pair is generated.
 - If `station_private.pem` exists, it is preserved and
   `station_public.pem` is checked and repaired from it when needed.
 - If only `station_public.pem` exists, installation stops rather than
   generating or overwriting private-key material.
-- Existing `/etc/nmea_sproxy` configs and keys are preserved.
+- Existing configuration, station private key, and trusted AISMixer public key
+  are preserved. The derived station public key may be repaired from the
+  preserved private key.
 - A missing `aismixer_public.pem` produces a warning; copy the trusted server
   public key before starting the proxy.
 
@@ -486,7 +551,7 @@ service user can read the station private key and AISMixer public key:
 sudo ls -l /etc/nmea_sproxy/keys
 ```
 
-From the `nmea_sproxy` directory, re-run `sudo ./install.sh` to generate a
+From the `nmea_sproxy` directory, re-run `bash ./install.sh` to generate a
 missing station key pair or repair a station public key while preserving an
 existing private key. Copy the trusted AISMixer public key separately; the
 installer does not fetch it.
@@ -503,14 +568,34 @@ sudo journalctl -u nmea_sproxy@boat -f
 
 ## Update and uninstall
 
-From the repository:
+From the repository root, update the checkout and installed files, then restart
+the singleton when ready:
 
 ```bash
-sudo ./nmea_sproxy/update.sh
-sudo ./nmea_sproxy/uninstall.sh
+git pull --ff-only
+./nmea_sproxy/update.sh
+sudo systemctl restart nmea_sproxy.service
+sudo systemctl status nmea_sproxy.service
 ```
 
-`update.sh` does not modify `/etc/nmea_sproxy` configs or keys.
+`update.sh` does not modify `/etc/nmea_sproxy` configs or keys and intentionally
+does not restart any service. For template deployments, restart and inspect
+only the selected instances, for example:
+
+```bash
+sudo systemctl restart nmea_sproxy@boat.service
+sudo systemctl status nmea_sproxy@boat.service
+```
+
+If this checkout predates the Quick Start permission step, run
+`chmod +x nmea_sproxy/update.sh` once before invoking the updater.
+
+Uninstall from the repository root with:
+
+```bash
+bash ./nmea_sproxy/uninstall.sh
+```
+
 `uninstall.sh` preserves `/etc/nmea_sproxy` by default; use
-`uninstall.sh --purge-config` only when operator configs and keys should also
-be removed.
+`bash ./nmea_sproxy/uninstall.sh --purge-config` only when operator configs and
+keys should also be removed.

@@ -14,34 +14,65 @@
 > AISMixer receives AIS feeds from multiple receivers, extracts `!AIVDM` and
 > `!AIVDO`, reassembles multipart messages, removes near-real-time duplicates,
 > manages NMEA TAG metadata, and forwards one clean logical stream. Optional
-> logical routing can direct each ingress source to selected named UDP targets,
-> while `aismixerctl` can atomically replace or disable the active routing
-> snapshot through a local Unix-domain control socket.
+> logical routing directs ingress sources to named UDP targets, while the local
+> `aismixerctl` control interface exposes runtime status, statistics, and atomic
+> routing updates.
 
----
+## 🚀 Quick start
 
-## 🌿 Branches and website
+The lifecycle scripts can run directly as root. When invoked by a non-root user,
+they elevate privileged operations with `sudo`; they stop with an explanation if
+neither condition is available.
 
-The `main` branch is the primary runtime and development branch. It contains the
-Python service, secure proxy helpers, configuration examples, control-plane
-components, and the test suite under `tests/`.
+Standalone `systemctl` commands and commands that write under `/etc` assume a
+root shell; non-root operators should prefix them with `sudo` when required.
 
-The public website lives on the long-lived `website` branch. GitHub Pages
-deploys from that branch using `/docs` as its site root, so `docs/` is
-intentionally not present on `main`.
+### Fresh installation
 
----
+On a systemd-based Debian or Raspberry Pi OS host:
+
+```bash
+git clone https://github.com/iliyan85/aismixer
+cd aismixer
+chmod +x install.sh
+./install.sh
+systemctl start aismixer
+systemctl status aismixer
+```
+
+`install.sh` installs the runtime under `/opt/aismixer`, seeds missing files
+under `/etc/aismixer` while preserving existing configuration and keys, installs
+the global `aismixerctl` command, and enables AISMixer at boot. It intentionally
+does **not** start the service. Review `/etc/aismixer/config.yaml` before exposing
+the service outside a trusted network.
+
+### Update
+
+The repository tracks lifecycle scripts without an executable bit. Before the
+first update, run `chmod +x update.sh` once. Then update from the checkout:
+
+```bash
+git pull --ff-only
+./update.sh
+systemctl status aismixer
+```
+
+`update.sh` refreshes installed runtime files, the systemd unit, and
+`aismixerctl`, reloads systemd, and **restarts AISMixer**. It leaves operator
+configuration and keys under `/etc/aismixer` untouched. `uninstall.sh` preserves
+that directory unless `--purge-config` is explicitly requested.
 
 ## 🧭 What is AISMixer?
 
-**AISMixer** is a Python service for receiving, normalizing, deduplicating,
-tagging, routing, and forwarding AIS NMEA 0183 streams.
+**AISMixer** is a production-oriented Python service for receiving,
+normalizing, deduplicating, tagging, routing, and forwarding AIS NMEA 0183
+streams.
 
 - **`aismixer.py`** is the long-running mixer and data-plane service.
-- **`nmea_sproxy`** is the station-side network proxy. One process forwards one
-  local UDP or physical serial input to one AISMixer UDPSEC or UDP input.
-- **`aismixerctl.py`** is the operator CLI for the optional local routing-control
-  socket.
+- **`aismixerctl`** is the installed operator command for the optional local
+  control socket.
+- **`nmea_sproxy`** is the station-side proxy for one local UDP or serial input
+  and one UDPSEC or explicitly configured plain-UDP output.
 
 ```text
 AIS receiver UDP      \
@@ -51,167 +82,16 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP targets    |
                                 +----------------+
                                          ^
                                          |
-                                optional Unix control plane
+                                optional local control
                                          |
                                    aismixerctl
 ```
 
----
+## ⚙️ Basic configuration
 
-## ✅ Current capabilities
-
-### 📡 Ingress and egress
-
-- UDP ingress over IPv4 and IPv6, with optional application-level allow-lists
-  for AISMixer UDP/UDPSEC listeners and `nmea_sproxy` local UDP input.
-- Authenticated encrypted UDPSEC ingress compatible with `nmea_sproxy`.
-- Physical serial and USB virtual COM input through `nmea_sproxy`, plus an
-  explicit plain UDP mode for trusted LAN/VPN environments.
-- Optional outbound source-address binding for AISMixer UDP forwarders and
-  `nmea_sproxy` UDPSEC/plain UDP outputs.
-- UDP broadcast egress in legacy mode and named UDP targets in routing mode.
-
-### ⚙️ Processing
-
-- Extraction of supported `!AIVDM` and `!AIVDO` sentences.
-- Fully out-of-order multipart assembly, with exact repeats treated
-  idempotently for assembly and conflicting fragments invalidating the live
-  group.
-- Deterministic, lifecycle-aware NMEA TAG `s`/`c`/`g` handling.
-- Group-atomic multipart deduplication decisions: global in legacy mode and
-  scoped to each `target_id` in routing mode.
-- Explicit, tested process-local TTL lifecycles for deduplication, assembly,
-  processor-owned multipart metadata, and secure ingress state.
-- Optional constructor-level process-local limits in the Python reference state
-  objects, plus immutable statistics snapshots for deduplication, assembly, and
-  secure state.
-
-### 🔀 Routing and operation
-
-- Legacy broadcast mode or static logical routing loaded at startup.
-- Named ingress `source_id` and egress `target_id` identities.
-- Logical source zones with `include`, `union`, `intersection`, and
-  `difference`, consumed by ordered routes.
-- One immutable routing snapshot and source match per accepted `IngressFrame`.
-- Optional atomic runtime routing replacement through the Unix-domain NDJSON
-  control plane and `aismixerctl`.
-- `routing.status`, `routing.replace`, and `routing.disable`.
-- Repository-managed systemd service with `RuntimeDirectory=aismixer` and a
-  global `/usr/local/bin/aismixerctl` wrapper installed by lifecycle scripts.
-
----
-
-## 🔀 Architecture
-
-AISMixer keeps the **data plane** and **control plane** separate.
-
-### 📡 Data plane
-
-Built-in UDP and UDPSEC producers create immutable `IngressFrame` objects, and
-a single ingress fan-in transports queue items unchanged to the processor
-stage. That stage accepts direct frames by object identity, invokes the
-synchronous Python reference processor, and retains one compatibility adapter
-for valid legacy `IngressEvent` objects; invalid compatibility events and
-unsupported queue items are ignored before routing. Each non-empty complete
-processor-output batch then passes to a single egress stage, which dispatches
-it sequentially before the processor stage consumes the next item.
-
-All UDP and UDPSEC producer tasks, the ingress fan-in task, and the processor
-and egress tasks are supervised as one process-local lifecycle. Failure or
-unexpected completion of any one terminates the runtime after all remaining
-tasks are cancelled and awaited; no automatic restart, retry, or delivery
-replay is provided.
-
-For each accepted frame, the data plane captures one immutable routing snapshot
-and matches `source_id` once. It scans the frame payload as bytes, parses NMEA
-fragment fields and relevant TAG metadata once, passes parsed sentences to the
-assembler, applies global or target-scoped deduplication, constructs outbound
-TAG metadata, and forwards accepted sentences to UDP egress destinations. The
-Python compatibility assembler currently materializes and stores matched
-sentence strings.
-
-Campaign D remains Python-only and process-local and defines no native API or
-ABI. Native processor implementations, coordinator/worker processes,
-multiprocessing, and IPC remain future work.
-
-- **Legacy mode:** global deduplication and broadcast to all forwarders.
-- **Routing mode:** logical source matching, per-target deduplication, and
-  targeted forwarding to named UDP egress destinations.
-- One routing snapshot and source match are used per accepted frame; a
-  concurrent control update affects the next frame, not the one already being
-  processed.
-
-### 🎛️ Control plane
-
-When enabled, the local Unix-domain socket accepts newline-delimited JSON
-requests. The control service validates a candidate routing section against the
-currently available target IDs, compiles a new immutable table, and atomically
-replaces the process-local routing state.
-
-### 🧩 Main components
-
-| Component | Role |
-|---|---|
-| `aismixer.py` | Main runtime, ingress tasks and fan-in, processor and egress stages, optional control lifecycle |
-| `core/routing.py` / `core/routing_state.py` | Logical routing and process-local immutable snapshots |
-| `core/routing_control*.py` | Versioned control protocol, service, and Unix-domain transport |
-| `aismixerctl.py` | Operator CLI for runtime routing control |
-| `aismixer_secure.py` | UDPSEC handshake, authentication, and decryption |
-| `nmea_sproxy/` | Station-side network proxy: one input to one AISMixer UDPSEC or UDP input |
-| `core/ingress_frame.py` / `core/nmea_scanner.py` / `core/parsed_sentence.py` | Immutable ingress frames, bytes-native scan spans, and parsed fragment/TAG metadata |
-| `assembler.py` | Multipart `!AIVDM`/`!AIVDO` reassembly |
-| `dedup.py` | Global or target-scoped duplicate suppression |
-| `meta_writer.py` / `meta_cleaner.py` | NMEA TAG output and ingress cleanup |
-| `forwarder.py` | UDP broadcast and targeted egress |
-
----
-
-## 📐 Processing contract
-
-[BEHAVIORAL_CONTRACT.md](BEHAVIORAL_CONTRACT.md) is the normative, tested
-contract for the Python reference implementation and the basis for future
-differential testing of a native processor. This README remains an operational
-overview, not a duplicate normative specification.
-
-The processor stage accepts immutable `IngressFrame` objects directly and
-retains one adapter for legacy `IngressEvent` objects whose `raw_line` is a
-`str`, including subclasses. Invalid compatibility events and unsupported
-items are ignored before routing. Each accepted frame uses one routing snapshot
-and source match; its payload is scanned as bytes, and fragment fields and
-relevant TAG metadata are parsed once. The Python compatibility assembler
-currently materializes matched sentence spans as strings.
-
-Multipart assembly supports fully out-of-order arrivals: an exact repeat at an
-occupied ordinal is idempotent for assembly, while a different sentence at
-that ordinal invalidates the live assembler generation. Multipart
-deduplication decisions are group-atomic, and multipart TAG `s`, `c`, and `g`
-state follows assembler lifecycle boundaries.
-
-Deduplication state, multipart assembly state, processor-owned multipart
-metadata, and secure replay/session/nonce state have explicit, deterministic,
-process-local TTL lifecycles. The Python reference state objects accept an
-optional deduplication `max_entries` capacity and optional assembly
-`max_fragments_per_group` and `max_pending_groups` limits. Current service
-wiring uses their `None` defaults, leaving those dimensions unbounded. When
-capacity admission applies, expired state is handled before deterministic
-eviction of live state. The deduplication, assembly, and secure state objects
-expose immutable statistics snapshots for inspection and testing. Exact
-lifecycle boundaries and edge cases remain in the behavioural contract.
-
----
-
-## 🚀 Quick start: legacy broadcast mode
-
-When no top-level `routing:` section is configured, AISMixer keeps its original
-broadcast behavior:
-
-- deduplication is global;
-- every accepted output sentence is sent to every configured forwarder;
-- unnamed forwarders remain valid;
-- routing-control generations may exist, but the active routing table is
-  disabled.
-
-Minimal example:
+The installed service reads `/etc/aismixer/config.yaml`. With no top-level
+`routing:` section, AISMixer uses legacy broadcast mode: deduplication is global
+and every accepted output sentence goes to every configured forwarder.
 
 ```yaml
 station_id: mixstation_1
@@ -222,134 +102,40 @@ udp_inputs:
     listen_port: 17777
 
 forwarders:
-  - host: 203.0.113.10
-    port: 5000
-  - host: 127.0.0.1
+  - id: local_display
+    host: 127.0.0.1
     port: 19000
 ```
 
-Run from the repository:
-
-```bash
-python3 aismixer.py
-```
+The repository examples are inactive until copied or adapted. See
+[`examples/config-routing.yaml`](examples/config-routing.yaml) for static
+routing and
+[`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
+for routing with local control enabled.
 
 ### Network endpoint controls
 
-`listen_ip` selects one address family for both `udp_inputs` and `sec_inputs`:
-`0.0.0.0` listens on all local IPv4 addresses and accepts IPv4 only, while `::`
-listens on all local IPv6 addresses and accepts IPv6 only. For dual-stack
-ingress, configure both entries explicitly; they may use the same port number.
+- `listen_ip` selects one address family. Use separate entries for IPv4 and
+  IPv6 dual-stack ingress.
+- Optional `udp_inputs[].allow_from` and `sec_inputs[].allow_from` values are
+  application-level literal-IP/CIDR allow-lists. Omission applies no application
+  ACL; an explicitly empty list denies all packets for that listener.
+- Optional `forwarders[].source_ip` binds an outbound UDP socket to a literal
+  local source address.
 
-Two optional network-boundary controls are available in AISMixer
+These controls complement, rather than replace, host firewall and routing
+policy.
+
+## 🧰 `aismixerctl`
+
+`install.sh` installs `/usr/local/bin/aismixerctl`. The command talks to the
+optional local Unix-domain control socket; it does not modify configuration
+files or persist runtime routing across a restart.
+
+### Enable local control
+
+The control service is disabled until explicitly enabled in AISMixer
 configuration:
-
-- `forwarders[].source_ip` binds an outbound UDP forwarder socket to a literal
-  IPv4 or IPv6 source address. When omitted, the operating system chooses the
-  source address as before. Hostnames in `forwarders[].host` are resolved only
-  within the address family selected by `source_ip`.
-- `udp_inputs[].allow_from` and `sec_inputs[].allow_from` are
-  application-level ingress allow-lists. When the key is omitted, AISMixer does
-  not apply an application ACL. An explicitly empty list denies all packets for
-  that listener. Entries must be literal IP addresses or CIDR networks; hostnames
-  are rejected during startup.
-
-The ingress ACL complements the host firewall; it does not replace firewall,
-routing, or interface-level policy.
-
-```yaml
-udp_inputs:
-  - id: roof_receiver
-    listen_ip: "0.0.0.0"
-    listen_port: 17777
-    allow_from:
-      - 192.0.2.15
-      - 198.51.100.0/24
-
-sec_inputs:
-  - id: secure_stations
-    listen_ip: "::"
-    listen_port: 19999
-    allow_from:
-      - 2001:db8:42::/64
-      - 2001:db8:43::44
-
-forwarders:
-  - id: aishub
-    host: feed.example.net
-    port: 10110
-    source_ip: 192.0.2.15
-```
-
----
-
-## 🗺️ Static logical routing
-
-Routing mode is enabled by adding a valid top-level `routing:` section.
-
-In routing mode:
-
-- matching uses the accepted frame's internal `source_id`;
-- matching does **not** use the emitted NMEA TAG `s` value;
-- route targets must reference named forwarders;
-- unknown or unsupported target IDs fail startup validation;
-- zones are logical source-ID sets, not geographic AIS areas;
-- deduplication is scoped per logical `target_id`.
-
-### 🪪 Canonical source and target IDs
-
-- `udp:<input-id>` when `udp_inputs[].id` is configured.
-- `udp:<mapped-alias>` when a UDP alias map supplies identity.
-- `udp:<remote-ip>` when no UDP ID or alias is available.
-- `udpsec:<authenticated-station-id>` for an authenticated UDPSEC station.
-- `udp:<forwarder-id>` for a named UDP forwarder.
-
-`sec_inputs[].id` may affect the emitted TAG `s` alias when the global
-`station_id` is empty, but it does not replace the authenticated UDPSEC routing
-source ID.
-
-### 🧮 Logical zone operations
-
-```yaml
-routing:
-  zones:
-    fixed_receivers:
-      include:
-        - udp:roof
-        - udp:dock
-
-    mobile_receivers:
-      include:
-        - udpsec:boat_ais
-
-    trusted_sources:
-      union:
-        - fixed_receivers
-        - mobile_receivers
-
-    trusted_fixed_sources:
-      intersection:
-        - trusted_sources
-        - fixed_receivers
-
-    public_without_boat:
-      difference:
-        - trusted_sources
-        - mobile_receivers
-```
-
-Operands for `union`, `intersection`, and `difference` are names of other
-logical zones. They are not coordinates, geographic regions, MMSI lists, or
-vessel filters.
-
-See [`examples/config-routing.yaml`](examples/config-routing.yaml) for an
-inactive full static-routing example.
-
----
-
-## 🎛️ Runtime routing control
-
-The Unix control server remains disabled until explicitly enabled:
 
 ```yaml
 control:
@@ -357,199 +143,237 @@ control:
     enabled: true
     socket_path: /run/aismixer/control.sock
     socket_mode: "0660"
-    max_request_bytes: 1048576
 ```
 
-### ⚠️ Operational notes
+The installed systemd unit creates `/run/aismixer` while the service is running.
+Socket ownership and mode determine access; there is no application-level
+authentication token. The interface requires POSIX Unix-domain socket support.
 
-- Adding `control:` or `control.unix:` alone does not enable the server.
-- The installed systemd unit uses `RuntimeDirectory=aismixer` to create
-  `/run/aismixer` before AISMixer starts. systemd removes that runtime directory
-  after the service stops; it is not persistent state.
-- If AISMixer is run outside the installed systemd unit, provide an equivalent
-  parent directory for the configured socket path.
-- Filesystem ownership, group, and mode control access to the socket.
-- The installed unit sets no `User=`, `Group=`, or `DynamicUser=` and has no
-  dedicated service account.
-- With the current root-run service and `socket_mode: "0660"`, access may
-  effectively be root-only unless the operator deliberately configures
-  ownership or group policy for the socket.
-- There is no application-level authentication token.
-- The interface is POSIX-only; Windows can run pure tests and development code,
-  but not the Unix socket listener.
-- Runtime routing changes are process-local and disappear after restart.
+### Interactive workflow
 
-See
-[`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
-for an inactive complete configuration with static routing and runtime control.
-
----
-
-## 🧰 `aismixerctl`
-
-The installer deploys a small POSIX wrapper at `/usr/local/bin/aismixerctl`.
-The wrapper executes `/usr/bin/python3 /opt/aismixer/aismixerctl.py "$@"` and
-contains no routing or protocol logic.
-
-Run the CLI as a socket-authorized user. With the default root-owned installed
-socket, this normally means:
-
-```bash
-sudo aismixerctl status
-```
-
-From a repository checkout or copied service directory, use:
-
-```bash
-python3 aismixerctl.py status
-```
-
-Use `--socket` to override the default path:
-
-```bash
-aismixerctl --socket /custom/path.sock status
-```
-
-Replace the active process-local routing snapshot:
-
-```bash
-sudo aismixerctl \
-  replace \
-  --file examples/routing-update.yaml \
-  --expected-generation 3
-```
-
-Disable routing and return the running process to legacy broadcast mode:
-
-```bash
-sudo aismixerctl \
-  disable \
-  --expected-generation 4
-```
-
-### 🔢 Generation semantics
-
-- `status` returns the current generation.
-- `replace` and `disable` may carry an expected generation.
-- A stale update is rejected instead of overwriting a newer snapshot.
-- The CLI does not retry automatically.
-
-`replace --file` accepts either:
-
-1. a full configuration containing a top-level `routing:` mapping; or
-2. a direct routing section containing only `zones:` and `routes:`.
-
-`routing: null` is not a replacement request; use `disable`.
-
-See [`examples/routing-update.yaml`](examples/routing-update.yaml) for a direct
-routing-section update file.
-
----
-
-## 🔐 `nmea_sproxy` Outputs
-
-UDPSEC is AISMixer's authenticated encrypted station-to-mixer UDP transport; it is not an
-external standardized protocol. For each handshake, each endpoint creates a fresh ephemeral
-P-256 keypair; the authenticated ECDHE exchange produces the shared secret. Out-of-band long-term P-256
-identity keys let the endpoints mutually authenticate the exchange with ECDSA signatures over
-transcript-bound SHA-256 digests; they are not key-agreement inputs. HKDF-SHA256 derives
-independent client-to-server and server-to-client AES-256-GCM traffic keys from the ephemeral
-shared secret and authenticated transcript. After sending its authenticated ServerHello, the
-server keeps a pending session until an encrypted sequence-zero client-to-server ping confirms
-key possession; it then promotes the session and sends an encrypted server-to-client pong,
-which the client authenticates. Forward secrecy against later identity-key compromise requires
-past ephemeral private keys and raw ECDHE shared secrets to be gone and neither endpoint to have
-been compromised while they were in memory. Endpoint compromise exposes current material; a
-currently compromised identity private key enables future impersonation. These properties are
-supported by engineering validation, not formal cryptographic verification. Authorized station
-public keys are configured through `authorized_keys.yaml`. Handshake replay plus pending and active
-sessions are bounded, TTL-managed, and process-local. Data packets use random 12-byte nonces with
-per-session replay detection. Allowed traffic drives expiry cleanup; secure replay/session/nonce
-state is lost on restart. UDPSEC protects packets in transit but does not prove AIS payloads
-semantically true or physically accurate.
-
-See the [`nmea_sproxy` guide](nmea_sproxy/README.md), [security
-policy](SECURITY.md), [behavioural contract](BEHAVIORAL_CONTRACT.md), and
-[Wiki](https://github.com/iliyan85/aismixer/wiki) for protocol operation,
-security scope, exact state semantics, and deeper background.
-
-`nmea_sproxy` is the station-side proxy:
+The interactive shell is the quickest way to discover current state and inspect
+process-local counters. With the default root-owned socket:
 
 ```text
-one local input (UDP or serial) → one AISMixer UDPSEC or UDP input
+sudo aismixerctl
+aismixerctl> status
+aismixerctl> show statistics
+aismixerctl> show statistics inputs
+aismixerctl> show statistics outputs
 ```
 
-Example commands:
+Use `help` inside the shell. Input and output statistics commands also accept an
+optional input or output filter. One-shot commands remain available for scripts.
+
+### Routing updates
+
+Replace or disable the active process-local routing snapshot atomically:
+
+```bash
+sudo aismixerctl replace --file examples/routing-update.yaml --expected-generation 3
+sudo aismixerctl disable --expected-generation 4
+```
+
+The expected generation is optional; when supplied, it prevents a stale update
+from overwriting newer state. The CLI does not retry automatically.
+
+## 🔐 `nmea_sproxy`
+
+`nmea_sproxy` is the station-side network proxy. One process or systemd instance
+represents one relation: one local UDP or physical serial/USB input to one
+network output. UDPSEC is the secure/default transport to AISMixer; plain UDP
+must be selected explicitly and is intended only for trusted LAN/VPN paths.
+
+### Install and start
+
+From the AISMixer checkout:
 
 ```bash
 cd nmea_sproxy
-python3 nmea_sproxy.py
-sudo systemctl start nmea_sproxy
-sudo systemctl start nmea_sproxy@boat
+chmod +x install.sh
+./install.sh
 ```
 
-Template names such as `boat`, `yacht`, or `balchik_roof` are operator-chosen
-labels. See [`nmea_sproxy/README.md`](nmea_sproxy/README.md) for the detailed
-station-side guide.
+The proxy installer prepares the configuration layout and station key pair while
+preserving existing operator material, installs singleton and template units,
+enables only the singleton, and starts no service. Complete the relation
+configuration and, for the default UDPSEC mode, the trusted AISMixer public-key
+setup described in the [operator guide](nmea_sproxy/README.md), then start it:
 
-`nmea_sproxy` has its own station-side endpoint controls: top-level
-`allow_from` limits which local/LAN UDP senders may be forwarded under the
-station identity. Top-level `source_ip` is the legacy UDPSEC source binding;
-for explicit `output:` mappings, `output.source_ip` binds either UDPSEC or plain
-UDP output sockets to a literal source address. These are configured in
-`nmea_sproxy` relation files; they are separate from AISMixer's `udp_inputs[]`,
-`sec_inputs[]`, and `forwarders[]` controls.
+```bash
+systemctl start nmea_sproxy.service
+systemctl status nmea_sproxy.service
+```
 
-For stations with a physical AIS receiver, `nmea_sproxy` can also read directly
-from a serial or USB virtual COM port and forward the resulting NMEA sentences
-through the configured UDPSEC or UDP output. It can also explicitly forward
-plain UDP for trusted LAN/VPN environments; plain UDP provides no UDPSEC
-authentication, encryption, replay protection, or liveness protocol.
+### Singleton and template instances
 
----
+The singleton reads `/etc/nmea_sproxy/config.yaml`. Template instances such as
+`boat`, `yacht`, or `roof` use operator-chosen relation names and configuration
+under `/etc/nmea_sproxy/instances/`. Copy and edit a relation file before
+starting its instance:
+
+```bash
+cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
+systemctl enable --now nmea_sproxy@boat.service
+systemctl status nmea_sproxy@boat.service
+```
+
+Run another template instance when another independent relation is required. A
+template-only deployment should disable and stop the unused singleton with
+`systemctl disable --now nmea_sproxy.service`.
+
+### Update
+
+The proxy updater is also tracked without an executable bit. From the repository
+root, make it executable once and run it after pulling changes:
+
+```bash
+git pull --ff-only
+cd nmea_sproxy
+chmod +x update.sh
+./update.sh
+```
+
+Unlike AISMixer's updater, `nmea_sproxy/update.sh` updates installed files and
+reloads systemd but intentionally **does not restart** the singleton or any
+template instance. Restart only the relations you choose, when ready:
+
+```bash
+systemctl restart nmea_sproxy.service
+systemctl restart nmea_sproxy@boat.service
+```
+
+### Security boundary
+
+UDPSEC is AISMixer's project-specific authenticated and encrypted UDP transport,
+not an external standard. It mutually authenticates configured endpoint
+identities, protects packet confidentiality and integrity in transit, and
+provides replay and liveness checks. Its forward-secrecy properties depend on
+ephemeral secrets being discarded and endpoints not being compromised while
+those secrets are live; the design has engineering validation, not formal
+cryptographic verification. UDPSEC does not prove that AIS payloads are
+semantically true or physically accurate. Explicit plain UDP provides no
+confidentiality, station authentication, cryptographic integrity, replay
+protection, or liveness protocol. See the
+[`nmea_sproxy` guide](nmea_sproxy/README.md), [security policy](SECURITY.md),
+[behavioural contract](BEHAVIORAL_CONTRACT.md), and
+[Wiki](https://github.com/iliyan85/aismixer/wiki) for keys, trust, configuration,
+session behavior, endpoint policy, and troubleshooting.
+
+## ✅ Current capabilities
+
+### 📡 Ingress and egress
+
+- UDP ingress over IPv4 and IPv6, with optional application-level allow-lists.
+- Authenticated encrypted UDPSEC ingress compatible with `nmea_sproxy`.
+- Physical serial and USB virtual COM input through `nmea_sproxy`, plus explicit
+  plain UDP for trusted networks.
+- Optional outbound source-address binding for AISMixer and proxy outputs.
+- UDP broadcast egress in legacy mode and named UDP targets in routing mode.
+
+### ⚙️ Processing
+
+- Extraction of supported `!AIVDM`, `!AIVDO`, and compatible AIS sentences.
+- Fully out-of-order multipart assembly; exact repeats are idempotent and
+  conflicting fragments invalidate the live group.
+- Deterministic, lifecycle-aware NMEA TAG `s`/`c`/`g` handling.
+- Group-atomic multipart deduplication: global in legacy mode and scoped to each
+  `target_id` in routing mode.
+- Bounded process-local ingress, processing, and egress queues apply
+  backpressure; mutable data-plane state has an explicit instance-owned
+  processor lifecycle and reset boundary.
+- Explicit process-local TTL lifecycles, optional reference-state capacities,
+  and fresh immutable, pull-based runtime statistics snapshots.
+
+### 🔀 Routing and operation
+
+- Legacy broadcast mode or static logical routing loaded at startup.
+- Named ingress `source_id` and egress `target_id` identities.
+- Logical source zones with `include`, `union`, `intersection`, and `difference`.
+- One immutable `ProcessingSnapshot`, bound only when an ingress frame is
+  admitted; routing mode performs one source match at that point.
+- Optional atomic runtime routing replacement through `aismixerctl`.
+- Supervised process-local ingress, processing, and egress tasks; the optional
+  control listener is lifecycle-managed separately.
+
+## 🔀 Architecture
+
+AISMixer keeps the data plane and optional control plane separate.
+
+### 📡 Data plane
+
+UDP and UDPSEC producers create immutable ingress frames in private bounded
+queues. Fan-in admits them to bounded processing before the one instance-owned
+processor scans NMEA data, assembles multipart messages, applies global or
+target-scoped deduplication, and builds controlled TAG metadata. Full AISMixer
+stage queues wait with backpressure instead of dropping their queued items.
+
+Each admitted frame has one bound `ProcessingSnapshot`; routing mode adds one
+source match. Non-empty `OutputBatch` values cross a bounded egress handoff in
+order, and processing waits for local egress completion before advancing. There
+is no automatic delivery replay if a supervised runtime task fails.
+
+### 🎛️ Control plane
+
+When enabled, the local NDJSON Unix-domain service validates requests against
+available target IDs and atomically swaps immutable process-local routing state.
+It also exposes runtime status plus read-only aggregate, per-input, and
+per-output runtime statistics to `aismixerctl`.
+
+### 🧩 Main components
+
+| Component | Role |
+|---|---|
+| `aismixer.py` | Runtime lifecycle, ingress fan-in, processing, egress, and optional control |
+| `core/routing*.py` | Logical routing and immutable snapshots |
+| `core/routing_control*.py` / `core/runtime_control.py` | Control protocol and Unix-domain service |
+| `core/runtime_statistics.py` | Process-local runtime counters and immutable views |
+| `aismixerctl.py` | Operator control and statistics CLI |
+| `aismixer_secure.py` | UDPSEC ingress |
+| `nmea_sproxy/` | Station-side UDP/serial-to-UDPSEC/UDP proxy |
+| `assembler.py` / `dedup.py` | Multipart assembly and duplicate suppression |
+| `meta_writer.py` / `meta_cleaner.py` | NMEA TAG output and ingress cleanup |
+| `forwarder.py` | UDP broadcast and targeted egress |
+
+The normative processing and runtime semantics are in
+[BEHAVIORAL_CONTRACT.md](BEHAVIORAL_CONTRACT.md). This README is an operator
+overview, not a second specification.
+
+## 🗺️ Logical routing
+
+### Legacy broadcast
+
+Without a top-level `routing:` section, deduplication is global and every
+accepted sentence goes to every forwarder. Unnamed forwarders remain valid.
+
+### Static routing
+
+A valid top-level `routing:` section enables ordered routes from source IDs or
+logical zones to named forwarders. Zones are source-ID sets, not geographic
+areas, MMSI lists, or vessel filters. Deduplication is scoped per target.
+
+Canonical identities include `udp:<input-id>`, `udp:<mapped-alias>`,
+`udp:<remote-ip>`, `udpsec:<authenticated-station-id>`, and
+`udp:<forwarder-id>` for named UDP targets. Routing matches internal source IDs,
+not emitted TAG `s` labels. See the [static example](examples/config-routing.yaml).
+
+### Runtime routing
+
+When local control is enabled, `routing.replace` and `routing.disable` affect
+frames not yet admitted to bounded processing through one atomic snapshot
+change; admitted work keeps its bound snapshot. Updates are process-local and
+disappear at restart. See the
+[control example](examples/config-routing-control.yaml) and
+[update payload](examples/routing-update.yaml).
 
 ## 🏷️ NMEA TAG behavior
 
-AISMixer reads ingress TAG metadata and emits a controlled `s`/`c`/`g` TAG
-block according to the runtime options described below.
-
-For multipart groups, TAG `s`, `c`, and `g` context follows assembler conflict,
-expiry, capacity-eviction, and completion boundaries. The exact ownership and
-selection rules are defined in
-[BEHAVIORAL_CONTRACT.md](BEHAVIORAL_CONTRACT.md).
-
-### 🪪 TAG `s` — source label
-
-The emitted TAG `s` value is selected separately from routing `source_id`.
-
-Priority:
-
-1. non-empty global `station_id`;
-2. per-input ID, UDP alias, or authorized UDPSEC station/client name;
-3. incoming TAG `s` when present;
-4. remote IP fallback.
-
-The emitted value is sanitized to `[A-Za-z0-9_]` and limited to 15 characters.
-Routing source IDs are opaque internal identifiers and are not sanitized or
-truncated as TAG `s` values.
-
-### 🕒 TAG `c` — timestamp
-
-For multipart groups, `c_preserve_ingress_c: true` selects the minimum valid
-numeric ingress TAG `c` value observed during the live assembler generation,
-independently of arrival order. When preservation is disabled or no valid value
-is present, AISMixer emits server time. The behavioural contract records the
-intentional single-sentence `c:0` compatibility exception.
-
-### 🧷 TAG `g` — output group metadata
-
-TAG `g` is ingress/output metadata for multipart messages. It is **not** the
-assembler key. Multipart assembly uses NMEA fragment fields together with the
-ingress assembler identity. Preserved group IDs use exact string agreement;
-missing or disagreeing observations produce one generated ID for the completed
-logical group.
-
-Relevant options:
+AISMixer reads ingress TAG metadata and emits controlled `s`/`c`/`g` metadata.
+The emitted `s` label is selected separately from the internal routing source ID
+and is sanitized for NMEA output. Depending on configuration, `c` can preserve
+valid ingress time or use server time, and multipart `g` can preserve an agreed
+ingress group ID or generate one output ID. TAG `g` is metadata, not the
+multipart assembler key.
 
 ```yaml
 g_preserve_ingress_gid: true
@@ -558,69 +382,20 @@ g_always_tag_single: false
 c_preserve_ingress_c: true
 ```
 
----
+Exact priority, multipart ownership, conflict, expiry, and compatibility rules
+belong to the [behavioural contract](BEHAVIORAL_CONTRACT.md).
 
-## 📦 Installation
+## 📚 Examples and testing
 
-Install the repository-managed systemd service and global CLI wrapper:
-
-```bash
-./install.sh
-```
-
-The installer deploys runtime files to `/opt/aismixer`, installs
-`aismixer.service`, installs `/usr/local/bin/aismixerctl`, reloads systemd, and
-enables the service. It does not start AISMixer automatically. The unit uses
-`RuntimeDirectory=aismixer`, so systemd creates `/run/aismixer` while the
-service is running and removes it after the service stops.
-
-The installed service reads `/etc/aismixer/config.yaml`. On first installation,
-`install.sh` seeds `/etc/aismixer` from the repository configuration while
-preserving any existing operator configuration and keys.
-
-Update installed runtime files and restart the service with:
-
-```bash
-./update.sh
-```
-
-`update.sh` leaves operator configuration and keys under `/etc/aismixer`
-untouched.
-
-Uninstall the service and installed runtime files with:
-
-```bash
-./uninstall.sh
-```
-
-By default, uninstall preserves `/etc/aismixer`; the explicit
-`./uninstall.sh --purge-config` option also removes operator configuration and
-keys.
-
----
-
-## 📚 Examples
-
-The examples are inactive until copied or adapted by an operator:
-
-- [`examples/config-routing.yaml`](examples/config-routing.yaml) — full static
-  routing configuration.
+- [`examples/config-routing.yaml`](examples/config-routing.yaml) — static routing.
 - [`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
-  — full routing configuration with `control.unix` enabled.
+  — static routing with local control.
 - [`examples/routing-update.yaml`](examples/routing-update.yaml) — direct routing
-  section for `aismixerctl replace --file`.
-- [`examples/README.md`](examples/README.md) — short guide to the example files.
+  update for `aismixerctl`.
+- [`examples/README.md`](examples/README.md) — example-file guide.
 
-All addresses, IDs, ports, paths, and keys in example files must be adapted to
-the deployment.
-
----
-
-## 🧪 Testing
-
-The test suite covers multipart assembly, TAG handling, metadata processing,
-UDPSEC helpers, routing, snapshot replacement, control protocol and transports,
-`aismixerctl`, and forwarding behavior.
+All example addresses, IDs, ports, paths, and keys require operator adaptation.
+Run the repository test suite with:
 
 ```bash
 python -m pytest
@@ -629,38 +404,41 @@ python -m pytest
 Real Unix-domain listener tests require Linux, WSL, Raspberry Pi OS, or another
 POSIX environment with asyncio Unix-socket support.
 
----
-
 ## ⚠️ Current limitations
 
-- UDP is the only currently implemented AISMixer egress adapter.
-- Routing state and generations are process-local; runtime changes are not
-  persisted.
+- UDP is the only implemented AISMixer egress adapter.
+- Routing state, generations, and runtime statistics are process-local; runtime
+  routing changes are not persisted.
 - Secure replay, session, and nonce state is process-local and non-durable;
-  expiry cleanup is traffic-driven rather than background-timer-driven.
-- Current service wiring leaves the optional deduplication and assembly limits
-  at `None`, so those dimensions have no capacity bound.
-- There is no multiprocessing coordinator or cross-process synchronization.
-- There is no automatic config reload/watch.
-- There is no geographic, MMSI, or vessel-content filtering.
-- There is no long-term storage, analytics, or spoof detection.
-- Unix control requires POSIX Unix-domain socket support.
-- Control access relies on Unix filesystem permissions, with no
-  application-level token.
-- A dedicated service user/group policy is not yet introduced.
+  expiry cleanup is driven by allowed traffic.
+- Current service wiring leaves optional deduplication and assembly capacities
+  at `None`.
+- There is no coordinator process or separate ingress/egress worker processes,
+  IPC, cross-process routing or metrics aggregation, automatic worker restart,
+  or configuration reload.
+- There is no geographic, MMSI, vessel-content, long-term storage, analytics, or
+  spoof-detection feature.
+- Local control requires POSIX Unix sockets and relies on filesystem permissions;
+  there is no application token or dedicated service account policy.
 
----
+## 📖 Documentation map
 
-## 📖 Further documentation
+- [Behavioural contract](BEHAVIORAL_CONTRACT.md) — normative processing and
+  runtime semantics.
+- [`nmea_sproxy` operator guide](nmea_sproxy/README.md) — complete station-side
+  installation, configuration, keys, serial, output, service, and troubleshooting
+  guidance.
+- [GitHub Wiki](https://github.com/iliyan85/aismixer/wiki) — deeper architecture
+  and explanatory material.
+- [Examples](examples/README.md) · [Security policy](SECURITY.md) ·
+  [Contributing guide](CONTRIBUTING.md) · [Roadmap](ROADMAP.md) ·
+  [Public website](https://aismixer.net)
 
-- [Behavioural contract](BEHAVIORAL_CONTRACT.md)
-- [Examples](examples/README.md)
-- [`nmea_sproxy` operator guide](nmea_sproxy/README.md)
-- [GitHub Wiki](https://github.com/iliyan85/aismixer/wiki)
-- [Contributing guide](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
-- [Project roadmap](ROADMAP.md)
-- [Public website](https://aismixer.net)
+## 🌿 Branches and website
+
+`main` contains the service, proxy, examples, control components, and `tests/`.
+The public website lives on `website`; GitHub Pages uses `/docs` from that branch,
+so `docs/` is intentionally absent from `main`.
 
 [⬆ Back to language selector](#english)
 
@@ -683,36 +461,67 @@ POSIX environment with asyncio Unix-socket support.
 > AISMixer приема AIS потоци от няколко приемника, извлича `!AIVDM` и `!AIVDO`,
 > сглобява multipart съобщения, премахва близки във времето дубликати, управлява
 > NMEA TAG метаданните и препраща един чист логически поток. По желание
-> логическата маршрутизация насочва всеки входен източник към избрани именувани
-> UDP цели, а `aismixerctl` може атомарно да замени или изключи активната
-> моментна снимка на маршрутизацията през локален Unix-domain socket за
-> управление.
+> логическата маршрутизация насочва входните източници към именувани UDP цели, а
+> локалният интерфейс `aismixerctl` предоставя статус и статистика по време на
+> работа и атомарни промени на маршрутизацията.
 
----
+## 🚀 Бърз старт
 
-## 🌿 Клонове и уебсайт
+Скриптовете за жизнения цикъл могат да се изпълняват директно като root. Когато
+ги стартира потребител без root права, те повишават правата на привилегированите
+операции чрез `sudo`; ако нито едно от двете не е налично, спират с обяснение.
 
-Клонът `main` е основният клон за работа и разработка. В него са Python
-услугата, компонентите на защитеното мрежово прокси, конфигурационните примери,
-модулите на слоя за управление и тестовете в `tests/`.
+Самостоятелните команди `systemctl` и командите, които пишат в `/etc`,
+предполагат root shell; при нужда потребител без root права трябва да добави
+`sudo`.
 
-Публичният сайт е в дългоживеещия клон `website`. GitHub Pages се публикува от
-него с `/docs` като основна директория на сайта, затова `docs/` умишлено не
-присъства в `main`.
+### Нова инсталация
 
----
+На Debian или Raspberry Pi OS система със systemd:
+
+```bash
+git clone https://github.com/iliyan85/aismixer
+cd aismixer
+chmod +x install.sh
+./install.sh
+systemctl start aismixer
+systemctl status aismixer
+```
+
+`install.sh` разполага runtime файловете в `/opt/aismixer`, създава липсващите
+файлове в `/etc/aismixer`, без да презаписва съществуващите конфигурации и
+ключове, инсталира глобалната команда `aismixerctl` и включва AISMixer за
+автоматично стартиране при boot. Умишлено **не** стартира услугата. Прегледайте
+`/etc/aismixer/config.yaml`, преди да изложите услугата извън доверена мрежа.
+
+### Обновяване
+
+Хранилището проследява скриптовете за жизнения цикъл без executable bit. Преди
+първото обновяване изпълнете еднократно `chmod +x update.sh`. След това обновете
+от локалното копие:
+
+```bash
+git pull --ff-only
+./update.sh
+systemctl status aismixer
+```
+
+`update.sh` обновява инсталираните runtime файлове, systemd unit-а и
+`aismixerctl`, презарежда systemd и **рестартира AISMixer**. Операторските
+конфигурации и ключове в `/etc/aismixer` остават непроменени. `uninstall.sh`
+запазва тази директория, освен ако изрично не е зададено `--purge-config`.
 
 ## 🧭 Какво е AISMixer?
 
-**AISMixer** е Python услуга за приемане, нормализиране, дедупликация, обработка
-на TAG метаданни, маршрутизация и препращане на AIS NMEA 0183 потоци.
+**AISMixer** е ориентирана към реална експлоатация Python услуга за приемане,
+нормализиране, дедупликация, обработка на TAG метаданни, маршрутизация и
+препращане на AIS NMEA 0183 потоци.
 
-- **`aismixer.py`** е дългосрочно работещата смесваща услуга от слоя за данни.
-- **`nmea_sproxy`** е мрежовото прокси при станцията. Един процес препраща един
-  локален UDP или физически сериен вход към един UDPSEC или UDP вход на
-  AISMixer.
-- **`aismixerctl.py`** е операторският инструмент за команден ред към
-  незадължителния локален сокет за управление на маршрутизацията.
+- **`aismixer.py`** е дългосрочно работещата mixer услуга от слоя за данни.
+- **`aismixerctl`** е инсталираната операторска команда за незадължителния локален
+  сокет за управление.
+- **`nmea_sproxy`** е проксито при станцията за един локален UDP или сериен вход
+  и един UDPSEC или изрично конфигуриран plain-UDP изход.
 
 ```text
 AIS приемник UDP      \
@@ -722,181 +531,18 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP цели       |
                                 +----------------+
                                          ^
                                          |
-                            незадължителен Unix слой
-                                  за управление
+                               незадължително локално
+                                     управление
                                          |
                                    aismixerctl
 ```
 
----
+## ⚙️ Основна конфигурация
 
-## ✅ Текущи възможности
-
-### 📡 Входове и изходи
-
-- UDP входове по IPv4 и IPv6 с незадължителни списъци с разрешени адреси за
-  UDP/UDPSEC входовете на AISMixer и локалния UDP вход на `nmea_sproxy`.
-- Автентикиран и криптиран UDPSEC вход, съвместим с `nmea_sproxy`.
-- Физически сериен порт и USB virtual COM вход чрез `nmea_sproxy`, както и
-  изричен режим с plain UDP за доверени LAN/VPN среди.
-- Незадължително обвързване с изходен адрес за UDP forwarder-ите на AISMixer и
-  за UDPSEC и plain UDP изходите на `nmea_sproxy`.
-- Broadcast UDP изход в legacy режим и именувани UDP цели в routing режим.
-
-### ⚙️ Обработка
-
-- Извличане на поддържаните `!AIVDM` и `!AIVDO` изречения.
-- Сглобяване на multipart съобщения независимо от реда на пристигане; точните
-  повторения са идемпотентни за сглобяването, а конфликтните фрагменти
-  обезсилват активната група.
-- Детерминистична обработка на NMEA TAG `s`/`c`/`g`, съобразена с жизнения цикъл.
-- Решения за дедупликация, атомарни за цялата multipart група: глобални в legacy
-  режим и отделни за всеки `target_id` в routing режим.
-- Изрични, локални за процеса TTL жизнени цикли, проверени с тестове, за
-  дедупликацията, сглобяването, multipart метаданните, управлявани от процесора,
-  и състоянието на защитения вход.
-- Незадължителни ограничения, задавани чрез конструктора на обектите за локално
-  състояние в референтната Python реализация, както и неизменяеми моментни
-  снимки на статистиката за дедупликация, сглобяване и защитено състояние.
-
-### 🔀 Маршрутизация и експлоатация
-
-- Legacy broadcast режим или статична логическа маршрутизация, заредена при
-  стартиране.
-- Именувани входни `source_id` и изходни `target_id` идентификатори.
-- Логически зони на източници с `include`, `union`, `intersection` и
-  `difference`, използвани от подредени маршрути.
-- Една неизменяема моментна снимка на маршрутизацията и едно съпоставяне на
-  източника за всеки приет `IngressFrame`.
-- Незадължителна атомарна подмяна на маршрутизацията по време на работа чрез
-  Unix-domain socket с NDJSON протокол и `aismixerctl`.
-- `routing.status`, `routing.replace` и `routing.disable`.
-- Поддържана в хранилището systemd услуга с `RuntimeDirectory=aismixer` и
-  глобален `/usr/local/bin/aismixerctl` wrapper, инсталиран от скриптовете за
-  жизнения цикъл.
-
----
-
-## 🔀 Архитектура
-
-AISMixer разделя **слоя за данни** (`data plane`) и **слоя за управление**
-(`control plane`).
-
-### 📡 Слой за данни
-
-Вградените UDP и UDPSEC входове създават неизменяеми `IngressFrame` обекти, а
-един ingress fan-in пренася елементите от опашките непроменени към етапа за
-обработка. Този етап приема директните `IngressFrame` обекти със запазена
-идентичност на обекта, извиква синхронния референтен Python процесор и поддържа
-един адаптер за съвместимост с валидни legacy `IngressEvent` обекти;
-невалидните събития за съвместимост и неподдържаните елементи от опашката се
-пренебрегват преди маршрутизирането. След това всеки непразен пълен пакет от
-изходи на процесора се предава към един egress етап, който го изпраща
-последователно, преди етапът за обработка да приеме следващия елемент.
-
-Всички задачи за UDP и UDPSEC входовете, ingress fan-in задачата и задачите на
-етапите за обработка и egress се наблюдават като един локален за процеса жизнен
-цикъл. Грешка или неочаквано приключване на която и да е от тях прекратява
-runtime-а, след като останалите задачи бъдат отменени и изчакани; няма
-автоматично рестартиране, повторен опит или повторно изпращане на данните.
-
-За всеки приет `IngressFrame` слоят за данни взема една неизменяема моментна
-снимка на маршрутизацията и съпоставя `source_id` веднъж. Той сканира payload-а
-на `IngressFrame` обекта като байтове, парсва веднъж NMEA полетата на фрагмента
-и приложимите TAG метаданни, подава парснатите изречения към assembler-а,
-прилага глобална или отделна за всяка цел дедупликация, изгражда изходните TAG
-метаданни и препраща приетите изречения към UDP дестинациите. Python
-реализацията на assembler-а за съвместимост в момента материализира и
-съхранява съвпадналите изречения като низове.
-
-Campaign D остава изцяло Python и локална за процеса и не дефинира нативен API
-или ABI. Нативните реализации на процесора, coordinator/worker процесите,
-multiprocessing и IPC остават бъдеща работа.
-
-- **Legacy режим:** глобална дедупликация и broadcast към всички forwarder-и.
-- **Routing режим:** логическо съпоставяне на източника, дедупликация по цел и
-  целево препращане към именувани UDP дестинации.
-- За всеки приет `IngressFrame` се използват една моментна снимка на
-  маршрутизацията и едно съпоставяне на източника; паралелна промяна в слоя за
-  управление засяга следващия `IngressFrame`, а не вече обработвания.
-
-### 🎛️ Слой за управление
-
-При включване локалният Unix-domain socket приема JSON заявки, разделени с нов
-ред. Услугата за управление проверява предложената секция за маршрутизация спрямо
-наличните `target_id`, компилира нова неизменяема таблица и атомарно заменя
-локалното за процеса състояние на маршрутизацията.
-
-### 🧩 Основни компоненти
-
-| Компонент | Роля |
-|---|---|
-| `aismixer.py` | Основен процес, задачи и fan-in за входовете, етапи за обработка и egress, жизнен цикъл на незадължителния слой за управление |
-| `core/routing.py` / `core/routing_state.py` | Логическа маршрутизация и неизменяеми моментни снимки, локални за процеса |
-| `core/routing_control*.py` | Версиониран протокол, услуга за управление и Unix-domain транспорт |
-| `aismixerctl.py` | Операторски CLI за управление на маршрутизацията по време на работа |
-| `aismixer_secure.py` | UDPSEC handshake, автентикация и декриптиране |
-| `nmea_sproxy/` | Мрежово прокси при станцията: един вход към един UDPSEC или UDP вход на AISMixer |
-| `core/ingress_frame.py` / `core/nmea_scanner.py` / `core/parsed_sentence.py` | Неизменяеми входни `IngressFrame` обекти, байтови диапазони от сканирането и парснати метаданни за фрагменти/TAG блокове |
-| `assembler.py` | Сглобяване на multipart `!AIVDM`/`!AIVDO` |
-| `dedup.py` | Глобална дедупликация или дедупликация по цел |
-| `meta_writer.py` / `meta_cleaner.py` | NMEA TAG изход и почистване на входа |
-| `forwarder.py` | UDP broadcast и целево препращане |
-
----
-
-## 📐 Договор за обработка
-
-[BEHAVIORAL_CONTRACT.md](BEHAVIORAL_CONTRACT.md) е нормативният, проверен с
-тестове договор за поведението на референтната Python реализация и основата за
-бъдещо диференциално тестване на нативен процесор. Този README остава
-оперативен преглед, а не дублирана нормативна спецификация.
-
-Етапът за обработка приема директно неизменяеми `IngressFrame` обекти и
-запазва един адаптер за legacy `IngressEvent` обекти, чийто `raw_line` е `str`,
-включително подкласове. Невалидните събития за съвместимост и неподдържаните
-елементи се пренебрегват преди маршрутизирането. За всеки приет `IngressFrame`
-се използват една моментна снимка на маршрутизацията и едно съпоставяне на
-източника; payload-ът се сканира като байтове, а полетата на фрагмента и
-приложимите TAG метаданни се парсват веднъж. Python реализацията на assembler-а
-за съвместимост в момента материализира съвпадналите диапазони на изреченията
-като низове.
-
-Multipart сглобяването поддържа фрагменти в напълно произволен ред: точно
-повторение на изречението на вече заета поредна позиция е идемпотентно за
-сглобяването, а различно изречение на същата позиция обезсилва активното
-поколение на assembler-а. Решенията за multipart дедупликация са атомарни за
-цялата група, а състоянието на TAG `s`, `c` и `g` следва границите на жизнения
-цикъл на assembler-а.
-
-Състоянието за дедупликация, състоянието за multipart сглобяване, multipart
-метаданните, управлявани от процесора, и защитеното състояние за replay,
-сесии и nonce имат изрични, детерминирани TTL жизнени цикли, локални за процеса.
-Обектите за състояние на референтната Python реализация приемат незадължителен
-лимит `max_entries` за дедупликацията и незадължителни ограничения
-`max_fragments_per_group` и `max_pending_groups` за сглобяването. Текущата
-интеграция на услугата използва стойностите им по подразбиране `None`, което
-оставя тези измерения без горна граница. Когато се прилага ограничение на
-капацитета, първо се обработва изтеклото състояние и едва след това
-детерминистично се премахва активен запис. Обектите за състояние на
-дедупликацията, сглобяването и защитения вход предоставят неизменяеми моментни
-снимки на статистиката за инспекция и тестване. Точните граници на жизнения
-цикъл и граничните случаи остават в договора за поведение.
-
----
-
-## 🚀 Бърз старт: legacy broadcast режим
-
-Когато на най-горното ниво няма секция `routing:`, AISMixer запазва
-първоначалното broadcast поведение:
-
-- дедупликацията е глобална;
-- всяко прието изходно изречение се изпраща към всички forwarder-и;
-- forwarder-и без `id` остават валидни;
-- може да има поколения за управление на маршрутизацията, но активната таблица
-  за маршрутизация е изключена.
-
-Минимален пример:
+Инсталираната услуга чете `/etc/aismixer/config.yaml`. Ако няма секция
+`routing:` на най-горното ниво, AISMixer използва legacy broadcast режим:
+дедупликацията е глобална и всяко прието изходно изречение отива към всеки
+конфигуриран forwarder.
 
 ```yaml
 station_id: mixstation_1
@@ -907,138 +553,40 @@ udp_inputs:
     listen_port: 17777
 
 forwarders:
-  - host: 203.0.113.10
-    port: 5000
-  - host: 127.0.0.1
+  - id: local_display
+    host: 127.0.0.1
     port: 19000
 ```
 
-Стартиране от локално копие на хранилището:
-
-```bash
-python3 aismixer.py
-```
+Примерите в хранилището са неактивни, докато не бъдат копирани или адаптирани.
+Вижте [`examples/config-routing.yaml`](examples/config-routing.yaml) за статична
+маршрутизация и
+[`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
+за маршрутизация с включено локално управление.
 
 ### Контрол на мрежовите крайни точки
 
-`listen_ip` избира едно адресно семейство както за `udp_inputs`, така и за
-`sec_inputs`: `0.0.0.0` слуша на всички локални IPv4 адреси и приема само IPv4,
-а `::` слуша на всички локални IPv6 адреси и приема само IPv6. За вход
-едновременно през IPv4 и IPv6 конфигурирайте изрично и двата записа; те могат да
-използват един и същ номер на порт.
+- `listen_ip` избира едно адресно семейство. За вход едновременно по IPv4 и IPv6
+  използвайте отделни записи.
+- Незадължителните `udp_inputs[].allow_from` и `sec_inputs[].allow_from` са
+  списъци с буквални IP адреси/CIDR мрежи, разрешени на ниво приложение. При
+  липсващ ключ няма приложен ACL; изрично празен списък отказва всички пакети за
+  съответния listener.
+- Незадължителният `forwarders[].source_ip` обвързва изходен UDP сокет с буквално
+  зададен локален адрес на източника.
 
-В конфигурацията на AISMixer има два незадължителни механизма за контрол на
-мрежовата граница:
+Тези механизми допълват, а не заменят firewall-а и routing политиката на хоста.
 
-- `forwarders[].source_ip` обвързва сокета на изходния UDP препращач с конкретно
-  зададен IPv4 или IPv6 адрес на източника. Когато ключът е пропуснат,
-  операционната система избира адреса както досега. Имената на хостове във
-  `forwarders[].host` се преобразуват само до адреси от семейството, избрано от
-  `source_ip`.
-- `udp_inputs[].allow_from` и `sec_inputs[].allow_from` са списъци с разрешени
-  входни адреси на ниво приложение. Когато ключът е пропуснат, AISMixer не
-  прилага такъв ACL. Явно празен списък отказва всички пакети за съответния
-  вход. Записите трябва да са буквални IP адреси или CIDR мрежи; имена на
-  хостове се отхвърлят при стартиране.
+## 🧰 `aismixerctl`
 
-Входният ACL допълва firewall-а на хоста; не заменя правилата на firewall-а,
-маршрутизацията или политиката на мрежовия интерфейс.
+`install.sh` инсталира `/usr/local/bin/aismixerctl`. Командата комуникира с
+незадължителния локален Unix-domain сокет за управление; тя не променя
+конфигурационни файлове и не запазва runtime маршрутизацията след рестарт.
 
-```yaml
-udp_inputs:
-  - id: roof_receiver
-    listen_ip: "0.0.0.0"
-    listen_port: 17777
-    allow_from:
-      - 192.0.2.15
-      - 198.51.100.0/24
+### Включване на локалното управление
 
-sec_inputs:
-  - id: secure_stations
-    listen_ip: "::"
-    listen_port: 19999
-    allow_from:
-      - 2001:db8:42::/64
-      - 2001:db8:43::44
-
-forwarders:
-  - id: aishub
-    host: feed.example.net
-    port: 10110
-    source_ip: 192.0.2.15
-```
-
----
-
-## 🗺️ Статична логическа маршрутизация
-
-Режимът за маршрутизация се включва с валидна секция `routing:` на най-горното
-ниво.
-
-В този режим:
-
-- съпоставянето използва вътрешния `source_id` на приетия `IngressFrame`;
-- съпоставянето **не** използва излъчения NMEA TAG `s`;
-- целите на маршрутите трябва да сочат към именувани forwarder-и;
-- при неизвестен или неподдържан `target_id` проверката при стартиране завършва
-  с грешка;
-- зоните са логически множества от `source_id`, а не географски AIS области;
-- дедупликацията се изпълнява по отделен логически `target_id`.
-
-### 🪪 Канонични `source_id` и `target_id`
-
-- `udp:<input-id>` при конфигуриран `udp_inputs[].id`.
-- `udp:<mapped-alias>` при идентификатор от картата с UDP псевдоними.
-- `udp:<remote-ip>` когато няма UDP ID или псевдоним.
-- `udpsec:<authenticated-station-id>` за автентикирана UDPSEC станция.
-- `udp:<forwarder-id>` за именуван UDP forwarder.
-
-`sec_inputs[].id` може да влияе на псевдонима в излъчения TAG `s`, когато
-глобалният `station_id` е празен, но не заменя автентикирания UDPSEC
-идентификатор за маршрутизация.
-
-### 🧮 Операции върху логически зони
-
-```yaml
-routing:
-  zones:
-    fixed_receivers:
-      include:
-        - udp:roof
-        - udp:dock
-
-    mobile_receivers:
-      include:
-        - udpsec:boat_ais
-
-    trusted_sources:
-      union:
-        - fixed_receivers
-        - mobile_receivers
-
-    trusted_fixed_sources:
-      intersection:
-        - trusted_sources
-        - fixed_receivers
-
-    public_without_boat:
-      difference:
-        - trusted_sources
-        - mobile_receivers
-```
-
-Операндите на `union`, `intersection` и `difference` са имена на други логически
-зони. Те не са координати, географски области, MMSI списъци или филтри по
-плавателен съд.
-
-Вижте [`examples/config-routing.yaml`](examples/config-routing.yaml) за неактивен
-пълен пример със статична маршрутизация.
-
----
-
-## 🎛️ Управление на маршрутизацията по време на работа
-
-Unix сървърът за управление остава изключен, докато не бъде включен изрично:
+Услугата за управление е изключена, докато не бъде включена изрично в
+конфигурацията на AISMixer:
 
 ```yaml
 control:
@@ -1046,217 +594,247 @@ control:
     enabled: true
     socket_path: /run/aismixer/control.sock
     socket_mode: "0660"
-    max_request_bytes: 1048576
 ```
 
-### ⚠️ Оперативни бележки
+Инсталираният systemd unit създава `/run/aismixer`, докато услугата работи.
+Собственикът и режимът на сокета определят достъпа; няма token за автентикация на
+ниво приложение. Интерфейсът изисква POSIX поддръжка за Unix-domain sockets.
 
-- Самото добавяне на `control:` или `control.unix:` не включва сървъра.
-- Инсталираният systemd unit използва `RuntimeDirectory=aismixer`, за да създаде
-  `/run/aismixer` преди старта на AISMixer. systemd премахва тази работна
-  директория след спиране на услугата; тя не е постоянно състояние.
-- Ако AISMixer се стартира извън инсталирания systemd unit, осигурете
-  еквивалентна родителска директория за конфигурирания път до сокета.
-- Собственикът, групата и режимът на файловата система управляват достъпа до
-  сокета.
-- Unit-ът не задава `User=`, `Group=` или `DynamicUser=` и услугата няма
-  отделен служебен акаунт.
-- При текущата услуга, работеща като root, и `socket_mode: "0660"` достъпът може
-  на практика да е само за root, освен ако операторът умишлено не настрои
-  собствеността или груповата политика за сокета.
-- Няма маркер за автентикация на ниво приложение.
-- Интерфейсът е само за POSIX. Windows може да изпълнява чистите тестове и кода
-  за разработка, но не и слушателя на Unix-domain сокета.
-- Промените в маршрутизацията по време на работа са локални за процеса и
-  изчезват след рестарт.
+### Интерактивен режим
 
-Вижте
-[`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
-за неактивна пълна конфигурация със статична маршрутизация и управление по време
-на работа.
+Интерактивната обвивка е най-бързият начин за откриване на текущото състояние и
+преглед на локалните за процеса броячи. При сокет, собственост на root:
 
----
+```text
+sudo aismixerctl
+aismixerctl> status
+aismixerctl> show statistics
+aismixerctl> show statistics inputs
+aismixerctl> show statistics outputs
+```
 
-## 🧰 `aismixerctl`
+В самата обвивка използвайте `help`. Командите за входна и изходна статистика
+приемат и незадължителен филтър за вход или изход. Еднократните команди остават
+налични за скриптове.
 
-Инсталаторът поставя малък обвиващ POSIX скрипт в
-`/usr/local/bin/aismixerctl`. Скриптът изпълнява
-`/usr/bin/python3 /opt/aismixer/aismixerctl.py "$@"` и не съдържа логика за
-маршрутизация или протокол.
+### Промени на маршрутизацията
 
-CLI трябва да се изпълнява от потребител с достъп до сокета. При инсталирания
-по подразбиране сокет, който е собственост на root, това обикновено означава:
+Атомарна подмяна или изключване на активната, локална за процеса моментна снимка:
 
 ```bash
-sudo aismixerctl status
+sudo aismixerctl replace --file examples/routing-update.yaml --expected-generation 3
+sudo aismixerctl disable --expected-generation 4
 ```
 
-От локално копие на хранилището или копирана директория на услугата използвайте:
+Очакваното поколение е незадължително; когато е зададено, то не допуска остаряла
+промяна да презапише по-ново състояние. CLI не повтаря заявката автоматично.
+
+## 🔐 `nmea_sproxy`
+
+`nmea_sproxy` е мрежовото прокси при станцията. Един процес или systemd instance
+представлява една връзка: един локален UDP или физически сериен/USB вход към един
+мрежов изход. UDPSEC е защитеният транспорт по подразбиране към AISMixer; plain
+UDP трябва да се избере изрично и е предназначен само за доверени LAN/VPN връзки.
+
+### Инсталиране и стартиране
+
+От локалното копие на AISMixer:
 
 ```bash
-python3 aismixerctl.py status
+cd nmea_sproxy
+chmod +x install.sh
+./install.sh
 ```
 
-Използвайте `--socket`, за да зададете друг път:
+Инсталаторът на проксито подготвя структурата за конфигурация и ключовата двойка
+на станцията, като запазва съществуващите операторски данни, инсталира singleton
+и template unit-и, включва само singleton услугата и не стартира услуга.
+Завършете конфигурацията на връзката и, за UDPSEC режима по подразбиране,
+настройката на доверения публичен ключ на AISMixer, описани в [операторското
+ръководство](nmea_sproxy/README.md), след което я стартирайте:
 
 ```bash
-aismixerctl --socket /custom/path.sock status
+systemctl start nmea_sproxy.service
+systemctl status nmea_sproxy.service
 ```
 
-Подмяна на активната, локална за процеса моментна снимка на маршрутизацията:
+### Singleton и template instances
+
+Singleton услугата чете `/etc/nmea_sproxy/config.yaml`. Template instances като
+`boat`, `yacht` или `roof` използват избрани от оператора имена на връзки и
+конфигурация в `/etc/nmea_sproxy/instances/`. Копирайте и редактирайте файла на
+връзката, преди да стартирате instance-а:
 
 ```bash
-sudo aismixerctl \
-  replace \
-  --file examples/routing-update.yaml \
-  --expected-generation 3
+cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
+systemctl enable --now nmea_sproxy@boat.service
+systemctl status nmea_sproxy@boat.service
 ```
 
-Изключване на маршрутизацията и връщане на работещия процес към legacy
-broadcast режим:
+За всяка допълнителна независима връзка стартирайте друг template instance.
+Инсталация само с template instances трябва да изключи и спре неизползваната
+singleton услуга с `systemctl disable --now nmea_sproxy.service`.
+
+### Обновяване
+
+Updater-ът на проксито също се проследява без executable bit. От корена на
+хранилището го направете изпълним еднократно и го стартирайте след изтегляне на
+промените:
 
 ```bash
-sudo aismixerctl \
-  disable \
-  --expected-generation 4
+git pull --ff-only
+cd nmea_sproxy
+chmod +x update.sh
+./update.sh
 ```
 
-### 🔢 Семантика на поколенията
+За разлика от updater-а на AISMixer, `nmea_sproxy/update.sh` обновява
+инсталираните файлове и презарежда systemd, но умишлено **не рестартира**
+singleton услугата или template instances. Когато сте готови, рестартирайте
+само избраните връзки:
 
-- `status` връща текущото поколение.
-- `replace` и `disable` могат да съдържат очаквано поколение.
-- Остаряла актуализация се отхвърля, вместо да презапише по-нова моментна
-  снимка.
-- CLI не прави автоматични повторни опити.
+```bash
+systemctl restart nmea_sproxy.service
+systemctl restart nmea_sproxy@boat.service
+```
 
-`replace --file` приема:
+### Граница на сигурността
 
-1. пълна конфигурация с `routing:` mapping на най-горното ниво; или
-2. директна секция за маршрутизация само с `zones:` и `routes:`.
-
-`routing: null` не е заявка за подмяна; използвайте `disable`.
-
-Вижте [`examples/routing-update.yaml`](examples/routing-update.yaml) за директен
-файл за актуализиране на секцията за маршрутизация.
-
----
-
-## 🔐 Изходи на `nmea_sproxy`
-
-UDPSEC е автентикираният и криптиран UDP транспорт между станцията и AISMixer;
-това не е външен стандартизиран протокол. При всеки handshake всяка крайна точка
-създава нова ефемерна ключова двойка P-256; автентикираният ECDHE обмен
-създава споделената тайна. Дългосрочните P-256 ключове за идентичност са конфигурирани
-извън протокола като опорни точки на доверие; чрез тях двете крайни точки се
-удостоверяват взаимно с ECDSA подписи върху SHA-256 хешове, обвързани с
-транскрипта. Ключовете за идентичност не участват в договарянето на ключове. От
-ефемерната споделена тайна и автентикирания транскрипт HKDF-SHA256 извежда
-независими AES-256-GCM ключове за трафика от клиент към сървър и от сървър към
-клиент. След като изпрати удостоверения ServerHello, сървърът държи чакаща сесия,
-докато криптиран ping от клиента към сървъра със запазен пореден номер нула
-потвърди притежаването на ключовете; след това активира сесията и изпраща
-към клиента криптиран pong, който клиентът удостоверява. Защитата на миналите сесии
-(forward secrecy) при по-късно компрометиране на ключ за идентичност изисква
-предишните ефемерни частни ключове и ECDHE споделени тайни да не са налични и
-никоя от крайните точки да не е била компрометирана, докато те са били в паметта.
-Компрометирана крайна точка разкрива текущия материал, а компрометиран в момента
-частен ключ за идентичност позволява на нападател да се представя за съответната
-крайна точка в бъдещи сесии. Тези свойства са подкрепени от инженерна проверка,
-а не от формална криптографска верификация. Публичните ключове на разрешените
-станции се задават в `authorized_keys.yaml`. Записите за защита от повторение на
-handshake съобщения, както и чакащите и активните сесии, са ограничени по брой,
-управляват се чрез TTL и са локални за процеса. Пакетите с данни използват
-случайни 12-байтови nonce стойности с откриване на повторения във всяка сесия.
-Почистването на изтеклите записи се задейства от разрешен трафик, а не от фонов
-таймер; записите и nonce стойностите се губят при рестарт. UDPSEC защитава
-пакетите при пренос, но не доказва, че AIS съдържанието е семантично вярно или физически точно.
-
-За работата на протокола, обхвата на сигурността, точната семантика на
-състоянието и по-подробен контекст вижте [ръководството за
+UDPSEC е специфичният за AISMixer автентикиран и криптиран UDP транспорт, а не
+външен стандарт. Той взаимно удостоверява конфигурираните идентичности на
+крайните точки, защитава поверителността и целостта на пакетите при пренос и
+проверява за replay и liveness. Свойствата му за forward secrecy зависят от
+унищожаването на ефемерните тайни и от това крайните точки да не са
+компрометирани, докато тези тайни са активни; дизайнът има инженерна, но не и
+формална криптографска проверка. UDPSEC не доказва, че AIS payload-ът е
+семантично верен или физически точен. Изрично конфигурираният plain UDP не
+предоставя поверителност, автентикация на станцията, криптографска цялост,
+защита от replay или liveness протокол. За ключове, доверие, конфигурация,
+поведение на сесиите, endpoint policy и диагностика вижте [ръководството за
 `nmea_sproxy`](nmea_sproxy/README.md), [политиката за сигурност](SECURITY.md),
 [договора за поведение](BEHAVIORAL_CONTRACT.md) и
 [Wiki](https://github.com/iliyan85/aismixer/wiki).
 
-`nmea_sproxy` е мрежовото прокси при станцията:
+## ✅ Текущи възможности
 
-```text
-един локален вход (UDP или сериен) → един UDPSEC или UDP вход на AISMixer
-```
+### 📡 Входове и изходи
 
-Примерни команди:
+- UDP входове по IPv4 и IPv6 с незадължителни списъци с разрешени адреси.
+- Автентикиран и криптиран UDPSEC вход, съвместим с `nmea_sproxy`.
+- Физически сериен порт и USB virtual COM вход чрез `nmea_sproxy`, както и
+  изрично зададен plain UDP за доверени мрежи.
+- Незадължително обвързване на изходния адрес за AISMixer и proxy изходите.
+- Broadcast UDP изход в legacy режим и именувани UDP цели в routing режим.
 
-```bash
-cd nmea_sproxy
-python3 nmea_sproxy.py
-sudo systemctl start nmea_sproxy
-sudo systemctl start nmea_sproxy@boat
-```
+### ⚙️ Обработка
 
-Имената на шаблони като `boat`, `yacht` или `balchik_roof` са етикети, избрани
-от оператора. Подробното ръководство е в
-[`nmea_sproxy/README.md`](nmea_sproxy/README.md).
+- Извличане на поддържаните `!AIVDM`, `!AIVDO` и съвместими AIS изречения.
+- Multipart сглобяване независимо от реда на пристигане; точните повторения са
+  идемпотентни, а конфликтните фрагменти обезсилват активната група.
+- Детерминистична обработка на NMEA TAG `s`/`c`/`g`, съобразена с жизнения цикъл.
+- Решения за multipart дедупликация, атомарни за групата: глобални в legacy
+  режим и отделни за всеки `target_id` в routing режим.
+- Ограничените локални за процеса опашки за ingress, обработка и egress прилагат
+  backpressure; изменяемото състояние на слоя за данни има изрична граница на
+  жизнен цикъл и reset, притежавана от процесорната инстанция.
+- Изрични локални за процеса TTL жизнени цикли, незадължителни ограничения на
+  референтното състояние и свежи неизменяеми pull-based снимки на runtime
+  статистиката.
 
-`nmea_sproxy` има собствени механизми за крайните точки при станцията:
-`allow_from` на най-горното ниво ограничава локалните/LAN UDP податели, които
-могат да бъдат препратени под идентичността на станцията. `source_ip` на
-най-горното ниво е legacy обвързването на UDPSEC източника; при изрично зададен
-`output:` mapping, `output.source_ip` обвързва UDPSEC или plain UDP изходните
-sockets към буквално зададен адрес на източника. Тези настройки са във
-файловете за връзки на `nmea_sproxy` и са отделни от AISMixer настройките
-`udp_inputs[]`, `sec_inputs[]` и `forwarders[]`.
+### 🔀 Маршрутизация и експлоатация
 
-За станции с физически AIS приемник `nmea_sproxy` може да чете директно от
-сериен порт или USB virtual COM и да препраща получените NMEA изречения през
-конфигурирания UDPSEC или UDP изход. Може също изрично да препраща plain UDP за
-доверени LAN/VPN среди; plain UDP не предоставя UDPSEC автентикация, криптиране,
-защита от replay или протокол за liveness.
+- Legacy broadcast режим или статична логическа маршрутизация при стартиране.
+- Именувани входни `source_id` и изходни `target_id` идентификатори.
+- Логически зони на източници с `include`, `union`, `intersection` и `difference`.
+- Един неизменяем `ProcessingSnapshot`, обвързан едва когато входният frame бъде
+  допуснат; routing режимът изпълнява едно съпоставяне на източника в този момент.
+- Незадължителна атомарна подмяна на маршрутизацията чрез `aismixerctl`.
+- Наблюдавани в един процес задачи за ingress, обработка и egress;
+  незадължителният control listener има отделно управление на жизнения цикъл.
 
----
+## 🔀 Архитектура
+
+AISMixer държи разделени слоя за данни и незадължителния слой за управление.
+
+### 📡 Слой за данни
+
+UDP и UDPSEC входовете създават неизменяеми ingress frames в отделни ограничени
+опашки. Fan-in ги допуска до ограничената обработка, преди единственият
+притежаващ състоянието процесор да сканира NMEA данните, да сглобява multipart
+съобщения, да прилага глобална или отделна за всяка цел дедупликация и да
+изгражда контролирани TAG метаданни. Пълните опашки между етапите на AISMixer
+изчакват с backpressure, вместо да отхвърлят елементите си.
+
+Всеки допуснат frame има един обвързан `ProcessingSnapshot`; routing режимът
+добавя едно съпоставяне на източника. Непразните `OutputBatch` стойности
+преминават подредено през ограничено предаване към egress и обработката изчаква
+локалното му завършване, преди да продължи. При грешка в наблюдавана runtime
+задача няма автоматично повторно изпращане.
+
+### 🎛️ Слой за управление
+
+Когато е включена, локалната NDJSON услуга през Unix-domain socket проверява
+заявките спрямо наличните идентификатори на цели и атомарно заменя неизменяемото,
+локално за процеса състояние на маршрутизацията. Тя предоставя също runtime
+статус и достъпна само за четене агрегирана runtime статистика, както и
+статистика по входове и изходи, чрез `aismixerctl`.
+
+### 🧩 Основни компоненти
+
+| Компонент | Роля |
+|---|---|
+| `aismixer.py` | Runtime жизнен цикъл, ingress fan-in, обработка, изход и незадължително управление |
+| `core/routing*.py` | Логическа маршрутизация и неизменяеми моментни снимки |
+| `core/routing_control*.py` / `core/runtime_control.py` | Протокол за управление и Unix-domain услуга |
+| `core/runtime_statistics.py` | Локални за процеса runtime броячи и неизменяеми изгледи |
+| `aismixerctl.py` | Операторски CLI за управление и статистика |
+| `aismixer_secure.py` | UDPSEC вход |
+| `nmea_sproxy/` | Прокси при станцията от UDP/serial към UDPSEC/UDP |
+| `assembler.py` / `dedup.py` | Multipart сглобяване и премахване на дубликати |
+| `meta_writer.py` / `meta_cleaner.py` | NMEA TAG изход и почистване на входа |
+| `forwarder.py` | UDP broadcast и целеви изход |
+
+Нормативната семантика на обработката и runtime поведението е в
+[BEHAVIORAL_CONTRACT.md](BEHAVIORAL_CONTRACT.md). Този README е операторски
+преглед, а не втора спецификация.
+
+## 🗺️ Логическа маршрутизация
+
+### Legacy broadcast
+
+Без секция `routing:` на най-горното ниво дедупликацията е глобална и всяко
+прието изречение отива към всеки forwarder. Forwarder-и без име остават валидни.
+
+### Статична маршрутизация
+
+Валидна секция `routing:` на най-горното ниво включва подредени маршрути от
+идентификатори или логически зони на източници към именувани forwarder-и. Зоните
+са множества от `source_id`, а не географски области, MMSI списъци или филтри по
+плавателен съд. Дедупликацията се изпълнява отделно за всяка цел.
+
+Каноничните идентификатори включват `udp:<input-id>`, `udp:<mapped-alias>`,
+`udp:<remote-ip>`, `udpsec:<authenticated-station-id>` и
+`udp:<forwarder-id>` за именуваните UDP цели. Маршрутизацията използва вътрешните
+идентификатори на източниците, а не излъчения TAG `s`. Вижте [примера за статична
+маршрутизация](examples/config-routing.yaml).
+
+### Маршрутизация по време на работа
+
+Когато локалното управление е включено, `routing.replace` и `routing.disable`
+засягат чрез една атомарна промяна frame-овете, които още не са допуснати до
+ограничената обработка; вече допуснатата работа запазва обвързаната си снимка.
+Промените са локални за процеса и изчезват при рестарт. Вижте [примера за
+управление](examples/config-routing-control.yaml) и [update
+payload-а](examples/routing-update.yaml).
 
 ## 🏷️ Поведение на NMEA TAG метаданните
 
-AISMixer чете входните TAG метаданни и излъчва контролиран `s`/`c`/`g` TAG block
-според описаните по-долу настройки.
-
-За multipart групите контекстът на TAG `s`, `c` и `g` следва границите на
-сглобяването при конфликт, изтичане, премахване поради ограничение на капацитета
-и завършване. Точните правила за притежание и избор са определени в
-[BEHAVIORAL_CONTRACT.md](BEHAVIORAL_CONTRACT.md).
-
-### 🪪 TAG `s` — етикет на източника
-
-Излъченият TAG `s` се избира отделно от `source_id` за маршрутизация.
-
-Приоритет:
-
-1. непразен глобален `station_id`;
-2. ID на входа, UDP псевдоним или име на разрешената UDPSEC станция/клиент;
-3. входящ TAG `s`, когато е наличен;
-4. отдалеченият IP като резервна стойност.
-
-Излъчената стойност се филтрира до `[A-Za-z0-9_]` и се ограничава до 15 символа.
-Идентификаторите `source_id` за маршрутизация са непрозрачни вътрешни стойности
-и не се филтрират или съкращават като TAG `s`.
-
-### 🕒 TAG `c` — времева отметка
-
-За multipart групите `c_preserve_ingress_c: true` избира минималната валидна
-числова стойност на входящ TAG `c`, наблюдавана през активното поколение на
-сглобяването, независимо от реда на пристигане. Когато запазването е изключено
-или няма валидна стойност, AISMixer излъчва сървърното време. Договорът за
-поведение описва умишленото изключение за съвместимост при единично изречение
-с `c:0`.
-
-### 🧷 TAG `g` — метаданни за изходната група
-
-TAG `g` представлява входни/изходни метаданни за multipart съобщения. Той
-**не** е ключът за сглобяване. Multipart сглобяването използва полетата на NMEA
-фрагментите заедно с идентичността на входния контекст за сглобяване. Запазените
-идентификатори на групи се сравняват като точни низове; липсващи или
-несъгласувани стойности водят до един генериран идентификатор за завършената
-логическа група.
-
-Свързани настройки:
+AISMixer чете входните TAG метаданни и излъчва контролирани `s`/`c`/`g`
+метаданни. Излъченият `s` се избира отделно от вътрешния идентификатор за
+маршрутизация и се филтрира за NMEA изход. Според конфигурацията `c` може да
+запази валидно входно време или да използва сървърното време, а multipart `g`
+може да запази съгласуван входен групов идентификатор или да генерира един
+изходен идентификатор. TAG `g` е метаданна, а не ключ за multipart сглобяване.
 
 ```yaml
 g_preserve_ingress_gid: true
@@ -1265,112 +843,64 @@ g_always_tag_single: false
 c_preserve_ingress_c: true
 ```
 
----
+Точните правила за приоритет, притежание на multipart състоянието, конфликт,
+изтичане и съвместимост са в [договора за поведение](BEHAVIORAL_CONTRACT.md).
 
-## 📦 Инсталация
+## 📚 Примери и тестове
 
-Инсталиране на поддържаната в хранилището systemd услуга и глобалния CLI
-wrapper:
-
-```bash
-./install.sh
-```
-
-Инсталаторът разполага файловете за изпълнение в `/opt/aismixer`, инсталира
-`aismixer.service` и `/usr/local/bin/aismixerctl`, презарежда systemd и активира
-услугата. Той не стартира AISMixer автоматично. Unit-ът използва
-`RuntimeDirectory=aismixer`, така че systemd създава `/run/aismixer`, докато
-услугата работи, и премахва директорията след спиране.
-
-Инсталираната услуга чете `/etc/aismixer/config.yaml`. При първа инсталация
-`install.sh` попълва `/etc/aismixer` от конфигурацията в хранилището и запазва
-съществуващите операторски конфигурации и ключове.
-
-Обновяване на инсталираните файлове за изпълнение и рестартиране на услугата:
-
-```bash
-./update.sh
-```
-
-`update.sh` не променя операторските конфигурации и ключове в `/etc/aismixer`.
-
-Премахване на услугата и инсталираните файлове за изпълнение:
-
-```bash
-./uninstall.sh
-```
-
-По подразбиране деинсталирането запазва `/etc/aismixer`; изричната опция
-`./uninstall.sh --purge-config` премахва и операторските конфигурации и ключове.
-
----
-
-## 📚 Примери
-
-Примерите са неактивни, докато операторът не ги копира или адаптира:
-
-- [`examples/config-routing.yaml`](examples/config-routing.yaml) — пълна
-  конфигурация за статична маршрутизация.
+- [`examples/config-routing.yaml`](examples/config-routing.yaml) — статична
+  маршрутизация.
 - [`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
-  — пълна конфигурация за маршрутизация с включен `control.unix`.
+  — статична маршрутизация с локално управление.
 - [`examples/routing-update.yaml`](examples/routing-update.yaml) — директна
-  секция за маршрутизация за `aismixerctl replace --file`.
-- [`examples/README.md`](examples/README.md) — кратко описание на примерните
-  файлове.
+  промяна на маршрутизацията за `aismixerctl`.
+- [`examples/README.md`](examples/README.md) — ръководство за примерните файлове.
 
-Всички адреси, идентификатори, портове, пътища и ключове в примерните файлове
-трябва да се адаптират към конкретната инсталация.
-
----
-
-## 🧪 Тестове
-
-Тестовете покриват multipart сглобяването, обработката на TAG и метаданни,
-помощните UDPSEC компоненти, маршрутизацията, подмяната на моментни снимки,
-протокола и транспортите за управление, `aismixerctl` и поведението при
-препращане.
+Всички примерни адреси, идентификатори, портове, пътища и ключове трябва да се
+адаптират от оператора. Стартирайте тестовете в хранилището с:
 
 ```bash
 python -m pytest
 ```
 
-Тестовете с действителен Unix-domain слушател изискват Linux, WSL, Raspberry Pi
-OS или друга POSIX среда с поддръжка на asyncio Unix сокети.
-
----
+Тестовете с действителен Unix-domain listener изискват Linux, WSL, Raspberry Pi
+OS или друга POSIX среда с поддръжка на asyncio Unix sockets.
 
 ## ⚠️ Текущи ограничения
 
-- UDP е единственият реализиран в момента изходен адаптер на AISMixer.
-- Състоянието и поколенията на маршрутизацията са локални за процеса; промените
-  по време на работа не се запазват.
-- Защитеното състояние за replay, сесии и nonce е локално за процеса и не е
-  трайно; почистването при изтичане се задейства от трафик, а не от фонов таймер.
-- Текущата интеграция на услугата оставя незадължителните ограничения за
-  дедупликация и сглобяване на `None`, затова тези измерения нямат ограничение
-  на капацитета.
-- Няма многопроцесен координатор или синхронизация между процеси.
-- Няма автоматично следене или презареждане на конфигурацията.
-- Няма географско филтриране, филтриране по MMSI или по съдържание за
-  плавателен съд.
-- Няма дългосрочно съхранение, анализи или откриване на spoofing.
-- Unix управлението изисква POSIX поддръжка за Unix-domain socket.
-- Контролът на достъпа разчита на Unix разрешенията на файловата система и няма
-  token на ниво приложение.
-- Все още няма политика с отделни потребител и група за услугата.
+- UDP е единственият реализиран изходен адаптер на AISMixer.
+- Състоянието, поколенията и runtime статистиката на маршрутизацията са локални
+  за процеса; промените по време на работа не се запазват.
+- Защитеното състояние за replay, сесии и nonce е локално за процеса и нетрайно;
+  почистването при изтичане се задейства от разрешен трафик.
+- Текущата интеграция оставя незадължителните ограничения за дедупликация и
+  сглобяване на `None`.
+- Няма координаторен процес или отделни ingress/egress worker процеси, IPC,
+  междупроцесна маршрутизация или агрегиране на метрики, автоматичен рестарт на
+  worker процеси или презареждане на конфигурацията.
+- Няма географско филтриране, филтриране по MMSI или съдържание на плавателния
+  съд, дългосрочно съхранение, анализи или откриване на spoofing.
+- Локалното управление изисква POSIX Unix sockets и разчита на разрешенията на
+  файловата система; няма приложен token или политика с отделен служебен акаунт.
 
----
+## 📖 Карта на документацията
 
-## 📖 Допълнителна документация
+- [Договор за поведение](BEHAVIORAL_CONTRACT.md) — нормативна семантика на
+  обработката и runtime поведението.
+- [Операторско ръководство за `nmea_sproxy`](nmea_sproxy/README.md) — пълни
+  указания за инсталация, конфигурация, ключове, serial input, изход, услуги и
+  диагностика при станцията.
+- [GitHub Wiki](https://github.com/iliyan85/aismixer/wiki) — по-задълбочена
+  архитектура и обяснителни материали.
+- [Примери](examples/README.md) · [Политика за сигурност](SECURITY.md) ·
+  [Ръководство за принос](CONTRIBUTING.md) · [План за развитие](ROADMAP.md) ·
+  [Публичен уебсайт](https://aismixer.net)
 
-- [Договор за поведение](BEHAVIORAL_CONTRACT.md)
-- [Примерни конфигурации](examples/README.md)
-- [Операторско ръководство за `nmea_sproxy`](nmea_sproxy/README.md)
-- [GitHub Wiki](https://github.com/iliyan85/aismixer/wiki)
-- [Ръководство за принос](CONTRIBUTING.md)
-- [Политика за сигурност](SECURITY.md)
-- [План за развитие](ROADMAP.md)
-- [Публичен уебсайт](https://aismixer.net)
+## 🌿 Клонове и уебсайт
+
+`main` съдържа услугата, проксито, примерите, компонентите за управление и
+`tests/`. Публичният уебсайт е в `website`; GitHub Pages използва `/docs` от този
+клон, затова `docs/` умишлено отсъства от `main`.
 
 [⬆ Към избора на език](#english)
 
@@ -1392,36 +922,69 @@ OS или друга POSIX среда с поддръжка на asyncio Unix с
 > AISMixer primește fluxuri AIS de la mai multe receptoare, extrage `!AIVDM` și
 > `!AIVDO`, reasamblează mesajele multipart, elimină duplicatele aproape în timp
 > real, gestionează metadatele NMEA TAG și redirecționează un flux logic curat.
-> Rutarea logică opțională poate direcționa fiecare sursă de ingress către
-> anumite destinații UDP denumite, iar `aismixerctl` poate înlocui atomic sau
-> dezactiva snapshot-ul activ de rutare printr-un socket local din domeniul Unix.
+> Rutarea logică opțională direcționează sursele de ingress către destinații UDP
+> denumite, iar interfața locală `aismixerctl` oferă stare și statistici runtime,
+> precum și actualizări atomice ale rutării.
 
----
+## 🚀 Pornire rapidă
 
-## 🌿 Ramuri și site web
+Scripturile ciclului de viață pot rula direct ca root. Când sunt invocate de un
+utilizator non-root, ele ridică privilegiile operațiilor necesare prin `sudo`; se
+opresc cu o explicație dacă niciuna dintre variante nu este disponibilă.
 
-Ramura `main` este ramura principală pentru runtime și dezvoltare. Aceasta
-conține serviciul Python, componentele proxy securizate, exemplele de
-configurare, componentele planului de control și suita de teste din `tests/`.
+Comenzile `systemctl` independente și comenzile care scriu sub `/etc` presupun
+un shell root; operatorii non-root trebuie să le prefixeze cu `sudo` când este
+necesar.
 
-Site-ul public se află pe ramura de lungă durată `website`. GitHub Pages publică
-din această ramură, folosind `/docs` drept rădăcină a site-ului; de aceea,
-directorul `docs/` nu este prezent în mod intenționat pe `main`.
+### Instalare nouă
 
----
+Pe o gazdă Debian sau Raspberry Pi OS bazată pe systemd:
+
+```bash
+git clone https://github.com/iliyan85/aismixer
+cd aismixer
+chmod +x install.sh
+./install.sh
+systemctl start aismixer
+systemctl status aismixer
+```
+
+`install.sh` instalează runtime-ul în `/opt/aismixer`, creează fișierele lipsă
+din `/etc/aismixer` păstrând configurația și cheile existente, instalează comanda
+globală `aismixerctl` și activează AISMixer pentru pornire la boot. În mod
+intenționat, **nu** pornește serviciul. Verificați
+`/etc/aismixer/config.yaml` înainte de a expune serviciul în afara unei rețele de
+încredere.
+
+### Actualizare
+
+Repository-ul urmărește scripturile ciclului de viață fără bitul executabil.
+Înainte de prima actualizare, rulați o singură dată `chmod +x update.sh`. Apoi
+actualizați din checkout:
+
+```bash
+git pull --ff-only
+./update.sh
+systemctl status aismixer
+```
+
+`update.sh` actualizează fișierele runtime instalate, unitatea systemd și
+`aismixerctl`, reîncarcă systemd și **repornește AISMixer**. Configurația și
+cheile operatorului din `/etc/aismixer` rămân nemodificate. `uninstall.sh`
+păstrează acel director dacă `--purge-config` nu este cerut explicit.
 
 ## 🧭 Ce este AISMixer?
 
-**AISMixer** este un serviciu Python pentru recepționarea, normalizarea,
-deduplicarea, etichetarea, rutarea și redirecționarea fluxurilor AIS NMEA 0183.
+**AISMixer** este un serviciu Python orientat spre exploatare reală pentru
+recepționarea, normalizarea, deduplicarea, etichetarea, rutarea și
+redirecționarea fluxurilor AIS NMEA 0183.
 
-- **`aismixer.py`** este serviciul de mixare și de plan de date care rulează
+- **`aismixer.py`** este serviciul de mixare și plan de date care rulează
   continuu.
-- **`nmea_sproxy`** este proxy-ul de rețea de la stație. Un proces
-  redirecționează o intrare UDP locală sau o intrare serială fizică spre o
-  intrare AISMixer UDPSEC sau UDP.
-- **`aismixerctl.py`** este CLI-ul operatorului pentru socket-ul local opțional
-  de control al rutării.
+- **`aismixerctl`** este comanda instalată pentru operatori, destinată socket-ului
+  local opțional de control.
+- **`nmea_sproxy`** este proxy-ul de la stație pentru o intrare UDP locală sau
+  serială și o ieșire UDPSEC sau UDP simplu configurată explicit.
 
 ```text
 Receptor AIS UDP      \
@@ -1431,179 +994,17 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | Destinații UDP |
                                 +----------------+
                                          ^
                                          |
-                                plan de control Unix opțional
+                                  control local opțional
                                          |
                                    aismixerctl
 ```
 
----
+## ⚙️ Configurație de bază
 
-## ✅ Capabilități actuale
-
-### 📡 Intrări și ieșiri
-
-- Ingress UDP prin IPv4 și IPv6, cu liste opționale de adrese permise pentru
-  intrările UDP/UDPSEC AISMixer și intrarea UDP locală a `nmea_sproxy`.
-- Ingress UDPSEC autentificat și criptat, compatibil cu `nmea_sproxy`.
-- Intrare serială fizică și USB virtual COM prin `nmea_sproxy`, plus un mod UDP
-  simplu, explicit, pentru medii LAN/VPN de încredere.
-- Asocierea opțională a adresei-sursă pentru forwarderele UDP AISMixer și
-  ieșirile UDPSEC/UDP simplu ale `nmea_sproxy`.
-- Egress UDP broadcast în modul legacy și destinații UDP denumite în modul de
-  rutare.
-
-### ⚙️ Procesare
-
-- Extragerea propozițiilor `!AIVDM` și `!AIVDO` acceptate.
-- Asamblare multipart complet independentă de ordinea sosirii; repetările
-  identice sunt idempotente pentru asamblare, iar fragmentele conflictuale
-  invalidează grupul activ.
-- Gestionare deterministă a NMEA TAG `s`/`c`/`g`, care respectă ciclul de viață.
-- Decizii de deduplicare atomice la nivelul întregului grup multipart: globale
-  în modul legacy și separate pentru fiecare `target_id` în modul de rutare.
-- Cicluri de viață TTL locale procesului, explicite și verificate prin teste,
-  pentru deduplicare, asamblare, metadatele multipart gestionate de procesor și
-  starea de ingress securizat.
-- Limite locale procesului, opționale la nivel de constructor, în obiectele de
-  stare Python de referință, plus snapshot-uri statistice imuabile pentru
-  deduplicare, asamblare și starea securizată.
-
-### 🔀 Rutare și operare
-
-- Mod legacy broadcast sau rutare logică statică încărcată la pornire.
-- Identități denumite `source_id` pentru ingress și `target_id` pentru egress.
-- Zone logice de surse cu `include`, `union`, `intersection` și `difference`,
-  consumate de rute ordonate.
-- Un singur snapshot imuabil de rutare și o singură potrivire a sursei pentru
-  fiecare `IngressFrame` acceptat.
-- Înlocuirea atomică opțională a rutării la runtime prin planul de control
-  NDJSON pe socket din domeniul Unix și `aismixerctl`.
-- `routing.status`, `routing.replace` și `routing.disable`.
-- Serviciu systemd administrat de repository cu `RuntimeDirectory=aismixer` și
-  wrapper global `/usr/local/bin/aismixerctl` instalat de scripturile ciclului
-  de viață.
-
----
-
-## 🔀 Arhitectură
-
-AISMixer păstrează separate **planul de date** și **planul de control**.
-
-### 📡 Planul de date
-
-Producătorii UDP și UDPSEC integrați creează obiecte `IngressFrame` imuabile,
-iar un singur fan-in ingress transportă elementele cozilor nemodificate către
-etapa procesorului. Această etapă acceptă direct cadrele păstrând identitatea
-obiectului, invocă procesorul sincron de referință implementat în Python și
-menține un singur adaptor de compatibilitate pentru obiectele legacy
-`IngressEvent` valide; evenimentele de compatibilitate nevalide și elementele
-nesuportate sunt ignorate înainte de rutare. Fiecare lot complet nevid de ieșiri
-ale procesorului ajunge apoi la o singură etapă egress, care îl expediază
-secvențial înainte ca etapa procesorului să consume următorul element.
-
-Toate task-urile producătorilor UDP și UDPSEC, ale fan-in-ului ingress și ale
-etapelor de procesare și egress sunt supravegheate ca un singur ciclu de viață
-local procesului. Eșecul sau finalizarea neașteptată a oricăruia termină
-runtime-ul după anularea și așteptarea celorlalte task-uri; nu există repornire
-automată, reîncercare sau reluare a livrării.
-
-Pentru fiecare cadru acceptat, planul de date preia un singur snapshot imuabil
-de rutare și potrivește `source_id` o singură dată. Scanează payload-ul cadrului
-la nivel de octeți, parsează o singură dată câmpurile fragmentului NMEA și
-metadatele TAG relevante, transmite propozițiile parsate către assembler,
-aplică deduplicarea globală sau separată pe destinații, construiește metadatele
-TAG de ieșire și redirecționează propozițiile acceptate spre destinațiile UDP
-egress. Implementarea Python de compatibilitate a assemblerului materializează
-și stochează momentan propozițiile potrivite ca șiruri.
-
-Campaign D rămâne exclusiv Python și locală procesului și nu definește un API
-sau ABI nativ. Implementările native ale procesorului, procesele
-coordinator/worker, multiprocessing și IPC rămân activități viitoare.
-
-- **Modul legacy:** deduplicare globală și broadcast către toate forwarderele.
-- **Modul de rutare:** potrivirea sursei logice, deduplicare pentru fiecare
-  destinație și redirecționare direcționată către destinații UDP egress denumite.
-- Pentru fiecare cadru acceptat se folosesc un singur snapshot de rutare și o
-  singură potrivire a sursei; o actualizare de control concurentă afectează
-  cadrul următor, nu pe cel deja în curs de procesare.
-
-### 🎛️ Planul de control
-
-Când este activat, socket-ul local din domeniul Unix acceptă cereri JSON
-delimitate prin linii noi. Serviciul de control validează o secțiune de rutare
-candidată în raport cu ID-urile de destinație disponibile, compilează un tabel
-imuabil nou și înlocuiește atomic starea de rutare locală procesului.
-
-### 🧩 Componente principale
-
-| Componentă | Rol |
-|---|---|
-| `aismixer.py` | Runtime principal, task-uri și fan-in ingress, etape de procesare și egress, plus ciclul de viață opțional al controlului |
-| `core/routing.py` / `core/routing_state.py` | Rutare logică și snapshot-uri imuabile locale procesului |
-| `core/routing_control*.py` | Protocol de control versionat, serviciu și transport prin socket din domeniul Unix |
-| `aismixerctl.py` | CLI pentru controlul rutării la runtime de către operator |
-| `aismixer_secure.py` | Handshake UDPSEC, autentificare și decriptare |
-| `nmea_sproxy/` | Proxy de rețea la stație: o intrare spre o intrare AISMixer UDPSEC sau UDP |
-| `core/ingress_frame.py` / `core/nmea_scanner.py` / `core/parsed_sentence.py` | Cadre `IngressFrame` imuabile, intervale de scanare la nivel de octeți și metadate fragment/TAG parsate |
-| `assembler.py` | Reasamblarea mesajelor multipart `!AIVDM`/`!AIVDO` |
-| `dedup.py` | Suprimarea duplicatelor global sau separat pentru fiecare destinație |
-| `meta_writer.py` / `meta_cleaner.py` | Ieșire NMEA TAG și curățarea ingress-ului |
-| `forwarder.py` | Broadcast UDP și egress direcționat |
-
----
-
-## 📐 Contractul de procesare
-
-[BEHAVIORAL_CONTRACT.md](BEHAVIORAL_CONTRACT.md) este contractul normativ,
-verificat prin teste, pentru implementarea Python de referință și baza pentru
-viitoarea testare diferențială a unui procesor nativ. Acest README rămâne o
-prezentare generală operațională, nu o copie a specificației normative.
-
-Etapa procesorului acceptă direct obiecte `IngressFrame` imuabile și
-păstrează un singur adaptor pentru obiectele legacy `IngressEvent` al căror
-`raw_line` este un `str`, inclusiv subclase. Evenimentele de compatibilitate
-nevalide și elementele nesuportate sunt ignorate înainte de rutare. Pentru
-fiecare cadru acceptat se folosesc un singur snapshot de rutare și o singură
-potrivire a sursei; payload-ul este scanat la nivel de octeți, iar câmpurile
-fragmentului și metadatele TAG relevante sunt parsate o singură dată.
-Implementarea Python de compatibilitate a assemblerului materializează momentan
-intervalele propozițiilor identificate ca șiruri.
-
-Asamblarea multipart acceptă sosiri într-o ordine complet arbitrară: repetarea
-exactă a unei propoziții la un ordinal deja ocupat este idempotentă pentru
-asamblare, iar o propoziție diferită la același ordinal invalidează generația
-activă a assemblerului. Deciziile de deduplicare multipart sunt atomice la
-nivel de grup, iar starea TAG `s`, `c` și `g` urmează limitele ciclului de viață
-al assemblerului.
-
-Starea de deduplicare, starea asamblării multipart, metadatele multipart
-gestionate de procesor și starea securizată pentru replay,
-sesiuni și nonce-uri au cicluri de viață TTL explicite, deterministe și locale
-procesului. Obiectele de stare Python de referință acceptă pentru deduplicare
-capacitatea opțională `max_entries`, iar pentru asamblare limitele opționale
-`max_fragments_per_group` și `max_pending_groups`. Integrarea actuală a
-serviciului folosește valorile implicite `None`, lăsând aceste dimensiuni fără
-limită. Când se aplică o limită de capacitate, starea expirată este tratată
-înaintea evacuării deterministe a stării active. Obiectele de deduplicare,
-asamblare și stare securizată expun snapshot-uri statistice imuabile pentru
-inspecție și testare. Limitele exacte ale ciclurilor de viață și cazurile de
-margine rămân în contractul comportamental.
-
----
-
-## 🚀 Pornire rapidă: modul legacy broadcast
-
-Când nu este configurată nicio secțiune top-level `routing:`, AISMixer își
-păstrează comportamentul broadcast inițial:
-
-- deduplicarea este globală;
-- fiecare propoziție de ieșire acceptată este trimisă către fiecare forwarder
-  configurat;
-- forwarderele fără nume rămân valide;
-- generațiile pentru controlul rutării pot exista, însă tabelul activ de rutare
-  este dezactivat.
-
-Exemplu minimal:
+Serviciul instalat citește `/etc/aismixer/config.yaml`. Fără o secțiune
+top-level `routing:`, AISMixer folosește modul legacy broadcast: deduplicarea
+este globală, iar fiecare propoziție acceptată este trimisă către fiecare
+forwarder configurat.
 
 ```yaml
 station_id: mixstation_1
@@ -1614,138 +1015,41 @@ udp_inputs:
     listen_port: 17777
 
 forwarders:
-  - host: 203.0.113.10
-    port: 5000
-  - host: 127.0.0.1
+  - id: local_display
+    host: 127.0.0.1
     port: 19000
 ```
 
-Rulare din repository:
-
-```bash
-python3 aismixer.py
-```
+Exemplele din repository sunt inactive până când sunt copiate sau adaptate.
+Consultați [`examples/config-routing.yaml`](examples/config-routing.yaml) pentru
+rutare statică și
+[`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
+pentru rutare cu controlul local activat.
 
 ### Controale pentru endpoint-urile de rețea
 
-`listen_ip` selectează o singură familie de adrese atât pentru `udp_inputs`, cât
-și pentru `sec_inputs`: `0.0.0.0` ascultă pe toate adresele IPv4 locale și
-acceptă numai IPv4, iar `::` ascultă pe toate adresele IPv6 locale și acceptă
-numai IPv6. Pentru ingress dual-stack, configurați explicit ambele intrări;
-acestea pot folosi același număr de port.
+- `listen_ip` selectează o singură familie de adrese. Folosiți intrări separate
+  pentru ingress dual-stack IPv4 și IPv6.
+- Valorile opționale `udp_inputs[].allow_from` și `sec_inputs[].allow_from` sunt
+  liste de adrese IP/rețele CIDR literale permise la nivelul aplicației. Omiterea
+  nu aplică un ACL al aplicației; o listă explicit goală respinge toate pachetele
+  listener-ului respectiv.
+- `forwarders[].source_ip` opțional asociază socket-ul UDP de ieșire cu o adresă
+  locală sursă literală.
 
-În configurația AISMixer sunt disponibile două controale opționale pentru
-perimetrul de rețea:
+Aceste controale completează, nu înlocuiesc, firewall-ul și politica de rutare a
+gazdei.
 
-- `forwarders[].source_ip` asociază socket-ul unui forwarder UDP de ieșire cu o
-  adresă-sursă IPv4 sau IPv6 literală. Când opțiunea este omisă, sistemul de
-  operare alege adresa-sursă la fel ca înainte. Numele de host din
-  `forwarders[].host` sunt rezolvate numai în familia de adrese selectată prin
-  `source_ip`.
-- `udp_inputs[].allow_from` și `sec_inputs[].allow_from` sunt liste de adrese
-  ingress permise la nivelul aplicației. Când cheia este omisă, AISMixer nu
-  aplică un ACL la nivelul aplicației. O listă explicit goală respinge toate
-  pachetele pentru listener-ul respectiv. Intrările trebuie să fie adrese IP
-  literale sau rețele CIDR; numele de host sunt respinse la pornire.
+## 🧰 `aismixerctl`
 
-ACL-ul de ingress completează firewall-ul gazdei; nu înlocuiește firewall-ul,
-rutarea sau politica la nivel de interfață.
+`install.sh` instalează `/usr/local/bin/aismixerctl`. Comanda comunică prin
+socket-ul local opțional de control din domeniul Unix; nu modifică fișierele de
+configurație și nu persistă rutarea runtime după repornire.
 
-```yaml
-udp_inputs:
-  - id: roof_receiver
-    listen_ip: "0.0.0.0"
-    listen_port: 17777
-    allow_from:
-      - 192.0.2.15
-      - 198.51.100.0/24
+### Activarea controlului local
 
-sec_inputs:
-  - id: secure_stations
-    listen_ip: "::"
-    listen_port: 19999
-    allow_from:
-      - 2001:db8:42::/64
-      - 2001:db8:43::44
-
-forwarders:
-  - id: aishub
-    host: feed.example.net
-    port: 10110
-    source_ip: 192.0.2.15
-```
-
----
-
-## 🗺️ Rutare logică statică
-
-Modul de rutare este activat prin adăugarea unei secțiuni top-level `routing:`
-valide.
-
-În modul de rutare:
-
-- potrivirea folosește `source_id` intern al cadrului acceptat;
-- potrivirea **nu** folosește valoarea NMEA TAG `s` emisă;
-- destinațiile rutelor trebuie să facă referire la forwardere denumite;
-- ID-urile de destinație necunoscute sau nesuportate determină eșecul validării
-  la pornire;
-- zonele sunt mulțimi logice de ID-uri de sursă, nu zone AIS geografice;
-- deduplicarea este separată pentru fiecare `target_id` logic.
-
-### 🪪 ID-uri canonice de sursă și destinație
-
-- `udp:<input-id>` când este configurat `udp_inputs[].id`.
-- `udp:<mapped-alias>` când o hartă de aliasuri UDP furnizează identitatea.
-- `udp:<remote-ip>` când nu este disponibil niciun ID UDP sau alias.
-- `udpsec:<authenticated-station-id>` pentru o stație UDPSEC autentificată.
-- `udp:<forwarder-id>` pentru un forwarder UDP denumit.
-
-`sec_inputs[].id` poate influența aliasul TAG `s` emis când `station_id` global
-este gol, dar nu înlocuiește ID-ul sursei de rutare pentru stația UDPSEC
-autentificată.
-
-### 🧮 Operații cu zone logice
-
-```yaml
-routing:
-  zones:
-    fixed_receivers:
-      include:
-        - udp:roof
-        - udp:dock
-
-    mobile_receivers:
-      include:
-        - udpsec:boat_ais
-
-    trusted_sources:
-      union:
-        - fixed_receivers
-        - mobile_receivers
-
-    trusted_fixed_sources:
-      intersection:
-        - trusted_sources
-        - fixed_receivers
-
-    public_without_boat:
-      difference:
-        - trusted_sources
-        - mobile_receivers
-```
-
-Operanzii pentru `union`, `intersection` și `difference` sunt numele altor zone
-logice. Nu sunt coordonate, regiuni geografice, liste MMSI sau filtre pentru
-nave.
-
-Consultați [`examples/config-routing.yaml`](examples/config-routing.yaml) pentru
-un exemplu complet, inactiv, de rutare statică.
-
----
-
-## 🎛️ Controlul rutării la runtime
-
-Serverul de control Unix rămâne dezactivat până când este activat explicit:
+Serviciul de control rămâne dezactivat până când este activat explicit în
+configurația AISMixer:
 
 ```yaml
 control:
@@ -1753,220 +1057,253 @@ control:
     enabled: true
     socket_path: /run/aismixer/control.sock
     socket_mode: "0660"
-    max_request_bytes: 1048576
 ```
 
-### ⚠️ Note operaționale
+Unitatea systemd instalată creează `/run/aismixer` cât timp serviciul rulează.
+Proprietarul și modul socket-ului determină accesul; nu există token de
+autentificare la nivelul aplicației. Interfața necesită suport POSIX pentru
+socket-uri din domeniul Unix.
 
-- Simpla adăugare a `control:` sau `control.unix:` nu activează serverul.
-- Unitatea systemd instalată folosește `RuntimeDirectory=aismixer` pentru a crea
-  `/run/aismixer` înainte de pornirea AISMixer. systemd elimină acest director
-  runtime după oprirea serviciului; el nu reprezintă stare persistentă.
-- Dacă AISMixer rulează în afara unității systemd instalate, trebuie furnizat un
-  director-părinte echivalent pentru calea configurată a socket-ului.
-- Proprietarul, grupul și modul fișierului controlează accesul la socket.
-- Unitatea instalată nu setează `User=`, `Group=` sau `DynamicUser=` și nu are
-  un cont de serviciu dedicat.
-- Cu serviciul actual rulat ca root și `socket_mode: "0660"`, accesul poate fi
-  efectiv limitat la root, dacă operatorul nu configurează în mod deliberat
-  proprietarul sau politica de grup pentru socket.
-- Nu există token de autentificare la nivelul aplicației.
-- Interfața este numai pentru POSIX; Windows poate rula testele pure și codul de
-  dezvoltare, dar nu listener-ul pentru socket-ul Unix.
-- Modificările de rutare la runtime sunt locale procesului și dispar după
-  repornire.
+### Flux interactiv
 
-Consultați
-[`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
-pentru o configurație completă, inactivă, cu rutare statică și control la
-runtime.
-
----
-
-## 🧰 `aismixerctl`
-
-Programul de instalare amplasează un mic wrapper POSIX în
-`/usr/local/bin/aismixerctl`. Wrapper-ul execută
-`/usr/bin/python3 /opt/aismixer/aismixerctl.py "$@"` și nu conține logică de
-rutare sau de protocol.
-
-Rulați CLI-ul ca utilizator autorizat pentru socket. Cu socket-ul instalat
-implicit, deținut de root, aceasta înseamnă de obicei:
-
-```bash
-sudo aismixerctl status
-```
-
-Dintr-un checkout al repository-ului sau dintr-un director copiat al
-serviciului, utilizați:
-
-```bash
-python3 aismixerctl.py status
-```
-
-Utilizați `--socket` pentru a suprascrie calea implicită:
-
-```bash
-aismixerctl --socket /custom/path.sock status
-```
-
-Înlocuiți snapshot-ul activ de rutare, local procesului:
-
-```bash
-sudo aismixerctl \
-  replace \
-  --file examples/routing-update.yaml \
-  --expected-generation 3
-```
-
-Dezactivați rutarea și readuceți procesul care rulează în modul legacy
-broadcast:
-
-```bash
-sudo aismixerctl \
-  disable \
-  --expected-generation 4
-```
-
-### 🔢 Semantica generațiilor
-
-- `status` returnează generația curentă.
-- `replace` și `disable` pot include o generație așteptată.
-- O actualizare învechită este respinsă în loc să suprascrie un snapshot mai
-  nou.
-- CLI-ul nu reîncearcă automat.
-
-`replace --file` acceptă fie:
-
-1. o configurație completă care conține un mapping top-level `routing:`; fie
-2. o secțiune directă de rutare care conține numai `zones:` și `routes:`.
-
-`routing: null` nu reprezintă o cerere de înlocuire; utilizați `disable`.
-
-Consultați [`examples/routing-update.yaml`](examples/routing-update.yaml) pentru
-un fișier de actualizare care conține direct secțiunea de rutare.
-
----
-
-## 🔐 Ieșirile `nmea_sproxy`
-
-UDPSEC este transportul UDP autentificat și criptat folosit de AISMixer între
-stație și mixer; nu este un protocol extern standardizat. Pentru fiecare
-handshake, fiecare endpoint creează o pereche efemeră nouă P-256; schimbul ECDHE
-autentificat produce secretul comun. Cheile P-256 de identitate pe termen lung
-sunt ancore de încredere configurate în afara protocolului; prin ele, cele două
-endpoint-uri se autentifică reciproc cu semnături ECDSA peste digesturi SHA-256
-legate de transcript. Cheile de identitate nu participă la acordul de chei.
-HKDF-SHA256 derivă chei de trafic AES-256-GCM independente pentru direcțiile
-client-către-server și server-către-client din
-secretul efemer comun și transcriptul autentificat. După trimiterea mesajului
-ServerHello autentificat, serverul ține sesiunea în așteptare până când un ping
-criptat trimis de client către server, cu secvența zero, confirmă posesia
-cheilor; apoi o promovează și trimite un pong criptat de la server către client,
-autentificat de client. Forward secrecy la compromiterea ulterioară a cheii de
-identitate impune ca vechile chei private efemere și secretele ECDHE să nu mai
-existe și ca niciun endpoint să nu fi fost compromis cât timp erau în memorie.
-Compromiterea endpoint-ului expune materialul curent; o cheie privată de
-identitate compromisă în prezent permite uzurparea identității în sesiuni
-viitoare. Aceste proprietăți sunt susținute de validare inginerească, nu de
-verificare criptografică formală. Cheile publice ale stațiilor autorizate sunt
-configurate în `authorized_keys.yaml`. Înregistrările
-de replay ale handshake-ului și sesiunile în așteptare și active folosesc o
-stare locală a procesului, limitată și gestionată prin TTL. Pachetele de date
-folosesc nonce-uri aleatorii de 12 octeți, cu detectarea replay-urilor în fiecare
-sesiune. Curățarea la expirare este declanșată de traficul permis, nu de un timer
-în fundal, iar starea securizată pentru replay, sesiuni și nonce-uri se pierde la
-repornirea serviciului. UDPSEC protejează pachetele în tranzit, dar nu
-dovedește că payload-ul AIS este veridic din punct de vedere semantic sau exact
-din punct de vedere fizic.
-
-Pentru funcționarea protocolului, domeniul de securitate, semantica exactă a
-stării și context suplimentar, consultați [ghidul
-`nmea_sproxy`](nmea_sproxy/README.md), [politica de securitate](SECURITY.md),
-[contractul comportamental](BEHAVIORAL_CONTRACT.md) și
-[Wiki](https://github.com/iliyan85/aismixer/wiki).
-
-`nmea_sproxy` este proxy-ul de la stație:
+Shell-ul interactiv este cea mai rapidă cale de a descoperi starea curentă și de
+a inspecta contoarele locale procesului. Cu socket-ul implicit deținut de root:
 
 ```text
-o intrare locală (UDP sau serială) → o intrare AISMixer UDPSEC sau UDP
+sudo aismixerctl
+aismixerctl> status
+aismixerctl> show statistics
+aismixerctl> show statistics inputs
+aismixerctl> show statistics outputs
 ```
 
-Exemple de comenzi:
+Folosiți `help` în shell. Comenzile pentru statisticile intrărilor și ieșirilor
+acceptă și un filtru opțional. Comenzile one-shot rămân disponibile pentru
+scripturi.
+
+### Actualizări de rutare
+
+Înlocuiți sau dezactivați atomic snapshot-ul activ de rutare, local procesului:
+
+```bash
+sudo aismixerctl replace --file examples/routing-update.yaml --expected-generation 3
+sudo aismixerctl disable --expected-generation 4
+```
+
+Generația așteptată este opțională; atunci când este furnizată, împiedică o
+actualizare învechită să suprascrie o stare mai nouă. CLI-ul nu reîncearcă
+automat.
+
+## 🔐 `nmea_sproxy`
+
+`nmea_sproxy` este proxy-ul de rețea de la stație. Un proces sau o instanță
+systemd reprezintă o relație: o intrare UDP locală sau serială/USB fizică spre o
+ieșire de rețea. UDPSEC este transportul securizat/implicit spre AISMixer; UDP
+simplu trebuie selectat explicit și este destinat numai conexiunilor LAN/VPN de
+încredere.
+
+### Instalare și pornire
+
+Din checkout-ul AISMixer:
 
 ```bash
 cd nmea_sproxy
-python3 nmea_sproxy.py
-sudo systemctl start nmea_sproxy
-sudo systemctl start nmea_sproxy@boat
+chmod +x install.sh
+./install.sh
 ```
 
-Numele de template precum `boat`, `yacht` sau `balchik_roof` sunt etichete
-alese de operator. Consultați
-[`nmea_sproxy/README.md`](nmea_sproxy/README.md) pentru ghidul detaliat destinat
-stației.
+Programul de instalare al proxy-ului pregătește structura de configurare și
+perechea de chei a stației, păstrând materialul existent al operatorului,
+instalează unitățile singleton și template, activează numai singleton-ul și nu
+pornește niciun serviciu. Finalizați configurarea relației și, pentru modul
+UDPSEC implicit, configurarea cheii publice AISMixer de încredere descrisă în [ghidul
+operatorului](nmea_sproxy/README.md), apoi porniți serviciul:
 
-`nmea_sproxy` are propriile controale pentru endpoint-urile de la stație:
-`allow_from` top-level limitează expeditorii UDP locali sau LAN care pot fi
-redirecționați sub identitatea stației. `source_ip` top-level este asocierea
-legacy a sursei UDPSEC; pentru mapări explicite în `output:`,
-`output.source_ip` asociază cu o adresă-sursă literală socket-urile de ieșire
-UDPSEC sau UDP simplu. Acestea sunt configurate în fișierele de relații
-`nmea_sproxy`; sunt separate de controalele AISMixer `udp_inputs[]`,
-`sec_inputs[]` și `forwarders[]`.
+```bash
+systemctl start nmea_sproxy.service
+systemctl status nmea_sproxy.service
+```
 
-Pentru stațiile cu receptor AIS fizic, `nmea_sproxy` poate citi direct de la
-un port serial sau USB virtual COM și poate redirecționa propozițiile NMEA
-rezultate prin ieșirea UDPSEC sau UDP configurată. De asemenea, poate
-redirecționa explicit UDP simplu pentru medii LAN/VPN de încredere; UDP simplu
-nu oferă autentificare UDPSEC, criptare, protecție împotriva replay-ului sau
-protocol de liveness.
+### Instanțe singleton și template
 
----
+Singleton-ul citește `/etc/nmea_sproxy/config.yaml`. Instanțele template precum
+`boat`, `yacht` sau `roof` folosesc nume de relații alese de operator și
+configurații din `/etc/nmea_sproxy/instances/`. Copiați și editați fișierul
+relației înainte de a-i porni instanța:
+
+```bash
+cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
+systemctl enable --now nmea_sproxy@boat.service
+systemctl status nmea_sproxy@boat.service
+```
+
+Rulați o altă instanță template atunci când este necesară o altă relație
+independentă. O instalare bazată numai pe instanțe template trebuie să
+dezactiveze și să oprească singleton-ul nefolosit cu
+`systemctl disable --now nmea_sproxy.service`.
+
+### Actualizare
+
+Updater-ul proxy-ului este, de asemenea, urmărit fără bit executabil. Din
+rădăcina repository-ului, faceți-l executabil o singură dată și rulați-l după
+preluarea modificărilor:
+
+```bash
+git pull --ff-only
+cd nmea_sproxy
+chmod +x update.sh
+./update.sh
+```
+
+Spre deosebire de updater-ul AISMixer, `nmea_sproxy/update.sh` actualizează
+fișierele instalate și reîncarcă systemd, dar intenționat **nu repornește**
+singleton-ul sau nicio instanță template. Reporniți numai relațiile alese, când
+sunteți pregătit:
+
+```bash
+systemctl restart nmea_sproxy.service
+systemctl restart nmea_sproxy@boat.service
+```
+
+### Limită de securitate
+
+UDPSEC este transportul UDP autentificat și criptat specific AISMixer, nu un
+standard extern. Autentifică reciproc identitățile configurate ale
+endpoint-urilor, protejează confidențialitatea și integritatea pachetelor în
+tranzit și verifică replay-ul și liveness-ul. Proprietățile sale de forward
+secrecy depind de eliminarea secretelor efemere și de faptul că endpoint-urile nu
+sunt compromise cât timp acele secrete sunt active; designul are validare
+inginerească, nu verificare criptografică formală. UDPSEC nu dovedește că
+payload-urile AIS sunt adevărate semantic sau exacte fizic. UDP simplu explicit
+nu oferă confidențialitate, autentificarea stației, integritate criptografică,
+protecție anti-replay sau protocol de liveness. Pentru chei,
+încredere, configurare, comportamentul sesiunilor, politica endpoint-urilor și
+depanare, consultați [ghidul `nmea_sproxy`](nmea_sproxy/README.md), [politica de
+securitate](SECURITY.md), [contractul comportamental](BEHAVIORAL_CONTRACT.md) și
+[Wiki](https://github.com/iliyan85/aismixer/wiki).
+
+## ✅ Capabilități actuale
+
+### 📡 Intrări și ieșiri
+
+- Ingress UDP prin IPv4 și IPv6, cu liste opționale de adrese permise la nivelul
+  aplicației.
+- Ingress UDPSEC autentificat și criptat, compatibil cu `nmea_sproxy`.
+- Intrare serială fizică și USB virtual COM prin `nmea_sproxy`, plus UDP simplu
+  explicit pentru rețele de încredere.
+- Asocierea opțională a adresei-sursă pentru ieșirile AISMixer și proxy.
+- Egress UDP broadcast în modul legacy și destinații UDP denumite în modul de
+  rutare.
+
+### ⚙️ Procesare
+
+- Extragerea propozițiilor AIS `!AIVDM`, `!AIVDO` și compatibile acceptate.
+- Asamblare multipart complet independentă de ordinea sosirii; repetările exacte
+  sunt idempotente, iar fragmentele conflictuale invalidează grupul activ.
+- Gestionare deterministă a NMEA TAG `s`/`c`/`g`, care respectă ciclul de viață.
+- Decizii de deduplicare multipart atomice la nivel de grup: globale în modul
+  legacy și separate pentru fiecare `target_id` în modul de rutare.
+- Cozile limitate, locale procesului, pentru ingress, procesare și egress aplică
+  backpressure; starea mutabilă a planului de date are o limită explicită de
+  ciclu de viață și reset deținută de instanța procesorului.
+- Cicluri de viață TTL explicite, locale procesului, capacități opționale ale
+  stării de referință și snapshot-uri runtime proaspete, imuabile și pull-based.
+
+### 🔀 Rutare și operare
+
+- Mod legacy broadcast sau rutare logică statică încărcată la pornire.
+- Identități denumite `source_id` pentru ingress și `target_id` pentru egress.
+- Zone logice de surse cu `include`, `union`, `intersection` și `difference`.
+- Un `ProcessingSnapshot` imuabil, asociat numai când un cadru de ingress este
+  admis; modul de rutare efectuează atunci o singură potrivire a sursei.
+- Înlocuirea atomică opțională a rutării prin `aismixerctl`.
+- Task-uri supravegheate local procesului pentru ingress, procesare și egress;
+  listener-ul de control opțional are un ciclu de viață gestionat separat.
+
+## 🔀 Arhitectură
+
+AISMixer păstrează separate planul de date și planul de control opțional.
+
+### 📡 Planul de date
+
+Producătorii UDP și UDPSEC creează cadre de ingress imuabile în cozi private
+limitate. Fan-in le admite în procesarea limitată înainte ca procesorul unic,
+care deține starea, să scaneze datele NMEA, să asambleze mesajele multipart, să
+aplice deduplicarea globală sau separată pe destinații și să construiască
+metadate TAG controlate. Cozile pline ale etapelor AISMixer așteaptă cu
+backpressure în loc să elimine elementele aflate în coadă.
+
+Fiecare cadru admis are un `ProcessingSnapshot` asociat; modul de rutare adaugă
+o singură potrivire a sursei. Valorile `OutputBatch` ne-goale traversează
+ordonat un handoff egress limitat, iar procesarea așteaptă finalizarea locală a
+egress-ului înainte de a continua. Dacă un task runtime supravegheat eșuează,
+nu există reluarea automată a livrării.
+
+### 🎛️ Planul de control
+
+Când este activat, serviciul local NDJSON prin socket din domeniul Unix validează
+cererile în raport cu ID-urile de destinație disponibile și înlocuiește atomic
+starea de rutare imuabilă, locală procesului. De asemenea, expune starea și
+statistici runtime read-only agregate, per-input și per-output prin
+`aismixerctl`.
+
+### 🧩 Componente principale
+
+| Componentă | Rol |
+|---|---|
+| `aismixer.py` | Ciclul de viață runtime, fan-in ingress, procesare, egress și control opțional |
+| `core/routing*.py` | Rutare logică și snapshot-uri imuabile |
+| `core/routing_control*.py` / `core/runtime_control.py` | Protocol de control și serviciu prin socket Unix |
+| `core/runtime_statistics.py` | Contoare runtime locale procesului și vizualizări imuabile |
+| `aismixerctl.py` | CLI pentru control și statistici destinat operatorului |
+| `aismixer_secure.py` | Ingress UDPSEC |
+| `nmea_sproxy/` | Proxy la stație de la UDP/serial la UDPSEC/UDP |
+| `assembler.py` / `dedup.py` | Asamblare multipart și suprimarea duplicatelor |
+| `meta_writer.py` / `meta_cleaner.py` | Ieșire NMEA TAG și curățarea ingress-ului |
+| `forwarder.py` | Broadcast UDP și egress direcționat |
+
+Semantica normativă de procesare și runtime se află în
+[BEHAVIORAL_CONTRACT.md](BEHAVIORAL_CONTRACT.md). Acest README este o prezentare
+pentru operatori, nu o a doua specificație.
+
+## 🗺️ Rutare logică
+
+### Legacy broadcast
+
+Fără o secțiune top-level `routing:`, deduplicarea este globală și fiecare
+propoziție acceptată ajunge la fiecare forwarder. Forwarderele fără nume rămân
+valide.
+
+### Rutare statică
+
+O secțiune top-level `routing:` validă activează rute ordonate de la ID-uri de
+sursă sau zone logice către forwardere denumite. Zonele sunt mulțimi de ID-uri
+de sursă, nu regiuni geografice, liste MMSI sau filtre de nave. Deduplicarea este
+separată pentru fiecare destinație.
+
+Identitățile canonice includ `udp:<input-id>`, `udp:<mapped-alias>`,
+`udp:<remote-ip>`, `udpsec:<authenticated-station-id>` și
+`udp:<forwarder-id>` pentru destinații UDP denumite. Rutarea potrivește ID-urile
+interne ale surselor, nu etichetele TAG `s` emise. Consultați [exemplul
+static](examples/config-routing.yaml).
+
+### Rutare la runtime
+
+Când controlul local este activat, `routing.replace` și `routing.disable`
+afectează printr-o schimbare atomică de snapshot cadrele care nu au fost încă
+admise în procesarea limitată; lucrul deja admis își păstrează snapshot-ul
+asociat. Actualizările sunt locale procesului și dispar la repornire. Consultați [exemplul
+de control](examples/config-routing-control.yaml) și [payload-ul de
+actualizare](examples/routing-update.yaml).
 
 ## 🏷️ Comportamentul metadatelor NMEA TAG
 
-AISMixer citește metadatele TAG de ingress și emite un bloc TAG `s`/`c`/`g`
-controlat, conform opțiunilor runtime descrise mai jos.
-
-Pentru grupurile multipart, contextul TAG `s`, `c` și `g` urmează limitele de
-conflict, expirare, evacuare la atingerea capacității și finalizare ale
-assemblerului. Regulile exacte de proprietate și selecție sunt definite în
-[BEHAVIORAL_CONTRACT.md](BEHAVIORAL_CONTRACT.md).
-
-### 🪪 TAG `s` — eticheta sursei
-
-Valoarea TAG `s` emisă este aleasă separat de `source_id` folosit pentru rutare.
-
-Ordinea de prioritate:
-
-1. `station_id` global nevid;
-2. ID-ul intrării, aliasul UDP sau numele stației/clientului UDPSEC autorizat;
-3. TAG `s` de ingress, când este prezent;
-4. adresa IP a expeditorului, ca valoare de rezervă.
-
-Valoarea emisă este sanitizată la `[A-Za-z0-9_]` și limitată la 15 caractere.
-ID-urile surselor de rutare sunt identificatori interni opaci și nu sunt
-sanitizate sau trunchiate precum valorile TAG `s`.
-
-### 🕒 TAG `c` — marcaj temporal
-
-Pentru grupurile multipart, `c_preserve_ingress_c: true` selectează valoarea
-numerică minimă validă a TAG `c` de ingress observată în timpul generației
-active a assemblerului, indiferent de ordinea sosirii. Când păstrarea este
-dezactivată sau nu există o valoare validă, AISMixer emite timpul serverului.
-Contractul comportamental consemnează excepția intenționată de compatibilitate
-pentru `c:0` într-o propoziție individuală.
-
-### 🧷 TAG `g` — metadatele grupului de ieșire
-
-TAG `g` reprezintă metadate de ingress/ieșire pentru mesajele multipart. **Nu**
-este cheia assemblerului. Asamblarea multipart folosește câmpurile fragmentelor
-NMEA împreună cu identitatea assemblerului de ingress. ID-urile de grup păstrate
-folosesc egalitatea exactă a șirurilor; observațiile absente sau discordante
-produc un singur ID generat pentru grupul logic finalizat.
-
-Opțiuni relevante:
+AISMixer citește metadatele TAG de ingress și emite metadate `s`/`c`/`g`
+controlate. Eticheta `s` emisă este aleasă separat de ID-ul intern al sursei de
+rutare și este sanitizată pentru ieșirea NMEA. În funcție de configurație, `c`
+poate păstra un timp de ingress valid sau poate folosi timpul serverului, iar
+`g` multipart poate păstra un ID de grup ingress agreat sau poate genera un ID
+de ieșire. TAG `g` este metadată, nu cheia assemblerului multipart.
 
 ```yaml
 g_preserve_ingress_gid: true
@@ -1975,72 +1312,21 @@ g_always_tag_single: false
 c_preserve_ingress_c: true
 ```
 
----
+Regulile exacte pentru prioritate, proprietatea stării multipart, conflict,
+expirare și compatibilitate aparțin [contractului
+comportamental](BEHAVIORAL_CONTRACT.md).
 
-## 📦 Instalare
+## 📚 Exemple și testare
 
-Instalați serviciul systemd administrat de repository și wrapper-ul CLI global:
-
-```bash
-./install.sh
-```
-
-Programul de instalare amplasează fișierele runtime în `/opt/aismixer`,
-instalează `aismixer.service`, instalează `/usr/local/bin/aismixerctl`,
-reîncarcă systemd și activează serviciul. Nu pornește automat AISMixer. Unitatea
-folosește `RuntimeDirectory=aismixer`, astfel încât systemd creează
-`/run/aismixer` cât timp serviciul rulează și îl elimină după oprirea
-serviciului.
-
-Serviciul instalat citește `/etc/aismixer/config.yaml`. La prima instalare,
-`install.sh` inițializează `/etc/aismixer` din configurația repository-ului,
-păstrând configurația și cheile existente ale operatorului.
-
-Actualizați fișierele runtime instalate și reporniți serviciul cu:
-
-```bash
-./update.sh
-```
-
-`update.sh` nu modifică configurația și cheile operatorului din
-`/etc/aismixer`.
-
-Dezinstalați serviciul și fișierele runtime instalate cu:
-
-```bash
-./uninstall.sh
-```
-
-În mod implicit, dezinstalarea păstrează `/etc/aismixer`; opțiunea explicită
-`./uninstall.sh --purge-config` elimină și configurația, și cheile operatorului.
-
----
-
-## 📚 Exemple
-
-Fișierele de exemplu nu produc efecte până când sunt copiate sau adaptate de un
-operator:
-
-- [`examples/config-routing.yaml`](examples/config-routing.yaml) — configurație
-  completă pentru rutare statică.
+- [`examples/config-routing.yaml`](examples/config-routing.yaml) — rutare statică.
 - [`examples/config-routing-control.yaml`](examples/config-routing-control.yaml)
-  — configurație completă de rutare cu `control.unix` activat.
-- [`examples/routing-update.yaml`](examples/routing-update.yaml) — secțiune
-  directă de rutare pentru `aismixerctl replace --file`.
-- [`examples/README.md`](examples/README.md) — ghid scurt pentru fișierele de
-  exemplu.
+  — rutare statică cu control local.
+- [`examples/routing-update.yaml`](examples/routing-update.yaml) — actualizare
+  directă de rutare pentru `aismixerctl`.
+- [`examples/README.md`](examples/README.md) — ghidul fișierelor de exemplu.
 
-Toate adresele, ID-urile, porturile, căile și cheile din fișierele de exemplu
-trebuie adaptate la mediul de instalare.
-
----
-
-## 🧪 Testare
-
-Suita de teste acoperă asamblarea multipart, gestionarea TAG, procesarea
-metadatelor, componentele auxiliare UDPSEC, rutarea, înlocuirea snapshot-ului,
-protocolul și transporturile de control, `aismixerctl` și comportamentul de
-redirecționare.
+Toate adresele, ID-urile, porturile, căile și cheile de exemplu necesită
+adaptarea operatorului. Rulați suita de teste a repository-ului cu:
 
 ```bash
 python -m pytest
@@ -2049,39 +1335,41 @@ python -m pytest
 Testele reale pentru listener-ul din domeniul Unix necesită Linux, WSL,
 Raspberry Pi OS sau alt mediu POSIX cu suport asyncio pentru socket-uri Unix.
 
----
-
 ## ⚠️ Limitări actuale
 
-- UDP este singurul adaptor egress AISMixer implementat în prezent.
-- Starea și generațiile de rutare sunt locale procesului; modificările efectuate
-  la runtime nu sunt persistente.
-- Starea securizată pentru replay, sesiuni și nonce-uri este locală procesului
-  și nepersistentă; curățarea la expirare este declanșată de trafic, nu de un
-  timer în fundal.
-- Integrarea actuală a serviciului lasă limitele opționale de deduplicare și
-  asamblare la `None`, astfel că aceste dimensiuni nu au limită de capacitate.
-- Nu există coordonator multiprocessing sau sincronizare între procese.
-- Nu există reîncărcare sau urmărire automată a configurației.
-- Nu există filtrare geografică, după MMSI sau după conținutul datelor navei.
-- Nu există stocare pe termen lung, analiză sau detectare a spoofing-ului.
-- Controlul Unix necesită suport POSIX pentru socket-uri din domeniul Unix.
-- Controlul accesului se bazează pe permisiunile sistemului de fișiere Unix,
-  fără token la nivelul aplicației.
-- Nu a fost introdusă încă o politică pentru un utilizator/grup de serviciu
-  dedicat.
+- UDP este singurul adaptor egress AISMixer implementat.
+- Starea, generațiile și statisticile runtime de rutare sunt locale procesului;
+  modificările runtime nu sunt persistente.
+- Starea securizată pentru replay, sesiuni și nonce-uri este locală procesului și
+  nepersistentă; curățarea la expirare este determinată de traficul permis.
+- Integrarea curentă a serviciului lasă capacitățile opționale de deduplicare și
+  asamblare la `None`.
+- Nu există procese coordonator sau worker ingress/egress, IPC, rutare ori
+  agregare de metrici între procese, restart automat al workerilor sau
+  reîncărcare automată a configurației.
+- Nu există filtrare geografică, după MMSI ori conținutul navei, stocare pe termen
+  lung, analiză sau detectare a spoofing-ului.
+- Controlul local necesită socket-uri Unix POSIX și se bazează pe permisiunile
+  sistemului de fișiere; nu există token al aplicației sau politică pentru un
+  cont de serviciu dedicat.
 
----
+## 📖 Harta documentației
 
-## 📖 Documentație suplimentară
+- [Contract comportamental](BEHAVIORAL_CONTRACT.md) — semantica normativă de
+  procesare și runtime.
+- [Ghidul operatorului pentru `nmea_sproxy`](nmea_sproxy/README.md) — ghid complet
+  la stație pentru instalare, configurare, chei, serial, ieșire, servicii și
+  depanare.
+- [GitHub Wiki](https://github.com/iliyan85/aismixer/wiki) — arhitectură mai
+  aprofundată și material explicativ.
+- [Exemple](examples/README.md) · [Politica de securitate](SECURITY.md) ·
+  [Ghid de contribuție](CONTRIBUTING.md) · [Foaie de parcurs](ROADMAP.md) ·
+  [Site public](https://aismixer.net)
 
-- [Contract comportamental](BEHAVIORAL_CONTRACT.md)
-- [Exemple](examples/README.md)
-- [Ghidul operatorului pentru `nmea_sproxy`](nmea_sproxy/README.md)
-- [GitHub Wiki](https://github.com/iliyan85/aismixer/wiki)
-- [Ghid de contribuție](CONTRIBUTING.md)
-- [Politica de securitate](SECURITY.md)
-- [Foaia de parcurs a proiectului](ROADMAP.md)
-- [Site public](https://aismixer.net)
+## 🌿 Ramuri și site web
+
+`main` conține serviciul, proxy-ul, exemplele, componentele de control și
+`tests/`. Site-ul public se află pe `website`; GitHub Pages folosește `/docs` din
+acea ramură, astfel că `docs/` lipsește intenționat din `main`.
 
 [⬆ Înapoi la selectorul de limbă](#english)

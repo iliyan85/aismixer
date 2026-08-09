@@ -330,6 +330,16 @@ Do not claim that the full project is validated if only partial tests were run.
 
 Update documentation when behavior changes.
 
+Documentation ownership and size policy:
+
+* Root `README.md` is the concise public/operator overview. It MUST NOT exceed
+  2100 lines; approximately 700 lines per language is the practical upper
+  bound. Future additions should normally replace or condense existing material
+  so the README retains useful space below the hard limit.
+* `nmea_sproxy/README.md` is the detailed station-side operator guide.
+* `BEHAVIORAL_CONTRACT.md` owns normative processing and runtime semantics.
+* The GitHub Wiki owns deeper architecture and explanatory documentation.
+
 Important documentation areas include:
 
 * README usage examples;

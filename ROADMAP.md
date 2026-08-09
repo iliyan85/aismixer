@@ -28,10 +28,18 @@ boundaries; it does not mean that a native implementation or bindings exist:
 - An explicit synchronous `DataPlaneProcessor` boundary with immutable
   snapshot and output values, with `PythonDataPlaneProcessor` as the sole
   production reference implementation.
+- Processor-instance ownership of mutable assembler, deduplication, source,
+  and multipart metadata state, plus a synchronous ordered reset boundary.
 - Explicit single-process ingress fan-in, processor, and egress stages with
   process-local fail-fast supervision.
+- Private bounded ingress queues, bounded processing admission, and bounded
+  egress handoff with explicit process-local backpressure.
+- Admission-time binding of each `IngressFrame` and `ProcessingSnapshot` into
+  one immutable work item after processing capacity becomes available.
 - An ordered completion barrier that prevents processor work on a later frame
   from running ahead of the current non-empty batch's egress dispatch.
+- Fresh immutable, pull-based snapshots for queue, processor, egress-operation,
+  input-traffic, and output-target metrics, with process-local ownership.
 - An immutable dense numeric egress target registry covering every configured
   destination, including unnamed legacy destinations, while configuration and
   control target names remain string-facing.
@@ -57,9 +65,11 @@ The following service and operational capabilities are also implemented:
 - Static routing loaded from configuration.
 - Target-scoped deduplication in routing mode.
 - Runtime routing status, replacement, and disable operations.
-- Versioned JSON routing-control protocol.
+- Versioned JSON routing-control protocol with read-only aggregate, per-input,
+  and per-output runtime statistics.
 - Opt-in POSIX Unix-domain control server.
-- `aismixerctl` local operator CLI.
+- `aismixerctl` one-shot CLI and interactive operator shell for routing and
+  runtime statistics.
 - Repository-managed systemd unit with `RuntimeDirectory=aismixer`.
 - Globally installed `/usr/local/bin/aismixerctl` wrapper in lifecycle scripts.
 - Install and update flows preserve existing operator configuration and keys.
@@ -87,31 +97,28 @@ Remaining deployment hardening:
   primary runtime exception or prevent a later closer from running; correcting
   that is cleanup hardening, not a Campaign D processor-boundary guarantee.
 
-### 2. Campaign F — Worker Readiness
+### 2. Campaign F — Worker Readiness (Completed)
 
-Already implemented:
+The current single-process Python runtime now has the Worker Readiness
+foundation: bounded stage queues and backpressure, processor-instance state
+ownership and reset semantics, capacity-safe processing snapshot handoff,
+immutable pull-based metrics, runtime input/output traffic accounting, and
+read-only operator statistics through the control protocol and `aismixerctl`.
 
-- Explicit stage boundaries and process-local lifecycle supervision within the
-  current single service process.
-
-Still future:
-
-- Define bounded queues and backpressure for future worker boundaries; no
-  end-to-end worker backpressure guarantee exists today.
-- Define processor instance ownership and worker lifecycle.
-- Define the metrics boundary between stages and future workers.
-- Use explicit egress-worker terminology for future forwarding workers.
-- Prepare the current contracts for staged process separation without
-  introducing coordinator processes, IPC, or native bindings in Campaign F.
+This closes the in-process boundaries needed for staged process separation. It
+does not mean that ingress or egress worker processes, a coordinator, IPC,
+cross-process supervision, or distributed metrics already exist.
 
 ### 3. Later Process Architecture And Native Implementation
 
-- Introduce a coordinator process and dedicated ingress and egress workers.
+- Introduce a coordinator process and actual ingress worker and egress worker
+  processes.
+- Add IPC and cross-process routing-snapshot distribution.
 - Define cross-process lifecycle supervision and failure handling.
-- Add IPC and routing-snapshot distribution across processes.
 - Define worker restart and recovery policy.
-- Implement any native processor and its bindings behind the established
-  contracts.
+- Add cross-process or distributed metrics aggregation where required.
+- Implement a native processor and its bindings behind the established
+  processor contract.
 - Migrate in stages rather than as a single large rewrite.
 
 ### 4. Routing-State Operations
@@ -143,7 +150,8 @@ marked as future work:
 - Peer-to-peer routing exchange.
 - Dynamic ingress and egress adapter lifecycle management.
 - Geographic, MMSI, vessel, or payload-aware filtering.
-- Richer monitoring, metrics, and health reporting.
+- Exported, persistent, or distributed monitoring and health reporting beyond
+  the current process-local runtime statistics.
 
 ## Non-Goals For The Current Phase
 
