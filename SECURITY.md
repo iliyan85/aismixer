@@ -2,9 +2,10 @@
 
 ## Supported Development State
 
-AISMixer has not yet declared a formally supported stable release line. Until
-the first versioned release is declared, security fixes target the current
-`main` branch.
+AISMixer has not yet declared a formally supported stable release line.
+Security fixes currently target the `main` branch. Versioned pre-1.0 releases
+are release snapshots and do not establish a separately maintained
+security-support branch unless explicitly stated.
 
 Historical commits, forks, local modifications, and unmaintained deployments
 are not automatically supported. Operators should track current security
