@@ -12,8 +12,8 @@ PKG_RELEASE:=1
 # packaging/runtime validation. Do not follow a moving branch here.
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/iliyan85/aismixer.git
-PKG_SOURCE_DATE:=2026-08-09
-PKG_SOURCE_VERSION:=ee17f0ec1397b746dd74a5931baf7e505360e13c
+PKG_SOURCE_DATE:=2026-08-13
+PKG_SOURCE_VERSION:=10df1265b4226debe06815202ed88a4010a567fc
 
 # Add PKG_MIRROR_HASH before treating this as a reproducible public package.
 # PKG_MIRROR_HASH:=
