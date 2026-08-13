@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/python3 /usr/lib/aismixer/nmea_sproxy/nmea_sproxy.py "$@"

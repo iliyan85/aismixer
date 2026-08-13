@@ -54,14 +54,91 @@ def wait_for(predicate, timeout=1.0):
     return predicate()
 
 
-def test_absent_input_preserves_legacy_udp_mode():
+def test_absent_input_preserves_top_level_udp_configuration():
     proxy = load_proxy_module()
     config = {"listen_ip": "::", "listen_port": 50000}
 
     input_config = proxy.validate_local_input_config(config)
 
-    assert input_config == {"type": "udp"}
+    assert input_config == {
+        "type": "udp",
+        "listen_ip": "::",
+        "listen_port": 50000,
+    }
     assert "input" not in config
+
+
+def test_explicit_udp_input_normalizes_listener_fields():
+    proxy = load_proxy_module()
+    config = {
+        "input": {
+            "type": "udp",
+            "listen_ip": "2001:db8:42::10",
+            "listen_port": 50123,
+        },
+        "listen_ip": "127.0.0.1",
+        "listen_port": 50000,
+    }
+
+    input_config = proxy.validate_local_input_config(config)
+
+    assert input_config == {
+        "type": "udp",
+        "listen_ip": "2001:db8:42::10",
+        "listen_port": 50123,
+    }
+    assert config["input"] == input_config
+
+
+def test_udp_allow_from_normalizes_in_both_supported_forms():
+    proxy = load_proxy_module()
+    allow_from = ["2001:db8:42::15", "2001:db8:42::/64"]
+
+    top_level = proxy.validate_local_input_config({
+        "listen_ip": "::",
+        "listen_port": 50000,
+        "allow_from": allow_from,
+    })
+    explicit = proxy.validate_local_input_config({
+        "input": {
+            "type": "udp",
+            "listen_ip": "::",
+            "listen_port": 50000,
+            "allow_from": allow_from,
+        }
+    })
+
+    assert top_level == explicit == {
+        "type": "udp",
+        "listen_ip": "::",
+        "listen_port": 50000,
+        "allow_from": allow_from,
+    }
+    policy = proxy.compile_local_ingress_policy(explicit)
+    assert policy.allows("2001:db8:42::15")
+    assert not policy.allows("2001:db8:43::15")
+
+
+def test_udp_wildcard_host_and_ephemeral_port_remain_valid():
+    proxy = load_proxy_module()
+
+    top_level = proxy.validate_local_input_config({
+        "listen_ip": "",
+        "listen_port": 0,
+    })
+    explicit = proxy.validate_local_input_config({
+        "input": {
+            "type": "udp",
+            "listen_ip": "",
+            "listen_port": 0,
+        }
+    })
+
+    assert top_level == explicit == {
+        "type": "udp",
+        "listen_ip": "",
+        "listen_port": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -93,7 +170,20 @@ def test_serial_port_string_is_passed_unchanged(port):
     [
         (None, "explicit null"),
         ({}, "input.type"),
-        ({"type": "udp"}, "unsupported"),
+        ({"type": "udp"}, "input.listen_ip"),
+        (
+            {
+                "type": "udp",
+                "listen_ip": "::",
+                "listen_port": 50000,
+                "port": "COM4",
+            },
+            "unknown UDP input option",
+        ),
+        (
+            {"type": "tcp", "listen_ip": "::", "listen_port": 50000},
+            "unsupported",
+        ),
         ({"type": None}, "input.type"),
         ({"type": "serial"}, "input.port"),
         ({"type": "serial", "port": ""}, "input.port"),
@@ -118,7 +208,7 @@ def test_serial_port_string_is_passed_unchanged(port):
         ),
     ],
 )
-def test_invalid_serial_input_config_is_rejected(input_config, message):
+def test_invalid_local_input_config_is_rejected(input_config, message):
     proxy = load_proxy_module()
 
     with pytest.raises(proxy.ProxyConfigError, match=message):
@@ -131,6 +221,35 @@ def test_allow_from_is_rejected_with_serial_input():
     config["allow_from"] = ["192.0.2.15"]
 
     with pytest.raises(proxy.ProxyConfigError, match="allow_from"):
+        proxy.validate_local_input_config(config)
+
+
+@pytest.mark.parametrize("option", ["listen_ip", "listen_port", "allow_from"])
+def test_udp_only_nested_options_are_rejected_with_serial_input(option):
+    proxy = load_proxy_module()
+    value = {
+        "listen_ip": "::",
+        "listen_port": 50000,
+        "allow_from": ["192.0.2.15"],
+    }[option]
+    config = serial_proxy_config(**{option: value})
+
+    with pytest.raises(proxy.ProxyConfigError, match=option):
+        proxy.validate_local_input_config(config)
+
+
+def test_top_level_allow_from_is_rejected_with_explicit_udp_input():
+    proxy = load_proxy_module()
+    config = {
+        "input": {
+            "type": "udp",
+            "listen_ip": "::",
+            "listen_port": 50000,
+        },
+        "allow_from": ["2001:db8:42::/64"],
+    }
+
+    with pytest.raises(proxy.ProxyConfigError, match="use input.allow_from"):
         proxy.validate_local_input_config(config)
 
 
@@ -390,7 +509,7 @@ def test_serial_mode_missing_pyserial_fails_during_startup(monkeypatch):
         )
 
 
-def test_legacy_udp_mode_does_not_import_pyserial(monkeypatch):
+def test_udp_input_does_not_import_pyserial(monkeypatch):
     proxy = load_proxy_module()
     created = []
     real_import = builtins.__import__
@@ -406,7 +525,7 @@ def test_legacy_udp_mode_does_not_import_pyserial(monkeypatch):
 
     def import_without_serial(name, *args, **kwargs):
         if name == "serial":
-            raise AssertionError("legacy UDP mode must not import pySerial")
+            raise AssertionError("UDP input must not import pySerial")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(proxy.socket, "socket", fake_socket)
@@ -419,6 +538,38 @@ def test_legacy_udp_mode_does_not_import_pyserial(monkeypatch):
 
     assert isinstance(adapter, proxy.UdpInputAdapter)
     assert created[0].bound == ("127.0.0.1", 50000)
+
+
+def test_explicit_udp_adapter_binds_normalized_listener(monkeypatch):
+    proxy = load_proxy_module()
+    created = []
+
+    class FakeUdpSocket:
+        def bind(self, addr):
+            self.bound = addr
+
+    def fake_socket(*_args, **_kwargs):
+        sock = FakeUdpSocket()
+        created.append(sock)
+        return sock
+
+    monkeypatch.setattr(proxy.socket, "socket", fake_socket)
+
+    adapter = proxy.create_local_input_adapter(
+        {
+            "input": {
+                "type": "udp",
+                "listen_ip": "127.0.0.2",
+                "listen_port": 50123,
+            },
+            "listen_ip": "127.0.0.1",
+            "listen_port": 50000,
+        },
+        proxy.NetworkPolicy.unrestricted(),
+    )
+
+    assert isinstance(adapter, proxy.UdpInputAdapter)
+    assert created[0].bound == ("127.0.0.2", 50123)
 
 
 def test_serial_payload_is_encrypted_through_existing_udpsec_format(monkeypatch):

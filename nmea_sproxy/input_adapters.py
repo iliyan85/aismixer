@@ -3,7 +3,7 @@ import socket
 import threading
 
 
-LEGACY_UDP_INPUT_TYPE = "udp"
+UDP_INPUT_TYPE = "udp"
 SERIAL_INPUT_TYPE = "serial"
 
 DEFAULT_SERIAL_INPUT = {
@@ -68,6 +68,20 @@ def _positive_float(value, context):
     value = float(value)
     if value <= 0:
         raise InputConfigError(f"{context}: must be a positive number")
+    return value
+
+
+def _udp_listen_ip(value):
+    if not isinstance(value, str):
+        raise InputConfigError("input.listen_ip: must be a string")
+    return value
+
+
+def _udp_listen_port(value):
+    if not isinstance(value, int):
+        raise InputConfigError("input.listen_port: must be an integer UDP port")
+    if value < 0 or value > 65535:
+        raise InputConfigError("input.listen_port: must be in the range 0-65535")
     return value
 
 
@@ -180,9 +194,40 @@ def validate_serial_input_config(raw_input):
     }
 
 
+def validate_udp_input_config(raw_input):
+    if not isinstance(raw_input, dict):
+        raise InputConfigError("input: must be a mapping")
+
+    allowed_keys = {"type", "listen_ip", "listen_port", "allow_from"}
+    unknown_keys = sorted(set(raw_input) - allowed_keys)
+    if unknown_keys:
+        names = ", ".join(f"input.{key}" for key in unknown_keys)
+        raise InputConfigError(f"{names}: unknown UDP input option")
+
+    input_config = {
+        "type": UDP_INPUT_TYPE,
+        "listen_ip": _udp_listen_ip(
+            _explicit_value(raw_input, "listen_ip", required=True)
+        ),
+        "listen_port": _udp_listen_port(
+            _explicit_value(raw_input, "listen_port", required=True)
+        ),
+    }
+    if "allow_from" in raw_input:
+        input_config["allow_from"] = _explicit_value(raw_input, "allow_from")
+    return input_config
+
+
 def normalize_local_input_config(config):
     if "input" not in config:
-        return {"type": LEGACY_UDP_INPUT_TYPE}
+        raw_input = {
+            "type": UDP_INPUT_TYPE,
+            "listen_ip": _explicit_value(config, "listen_ip", required=True),
+            "listen_port": _explicit_value(config, "listen_port", required=True),
+        }
+        if "allow_from" in config:
+            raw_input["allow_from"] = _explicit_value(config, "allow_from")
+        return validate_udp_input_config(raw_input)
 
     raw_input = config["input"]
     if raw_input is None:
@@ -192,19 +237,27 @@ def normalize_local_input_config(config):
 
     raw_type = _explicit_value(raw_input, "type", required=True)
     if not isinstance(raw_type, str):
-        raise InputConfigError("input.type: must be 'serial'")
+        raise InputConfigError("input.type: must be 'udp' or 'serial'")
     input_type = raw_type.strip().lower()
-    if input_type != SERIAL_INPUT_TYPE:
+    if input_type not in {UDP_INPUT_TYPE, SERIAL_INPUT_TYPE}:
         raise InputConfigError(
-            f"input.type: unsupported value {raw_type!r}; supported value is 'serial'"
+            f"input.type: unsupported value {raw_type!r}; "
+            "supported values are 'udp' and 'serial'"
         )
 
     if "allow_from" in config:
+        if input_type == UDP_INPUT_TYPE:
+            raise InputConfigError(
+                "top-level allow_from cannot be used with an explicit input; "
+                "use input.allow_from for UDP input"
+            )
         raise InputConfigError(
-            "allow_from applies only to the legacy UDP input and cannot be "
+            "allow_from applies only to UDP input and cannot be "
             "used with input.type: serial"
         )
 
+    if input_type == UDP_INPUT_TYPE:
+        return validate_udp_input_config(raw_input)
     return validate_serial_input_config(raw_input)
 
 

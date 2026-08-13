@@ -2,9 +2,9 @@
 
 `nmea_sproxy` is a station-side network proxy. UDPSEC is AISMixer's
 authenticated encrypted UDP transport; it is not an external standardized
-protocol. UDPSEC remains the secure default and legacy behavior. Plain UDP
-output must be selected explicitly and is intended only for trusted LAN/VPN
-compatibility deployments.
+protocol. UDPSEC remains the secure default and the legacy top-level output
+behavior. Plain UDP output must be selected explicitly and is intended only
+for trusted LAN/VPN compatibility deployments.
 `nmea_sproxy` does not mix inputs, assemble multipart AIS, deduplicate, rewrite
 TAG metadata, route streams, or fan out to egress targets. AISMixer performs
 those jobs.
@@ -13,7 +13,7 @@ Each `nmea_sproxy` process represents exactly one relation:
 
 ```text
 one local input (UDP or serial) -> one network output (UDPSEC or UDP)
-listen_ip/listen_port or input.type: serial -> remote_host/remote_port or output
+top-level UDP fields or input.type: udp/serial -> remote_host/remote_port or output
 ```
 
 Run separate processes or systemd template instances for separate relations.
@@ -143,23 +143,41 @@ station_private_key: station_private.pem
 remote_public_key: aismixer_public.pem
 ```
 
-When `input:` is omitted, `listen_ip` / `listen_port` select the legacy local
-UDP input and behavior is unchanged.
+When `input:` is omitted, `listen_ip` / `listen_port` select UDP input through
+the backward-compatible top-level configuration form.
 When `output:` is omitted, `remote_host` / `remote_port` select the legacy
 AISMixer UDPSEC output and behavior is unchanged.
 
 ### Local input modes
 
-The legacy UDP mode remains the default and uses the top-level listener fields:
+UDP and serial are both first-class local input types. For compatibility, UDP
+remains the default when `input:` is omitted and uses the top-level listener
+fields:
 
 ```yaml
 listen_ip: "::"
 listen_port: 50000
 ```
 
-Serial input is enabled only by an explicit `input:` mapping. In serial mode no
-local UDP listener is created, and the configured `port` string is passed
-unchanged to pySerial.
+The canonical explicit UDP form is:
+
+```yaml
+input:
+  type: udp
+  listen_ip: "::"
+  listen_port: 50000
+  allow_from:
+    - 2001:db8:42::15
+    - 2001:db8:42::/64
+```
+
+The explicit UDP form does not borrow missing listener fields from the
+top-level compatibility form. `input.listen_ip` and `input.listen_port` are
+required, and `input.allow_from` is optional.
+
+Serial input also uses an explicit `input:` mapping. In serial mode no local
+UDP listener is created, and the configured `port` string is passed unchanged
+to pySerial.
 
 Linux example:
 
@@ -194,8 +212,9 @@ input:
 The serial defaults are `baudrate: 38400`, `bytesize: 8`, `parity: N`,
 `stopbits: 1`, `read_timeout: 1.0`, `reconnect_delay: 5`, and
 `max_line_bytes: 4096`. Explicit null values, invalid numeric ranges,
-unsupported parity or stop-bit values, missing/blank `input.port`, and unknown
-`input.type` values fail startup validation.
+unsupported parity or stop-bit values, missing/blank `input.port`, unknown
+input options, and `input.type` values other than `udp` or `serial` fail startup
+validation. UDP listener and ACL options are rejected in a serial mapping.
 
 The serial reader uses a daemon thread and a bounded queue, so it works on both
 Linux and Windows without putting the serial port in `select.select()`. If the
@@ -245,15 +264,18 @@ Explicit nulls, unknown output keys, blank hosts, invalid ports, invalid
 
 ### Network endpoint controls
 
-Two optional top-level controls are available for the station-side proxy:
+Two optional network controls are available for the station-side proxy:
 
-- `allow_from` is an application-level ACL for the local UDP sender. When the
-  key is omitted, no application ACL is applied and the current unrestricted
-  local-input behavior is preserved. `allow_from: []` denies all local UDP
-  input packets. Entries must be literal IPv4 or IPv6 addresses, or IPv4 or
-  IPv6 CIDR networks. Hostnames and malformed entries fail startup validation.
-  `allow_from` applies only to the legacy UDP input and is rejected when
-  `input.type: serial` is configured.
+- `allow_from` is an application-level ACL for the local UDP sender. Use the
+  top-level key with the backward-compatible top-level UDP form, or
+  `input.allow_from` with explicit `input.type: udp`. When the key is omitted,
+  no application ACL is applied and the current unrestricted local-input
+  behavior is preserved. `allow_from: []` denies all local UDP input packets.
+  Entries must be literal IPv4 or IPv6 addresses, or IPv4 or IPv6 CIDR
+  networks. Hostnames and malformed entries fail startup validation.
+  `allow_from` applies only to UDP input and is rejected for
+  `input.type: serial`. A top-level `allow_from` is rejected when any explicit
+  `input:` mapping is present, so an ACL cannot be silently ignored.
 - `source_ip` binds the legacy outbound UDPSEC socket to a literal IPv4 or IPv6
   source address and an automatically selected source port. In explicit output
   mode, use `output.source_ip` for either UDPSEC or plain UDP output. When
@@ -417,9 +439,9 @@ sudo systemctl start nmea_sproxy@balchik_roof
 
 `boat`, `yacht`, and names such as `balchik_roof` are operator-chosen labels.
 They are not predefined or numbered instance names. Each instance config must
-define one local input, either the legacy UDP listener or an explicit serial
-input, and one network output using UDPSEC to AISMixer or explicitly configured
-plain UDP to a compatible trusted-network consumer.
+define one local UDP or serial input and one network output using UDPSEC to
+AISMixer or explicitly configured plain UDP to a compatible trusted-network
+consumer.
 
 The installer creates `/etc/nmea_sproxy/instances/` but does not create
 instance configs or enable template instances.

@@ -1,0 +1,62 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+
+START=90
+STOP=10
+
+PROG=/usr/bin/aismixer
+KEY_TOOL=/usr/lib/aismixer/tools/aismixer_keys.py
+
+CONFIG_DIR=/etc/aismixer
+KEYS_DIR="$CONFIG_DIR/keys"
+PRIVATE_KEY="$KEYS_DIR/aismixer_private.pem"
+PUBLIC_KEY="$KEYS_DIR/aismixer_public.pem"
+RUN_DIR=/run/aismixer
+
+
+prepare_server_identity() {
+	mkdir -p "$KEYS_DIR" "$RUN_DIR" || return 1
+	chmod 0700 "$KEYS_DIR" || return 1
+
+	if [ -f "$PRIVATE_KEY" ]; then
+		/usr/bin/python3 "$KEY_TOOL" server \
+			--keys-dir "$KEYS_DIR" \
+			--repair-public || return 1
+		return 0
+	fi
+
+	if [ -e "$PUBLIC_KEY" ]; then
+		logger -t aismixer \
+			"Refusing to replace incomplete server identity: public key exists without private key"
+		return 1
+	fi
+
+	logger -t aismixer "Generating local AISMixer server identity"
+
+	/usr/bin/python3 "$KEY_TOOL" server \
+		--keys-dir "$KEYS_DIR" || return 1
+}
+
+
+start_service() {
+	prepare_server_identity || return 1
+
+	mkdir -p "$RUN_DIR" || return 1
+
+	procd_open_instance
+
+	procd_set_param command "$PROG"
+
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+
+	procd_set_param respawn 3600 5 5
+
+	procd_set_param file \
+		/etc/aismixer/config.yaml \
+		/etc/aismixer/udp_alias_map.yaml \
+		/etc/aismixer/authorized_keys.yaml
+
+	procd_close_instance
+}

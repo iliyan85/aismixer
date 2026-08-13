@@ -8,3 +8,5 @@
 *.txt text eol=lf
 .gitattributes text eol=lf
 .gitignore text eol=lf
+packaging/openwrt/aismixer/files/* text eol=lf
+packaging/openwrt/aismixer/Makefile text eol=lf

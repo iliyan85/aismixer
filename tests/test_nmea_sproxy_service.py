@@ -155,6 +155,20 @@ def test_configs_include_inactive_serial_examples_with_placeholder_device_id():
     assert "Virtual_COM_Port_<device-id>-if00" in combined
 
 
+def test_configs_include_canonical_explicit_udp_input_example():
+    combined = "\n".join(
+        read_proxy_file(name)
+        for name in ("config.yaml", "config.system.yaml")
+    )
+
+    assert "# Canonical explicit UDP input example." in combined
+    assert "# input:" in combined
+    assert "#   type: udp" in combined
+    assert "#   listen_ip: '::'" in combined
+    assert "#   listen_port: 50000" in combined
+    assert "#   allow_from:" in combined
+
+
 def test_install_preserves_existing_system_config():
     install = read_proxy_file("install.sh")
     preserve = 'if path_exists "$CONFIG_FILE"; then'

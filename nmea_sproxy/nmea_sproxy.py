@@ -11,8 +11,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from input_adapters import (
     InputConfigError,
-    LEGACY_UDP_INPUT_TYPE,
     SERIAL_INPUT_TYPE,
+    UDP_INPUT_TYPE,
     SerialInputAdapter,
     UdpInputAdapter,
     normalize_local_input_config,
@@ -225,11 +225,12 @@ def load_config(path=None):
 
 
 def validate_local_input_config(config):
+    had_explicit_input = "input" in config
     try:
         input_config = normalize_local_input_config(config)
     except InputConfigError as exc:
         raise ProxyConfigError(str(exc)) from exc
-    if input_config["type"] == SERIAL_INPUT_TYPE:
+    if had_explicit_input:
         config["input"] = input_config
     return input_config
 
@@ -241,7 +242,7 @@ def create_local_input_adapter(config, ingress_policy=None):
             return SerialInputAdapter(input_config)
         except InputConfigError as exc:
             raise ProxyConfigError(str(exc)) from exc
-    return UdpInputAdapter.bind(config, ingress_policy)
+    return UdpInputAdapter.bind(input_config, ingress_policy)
 
 
 def validate_output_config(config):
@@ -931,8 +932,8 @@ def main(argv=None):
         config = load_config(config_path)
         input_config = validate_local_input_config(config)
         output_config = config["output"]
-        if input_config["type"] == LEGACY_UDP_INPUT_TYPE:
-            ingress_policy = compile_local_ingress_policy(config)
+        if input_config["type"] == UDP_INPUT_TYPE:
+            ingress_policy = compile_local_ingress_policy(input_config)
         else:
             ingress_policy = NetworkPolicy.unrestricted()
     except (NetworkPolicyConfigError, ProxyConfigError) as e:
@@ -981,7 +982,10 @@ def main(argv=None):
             f"at {input_config['baudrate']} baud"
         )
     else:
-        print(f"📡 Listening on UDP {config['listen_ip']}:{config['listen_port']}")
+        print(
+            f"📡 Listening on UDP "
+            f"{input_config['listen_ip']}:{input_config['listen_port']}"
+        )
 
     if output_config["type"] == UDP_OUTPUT_TYPE:
         print(

@@ -1,8 +1,8 @@
 # One nmea_sproxy process is one 1:1 network proxy:
 # one local input (UDP or serial) -> one network output (UDPSEC or UDP).
 #
-# Leave input and output omitted for the legacy behavior:
-# local UDP input -> UDPSEC output.
+# Leave input omitted for the backward-compatible top-level UDP form.
+# Leave output omitted for the legacy UDPSEC egress form.
 listen_ip: '::'
 listen_port: 50000
 # Optional application-level ACL for local UDP senders. Omit for unrestricted.
@@ -10,6 +10,15 @@ listen_port: 50000
 # allow_from:
 #   - 2001:db8:42::15
 #   - 2001:db8:42::/64
+# Canonical explicit UDP input example. When input is present, keep allow_from
+# inside this mapping rather than at the top level.
+# input:
+#   type: udp
+#   listen_ip: '::'
+#   listen_port: 50000
+#   allow_from:
+#     - 2001:db8:42::15
+#     - 2001:db8:42::/64
 remote_host: 192.0.2.10
 remote_port: 17777
 # Optional legacy UDPSEC outbound source bind. Omit to let the OS choose.

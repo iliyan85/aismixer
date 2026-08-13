@@ -116,8 +116,8 @@ still change public APIs and configuration behavior as the service matures.
 - Retains one input-to-one output relation per proxy process/systemd instance,
   singleton and template-instance deployment, CLI/environment/system config
   resolution, relative key-path handling, identity-key preservation/repair,
-  and legacy key-path aliases. Omitting `input:` and `output:` retains the
-  legacy local-UDP-to-UDPSEC defaults.
+  and legacy key-path aliases. Omitting `input:` retains the backward-compatible
+  top-level UDP input form; omitting `output:` retains the legacy UDPSEC output.
 
 ### Networking and Deployment
 

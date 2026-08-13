@@ -583,6 +583,58 @@ def test_plain_udp_main_does_not_open_keys_or_handshake(monkeypatch, tmp_path):
     assert proxy.main(["--config", str(config_path)]) == 0
 
 
+def test_explicit_udp_main_passes_nested_allow_from_policy_to_adapter(monkeypatch):
+    proxy = load_proxy_module()
+    captured = {}
+    config = {
+        "input": {
+            "type": "udp",
+            "listen_ip": "::",
+            "listen_port": 50000,
+            "allow_from": ["2001:db8:42::/64"],
+        },
+        "output": {
+            "type": "udp",
+            "host": "192.0.2.10",
+            "port": 17777,
+            "legacy": False,
+        },
+    }
+
+    class LocalInput:
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+    class PlainOutput:
+        def close(self):
+            pass
+
+    def capture_input(_config, policy):
+        captured["policy"] = policy
+        return LocalInput()
+
+    monkeypatch.setattr(proxy, "resolve_config_path", lambda _path=None: None)
+    monkeypatch.setattr(proxy, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(proxy, "create_local_input_adapter", capture_input)
+    monkeypatch.setattr(
+        proxy,
+        "create_plain_udp_output_adapter",
+        lambda _output: PlainOutput(),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "run_plain_udp_relation",
+        lambda *_args, **_kwargs: 0,
+    )
+
+    assert proxy.main([]) == 0
+    assert captured["policy"].allows("2001:db8:42::15")
+    assert not captured["policy"].allows("2001:db8:43::15")
+
+
 def test_legacy_udpsec_main_loads_keys(monkeypatch, tmp_path):
     proxy = load_proxy_module()
     config_path = tmp_path / "udpsec.yaml"
