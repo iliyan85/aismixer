@@ -141,6 +141,25 @@ def test_udp_wildcard_host_and_ephemeral_port_remain_valid():
     }
 
 
+@pytest.mark.parametrize("value", [False, True])
+def test_udp_listen_port_rejects_booleans(value):
+    proxy = load_proxy_module()
+    configs = (
+        {"listen_ip": "::", "listen_port": value},
+        {
+            "input": {
+                "type": "udp",
+                "listen_ip": "::",
+                "listen_port": value,
+            }
+        },
+    )
+
+    for config in configs:
+        with pytest.raises(proxy.ProxyConfigError, match="integer UDP port"):
+            proxy.validate_local_input_config(config)
+
+
 @pytest.mark.parametrize(
     "port",
     [

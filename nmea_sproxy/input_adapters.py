@@ -78,7 +78,7 @@ def _udp_listen_ip(value):
 
 
 def _udp_listen_port(value):
-    if not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise InputConfigError("input.listen_port: must be an integer UDP port")
     if value < 0 or value > 65535:
         raise InputConfigError("input.listen_port: must be in the range 0-65535")
