@@ -39,6 +39,7 @@ endef
 define Package/aismixer-common
   $(call Package/aismixer/Default)
   TITLE:=Shared AISMixer runtime modules
+  SOURCE:=github.com/iliyan85/aismixer
   DEPENDS:=+python3
 endef
 
@@ -51,6 +52,7 @@ endef
 define Package/aismixer
   $(call Package/aismixer/Default)
   TITLE:=AIS/NMEA mixer, deduplicator and router
+  SOURCE:=github.com/iliyan85/aismixer
   DEPENDS:=+aismixer-common +python3-yaml +python3-cryptography
 endef
 
@@ -64,6 +66,7 @@ endef
 define Package/nmea_sproxy
   $(call Package/aismixer/Default)
   TITLE:=AIS/NMEA serial and UDP secure proxy
+  SOURCE:=github.com/iliyan85/aismixer
   DEPENDS:=+aismixer-common +python3-yaml +python3-cryptography +python3-pyserial
 endef
 

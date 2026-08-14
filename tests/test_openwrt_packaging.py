@@ -45,6 +45,16 @@ def test_openwrt_recipe_uses_canonical_three_package_split():
     assert "-".join(("nmea", "sproxy")) not in recipe
 
 
+def test_openwrt_packages_pin_stable_source_metadata():
+    recipe = read_text(PACKAGE_DIR / "Makefile")
+
+    for package_name in ("aismixer-common", "aismixer", "nmea_sproxy"):
+        package = makefile_block(recipe, f"Package/{package_name}")
+        sources = re.findall(r"^\s*SOURCE:=(\S+)\s*$", package, re.MULTILINE)
+
+        assert sources == ["github.com/iliyan85/aismixer"]
+
+
 def test_openwrt_common_package_copies_complete_core_tree():
     recipe = read_text(PACKAGE_DIR / "Makefile")
     install = makefile_block(recipe, "Package/aismixer-common/install")
