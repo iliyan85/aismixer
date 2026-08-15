@@ -20,6 +20,11 @@
 
 ## 🚀 Quick start
 
+Choose the deployment path for the host: conventional Linux with systemd, or
+the published OpenWrt APK packages with procd.
+
+### Conventional Linux with systemd
+
 The lifecycle scripts can run directly as root. When invoked by a non-root user,
 they elevate privileged operations with `sudo`; they stop with an explanation if
 neither condition is available.
@@ -27,7 +32,7 @@ neither condition is available.
 Standalone `systemctl` commands and commands that write under `/etc` assume a
 root shell; non-root operators should prefix them with `sudo` when required.
 
-### Fresh installation
+#### Fresh installation
 
 On a systemd-based Debian or Raspberry Pi OS host:
 
@@ -42,11 +47,11 @@ systemctl status aismixer
 
 `install.sh` installs the runtime under `/opt/aismixer`, seeds missing files
 under `/etc/aismixer` while preserving existing configuration and keys, installs
-the global `aismixerctl` command, and enables AISMixer at boot. It intentionally
-does **not** start the service. Review `/etc/aismixer/config.yaml` before exposing
-the service outside a trusted network.
+`/usr/local/bin/aismixerctl`, and enables AISMixer at boot. It intentionally does
+**not** start the service. Review `/etc/aismixer/config.yaml` before exposing the
+service outside a trusted network.
 
-### Update
+#### Update
 
 The repository tracks lifecycle scripts without an executable bit. Before the
 first update, run `chmod +x update.sh` once. Then update from the checkout:
@@ -61,6 +66,56 @@ systemctl status aismixer
 `aismixerctl`, reloads systemd, and **restarts AISMixer**. It leaves operator
 configuration and keys under `/etc/aismixer` untouched. `uninstall.sh` preserves
 that directory unless `--purge-config` is explicitly requested.
+
+### OpenWrt 25.12 (x86_64 only)
+
+For OpenWrt 25.12 on x86_64, a signed APK v3 repository publishes the current
+Python implementation with procd integration. This is the only currently
+published OpenWrt target. Run as root:
+
+```sh
+wget -O /etc/apk/keys/aismixer-openwrt.pem \
+  https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
+
+chmod 0644 /etc/apk/keys/aismixer-openwrt.pem
+
+REPO_FILE=/etc/apk/repositories.d/customfeeds.list
+REPO_URL='https://aismixer.net/openwrt/25.12/x86_64/packages.adb'
+
+grep -qxF "$REPO_URL" "$REPO_FILE" 2>/dev/null || {
+  printf '\n# AISMixer OpenWrt 25.12 x86_64 repository\n%s\n' \
+    "$REPO_URL" >> "$REPO_FILE"
+}
+
+apk update
+apk add aismixer
+```
+
+Repository public-key SHA-256:
+`170d30219e0e05d59898cd8ccd5ec9804e915df7882ab56b8e869ef6e99c8f9c`.
+The `aismixer` package resolves `aismixer-common` automatically as its shared
+dependency; normally, do not install it manually. To install only the
+station-side package instead:
+
+```sh
+apk add nmea_sproxy
+```
+
+On first service start, AISMixer automatically generates or repairs its local
+server identity when required, uses the OpenWrt configuration and identity
+layout under `/etc/aismixer`, and runs through procd. `nmea_sproxy` likewise
+generates or repairs its local station identity.
+
+For UDPSEC, peer trust is never provisioned automatically. Copy
+`/etc/aismixer/keys/aismixer_public.pem` from the mixer to the proxy's configured
+`remote_public_key` path (by default
+`/etc/nmea_sproxy/keys/aismixer_public.pem`), then authorize the station public
+identity key on AISMixer as described in the
+[`nmea_sproxy` guide](nmea_sproxy/README.md#authorize-the-station-in-aismixer).
+If the configured peer key is missing, unreadable, or invalid, preflight
+intentionally keeps the service stopped instead of entering a respawn loop.
+This is expected safe behavior, not a failed package installation. Explicit
+plain UDP does not require a peer key.
 
 ## 🧭 What is AISMixer?
 
@@ -128,9 +183,11 @@ policy.
 
 ## 🧰 `aismixerctl`
 
-`install.sh` installs `/usr/local/bin/aismixerctl`. The command talks to the
-optional local Unix-domain control socket; it does not modify configuration
-files or persist runtime routing across a restart.
+On the conventional Linux/systemd path, `install.sh` installs
+`/usr/local/bin/aismixerctl`. The OpenWrt `aismixer` package installs the same
+operator command as `/usr/bin/aismixerctl`. The command talks to the optional
+local Unix-domain control socket; it does not modify configuration files or
+persist runtime routing across a restart.
 
 ### Enable local control
 
@@ -179,10 +236,12 @@ from overwriting newer state. The CLI does not retry automatically.
 
 ## 🔐 `nmea_sproxy`
 
-`nmea_sproxy` is the station-side network proxy. One process or systemd instance
+`nmea_sproxy` is the station-side network proxy. One process or service instance
 represents one relation: one local UDP or physical serial/USB input to one
-network output. UDPSEC is the secure/default transport to AISMixer; plain UDP
-must be selected explicitly and is intended only for trusted LAN/VPN paths.
+network output. The install, update, and systemd template-instance instructions
+below describe the conventional Linux path; OpenWrt uses the singleton APK/procd
+path in Quick start. UDPSEC is the secure/default transport to AISMixer; plain
+UDP must be selected explicitly and is intended only for trusted LAN/VPN paths.
 
 ### Install and start
 
@@ -295,6 +354,9 @@ session behavior, endpoint policy, and troubleshooting.
 - Optional atomic runtime routing replacement through `aismixerctl`.
 - Supervised process-local ingress, processing, and egress tasks; the optional
   control listener is lifecycle-managed separately.
+- Conventional Linux deployment uses lifecycle scripts, systemd, and
+  `/usr/local/bin/aismixerctl`; the signed OpenWrt 25.12 x86_64 APK repository
+  provides Python packages with procd integration.
 
 ## 🔀 Architecture
 
@@ -467,6 +529,11 @@ so `docs/` is intentionally absent from `main`.
 
 ## 🚀 Бърз старт
 
+Изберете пътя за инсталиране според хоста: стандартен Linux със systemd или
+публикуваните APK пакети за OpenWrt с procd.
+
+### Стандартен Linux със systemd
+
 Скриптовете за жизнения цикъл могат да се изпълняват директно като root. Когато
 ги стартира потребител без root права, те повишават правата на привилегированите
 операции чрез `sudo`; ако нито едно от двете не е налично, спират с обяснение.
@@ -475,7 +542,7 @@ so `docs/` is intentionally absent from `main`.
 предполагат root shell; при нужда потребител без root права трябва да добави
 `sudo`.
 
-### Нова инсталация
+#### Нова инсталация
 
 На Debian или Raspberry Pi OS система със systemd:
 
@@ -490,11 +557,11 @@ systemctl status aismixer
 
 `install.sh` разполага runtime файловете в `/opt/aismixer`, създава липсващите
 файлове в `/etc/aismixer`, без да презаписва съществуващите конфигурации и
-ключове, инсталира глобалната команда `aismixerctl` и включва AISMixer за
-автоматично стартиране при boot. Умишлено **не** стартира услугата. Прегледайте
+ключове, инсталира `/usr/local/bin/aismixerctl` и включва AISMixer за автоматично
+стартиране при boot. Умишлено **не** стартира услугата. Прегледайте
 `/etc/aismixer/config.yaml`, преди да изложите услугата извън доверена мрежа.
 
-### Обновяване
+#### Обновяване
 
 Хранилището проследява скриптовете за жизнения цикъл без executable bit. Преди
 първото обновяване изпълнете еднократно `chmod +x update.sh`. След това обновете
@@ -510,6 +577,57 @@ systemctl status aismixer
 `aismixerctl`, презарежда systemd и **рестартира AISMixer**. Операторските
 конфигурации и ключове в `/etc/aismixer` остават непроменени. `uninstall.sh`
 запазва тази директория, освен ако изрично не е зададено `--purge-config`.
+
+### OpenWrt 25.12 (само x86_64)
+
+За OpenWrt 25.12 на x86_64 е публикувано подписано APK v3 хранилище. Пакетите
+съдържат текущата Python реализация и се интегрират с procd. В момента това е
+единствената публикувана цел за OpenWrt. Изпълнете като root:
+
+```sh
+wget -O /etc/apk/keys/aismixer-openwrt.pem \
+  https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
+
+chmod 0644 /etc/apk/keys/aismixer-openwrt.pem
+
+REPO_FILE=/etc/apk/repositories.d/customfeeds.list
+REPO_URL='https://aismixer.net/openwrt/25.12/x86_64/packages.adb'
+
+grep -qxF "$REPO_URL" "$REPO_FILE" 2>/dev/null || {
+  printf '\n# AISMixer OpenWrt 25.12 x86_64 repository\n%s\n' \
+    "$REPO_URL" >> "$REPO_FILE"
+}
+
+apk update
+apk add aismixer
+```
+
+SHA-256 отпечатъкът на публичния ключ на хранилището е
+`170d30219e0e05d59898cd8ccd5ec9804e915df7882ab56b8e869ef6e99c8f9c`.
+Пакетът `aismixer` инсталира автоматично общата зависимост `aismixer-common`;
+обикновено не е нужно да я инсталирате ръчно. За да инсталирате вместо това само
+пакета при станцията:
+
+```sh
+apk add nmea_sproxy
+```
+
+При първото стартиране AISMixer автоматично генерира или поправя при
+необходимост локалната си сървърна идентичност, използва OpenWrt структурата за
+конфигурация и идентичност в `/etc/aismixer` и се стартира чрез procd.
+`nmea_sproxy` прави същото за локалната идентичност на станцията.
+
+При UDPSEC доверието към отсрещната страна никога не се настройва автоматично.
+Копирайте `/etc/aismixer/keys/aismixer_public.pem` от хоста с AISMixer на
+зададения в конфигурацията на проксито път `remote_public_key` (по подразбиране
+`/etc/nmea_sproxy/keys/aismixer_public.pem`), след което разрешете публичния
+ключ за идентичност на станцията в AISMixer според [ръководството за
+`nmea_sproxy`](nmea_sproxy/README.md#authorize-the-station-in-aismixer). Ако
+публичният ключ на отсрещната страна, зададен в конфигурацията, липсва, не може
+да бъде прочетен или е невалиден, предварителната проверка умишлено оставя
+услугата спряна, вместо да допусне respawn loop. Това е очаквано безопасно
+поведение, а не неуспешна инсталация на пакета. Изрично конфигурираният plain UDP
+не изисква публичен ключ на отсрещната страна.
 
 ## 🧭 Какво е AISMixer?
 
@@ -579,7 +697,9 @@ forwarders:
 
 ## 🧰 `aismixerctl`
 
-`install.sh` инсталира `/usr/local/bin/aismixerctl`. Командата комуникира с
+При стандартната Linux/systemd инсталация `install.sh` инсталира
+`/usr/local/bin/aismixerctl`. Пакетът `aismixer` за OpenWrt инсталира същата
+операторска команда в `/usr/bin/aismixerctl`. Командата комуникира с
 незадължителния локален Unix-domain сокет за управление; тя не променя
 конфигурационни файлове и не запазва runtime маршрутизацията след рестарт.
 
@@ -631,10 +751,13 @@ sudo aismixerctl disable --expected-generation 4
 
 ## 🔐 `nmea_sproxy`
 
-`nmea_sproxy` е мрежовото прокси при станцията. Един процес или systemd instance
-представлява една връзка: един локален UDP или физически сериен/USB вход към един
-мрежов изход. UDPSEC е защитеният транспорт по подразбиране към AISMixer; plain
-UDP трябва да се избере изрично и е предназначен само за доверени LAN/VPN връзки.
+`nmea_sproxy` е мрежовото прокси при станцията. Един процес или инстанция на
+услугата представлява една връзка: един локален UDP или физически сериен/USB
+вход към един мрежов изход. Инструкциите по-долу за инсталиране, обновяване и
+systemd template instances описват стандартния Linux път; OpenWrt използва
+описания в „Бърз старт“ singleton модел с APK/procd. UDPSEC е защитеният
+транспорт по подразбиране към AISMixer; plain UDP трябва да се избере изрично и
+е предназначен само за доверени LAN/VPN връзки.
 
 ### Инсталиране и стартиране
 
@@ -751,6 +874,9 @@ UDPSEC е специфичният за AISMixer автентикиран и к�
 - Незадължителна атомарна подмяна на маршрутизацията чрез `aismixerctl`.
 - Наблюдавани в един процес задачи за ingress, обработка и egress;
   незадължителният control listener има отделно управление на жизнения цикъл.
+- Стандартното разполагане под Linux използва скриптове за жизнения цикъл,
+  systemd и `/usr/local/bin/aismixerctl`; подписаното APK хранилище за OpenWrt
+  25.12 x86_64 предоставя Python пакети, интегрирани с procd.
 
 ## 🔀 Архитектура
 
@@ -928,6 +1054,11 @@ OS или друга POSIX среда с поддръжка на asyncio Unix so
 
 ## 🚀 Pornire rapidă
 
+Alegeți calea de instalare potrivită gazdei: Linux convențional cu systemd sau
+pachetele APK publicate pentru OpenWrt, integrate cu procd.
+
+### Linux convențional cu systemd
+
 Scripturile ciclului de viață pot rula direct ca root. Când sunt invocate de un
 utilizator non-root, ele ridică privilegiile operațiilor necesare prin `sudo`; se
 opresc cu o explicație dacă niciuna dintre variante nu este disponibilă.
@@ -936,7 +1067,7 @@ Comenzile `systemctl` independente și comenzile care scriu sub `/etc` presupun
 un shell root; operatorii non-root trebuie să le prefixeze cu `sudo` când este
 necesar.
 
-### Instalare nouă
+#### Instalare nouă
 
 Pe o gazdă Debian sau Raspberry Pi OS bazată pe systemd:
 
@@ -950,13 +1081,13 @@ systemctl status aismixer
 ```
 
 `install.sh` instalează runtime-ul în `/opt/aismixer`, creează fișierele lipsă
-din `/etc/aismixer` păstrând configurația și cheile existente, instalează comanda
-globală `aismixerctl` și activează AISMixer pentru pornire la boot. În mod
+din `/etc/aismixer` păstrând configurația și cheile existente, instalează
+`/usr/local/bin/aismixerctl` și activează AISMixer pentru pornire la boot. În mod
 intenționat, **nu** pornește serviciul. Verificați
 `/etc/aismixer/config.yaml` înainte de a expune serviciul în afara unei rețele de
 încredere.
 
-### Actualizare
+#### Actualizare
 
 Repository-ul urmărește scripturile ciclului de viață fără bitul executabil.
 Înainte de prima actualizare, rulați o singură dată `chmod +x update.sh`. Apoi
@@ -972,6 +1103,57 @@ systemctl status aismixer
 `aismixerctl`, reîncarcă systemd și **repornește AISMixer**. Configurația și
 cheile operatorului din `/etc/aismixer` rămân nemodificate. `uninstall.sh`
 păstrează acel director dacă `--purge-config` nu este cerut explicit.
+
+### OpenWrt 25.12 (numai x86_64)
+
+Pentru OpenWrt 25.12 pe x86_64 este publicat un repository APK v3 semnat.
+Pachetele conțin implementarea Python actuală și se integrează cu procd. Aceasta
+este singura țintă OpenWrt publicată în prezent. Rulați ca root:
+
+```sh
+wget -O /etc/apk/keys/aismixer-openwrt.pem \
+  https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
+
+chmod 0644 /etc/apk/keys/aismixer-openwrt.pem
+
+REPO_FILE=/etc/apk/repositories.d/customfeeds.list
+REPO_URL='https://aismixer.net/openwrt/25.12/x86_64/packages.adb'
+
+grep -qxF "$REPO_URL" "$REPO_FILE" 2>/dev/null || {
+  printf '\n# AISMixer OpenWrt 25.12 x86_64 repository\n%s\n' \
+    "$REPO_URL" >> "$REPO_FILE"
+}
+
+apk update
+apk add aismixer
+```
+
+Amprenta SHA-256 a cheii publice a repository-ului este
+`170d30219e0e05d59898cd8ccd5ec9804e915df7882ab56b8e869ef6e99c8f9c`.
+Pachetul `aismixer` instalează automat dependența comună `aismixer-common`; în
+mod normal nu trebuie să o instalați manual. Pentru a instala în schimb doar
+pachetul de la stație:
+
+```sh
+apk add nmea_sproxy
+```
+
+La prima pornire a serviciului, AISMixer generează sau repară automat, după caz,
+identitatea locală a serverului, folosește structura OpenWrt pentru configurare
+și identitate din `/etc/aismixer` și pornește prin procd. `nmea_sproxy` procedează
+la fel pentru identitatea locală a stației.
+
+Pentru UDPSEC, încrederea în peer nu este configurată niciodată automat. Copiați
+`/etc/aismixer/keys/aismixer_public.pem` de pe gazda AISMixer la calea
+`remote_public_key` configurată pe proxy (implicit
+`/etc/nmea_sproxy/keys/aismixer_public.pem`), apoi autorizați cheia publică de
+identitate a stației în AISMixer conform [ghidului
+`nmea_sproxy`](nmea_sproxy/README.md#authorize-the-station-in-aismixer). Dacă acea
+cheie publică configurată pentru peer lipsește, nu poate fi citită sau este
+invalidă, verificarea preliminară menține intenționat serviciul oprit în loc să
+permită o buclă de respawn. Acesta este un comportament sigur așteptat, nu un
+eșec al instalării pachetului. UDP simplu configurat explicit nu necesită o
+cheie publică pentru peer.
 
 ## 🧭 Ce este AISMixer?
 
@@ -1042,9 +1224,11 @@ gazdei.
 
 ## 🧰 `aismixerctl`
 
-`install.sh` instalează `/usr/local/bin/aismixerctl`. Comanda comunică prin
-socket-ul local opțional de control din domeniul Unix; nu modifică fișierele de
-configurație și nu persistă rutarea runtime după repornire.
+În instalarea Linux/systemd convențională, `install.sh` instalează
+`/usr/local/bin/aismixerctl`. Pachetul `aismixer` pentru OpenWrt instalează
+aceeași comandă pentru operatori la calea `/usr/bin/aismixerctl`. Comanda
+comunică prin socket-ul local opțional de control din domeniul Unix; nu modifică
+fișierele de configurație și nu persistă rutarea runtime după repornire.
 
 ### Activarea controlului local
 
@@ -1096,11 +1280,13 @@ automat.
 
 ## 🔐 `nmea_sproxy`
 
-`nmea_sproxy` este proxy-ul de rețea de la stație. Un proces sau o instanță
-systemd reprezintă o relație: o intrare UDP locală sau serială/USB fizică spre o
-ieșire de rețea. UDPSEC este transportul securizat/implicit spre AISMixer; UDP
-simplu trebuie selectat explicit și este destinat numai conexiunilor LAN/VPN de
-încredere.
+`nmea_sproxy` este proxy-ul de rețea de la stație. Un proces sau o instanță de
+serviciu reprezintă o relație: o intrare UDP locală sau serială/USB fizică spre
+o ieșire de rețea. Instrucțiunile de mai jos pentru instalare, actualizare și
+instanțe template systemd descriu calea Linux convențională; OpenWrt folosește
+modelul singleton APK/procd descris în secțiunea Pornire rapidă. UDPSEC este
+transportul securizat/implicit spre AISMixer; UDP simplu trebuie selectat
+explicit și este destinat numai conexiunilor LAN/VPN de încredere.
 
 ### Instalare și pornire
 
@@ -1219,6 +1405,9 @@ securitate](SECURITY.md), [contractul comportamental](BEHAVIORAL_CONTRACT.md) ș
 - Înlocuirea atomică opțională a rutării prin `aismixerctl`.
 - Task-uri supravegheate local procesului pentru ingress, procesare și egress;
   listener-ul de control opțional are un ciclu de viață gestionat separat.
+- Instalarea convențională pe Linux folosește scripturi pentru ciclul de viață,
+  systemd și `/usr/local/bin/aismixerctl`; repository-ul APK semnat pentru
+  OpenWrt 25.12 x86_64 furnizează pachete Python integrate cu procd.
 
 ## 🔀 Arhitectură
 
