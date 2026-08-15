@@ -560,8 +560,13 @@
       <pre class="command-example" aria-label="Install AISMixer from the signed OpenWrt APK repository"><code>wget -O /etc/apk/keys/aismixer-openwrt.pem \
   https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
 
-echo 'https://aismixer.net/openwrt/25.12/x86_64/packages.adb' \
-  &gt; /etc/apk/repositories.d/customfeeds.list
+REPO_FILE=/etc/apk/repositories.d/customfeeds.list
+REPO_URL='https://aismixer.net/openwrt/25.12/x86_64/packages.adb'
+
+grep -qxF "$REPO_URL" "$REPO_FILE" 2&gt;/dev/null || {
+  printf '\n# AISMixer OpenWrt 25.12 x86_64 repository\n%s\n' \
+    "$REPO_URL" &gt;&gt; "$REPO_FILE"
+}
 
 apk update
 apk add aismixer</code></pre>
