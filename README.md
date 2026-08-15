@@ -117,6 +117,39 @@ intentionally keeps the service stopped instead of entering a respawn loop.
 This is expected safe behavior, not a failed package installation. Explicit
 plain UDP does not require a peer key.
 
+**OpenWrt USB serial hardware.** Native UART serial input needs no USB driver,
+and UDP input needs no USB serial driver. USB virtual serial hardware may need
+the OpenWrt kernel module appropriate to its device class before `nmea_sproxy`
+can open a `/dev/tty*` device; this is hardware-specific, not an `nmea_sproxy`
+package dependency. CDC ACM receivers use:
+
+```sh
+apk add kmod-usb-acm
+```
+
+After binding, CDC ACM devices typically appear as `/dev/ttyACM*`. Inspect the
+actual device path with:
+
+```sh
+dmesg | tail -n 30
+ls -l /dev/ttyACM* 2>/dev/null
+```
+
+Other USB-serial chipsets may need different drivers. `stty` may be absent from
+the base OpenWrt image. For optional serial diagnostics (`/dev/ttyACM0` is only
+an example, not a guaranteed path):
+
+```sh
+apk add coreutils-stty
+stty -F /dev/ttyACM0 -a
+```
+
+`coreutils-stty` is optional diagnostic tooling; `nmea_sproxy` does not require
+it, and pySerial configures the serial parameters used by `nmea_sproxy`. See the
+[OpenWrt Deployment Wiki page](https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment#usb-virtual-serial-receivers)
+for driver identification, raw serial verification, and hardware-specific
+troubleshooting.
+
 ## 🧭 What is AISMixer?
 
 **AISMixer** is a production-oriented Python service for receiving,
@@ -628,6 +661,40 @@ apk add nmea_sproxy
 услугата спряна, вместо да допусне respawn loop. Това е очаквано безопасно
 поведение, а не неуспешна инсталация на пакета. Изрично конфигурираният plain UDP
 не изисква публичен ключ на отсрещната страна.
+
+**USB устройства с виртуален сериен порт под OpenWrt.** Нито серийният вход през
+вграден UART, нито UDP входът се нуждаят от USB-сериен драйвер. За USB устройство
+с виртуален сериен порт може да е необходим подходящият за устройството модул за
+ядрото на OpenWrt, преди `nmea_sproxy` да може да отвори `/dev/tty*`; това е
+изискване, специфично за хардуера, а не пакетна зависимост на `nmea_sproxy`. При
+CDC ACM приемници инсталирайте:
+
+```sh
+apk add kmod-usb-acm
+```
+
+След като драйверът разпознае устройството, CDC ACM устройствата обикновено се
+появяват като `/dev/ttyACM*`. Проверете действителния път с:
+
+```sh
+dmesg | tail -n 30
+ls -l /dev/ttyACM* 2>/dev/null
+```
+
+Други USB-серийни чипсети може да изискват различни драйвери. `stty` може да
+липсва в базовия образ на OpenWrt. За незадължителна диагностика на серийния
+порт (`/dev/ttyACM0` е само пример, а не гарантиран път):
+
+```sh
+apk add coreutils-stty
+stty -F /dev/ttyACM0 -a
+```
+
+`coreutils-stty` е само незадължителен инструмент за диагностика; `nmea_sproxy`
+не го изисква, а pySerial настройва серийните параметри, използвани от
+`nmea_sproxy`. За идентифициране на драйвера, проверка на необработения сериен
+поток и отстраняване на специфични за хардуера проблеми вижте Wiki страницата
+[OpenWrt Deployment](https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment#usb-virtual-serial-receivers).
 
 ## 🧭 Какво е AISMixer?
 
@@ -1154,6 +1221,41 @@ invalidă, verificarea preliminară menține intenționat serviciul oprit în lo
 permită o buclă de respawn. Acesta este un comportament sigur așteptat, nu un
 eșec al instalării pachetului. UDP simplu configurat explicit nu necesită o
 cheie publică pentru peer.
+
+**Hardware serial prin USB în OpenWrt.** Nici intrarea serială printr-un UART
+nativ, nici intrarea UDP nu necesită un driver serial USB. Hardware-ul cu port
+serial virtual prin USB poate necesita modulul kernel OpenWrt corespunzător
+dispozitivului înainte ca `nmea_sproxy` să poată deschide un dispozitiv
+`/dev/tty*`; aceasta este o cerință specifică hardware-ului, nu o dependență a
+pachetului `nmea_sproxy`. Receptoarele CDC ACM folosesc:
+
+```sh
+apk add kmod-usb-acm
+```
+
+După asocierea driverului, dispozitivele CDC ACM apar de obicei ca
+`/dev/ttyACM*`. Verificați calea efectivă cu:
+
+```sh
+dmesg | tail -n 30
+ls -l /dev/ttyACM* 2>/dev/null
+```
+
+Alte chipseturi USB-serial pot necesita drivere diferite. `stty` poate lipsi din
+imaginea OpenWrt de bază. Pentru diagnosticare serială opțională
+(`/dev/ttyACM0` este doar un exemplu, nu o cale garantată):
+
+```sh
+apk add coreutils-stty
+stty -F /dev/ttyACM0 -a
+```
+
+`coreutils-stty` este doar un instrument opțional de diagnosticare;
+`nmea_sproxy` nu îl necesită, iar pySerial configurează parametrii seriali
+utilizați de `nmea_sproxy`. Consultați [pagina Wiki OpenWrt
+Deployment](https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment#usb-virtual-serial-receivers)
+pentru identificarea driverului, verificarea datelor seriale brute și depanarea
+specifică hardware-ului.
 
 ## 🧭 Ce este AISMixer?
 
