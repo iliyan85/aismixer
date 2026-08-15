@@ -47,7 +47,7 @@
     "alternateName": "aismixer",
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
-    "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
+    "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu", "OpenWrt"],
     "description": "Platformă open-source pentru procesare deterministă AIS NMEA 0183, rutare logică, etape cu capacitate finită, observabilitate runtime locală procesului și UDPSEC cu ECDHE autentificat.",
     "url": "https://aismixer.net/ro/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
@@ -365,7 +365,7 @@
       <div class="section-heading">
         <p class="eyebrow">Control local și observabilitate runtime</p>
         <h2>Controlați rutarea și inspectați activitatea runtime</h2>
-        <p class="section-intro">Planul local opțional de control, printr-un socket POSIX din domeniul Unix, oferă operații de rutare și statistici runtime read-only agregate, per intrare și per ieșire, prin comanda <span class="kbd">aismixerctl</span> instalată global. Rularea fără comandă deschide shell-ul interactiv pentru operator.</p>
+        <p class="section-intro">Planul local opțional de control, printr-un socket POSIX din domeniul Unix, oferă operații de rutare și statistici runtime read-only agregate, per intrare și per ieșire, prin comanda <span class="kbd">aismixerctl</span> instalată global.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
@@ -384,15 +384,11 @@
           <p><span class="kbd">runtime.statistics.inputs</span> separă traficul de transport de cadrele acceptate. <span class="kbd">runtime.statistics.outputs</span> raportează expedierile locale, mesajele și octeții pentru fiecare destinație.</p>
         </article>
         <article class="card">
-          <div class="icons" aria-hidden="true">⌨️</div>
-          <h3>Interactiv sau one-shot</h3>
-          <p>Shell-ul deschis fără comandă inițială oferă ajutor, tabele, istoric acolo unde este disponibil și aceleași operații de rutare și statistici păstrate pentru utilizarea one-shot cu JSON.</p>
+          <div class="icons" aria-hidden="true">🎛️</div>
+          <h3>Interfață locală pentru operatori</h3>
+          <p>Folosiți <span class="kbd">aismixerctl</span> pentru modificări locale ale rutării și inspecția read-only a activității runtime, cu ieșire lizibilă pentru operatori și JSON pentru automatizări one-shot.</p>
         </article>
       </div>
-      <pre class="command-example" aria-label="Exemple de comenzi interactive aismixerctl"><code>aismixerctl&gt; status
-aismixerctl&gt; show statistics
-aismixerctl&gt; show statistics inputs
-aismixerctl&gt; show statistics outputs</code></pre>
       <div class="callout">
         <p><strong>Limita statisticilor read-only.</strong> Statisticile sunt păstrate în memorie, sunt locale procesului, nepersistente și se resetează la repornire. Nu reprezintă istoric persistent, metrici distribuite sau un sistem Prometheus/time-series. Expedierea UDP locală reușită nu reprezintă confirmarea livrării la distanță.</p>
         <p><strong>Control intenționat local.</strong> Rutele runtime nu persistă după repornire, fișierele de configurare nu sunt rescrise, iar adaptoarele nu sunt create dinamic. Permisiunile socketului Unix reprezintă limita actuală de autorizare; nu există token de control la nivelul aplicației.</p>
@@ -538,11 +534,46 @@ aismixerctl&gt; show statistics outputs</code></pre>
       </div>
     </section>
 
+    <section id="openwrt" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Implementare OpenWrt la marginea rețelei</p>
+        <h2>Rulați AISMixer sau nmea_sproxy pe OpenWrt</h2>
+        <p class="section-intro">Un depozit APK semnat este disponibil pentru OpenWrt 25.12 pe x86_64. Aceasta este singura țintă OpenWrt publicată în prezent, iar pachetele folosesc implementarea Python.</p>
+      </div>
+      <div class="grid feature-row proxy-grid">
+        <article class="card">
+          <div class="icons" aria-hidden="true">📦</div>
+          <h3>Pachete semnate</h3>
+          <p>Instalați <span class="kbd">aismixer</span> sau <span class="kbd">nmea_sproxy</span>; ambele folosesc <span class="kbd">aismixer-common</span> ca dependență comună. Instalați <a href="https://aismixer.net/openwrt/keys/aismixer-openwrt.pem" target="_blank" rel="noopener">cheia publică a depozitului</a> în <span class="kbd">/etc/apk/keys/</span> înainte de a folosi <a href="https://aismixer.net/openwrt/25.12/x86_64/packages.adb" target="_blank" rel="noopener">depozitul de pachete</a>.</p>
+          <p>SHA-256 al cheii: <span class="kbd">170d30219e0e05d59898cd8ccd5ec9804e915df7882ab56b8e869ef6e99c8f9c</span></p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📡</div>
+          <h3>Două roluri la marginea rețelei</h3>
+          <p>AISMixer poate rula pe un dispozitiv periferic sau router cu OpenWrt. <span class="kbd">nmea_sproxy</span> poate rula independent lângă un receptor cu intrare UDP sau serială. Ieșirea poate fi UDP simplu, iar UDPSEC poate proteja legătura de rețea către AISMixer.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔐</div>
+          <h3>Încredere UDPSEC explicită</h3>
+          <p>AISMixer și <span class="kbd">nmea_sproxy</span> își generează automat perechile locale de chei de identitate la prima instalare sau pornire, după caz. Materialul de încredere UDPSEC nu este transferat niciodată automat între participanți: instalați local cheia publică AISMixer la stație și autorizați cheia publică a stației în AISMixer.</p>
+        </article>
+      </div>
+      <pre class="command-example" aria-label="Instalarea AISMixer din depozitul APK OpenWrt semnat"><code>wget -O /etc/apk/keys/aismixer-openwrt.pem \
+  https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
+
+echo 'https://aismixer.net/openwrt/25.12/x86_64/packages.adb' \
+  &gt; /etc/apk/repositories.d/customfeeds.list
+
+apk update
+apk add aismixer</code></pre>
+      <p class="boundary-note"><strong>Doar punctul terminal de lângă receptor.</strong> Folosiți <span class="kbd">apk add nmea_sproxy</span> în loc de <span class="kbd">apk add aismixer</span> pentru a instala independent proxy-ul de la stație. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> și <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> pentru pașii compleți de implementare și configurare a încrederii.</p>
+    </section>
+
     <section id="operations" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Instalare și operare</p>
+        <p class="eyebrow">Implementare și operare convenționale pe Linux</p>
         <h2>Un ciclu de viață Linux și systemd conceput pentru instalări reale</h2>
-        <p class="section-intro">Instalarea gestionată din depozit menține aliniate fișierele de runtime, starea operatorului, integrarea systemd, controlul local al rutării și statisticile runtime read-only.</p>
+        <p class="section-intro">Pentru gazdele Linux convenționale, implementarea systemd gestionată din depozit menține aliniate fișierele de runtime, starea operatorului, controlul local al rutării și statisticile runtime read-only. OpenWrt folosește calea APK/procd descrisă mai sus.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -563,7 +594,7 @@ aismixerctl&gt; show statistics outputs</code></pre>
         <article class="card">
           <div class="icons" aria-hidden="true">🧰</div>
           <h3>CLI global pentru operatori</h3>
-          <p>Fluxul de instalare plasează <span class="kbd">aismixerctl</span> în <span class="kbd">/usr/local/bin</span> pentru rutare runtime locală și statistici read-only, inclusiv shell-ul interactiv deschis fără comandă inițială.</p>
+          <p>Fluxul de instalare plasează <span class="kbd">aismixerctl</span> în <span class="kbd">/usr/local/bin</span> pentru rutare runtime locală și statistici read-only.</p>
         </article>
       </div>
     </section>
@@ -585,7 +616,7 @@ aismixerctl&gt; show statistics outputs</code></pre>
             <li>Asamblare multipart deterministă, gestionarea TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> și deduplicare globală sau per destinație.</li>
             <li>UDPSEC cu ECDHE efemer P-256 autentificat, identități ECDSA P-256 pe termen lung, chei AES-GCM direcționale independente și stare securizată locală cu limite stricte.</li>
             <li>Pentru fiecare proces sau instanță systemd <span class="kbd">nmea_sproxy</span>, o intrare UDP sau serială spre o ieșire UDPSEC ori o ieșire plain-UDP configurată explicit pentru o rețea de încredere, plus controale endpoint IPv4/IPv6.</li>
-            <li><span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață care gestionează privilegiile, păstrarea stării operatorului și CLI global pentru operatori.</li>
+            <li>Implementare Linux convențională cu <span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață care gestionează privilegiile, păstrarea stării operatorului și CLI global pentru operatori, alături de implementarea APK/procd publicată pentru OpenWrt 25.12 x86_64.</li>
           </ul>
         </article>
         <article class="card status-card status-next">

@@ -47,7 +47,7 @@
     "alternateName": "aismixer",
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
-    "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu"],
+    "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu", "OpenWrt"],
     "description": "Open-source platform for deterministic AIS processing, logical routing, bounded stages, process-local runtime observability, and authenticated ECDHE UDPSEC.",
     "url": "https://aismixer.net/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
@@ -364,7 +364,7 @@
       <div class="section-heading">
         <p class="eyebrow">Local control and runtime observability</p>
         <h2>Control routing and inspect runtime activity</h2>
-        <p class="section-intro">The optional local POSIX Unix-domain control plane exposes routing operations and read-only aggregate, per-input, and per-output runtime statistics through the globally installed <span class="kbd">aismixerctl</span> command. Running it without a command opens the interactive operator shell.</p>
+        <p class="section-intro">The optional local POSIX Unix-domain control plane exposes routing operations and read-only aggregate, per-input, and per-output runtime statistics through the globally installed <span class="kbd">aismixerctl</span> command.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
@@ -383,15 +383,11 @@
           <p><span class="kbd">runtime.statistics.inputs</span> separates transport traffic from accepted frames. <span class="kbd">runtime.statistics.outputs</span> reports per-target local dispatches, messages, and bytes.</p>
         </article>
         <article class="card">
-          <div class="icons" aria-hidden="true">⌨️</div>
-          <h3>Interactive or one-shot</h3>
-          <p>The no-command shell provides help, tables, history where available, and the same routing and statistics operations retained for one-shot JSON use.</p>
+          <div class="icons" aria-hidden="true">🎛️</div>
+          <h3>Local operator interface</h3>
+          <p>Use <span class="kbd">aismixerctl</span> for local routing changes and read-only runtime inspection, with human-readable output for operators and JSON output for one-shot automation.</p>
         </article>
       </div>
-      <pre class="command-example" aria-label="Example aismixerctl interactive commands"><code>aismixerctl&gt; status
-aismixerctl&gt; show statistics
-aismixerctl&gt; show statistics inputs
-aismixerctl&gt; show statistics outputs</code></pre>
       <div class="callout">
         <p><strong>Read-only statistics boundary.</strong> Statistics are in-memory, process-local, non-durable, and reset at restart. They are not persistent history, distributed metrics, or a Prometheus/time-series system. Successful local UDP dispatch is not remote delivery acknowledgement.</p>
         <p><strong>Deliberately local control.</strong> Runtime routes are not persisted after restart, configuration files are not rewritten, and adapters are not created dynamically. Unix socket permissions are the current authorization boundary; there is no application-level control token.</p>
@@ -537,11 +533,46 @@ aismixerctl&gt; show statistics outputs</code></pre>
       </div>
     </section>
 
+    <section id="openwrt" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">OpenWrt edge deployment</p>
+        <h2>Run AISMixer or nmea_sproxy on OpenWrt</h2>
+        <p class="section-intro">A signed APK repository is available for OpenWrt 25.12 on x86_64. This is the only currently published OpenWrt target, and the packages use the Python implementation.</p>
+      </div>
+      <div class="grid feature-row proxy-grid">
+        <article class="card">
+          <div class="icons" aria-hidden="true">📦</div>
+          <h3>Signed packages</h3>
+          <p>Install <span class="kbd">aismixer</span> or <span class="kbd">nmea_sproxy</span>; both use <span class="kbd">aismixer-common</span> as a shared dependency. Add the <a href="https://aismixer.net/openwrt/keys/aismixer-openwrt.pem" target="_blank" rel="noopener">repository public key</a> under <span class="kbd">/etc/apk/keys/</span> before using the <a href="https://aismixer.net/openwrt/25.12/x86_64/packages.adb" target="_blank" rel="noopener">package repository</a>.</p>
+          <p>Key SHA-256: <span class="kbd">170d30219e0e05d59898cd8ccd5ec9804e915df7882ab56b8e869ef6e99c8f9c</span></p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">📡</div>
+          <h3>Two edge deployment roles</h3>
+          <p>AISMixer can run on an OpenWrt edge/router host. <span class="kbd">nmea_sproxy</span> can run independently near a receiver with UDP or serial input. Its output can be plain UDP, or UDPSEC can protect the network hop to AISMixer.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔐</div>
+          <h3>Explicit UDPSEC trust</h3>
+          <p>AISMixer and <span class="kbd">nmea_sproxy</span> each generate their local identity key pair automatically on first installation or startup, as appropriate. UDPSEC peer trust material is never exchanged automatically: provision the AISMixer public key locally at the station and authorize the station public key on the AISMixer side.</p>
+        </article>
+      </div>
+      <pre class="command-example" aria-label="Install AISMixer from the signed OpenWrt APK repository"><code>wget -O /etc/apk/keys/aismixer-openwrt.pem \
+  https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
+
+echo 'https://aismixer.net/openwrt/25.12/x86_64/packages.adb' \
+  &gt; /etc/apk/repositories.d/customfeeds.list
+
+apk update
+apk add aismixer</code></pre>
+      <p class="boundary-note"><strong>Receiver-side endpoint only.</strong> Use <span class="kbd">apk add nmea_sproxy</span> instead of <span class="kbd">apk add aismixer</span> to install the station proxy independently. See the <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> and <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a> for complete deployment and trust-provisioning steps.</p>
+    </section>
+
     <section id="operations" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Deployment and operations</p>
+        <p class="eyebrow">Conventional Linux deployment and operations</p>
         <h2>A Linux and systemd lifecycle built for real installations</h2>
-        <p class="section-intro">The repository-managed deployment keeps runtime files, operator state, systemd integration, local routing control, and read-only runtime statistics aligned.</p>
+        <p class="section-intro">For conventional Linux hosts, the repository-managed systemd deployment keeps runtime files, operator state, local routing control, and read-only runtime statistics aligned. OpenWrt uses the APK/procd path described above.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -562,7 +593,7 @@ aismixerctl&gt; show statistics outputs</code></pre>
         <article class="card">
           <div class="icons" aria-hidden="true">🧰</div>
           <h3>Global operator CLI</h3>
-          <p>The installed workflow places <span class="kbd">aismixerctl</span> in <span class="kbd">/usr/local/bin</span> for local runtime routing and read-only statistics, including the no-command interactive shell.</p>
+          <p>The installed workflow places <span class="kbd">aismixerctl</span> in <span class="kbd">/usr/local/bin</span> for local runtime routing and read-only statistics.</p>
         </article>
       </div>
     </section>
@@ -584,7 +615,7 @@ aismixerctl&gt; show statistics outputs</code></pre>
             <li>Deterministic multipart assembly, TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> handling, and global or target-scoped deduplication.</li>
             <li>Authenticated ephemeral P-256 ECDHE UDPSEC, long-term P-256 ECDSA identities, independent directional AES-GCM keys, and hard-bounded local secure state.</li>
             <li>One UDP or serial input to one UDPSEC or explicit trusted plain-UDP output per <span class="kbd">nmea_sproxy</span> process or systemd instance, plus IPv4/IPv6 endpoint controls.</li>
-            <li>systemd <span class="kbd">RuntimeDirectory</span>, privilege-aware lifecycle scripts, preserved operator state, and the global operator CLI.</li>
+            <li>Conventional Linux deployment with systemd <span class="kbd">RuntimeDirectory</span>, privilege-aware lifecycle scripts, preserved operator state, and the global operator CLI, alongside the published OpenWrt 25.12 x86_64 APK/procd deployment.</li>
           </ul>
         </article>
         <article class="card status-card status-next">
