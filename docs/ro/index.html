@@ -551,6 +551,7 @@
           <div class="icons" aria-hidden="true">📡</div>
           <h3>Două roluri la marginea rețelei</h3>
           <p>AISMixer poate rula pe un dispozitiv periferic sau router cu OpenWrt. <span class="kbd">nmea_sproxy</span> poate rula independent lângă un receptor cu intrare UDP sau serială. Ieșirea poate fi UDP simplu, iar UDPSEC poate proteja legătura de rețea către AISMixer.</p>
+          <p>Receptoarele care expun un port serial virtual prin USB pot necesita driverul de nucleu corespunzător pentru OpenWrt. Dispozitivele CDC ACM folosesc driverul din <span class="kbd">kmod-usb-acm</span> și apar de obicei ca <span class="kbd">/dev/ttyACM*</span>; alte chipseturi USB-serial pot necesita un alt driver. Intrarea UDP și cea serială printr-un UART nativ nu necesită acest driver CDC ACM.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔐</div>

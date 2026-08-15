@@ -550,6 +550,7 @@
           <div class="icons" aria-hidden="true">📡</div>
           <h3>Две роли в периферната мрежа</h3>
           <p>AISMixer може да работи върху периферен хост или маршрутизатор с OpenWrt. <span class="kbd">nmea_sproxy</span> може да работи самостоятелно близо до приемника с UDP или сериен вход. Изходът му може да бъде некриптиран UDP, а UDPSEC може да защити мрежовата връзка до AISMixer.</p>
+          <p>Приемниците с виртуален сериен порт през USB могат да изискват съответния драйвер за ядрото на OpenWrt. При CDC ACM устройства това е <span class="kbd">kmod-usb-acm</span> и те обикновено се появяват като <span class="kbd">/dev/ttyACM*</span>; за други USB-серийни чипсети може да е необходим различен драйвер. UDP входът и директният сериен вход през хардуерен UART не изискват този CDC ACM драйвер.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔐</div>

@@ -550,6 +550,7 @@
           <div class="icons" aria-hidden="true">📡</div>
           <h3>Two edge deployment roles</h3>
           <p>AISMixer can run on an OpenWrt edge/router host. <span class="kbd">nmea_sproxy</span> can run independently near a receiver with UDP or serial input. Its output can be plain UDP, or UDPSEC can protect the network hop to AISMixer.</p>
+          <p>USB virtual serial receivers may need a matching OpenWrt kernel driver. CDC ACM devices use <span class="kbd">kmod-usb-acm</span> and typically appear as <span class="kbd">/dev/ttyACM*</span>; other USB-serial chipsets may need a different driver. UDP and native UART inputs do not need this CDC ACM driver.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔐</div>
