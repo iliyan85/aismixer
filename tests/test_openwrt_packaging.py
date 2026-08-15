@@ -1,7 +1,12 @@
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +26,46 @@ def makefile_block(recipe, name):
     )
     assert match is not None, f"missing Makefile block: {name}"
     return match.group(1)
+
+
+def nmea_sproxy_preflight_source():
+    init = read_text(PACKAGE_FILES / "nmea_sproxy.init")
+    match = re.search(
+        r'^\s*/usr/bin/python3 - "\$CONFIG" "\$RUNTIME_DIR" 2>&1 <<\'PY\'\n'
+        r"(.*?)^PY$",
+        init,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, "missing nmea_sproxy runtime preflight"
+    return match.group(1)
+
+
+def run_nmea_sproxy_preflight(config_path):
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            nmea_sproxy_preflight_source(),
+            str(config_path),
+            str(ROOT / "nmea_sproxy"),
+        ],
+        check=False,
+        capture_output=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        stdin=subprocess.DEVNULL,
+        text=True,
+    )
+
+
+def write_public_key(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
+    path.write_bytes(
+        public_key.public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
 
 
 def test_openwrt_recipe_uses_canonical_three_package_split():
@@ -53,6 +98,21 @@ def test_openwrt_packages_pin_stable_source_metadata():
         sources = re.findall(r"^\s*SOURCE:=(\S+)\s*$", package, re.MULTILINE)
 
         assert sources == ["github.com/iliyan85/aismixer"]
+
+
+def test_openwrt_package_revision_only_advances_local_release():
+    recipe = read_text(PACKAGE_DIR / "Makefile")
+
+    assert re.findall(r"^PKG_VERSION:=(\S+)$", recipe, re.MULTILINE) == [
+        "0.2.0"
+    ]
+    assert re.findall(r"^PKG_RELEASE:=(\S+)$", recipe, re.MULTILINE) == ["2"]
+    assert re.findall(
+        r"^PKG_SOURCE_VERSION:=(\S+)$", recipe, re.MULTILINE
+    ) == ["10df1265b4226debe06815202ed88a4010a567fc"]
+    assert re.findall(r"^PKG_MIRROR_HASH:=(\S+)$", recipe, re.MULTILINE) == [
+        "f4cf3d8fa68b338b58db38d4919d6f01c4027bef2b7db3108d48ad9c30db10c1"
+    ]
 
 
 def test_openwrt_common_package_copies_complete_core_tree():
@@ -123,6 +183,139 @@ def test_openwrt_nmea_sproxy_init_remains_singleton_without_process_title():
     assert "config_load" not in init
     assert "config_foreach" not in init
     assert "/sbin/uci" not in init
+
+
+def test_openwrt_nmea_sproxy_preflight_precedes_procd_instance():
+    init = read_text(PACKAGE_FILES / "nmea_sproxy.init")
+    start_service = re.search(
+        r"^start_service\(\) \{\n(.*?)^\}$",
+        init,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+    assert start_service is not None
+    body = start_service.group(1)
+    assert body.index('if [ ! -f "$CONFIG" ]') < body.index(
+        "prepare_station_identity || return 1"
+    )
+    assert body.index("prepare_station_identity || return 1") < body.index(
+        "check_runtime_readiness || return 1"
+    )
+    assert body.index("check_runtime_readiness || return 1") < body.index(
+        "procd_open_instance"
+    )
+    assert 'procd_set_param respawn 3600 5 5' in body
+    assert 'logger -t nmea_sproxy "$readiness_error"' in init
+
+
+def test_openwrt_nmea_sproxy_preflight_uses_installed_runtime_semantics():
+    init = read_text(PACKAGE_FILES / "nmea_sproxy.init")
+    preflight = nmea_sproxy_preflight_source()
+
+    assert "RUNTIME_DIR=/usr/lib/aismixer/nmea_sproxy" in init
+    assert "runtime.load_config(config_path)" in preflight
+    assert 'config["output"]["type"]' in preflight
+    assert "runtime.load_public_key(peer_key_path)" in preflight
+    assert "os.access(peer_key_path, os.R_OK)" in preflight
+    assert "/etc/nmea_sproxy/keys/aismixer_public.pem" not in init
+
+
+def test_openwrt_nmea_sproxy_preflight_rejects_missing_udpsec_peer_key(
+    tmp_path,
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "remote_public_key: trust/custom-peer.pem\n",
+        encoding="utf-8",
+    )
+
+    result = run_nmea_sproxy_preflight(config_path)
+    resolved_path = tmp_path / "trust" / "custom-peer.pem"
+
+    assert result.returncode == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "UDPSEC peer public key not provisioned; service not started: "
+        f"{resolved_path}"
+    )
+
+
+def test_openwrt_nmea_sproxy_preflight_does_not_require_peer_key_for_udp(
+    tmp_path,
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "remote_public_key: trust/missing-peer.pem\n"
+        "output:\n"
+        "  type: udp\n"
+        "  host: 192.0.2.20\n"
+        "  port: 17777\n",
+        encoding="utf-8",
+    )
+
+    result = run_nmea_sproxy_preflight(config_path)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_openwrt_nmea_sproxy_preflight_accepts_parseable_custom_peer_key(
+    tmp_path,
+):
+    peer_key_path = tmp_path / "trust" / "mixer.pem"
+    write_public_key(peer_key_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "remote_public_key: trust/mixer.pem\n",
+        encoding="utf-8",
+    )
+
+    result = run_nmea_sproxy_preflight(config_path)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_openwrt_nmea_sproxy_preflight_rejects_invalid_peer_key(tmp_path):
+    peer_key_path = tmp_path / "trust" / "mixer.pem"
+    peer_key_path.parent.mkdir()
+    peer_key_path.write_text("not a PEM public key\n", encoding="utf-8")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "remote_public_key: trust/mixer.pem\n",
+        encoding="utf-8",
+    )
+
+    result = run_nmea_sproxy_preflight(config_path)
+
+    assert result.returncode == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "UDPSEC peer public key invalid or unreadable; service not started: "
+        f"{peer_key_path}"
+    )
+
+
+def test_openwrt_nmea_sproxy_preflight_rejects_invalid_config(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "output:\n"
+        "  type: tcp\n"
+        "  host: 192.0.2.20\n"
+        "  port: 17777\n",
+        encoding="utf-8",
+    )
+
+    result = run_nmea_sproxy_preflight(config_path)
+
+    assert result.returncode == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "Configuration preflight failed; service not started: "
+        "output.type: supported values are 'udpsec' and 'udp'"
+    )
 
 
 def test_systemd_process_title_and_template_instance_remain_unchanged():

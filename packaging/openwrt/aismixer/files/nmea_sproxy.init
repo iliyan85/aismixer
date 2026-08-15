@@ -7,6 +7,7 @@ STOP=10
 
 PROG=/usr/bin/nmea_sproxy
 CONFIG=/etc/nmea_sproxy/config.yaml
+RUNTIME_DIR=/usr/lib/aismixer/nmea_sproxy
 
 KEY_TOOL=/usr/lib/aismixer/tools/aismixer_keys.py
 KEYS_DIR=/etc/nmea_sproxy/keys
@@ -38,6 +39,64 @@ prepare_station_identity() {
 }
 
 
+check_runtime_readiness() {
+	local readiness_error
+
+	readiness_error="$(
+		/usr/bin/python3 - "$CONFIG" "$RUNTIME_DIR" 2>&1 <<'PY'
+import os
+import sys
+
+config_path = sys.argv[1]
+runtime_dir = sys.argv[2]
+sys.path.insert(0, runtime_dir)
+
+try:
+    import nmea_sproxy as runtime
+
+    config = runtime.load_config(config_path)
+    output_type = config["output"]["type"]
+except Exception as exc:
+    detail = " ".join(str(exc).split()) or exc.__class__.__name__
+    print(f"Configuration preflight failed; service not started: {detail}")
+    raise SystemExit(1)
+
+if output_type != runtime.UDPSEC_OUTPUT_TYPE:
+    raise SystemExit(0)
+
+try:
+    peer_key_path = os.fspath(config["remote_public_key"])
+except Exception as exc:
+    detail = " ".join(str(exc).split()) or exc.__class__.__name__
+    print(f"Configuration preflight failed; service not started: {detail}")
+    raise SystemExit(1)
+
+if not os.path.isfile(peer_key_path) or not os.access(peer_key_path, os.R_OK):
+    print(
+        "UDPSEC peer public key not provisioned; service not started: "
+        f"{peer_key_path}"
+    )
+    raise SystemExit(1)
+
+try:
+    runtime.load_public_key(peer_key_path)
+except Exception:
+    print(
+        "UDPSEC peer public key invalid or unreadable; service not started: "
+        f"{peer_key_path}"
+    )
+    raise SystemExit(1)
+PY
+	)" || {
+		if [ -z "$readiness_error" ]; then
+			readiness_error="Runtime preflight failed; service not started"
+		fi
+		logger -t nmea_sproxy "$readiness_error"
+		return 1
+	}
+}
+
+
 start_service() {
 	if [ ! -f "$CONFIG" ]; then
 		logger -t nmea_sproxy "Configuration not found: $CONFIG"
@@ -45,6 +104,7 @@ start_service() {
 	fi
 
 	prepare_station_identity || return 1
+	check_runtime_readiness || return 1
 
 	procd_open_instance
 

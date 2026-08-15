@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=aismixer
 PKG_VERSION:=0.2.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 # Pin the exact upstream source revision used for the first OpenWrt
 # packaging/runtime validation. Do not follow a moving branch here.
