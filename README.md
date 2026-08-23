@@ -67,31 +67,46 @@ systemctl status aismixer
 configuration and keys under `/etc/aismixer` untouched. `uninstall.sh` preserves
 that directory unless `--purge-config` is explicitly requested.
 
-### OpenWrt 25.12 (x86_64 only)
+### OpenWrt 25.12
 
-For OpenWrt 25.12 on x86_64, a signed APK v3 repository publishes the current
-Python implementation with procd integration. This is the only currently
-published OpenWrt target. Run as root:
+OpenWrt 25.12 is supported as a production-oriented edge deployment
+environment. A signed APK v3 repository publishes the current Python
+implementation with procd integration for these package architectures:
+
+| OpenWrt 25.12 package architecture | Signed repository index |
+| --- | --- |
+| `x86_64` | [`packages.adb`](https://aismixer.net/openwrt/25.12/x86_64/packages.adb) |
+| `mips_24kc` | [`packages.adb`](https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb) |
+
+Select the package architecture that matches the official OpenWrt package feeds
+configured on the device; do not derive this value from `apk --print-arch`. The
+Python runtime and its dependencies
+require materially more writable space than a minimal OpenWrt installation.
+Verify available overlay space before installation; extroot is an OpenWrt
+deployment option when internal writable storage is limited. Run as root:
 
 ```sh
+# Choose 'x86_64' or 'mips_24kc':
+AISMIXER_ARCH='x86_64'
+
 wget -O /etc/apk/keys/aismixer-openwrt.pem \
   https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
 
 chmod 0644 /etc/apk/keys/aismixer-openwrt.pem
 
 REPO_FILE=/etc/apk/repositories.d/customfeeds.list
-REPO_URL='https://aismixer.net/openwrt/25.12/x86_64/packages.adb'
+REPO_URL="https://aismixer.net/openwrt/25.12/${AISMIXER_ARCH}/packages.adb"
 
 grep -qxF "$REPO_URL" "$REPO_FILE" 2>/dev/null || {
-  printf '\n# AISMixer OpenWrt 25.12 x86_64 repository\n%s\n' \
-    "$REPO_URL" >> "$REPO_FILE"
+  printf '\n# AISMixer OpenWrt 25.12 %s repository\n%s\n' \
+    "$AISMIXER_ARCH" "$REPO_URL" >> "$REPO_FILE"
 }
 
 apk update
 apk add aismixer
 ```
 
-Repository public-key SHA-256:
+Both package architectures use the same repository public key. Its SHA-256 is:
 `170d30219e0e05d59898cd8ccd5ec9804e915df7882ab56b8e869ef6e99c8f9c`.
 The `aismixer` package resolves `aismixer-common` automatically as its shared
 dependency; normally, do not install it manually. To install only the
@@ -100,6 +115,10 @@ station-side package instead:
 ```sh
 apk add nmea_sproxy
 ```
+
+The `mips_24kc` package path has been validated end to end: physical serial AIS
+ingress → `nmea_sproxy` → authenticated UDPSEC → AISMixer → processing, egress,
+and control-plane operation.
 
 On first service start, AISMixer automatically generates or repairs its local
 server identity when required, uses the OpenWrt configuration and identity
@@ -117,27 +136,30 @@ intentionally keeps the service stopped instead of entering a respawn loop.
 This is expected safe behavior, not a failed package installation. Explicit
 plain UDP does not require a peer key.
 
-**OpenWrt USB serial hardware.** Native UART serial input needs no USB driver,
-and UDP input needs no USB serial driver. USB virtual serial hardware may need
-the OpenWrt kernel module appropriate to its device class before `nmea_sproxy`
-can open a `/dev/tty*` device; this is hardware-specific, not an `nmea_sproxy`
-package dependency. CDC ACM receivers use:
+**OpenWrt serial hardware.** `nmea_sproxy` consumes an OS-provided serial
+device; it does not access USB devices directly. A native UART needs no USB
+driver. CDC ACM devices normally appear as `/dev/ttyACM*` and may require
+`kmod-usb-acm` if that driver is not already present in the OpenWrt image:
 
 ```sh
 apk add kmod-usb-acm
 ```
 
-After binding, CDC ACM devices typically appear as `/dev/ttyACM*`. Inspect the
-actual device path with:
+USB-UART adapters commonly appear as `/dev/ttyUSB*` and require the
+chipset-appropriate OpenWrt driver when it is not already available.
+`/dev/serial/by-id/...` is not guaranteed to exist on OpenWrt; identify the
+actual TTY path from kernel/hotplug output:
 
 ```sh
 dmesg | tail -n 30
-ls -l /dev/ttyACM* 2>/dev/null
+logread | tail -n 30
+ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 ```
 
-Other USB-serial chipsets may need different drivers. `stty` may be absent from
-the base OpenWrt image. For optional serial diagnostics (`/dev/ttyACM0` is only
-an example, not a guaranteed path):
+Hardware-specific kernel modules remain outside `nmea_sproxy`'s mandatory
+package dependencies. `stty` may be absent from the base OpenWrt image. For
+optional serial diagnostics (`/dev/ttyACM0` is only an example, not a guaranteed
+path):
 
 ```sh
 apk add coreutils-stty
@@ -358,8 +380,8 @@ session behavior, endpoint policy, and troubleshooting.
 
 - UDP ingress over IPv4 and IPv6, with optional application-level allow-lists.
 - Authenticated encrypted UDPSEC ingress compatible with `nmea_sproxy`.
-- Physical serial and USB virtual COM input through `nmea_sproxy`, plus explicit
-  plain UDP for trusted networks.
+- Physical serial input through `nmea_sproxy`, including USB virtual serial
+  devices exposed by the OS.
 - Optional outbound source-address binding for AISMixer and proxy outputs.
 - UDP broadcast egress in legacy mode and named UDP targets in routing mode.
 
@@ -388,8 +410,8 @@ session behavior, endpoint policy, and troubleshooting.
 - Supervised process-local ingress, processing, and egress tasks; the optional
   control listener is lifecycle-managed separately.
 - Conventional Linux deployment uses lifecycle scripts, systemd, and
-  `/usr/local/bin/aismixerctl`; the signed OpenWrt 25.12 x86_64 APK repository
-  provides Python packages with procd integration.
+  `/usr/local/bin/aismixerctl`; the signed OpenWrt 25.12 APK repository provides
+  Python packages for `x86_64` and `mips_24kc` with procd integration.
 
 ## 🔀 Architecture
 
@@ -611,31 +633,48 @@ systemctl status aismixer
 конфигурации и ключове в `/etc/aismixer` остават непроменени. `uninstall.sh`
 запазва тази директория, освен ако изрично не е зададено `--purge-config`.
 
-### OpenWrt 25.12 (само x86_64)
+### OpenWrt 25.12
 
-За OpenWrt 25.12 на x86_64 е публикувано подписано APK v3 хранилище. Пакетите
-съдържат текущата Python реализация и се интегрират с procd. В момента това е
-единствената публикувана цел за OpenWrt. Изпълнете като root:
+OpenWrt 25.12 се поддържа като ориентирана към реална експлоатация edge среда
+за разполагане. Подписано APK v3 хранилище публикува текущата Python реализация
+с procd интеграция за следните пакетни архитектури:
+
+| Архитектура на пакета за OpenWrt 25.12 | Подписан индекс на хранилището |
+| --- | --- |
+| `x86_64` | [`packages.adb`](https://aismixer.net/openwrt/25.12/x86_64/packages.adb) |
+| `mips_24kc` | [`packages.adb`](https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb) |
+
+Изберете пакетната архитектура, която съответства на официалните пакетни
+хранилища на OpenWrt, конфигурирани на устройството; не определяйте тази стойност
+чрез `apk --print-arch`. Python runtime-ът и зависимостите му изискват
+значително повече записваемо пространство от минимална OpenWrt инсталация.
+Преди инсталиране проверете свободното място в overlay; при ограничено вътрешно
+записваемо хранилище extroot е вариант за разполагане под OpenWrt. Изпълнете
+като root:
 
 ```sh
+# Изберете 'x86_64' или 'mips_24kc':
+AISMIXER_ARCH='x86_64'
+
 wget -O /etc/apk/keys/aismixer-openwrt.pem \
   https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
 
 chmod 0644 /etc/apk/keys/aismixer-openwrt.pem
 
 REPO_FILE=/etc/apk/repositories.d/customfeeds.list
-REPO_URL='https://aismixer.net/openwrt/25.12/x86_64/packages.adb'
+REPO_URL="https://aismixer.net/openwrt/25.12/${AISMIXER_ARCH}/packages.adb"
 
 grep -qxF "$REPO_URL" "$REPO_FILE" 2>/dev/null || {
-  printf '\n# AISMixer OpenWrt 25.12 x86_64 repository\n%s\n' \
-    "$REPO_URL" >> "$REPO_FILE"
+  printf '\n# AISMixer OpenWrt 25.12 %s repository\n%s\n' \
+    "$AISMIXER_ARCH" "$REPO_URL" >> "$REPO_FILE"
 }
 
 apk update
 apk add aismixer
 ```
 
-SHA-256 отпечатъкът на публичния ключ на хранилището е
+И двете пакетни архитектури използват един и същ публичен ключ за хранилището.
+Неговият SHA-256 отпечатък е
 `170d30219e0e05d59898cd8ccd5ec9804e915df7882ab56b8e869ef6e99c8f9c`.
 Пакетът `aismixer` инсталира автоматично общата зависимост `aismixer-common`;
 обикновено не е нужно да я инсталирате ръчно. За да инсталирате вместо това само
@@ -644,6 +683,10 @@ SHA-256 отпечатъкът на публичния ключ на храни�
 ```sh
 apk add nmea_sproxy
 ```
+
+Пакетното разполагане за `mips_24kc` е валидирано от край до край: физически
+сериен AIS вход → `nmea_sproxy` → автентикиран UDPSEC → AISMixer → обработка,
+изход и работа на слоя за управление.
 
 При първото стартиране AISMixer автоматично генерира или поправя при
 необходимост локалната си сървърна идентичност, използва OpenWrt структурата за
@@ -662,28 +705,31 @@ apk add nmea_sproxy
 поведение, а не неуспешна инсталация на пакета. Изрично конфигурираният plain UDP
 не изисква публичен ключ на отсрещната страна.
 
-**USB устройства с виртуален сериен порт под OpenWrt.** Нито серийният вход през
-вграден UART, нито UDP входът се нуждаят от USB-сериен драйвер. За USB устройство
-с виртуален сериен порт може да е необходим подходящият за устройството модул за
-ядрото на OpenWrt, преди `nmea_sproxy` да може да отвори `/dev/tty*`; това е
-изискване, специфично за хардуера, а не пакетна зависимост на `nmea_sproxy`. При
-CDC ACM приемници инсталирайте:
+**Сериен хардуер под OpenWrt.** `nmea_sproxy` използва предоставено от
+операционната система серийно устройство и няма пряк достъп до USB устройства.
+Вграденият UART не изисква USB драйвер. CDC ACM устройствата обикновено се
+появяват като `/dev/ttyACM*` и може да изискват `kmod-usb-acm`, ако драйверът
+не е включен в OpenWrt образа:
 
 ```sh
 apk add kmod-usb-acm
 ```
 
-След като драйверът разпознае устройството, CDC ACM устройствата обикновено се
-появяват като `/dev/ttyACM*`. Проверете действителния път с:
+USB-UART адаптерите обикновено се появяват като `/dev/ttyUSB*` и изискват
+подходящия за чипсета OpenWrt драйвер, когато той още не е наличен.
+`/dev/serial/by-id/...` не е гарантирано да съществува под OpenWrt; определете
+действителния TTY път от съобщенията на ядрото/hotplug:
 
 ```sh
 dmesg | tail -n 30
-ls -l /dev/ttyACM* 2>/dev/null
+logread | tail -n 30
+ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 ```
 
-Други USB-серийни чипсети може да изискват различни драйвери. `stty` може да
-липсва в базовия образ на OpenWrt. За незадължителна диагностика на серийния
-порт (`/dev/ttyACM0` е само пример, а не гарантиран път):
+Специфичните за хардуера модули на ядрото остават извън задължителните пакетни
+зависимости на `nmea_sproxy`. `stty` може да липсва в базовия образ на OpenWrt.
+За незадължителна диагностика на серийния порт (`/dev/ttyACM0` е само пример,
+а не гарантиран път):
 
 ```sh
 apk add coreutils-stty
@@ -911,8 +957,8 @@ UDPSEC е специфичният за AISMixer автентикиран и к�
 
 - UDP входове по IPv4 и IPv6 с незадължителни списъци с разрешени адреси.
 - Автентикиран и криптиран UDPSEC вход, съвместим с `nmea_sproxy`.
-- Физически сериен порт и USB virtual COM вход чрез `nmea_sproxy`, както и
-  изрично зададен plain UDP за доверени мрежи.
+- Физически сериен вход чрез `nmea_sproxy`, включително USB устройства с
+  виртуален сериен порт, предоставени от операционната система.
 - Незадължително обвързване на изходния адрес за AISMixer и proxy изходите.
 - Broadcast UDP изход в legacy режим и именувани UDP цели в routing режим.
 
@@ -943,7 +989,7 @@ UDPSEC е специфичният за AISMixer автентикиран и к�
   незадължителният control listener има отделно управление на жизнения цикъл.
 - Стандартното разполагане под Linux използва скриптове за жизнения цикъл,
   systemd и `/usr/local/bin/aismixerctl`; подписаното APK хранилище за OpenWrt
-  25.12 x86_64 предоставя Python пакети, интегрирани с procd.
+  25.12 предоставя интегрирани с procd Python пакети за `x86_64` и `mips_24kc`.
 
 ## 🔀 Архитектура
 
@@ -1171,31 +1217,48 @@ systemctl status aismixer
 cheile operatorului din `/etc/aismixer` rămân nemodificate. `uninstall.sh`
 păstrează acel director dacă `--purge-config` nu este cerut explicit.
 
-### OpenWrt 25.12 (numai x86_64)
+### OpenWrt 25.12
 
-Pentru OpenWrt 25.12 pe x86_64 este publicat un repository APK v3 semnat.
-Pachetele conțin implementarea Python actuală și se integrează cu procd. Aceasta
-este singura țintă OpenWrt publicată în prezent. Rulați ca root:
+OpenWrt 25.12 este suportat ca mediu edge orientat spre implementări de
+producție. Un repository APK v3 semnat publică implementarea Python actuală,
+integrată cu procd, pentru următoarele arhitecturi de pachete:
+
+| Arhitectură de pachet OpenWrt 25.12 | Index semnat al repository-ului |
+| --- | --- |
+| `x86_64` | [`packages.adb`](https://aismixer.net/openwrt/25.12/x86_64/packages.adb) |
+| `mips_24kc` | [`packages.adb`](https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb) |
+
+Selectați arhitectura de pachet care corespunde feed-urilor oficiale de pachete
+OpenWrt configurate pe dispozitiv; nu determinați această valoare cu
+`apk --print-arch`. Runtime-ul Python și dependențele sale
+necesită considerabil mai mult spațiu disponibil pentru scriere decât o
+instalare OpenWrt minimală. Verificați spațiul liber din overlay înainte de
+instalare; extroot este o opțiune de implementare OpenWrt când spațiul intern
+disponibil pentru scriere este limitat. Rulați ca root:
 
 ```sh
+# Selectați 'x86_64' sau 'mips_24kc':
+AISMIXER_ARCH='x86_64'
+
 wget -O /etc/apk/keys/aismixer-openwrt.pem \
   https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
 
 chmod 0644 /etc/apk/keys/aismixer-openwrt.pem
 
 REPO_FILE=/etc/apk/repositories.d/customfeeds.list
-REPO_URL='https://aismixer.net/openwrt/25.12/x86_64/packages.adb'
+REPO_URL="https://aismixer.net/openwrt/25.12/${AISMIXER_ARCH}/packages.adb"
 
 grep -qxF "$REPO_URL" "$REPO_FILE" 2>/dev/null || {
-  printf '\n# AISMixer OpenWrt 25.12 x86_64 repository\n%s\n' \
-    "$REPO_URL" >> "$REPO_FILE"
+  printf '\n# AISMixer OpenWrt 25.12 %s repository\n%s\n' \
+    "$AISMIXER_ARCH" "$REPO_URL" >> "$REPO_FILE"
 }
 
 apk update
 apk add aismixer
 ```
 
-Amprenta SHA-256 a cheii publice a repository-ului este
+Ambele arhitecturi de pachete folosesc aceeași cheie publică a repository-ului.
+Amprenta sa SHA-256 este
 `170d30219e0e05d59898cd8ccd5ec9804e915df7882ab56b8e869ef6e99c8f9c`.
 Pachetul `aismixer` instalează automat dependența comună `aismixer-common`; în
 mod normal nu trebuie să o instalați manual. Pentru a instala în schimb doar
@@ -1204,6 +1267,10 @@ pachetul de la stație:
 ```sh
 apk add nmea_sproxy
 ```
+
+Fluxul de implementare pentru pachetul `mips_24kc` a fost validat end-to-end:
+intrare AIS prin port serial fizic → `nmea_sproxy` → UDPSEC autentificat →
+AISMixer → procesare, ieșire și funcționarea planului de control.
 
 La prima pornire a serviciului, AISMixer generează sau repară automat, după caz,
 identitatea locală a serverului, folosește structura OpenWrt pentru configurare
@@ -1222,28 +1289,31 @@ permită o buclă de respawn. Acesta este un comportament sigur așteptat, nu un
 eșec al instalării pachetului. UDP simplu configurat explicit nu necesită o
 cheie publică pentru peer.
 
-**Hardware serial prin USB în OpenWrt.** Nici intrarea serială printr-un UART
-nativ, nici intrarea UDP nu necesită un driver serial USB. Hardware-ul cu port
-serial virtual prin USB poate necesita modulul kernel OpenWrt corespunzător
-dispozitivului înainte ca `nmea_sproxy` să poată deschide un dispozitiv
-`/dev/tty*`; aceasta este o cerință specifică hardware-ului, nu o dependență a
-pachetului `nmea_sproxy`. Receptoarele CDC ACM folosesc:
+**Hardware serial în OpenWrt.** `nmea_sproxy` folosește un dispozitiv serial
+furnizat de sistemul de operare; nu accesează direct dispozitive USB. Un UART
+nativ nu necesită driver USB. Dispozitivele CDC ACM apar de obicei ca
+`/dev/ttyACM*` și pot necesita `kmod-usb-acm` dacă driverul nu este deja prezent
+în imaginea OpenWrt:
 
 ```sh
 apk add kmod-usb-acm
 ```
 
-După asocierea driverului, dispozitivele CDC ACM apar de obicei ca
-`/dev/ttyACM*`. Verificați calea efectivă cu:
+Adaptoarele USB-UART apar frecvent ca `/dev/ttyUSB*` și necesită driverul OpenWrt
+potrivit chipsetului atunci când acesta nu este deja disponibil. Existența căii
+`/dev/serial/by-id/...` nu este garantată în OpenWrt; identificați calea TTY
+efectivă din mesajele kernel/hotplug:
 
 ```sh
 dmesg | tail -n 30
-ls -l /dev/ttyACM* 2>/dev/null
+logread | tail -n 30
+ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 ```
 
-Alte chipseturi USB-serial pot necesita drivere diferite. `stty` poate lipsi din
-imaginea OpenWrt de bază. Pentru diagnosticare serială opțională
-(`/dev/ttyACM0` este doar un exemplu, nu o cale garantată):
+Modulele kernel specifice hardware-ului rămân în afara dependențelor obligatorii
+ale pachetului `nmea_sproxy`. `stty` poate lipsi din imaginea OpenWrt de bază.
+Pentru diagnosticare serială opțională (`/dev/ttyACM0` este doar un exemplu, nu
+o cale garantată):
 
 ```sh
 apk add coreutils-stty
@@ -1477,8 +1547,8 @@ securitate](SECURITY.md), [contractul comportamental](BEHAVIORAL_CONTRACT.md) ș
 - Ingress UDP prin IPv4 și IPv6, cu liste opționale de adrese permise la nivelul
   aplicației.
 - Ingress UDPSEC autentificat și criptat, compatibil cu `nmea_sproxy`.
-- Intrare serială fizică și USB virtual COM prin `nmea_sproxy`, plus UDP simplu
-  explicit pentru rețele de încredere.
+- Intrare serială fizică prin `nmea_sproxy`, inclusiv dispozitive USB cu port
+  serial virtual puse la dispoziție de sistemul de operare.
 - Asocierea opțională a adresei-sursă pentru ieșirile AISMixer și proxy.
 - Egress UDP broadcast în modul legacy și destinații UDP denumite în modul de
   rutare.
@@ -1509,7 +1579,8 @@ securitate](SECURITY.md), [contractul comportamental](BEHAVIORAL_CONTRACT.md) ș
   listener-ul de control opțional are un ciclu de viață gestionat separat.
 - Instalarea convențională pe Linux folosește scripturi pentru ciclul de viață,
   systemd și `/usr/local/bin/aismixerctl`; repository-ul APK semnat pentru
-  OpenWrt 25.12 x86_64 furnizează pachete Python integrate cu procd.
+  OpenWrt 25.12 furnizează pachete Python pentru `x86_64` și `mips_24kc`,
+  integrate cu procd.
 
 ## 🔀 Arhitectură
 
