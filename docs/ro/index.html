@@ -493,7 +493,7 @@
         </div>
         <div class="path-connector">
           <span aria-hidden="true">→</span>
-          <small>port serial sau COM virtual prin USB</small>
+          <small>port serial sau dispozitiv serial virtual prin USB</small>
         </div>
         <div class="path-node path-node-accent">
           <span class="icons" aria-hidden="true">🔐</span>
@@ -513,8 +513,7 @@
           <h3>Intrări locale implementate</h3>
           <ul class="list">
             <li>UDP de la un receptor local conectat la rețea sau de la o aplicație AIS.</li>
-            <li>Intrare directă prin portul serial fizic.</li>
-            <li>Intrare COM virtuală prin USB de la un receptor AIS fizic.</li>
+            <li>Intrare serială fizică prin <span class="kbd">nmea_sproxy</span>, inclusiv dispozitive seriale virtuale prin USB puse la dispoziție de sistemul de operare.</li>
           </ul>
         </article>
         <article class="card">
@@ -538,20 +537,26 @@
       <div class="section-heading">
         <p class="eyebrow">Implementare OpenWrt la marginea rețelei</p>
         <h2>Rulați AISMixer sau nmea_sproxy pe OpenWrt</h2>
-        <p class="section-intro">Un depozit APK semnat este disponibil pentru OpenWrt 25.12 pe x86_64. Aceasta este singura țintă OpenWrt publicată în prezent, iar pachetele folosesc implementarea Python.</p>
+        <p class="section-intro">Depozitul AISMixer APK semnat pentru OpenWrt 25.12 publică implementarea Python/procd pentru arhitecturile <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
         <article class="card">
           <div class="icons" aria-hidden="true">📦</div>
           <h3>Pachete semnate</h3>
-          <p>Instalați <span class="kbd">aismixer</span> sau <span class="kbd">nmea_sproxy</span>; ambele folosesc <span class="kbd">aismixer-common</span> ca dependență comună. Instalați <a href="https://aismixer.net/openwrt/keys/aismixer-openwrt.pem" target="_blank" rel="noopener">cheia publică a depozitului</a> în <span class="kbd">/etc/apk/keys/</span> înainte de a folosi <a href="https://aismixer.net/openwrt/25.12/x86_64/packages.adb" target="_blank" rel="noopener">depozitul de pachete</a>.</p>
+          <p>Instalați <span class="kbd">aismixer</span> sau <span class="kbd">nmea_sproxy</span>. Dependența comună <span class="kbd">aismixer-common</span> este adăugată automat la instalarea oricăruia dintre cele două pachete.</p>
+          <p>Indexuri de depozit publicate:</p>
+          <ul class="list">
+            <li><span class="kbd">x86_64</span>: <a href="https://aismixer.net/openwrt/25.12/x86_64/packages.adb" target="_blank" rel="noopener">index <span class="kbd">packages.adb</span> semnat</a></li>
+            <li><span class="kbd">mips_24kc</span>: <a href="https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb" target="_blank" rel="noopener">index <span class="kbd">packages.adb</span> semnat</a></li>
+          </ul>
+          <p>Ambele arhitecturi folosesc aceeași <a href="https://aismixer.net/openwrt/keys/aismixer-openwrt.pem" target="_blank" rel="noopener">cheie publică a depozitului</a>; instalați-o în <span class="kbd">/etc/apk/keys/</span> înainte de a folosi oricare dintre cele două indexuri.</p>
           <p>SHA-256 al cheii: <span class="kbd">170d30219e0e05d59898cd8ccd5ec9804e915df7882ab56b8e869ef6e99c8f9c</span></p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">📡</div>
           <h3>Două roluri la marginea rețelei</h3>
           <p>AISMixer poate rula pe un dispozitiv periferic sau router cu OpenWrt. <span class="kbd">nmea_sproxy</span> poate rula independent lângă un receptor cu intrare UDP sau serială. Ieșirea poate fi UDP simplu, iar UDPSEC poate proteja legătura de rețea către AISMixer.</p>
-          <p>Receptoarele care expun un port serial virtual prin USB pot necesita driverul de nucleu corespunzător pentru OpenWrt. Dispozitivele CDC ACM folosesc driverul din <span class="kbd">kmod-usb-acm</span> și apar de obicei ca <span class="kbd">/dev/ttyACM*</span>; alte chipseturi USB-serial pot necesita un alt driver. Intrarea UDP și cea serială printr-un UART nativ nu necesită acest driver CDC ACM.</p>
+          <p><span class="kbd">nmea_sproxy</span> acceptă intrare serială fizică, inclusiv dispozitive seriale virtuale prin USB puse la dispoziție de sistemul de operare. Dispozitivele CDC ACM apar de obicei ca <span class="kbd">/dev/ttyACM*</span>, iar adaptoarele USB-UART ca <span class="kbd">/dev/ttyUSB*</span>. Driverul de nucleu necesar poate fi deja inclus în imaginea OpenWrt; în caz contrar, poate fi necesar pachetul <span class="kbd">kmod</span> corespunzător, de exemplu <span class="kbd">kmod-usb-acm</span> pentru CDC ACM. UART-ul nativ și intrarea UDP nu necesită un driver serial USB.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔐</div>
@@ -559,19 +564,25 @@
           <p>AISMixer și <span class="kbd">nmea_sproxy</span> își generează automat perechile locale de chei de identitate la prima instalare sau pornire, după caz. Materialul de încredere UDPSEC nu este transferat niciodată automat între participanți: instalați local cheia publică AISMixer la stație și autorizați cheia publică a stației în AISMixer.</p>
         </article>
       </div>
-      <pre class="command-example" aria-label="Instalarea AISMixer din depozitul APK OpenWrt semnat"><code>wget -O /etc/apk/keys/aismixer-openwrt.pem \
+      <p class="boundary-note"><strong>Arhitectura pachetului.</strong> Selectați arhitectura pachetului care corespunde surselor oficiale de pachete OpenWrt configurate pe dispozitiv; nu determinați această valoare folosind <span class="kbd">apk --print-arch</span>.</p>
+      <p class="boundary-note"><strong>Spațiu disponibil pentru scriere.</strong> Runtime-ul Python și dependențele necesită considerabil mai mult spațiu disponibil pentru scriere decât o instalare OpenWrt minimală. Verificați spațiul liber din overlay înainte de instalare; extroot este o opțiune de implementare OpenWrt atunci când spațiul intern disponibil pentru scriere este limitat.</p>
+      <pre class="command-example" aria-label="Instalarea AISMixer din depozitul APK OpenWrt semnat"><code># Selectați 'x86_64' sau 'mips_24kc':
+AISMIXER_ARCH='x86_64'
+
+wget -O /etc/apk/keys/aismixer-openwrt.pem \
   https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
 
 REPO_FILE=/etc/apk/repositories.d/customfeeds.list
-REPO_URL='https://aismixer.net/openwrt/25.12/x86_64/packages.adb'
+REPO_URL="https://aismixer.net/openwrt/25.12/${AISMIXER_ARCH}/packages.adb"
 
 grep -qxF "$REPO_URL" "$REPO_FILE" 2&gt;/dev/null || {
-  printf '\n# AISMixer OpenWrt 25.12 x86_64 repository\n%s\n' \
-    "$REPO_URL" &gt;&gt; "$REPO_FILE"
+  printf '\n# AISMixer OpenWrt 25.12 %s repository\n%s\n' \
+    "$AISMIXER_ARCH" "$REPO_URL" &gt;&gt; "$REPO_FILE"
 }
 
 apk update
 apk add aismixer</code></pre>
+      <p class="boundary-note"><strong>Validare cap la cap.</strong> Calea de implementare pentru <span class="kbd">mips_24kc</span> a fost validată cap la cap cu intrare AIS serială fizică, <span class="kbd">nmea_sproxy</span>, UDPSEC autentificat, procesare AISMixer, funcționarea serviciilor prin <span class="kbd">procd</span>, control local și observabilitate runtime.</p>
       <p class="boundary-note"><strong>Doar punctul terminal de lângă receptor.</strong> Folosiți <span class="kbd">apk add nmea_sproxy</span> în loc de <span class="kbd">apk add aismixer</span> pentru a instala independent proxy-ul de la stație. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> și <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> pentru pașii compleți de implementare și configurare a încrederii.</p>
     </section>
 
@@ -622,7 +633,7 @@ apk add aismixer</code></pre>
             <li>Asamblare multipart deterministă, gestionarea TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> și deduplicare globală sau per destinație.</li>
             <li>UDPSEC cu ECDHE efemer P-256 autentificat, identități ECDSA P-256 pe termen lung, chei AES-GCM direcționale independente și stare securizată locală cu limite stricte.</li>
             <li>Pentru fiecare proces sau instanță systemd <span class="kbd">nmea_sproxy</span>, o intrare UDP sau serială spre o ieșire UDPSEC ori o ieșire plain-UDP configurată explicit pentru o rețea de încredere, plus controale endpoint IPv4/IPv6.</li>
-            <li>Implementare Linux convențională cu <span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață care gestionează privilegiile, păstrarea stării operatorului și CLI global pentru operatori, alături de implementarea APK/procd publicată pentru OpenWrt 25.12 x86_64.</li>
+            <li>Implementare Linux convențională cu <span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață care gestionează privilegiile, păstrarea stării operatorului și CLI global pentru operatori, alături de implementarea APK/procd semnată pentru OpenWrt 25.12, publicată pentru <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</li>
           </ul>
         </article>
         <article class="card status-card status-next">

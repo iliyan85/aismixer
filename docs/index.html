@@ -492,7 +492,7 @@
         </div>
         <div class="path-connector">
           <span aria-hidden="true">→</span>
-          <small>serial port or USB virtual COM</small>
+          <small>physical serial or USB virtual serial</small>
         </div>
         <div class="path-node path-node-accent">
           <span class="icons" aria-hidden="true">🔐</span>
@@ -512,8 +512,7 @@
           <h3>Implemented local inputs</h3>
           <ul class="list">
             <li>UDP from a local networked receiver or AIS application.</li>
-            <li>Direct physical serial-port input.</li>
-            <li>USB virtual COM input from a physical AIS receiver.</li>
+            <li>Physical serial input through <span class="kbd">nmea_sproxy</span>, including USB virtual serial devices exposed by the OS.</li>
           </ul>
         </article>
         <article class="card">
@@ -537,20 +536,26 @@
       <div class="section-heading">
         <p class="eyebrow">OpenWrt edge deployment</p>
         <h2>Run AISMixer or nmea_sproxy on OpenWrt</h2>
-        <p class="section-intro">A signed APK repository is available for OpenWrt 25.12 on x86_64. This is the only currently published OpenWrt target, and the packages use the Python implementation.</p>
+        <p class="section-intro">The signed AISMixer APK repository for OpenWrt 25.12 currently publishes the Python/procd deployment for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
         <article class="card">
           <div class="icons" aria-hidden="true">📦</div>
           <h3>Signed packages</h3>
-          <p>Install <span class="kbd">aismixer</span> or <span class="kbd">nmea_sproxy</span>; both use <span class="kbd">aismixer-common</span> as a shared dependency. Add the <a href="https://aismixer.net/openwrt/keys/aismixer-openwrt.pem" target="_blank" rel="noopener">repository public key</a> under <span class="kbd">/etc/apk/keys/</span> before using the <a href="https://aismixer.net/openwrt/25.12/x86_64/packages.adb" target="_blank" rel="noopener">package repository</a>.</p>
+          <p>Install <span class="kbd">aismixer</span> or <span class="kbd">nmea_sproxy</span>. The shared <span class="kbd">aismixer-common</span> dependency is resolved automatically when installing either package.</p>
+          <p>Published repository indexes:</p>
+          <ul class="list">
+            <li><span class="kbd">x86_64</span>: <a href="https://aismixer.net/openwrt/25.12/x86_64/packages.adb" target="_blank" rel="noopener">signed <span class="kbd">packages.adb</span> index</a></li>
+            <li><span class="kbd">mips_24kc</span>: <a href="https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb" target="_blank" rel="noopener">signed <span class="kbd">packages.adb</span> index</a></li>
+          </ul>
+          <p>Both architectures use the same <a href="https://aismixer.net/openwrt/keys/aismixer-openwrt.pem" target="_blank" rel="noopener">repository public key</a>; add it under <span class="kbd">/etc/apk/keys/</span> before using either repository index.</p>
           <p>Key SHA-256: <span class="kbd">170d30219e0e05d59898cd8ccd5ec9804e915df7882ab56b8e869ef6e99c8f9c</span></p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">📡</div>
           <h3>Two edge deployment roles</h3>
-          <p>AISMixer can run on an OpenWrt edge/router host. <span class="kbd">nmea_sproxy</span> can run independently near a receiver with UDP or serial input. Its output can be plain UDP, or UDPSEC can protect the network hop to AISMixer.</p>
-          <p>USB virtual serial receivers may need a matching OpenWrt kernel driver. CDC ACM devices use <span class="kbd">kmod-usb-acm</span> and typically appear as <span class="kbd">/dev/ttyACM*</span>; other USB-serial chipsets may need a different driver. UDP and native UART inputs do not need this CDC ACM driver.</p>
+          <p>AISMixer can run on an OpenWrt edge/router host. <span class="kbd">nmea_sproxy</span> can run independently near a receiver with UDP or physical serial input, including USB virtual serial devices exposed by the OS. Its output can be plain UDP, or UDPSEC can protect the network hop to AISMixer.</p>
+          <p>CDC ACM devices commonly appear as <span class="kbd">/dev/ttyACM*</span>; USB-UART adapters commonly appear as <span class="kbd">/dev/ttyUSB*</span>. The required OpenWrt kernel driver may already be available in the image or may need the appropriate <span class="kbd">kmod</span> package, such as <span class="kbd">kmod-usb-acm</span> for CDC ACM. Native UART and UDP input do not require a USB serial driver.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔐</div>
@@ -558,19 +563,25 @@
           <p>AISMixer and <span class="kbd">nmea_sproxy</span> each generate their local identity key pair automatically on first installation or startup, as appropriate. UDPSEC peer trust material is never exchanged automatically: provision the AISMixer public key locally at the station and authorize the station public key on the AISMixer side.</p>
         </article>
       </div>
-      <pre class="command-example" aria-label="Install AISMixer from the signed OpenWrt APK repository"><code>wget -O /etc/apk/keys/aismixer-openwrt.pem \
+      <p class="boundary-note"><strong>Package architecture.</strong> Select the package architecture that matches the official OpenWrt package feeds configured on the device; do not derive this value from <span class="kbd">apk --print-arch</span>.</p>
+      <p class="boundary-note"><strong>Writable space.</strong> The Python runtime and dependencies require materially more writable space than a minimal OpenWrt installation. Verify available overlay space before installation; extroot is an OpenWrt deployment option where internal writable storage is limited.</p>
+      <pre class="command-example" aria-label="Install AISMixer from the signed OpenWrt APK repository"><code># Supported package architectures: x86_64 or mips_24kc
+AISMIXER_ARCH='x86_64'
+
+wget -O /etc/apk/keys/aismixer-openwrt.pem \
   https://aismixer.net/openwrt/keys/aismixer-openwrt.pem
 
 REPO_FILE=/etc/apk/repositories.d/customfeeds.list
-REPO_URL='https://aismixer.net/openwrt/25.12/x86_64/packages.adb'
+REPO_URL="https://aismixer.net/openwrt/25.12/${AISMIXER_ARCH}/packages.adb"
 
 grep -qxF "$REPO_URL" "$REPO_FILE" 2&gt;/dev/null || {
-  printf '\n# AISMixer OpenWrt 25.12 x86_64 repository\n%s\n' \
-    "$REPO_URL" &gt;&gt; "$REPO_FILE"
+  printf '\n# AISMixer OpenWrt 25.12 %s repository\n%s\n' \
+    "$AISMIXER_ARCH" "$REPO_URL" &gt;&gt; "$REPO_FILE"
 }
 
 apk update
 apk add aismixer</code></pre>
+      <p class="boundary-note"><strong>End-to-end validation.</strong> The <span class="kbd">mips_24kc</span> deployment path has been validated end to end with physical serial AIS ingress, <span class="kbd">nmea_sproxy</span>, authenticated UDPSEC, AISMixer processing, <span class="kbd">procd</span> service operation, and local runtime control and observability.</p>
       <p class="boundary-note"><strong>Receiver-side endpoint only.</strong> Use <span class="kbd">apk add nmea_sproxy</span> instead of <span class="kbd">apk add aismixer</span> to install the station proxy independently. See the <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> and <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a> for complete deployment and trust-provisioning steps.</p>
     </section>
 
@@ -621,7 +632,7 @@ apk add aismixer</code></pre>
             <li>Deterministic multipart assembly, TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> handling, and global or target-scoped deduplication.</li>
             <li>Authenticated ephemeral P-256 ECDHE UDPSEC, long-term P-256 ECDSA identities, independent directional AES-GCM keys, and hard-bounded local secure state.</li>
             <li>One UDP or serial input to one UDPSEC or explicit trusted plain-UDP output per <span class="kbd">nmea_sproxy</span> process or systemd instance, plus IPv4/IPv6 endpoint controls.</li>
-            <li>Conventional Linux deployment with systemd <span class="kbd">RuntimeDirectory</span>, privilege-aware lifecycle scripts, preserved operator state, and the global operator CLI, alongside the published OpenWrt 25.12 x86_64 APK/procd deployment.</li>
+            <li>Conventional Linux deployment with systemd <span class="kbd">RuntimeDirectory</span>, privilege-aware lifecycle scripts, preserved operator state, and the global operator CLI, alongside the signed OpenWrt 25.12 APK/procd deployment published for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</li>
           </ul>
         </article>
         <article class="card status-card status-next">
