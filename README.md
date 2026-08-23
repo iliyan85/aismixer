@@ -2,7 +2,7 @@
 
 **English · [Български](#bulgarian) · [Română](#romanian)**
 
-# 🛰️ AISMixer — AIS NMEA 0183 stream processor and routing engine
+# 🛰️ AISMixer — AIS NMEA 0183 stream processing and routing platform
 
 **Normalize · Deduplicate · Tag · Route · Forward**
 
@@ -11,9 +11,14 @@
 [🔐 `nmea_sproxy` guide](nmea_sproxy/README.md) · [🗺️ Roadmap](ROADMAP.md)
 
 > ### ⚡ TL;DR
-> AISMixer receives AIS feeds from multiple receivers, extracts `!AIVDM` and
-> `!AIVDO`, reassembles multipart messages, removes near-real-time duplicates,
-> manages NMEA TAG metadata, and forwards one clean logical stream. Optional
+> AISMixer is an open-source ecosystem for AIS NMEA 0183 stream processing,
+> routing, secure transport, deployment, and operational tooling. Its main
+> current components are the `aismixer` mixer/router and data-plane service,
+> the `nmea_sproxy` station-side proxy, and the `aismixerctl` local operator CLI.
+> The `aismixer` service receives AIS feeds from multiple receivers, extracts
+> `!AIVDM` and `!AIVDO`, reassembles multipart messages, removes
+> near-real-time duplicates, manages NMEA TAG metadata, and forwards one clean
+> logical stream. Optional
 > logical routing directs ingress sources to named UDP targets, while the local
 > `aismixerctl` control interface exposes runtime status, statistics, and atomic
 > routing updates.
@@ -47,9 +52,9 @@ systemctl status aismixer
 
 `install.sh` installs the runtime under `/opt/aismixer`, seeds missing files
 under `/etc/aismixer` while preserving existing configuration and keys, installs
-`/usr/local/bin/aismixerctl`, and enables AISMixer at boot. It intentionally does
-**not** start the service. Review `/etc/aismixer/config.yaml` before exposing the
-service outside a trusted network.
+`/usr/local/bin/aismixerctl`, and enables the `aismixer` service at boot. It
+intentionally does **not** start the service. Review
+`/etc/aismixer/config.yaml` before exposing the service outside a trusted network.
 
 #### Update
 
@@ -63,9 +68,9 @@ systemctl status aismixer
 ```
 
 `update.sh` refreshes installed runtime files, the systemd unit, and
-`aismixerctl`, reloads systemd, and **restarts AISMixer**. It leaves operator
-configuration and keys under `/etc/aismixer` untouched. `uninstall.sh` preserves
-that directory unless `--purge-config` is explicitly requested.
+`aismixerctl`, reloads systemd, and **restarts the `aismixer` service**. It leaves
+operator configuration and keys under `/etc/aismixer` untouched. `uninstall.sh`
+preserves that directory unless `--purge-config` is explicitly requested.
 
 ### OpenWrt 25.12
 
@@ -117,11 +122,11 @@ apk add nmea_sproxy
 ```
 
 The `mips_24kc` package path has been validated end to end: physical serial AIS
-ingress → `nmea_sproxy` → authenticated UDPSEC → AISMixer → processing, egress,
+ingress → `nmea_sproxy` → authenticated UDPSEC → `aismixer` → processing, egress,
 and control-plane operation.
 
-On first service start, AISMixer automatically generates or repairs its local
-server identity when required, uses the OpenWrt configuration and identity
+On first start, the `aismixer` service automatically generates or repairs its
+local server identity when required, uses the OpenWrt configuration and identity
 layout under `/etc/aismixer`, and runs through procd. `nmea_sproxy` likewise
 generates or repairs its local station identity.
 
@@ -129,7 +134,7 @@ For UDPSEC, peer trust is never provisioned automatically. Copy
 `/etc/aismixer/keys/aismixer_public.pem` from the mixer to the proxy's configured
 `remote_public_key` path (by default
 `/etc/nmea_sproxy/keys/aismixer_public.pem`), then authorize the station public
-identity key on AISMixer as described in the
+identity key for the `aismixer` service as described in the
 [`nmea_sproxy` guide](nmea_sproxy/README.md#authorize-the-station-in-aismixer).
 If the configured peer key is missing, unreadable, or invalid, preflight
 intentionally keeps the service stopped instead of entering a respawn loop.
@@ -174,11 +179,12 @@ troubleshooting.
 
 ## 🧭 What is AISMixer?
 
-**AISMixer** is a production-oriented Python service for receiving,
-normalizing, deduplicating, tagging, routing, and forwarding AIS NMEA 0183
-streams.
+**AISMixer** is the wider open-source project and ecosystem. Its main current
+components are:
 
-- **`aismixer.py`** is the long-running mixer and data-plane service.
+- **`aismixer`** is the production-oriented, long-running Python mixer/router
+  and data-plane service implemented in `aismixer.py`; it receives, normalizes,
+  deduplicates, tags, routes, and forwards AIS NMEA 0183 streams.
 - **`aismixerctl`** is the installed operator command for the optional local
   control socket.
 - **`nmea_sproxy`** is the station-side proxy for one local UDP or serial input
@@ -187,7 +193,7 @@ streams.
 ```text
 AIS receiver UDP      \
 AIS receiver UDP       \        +----------------+       +----------------+
-nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP targets    |
+nmea_sproxy UDPSEC/UDP ------> |    aismixer    | ----> | UDP targets    |
                                 |   data plane   |       +----------------+
                                 +----------------+
                                          ^
@@ -200,8 +206,9 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP targets    |
 ## ⚙️ Basic configuration
 
 The installed service reads `/etc/aismixer/config.yaml`. With no top-level
-`routing:` section, AISMixer uses legacy broadcast mode: deduplication is global
-and every accepted output sentence goes to every configured forwarder.
+`routing:` section, the `aismixer` service uses legacy broadcast mode:
+deduplication is global and every accepted output sentence goes to every
+configured forwarder.
 
 ```yaml
 station_id: mixstation_1
@@ -246,8 +253,8 @@ persist runtime routing across a restart.
 
 ### Enable local control
 
-The control service is disabled until explicitly enabled in AISMixer
-configuration:
+The control service is disabled until explicitly enabled in the `aismixer`
+service configuration:
 
 ```yaml
 control:
@@ -295,8 +302,9 @@ from overwriting newer state. The CLI does not retry automatically.
 represents one relation: one local UDP or physical serial/USB input to one
 network output. The install, update, and systemd template-instance instructions
 below describe the conventional Linux path; OpenWrt uses the singleton APK/procd
-path in Quick start. UDPSEC is the secure/default transport to AISMixer; plain
-UDP must be selected explicitly and is intended only for trusted LAN/VPN paths.
+path in Quick start. UDPSEC is the secure/default transport to the `aismixer`
+service; plain UDP must be selected explicitly and is intended only for trusted
+LAN/VPN paths.
 
 ### Install and start
 
@@ -311,8 +319,9 @@ chmod +x install.sh
 The proxy installer prepares the configuration layout and station key pair while
 preserving existing operator material, installs singleton and template units,
 enables only the singleton, and starts no service. Complete the relation
-configuration and, for the default UDPSEC mode, the trusted AISMixer public-key
-setup described in the [operator guide](nmea_sproxy/README.md), then start it:
+configuration and, for the default UDPSEC mode, the trusted public-key setup for
+the `aismixer` service described in the [operator guide](nmea_sproxy/README.md),
+then start it:
 
 ```bash
 systemctl start nmea_sproxy.service
@@ -348,9 +357,9 @@ chmod +x update.sh
 ./update.sh
 ```
 
-Unlike AISMixer's updater, `nmea_sproxy/update.sh` updates installed files and
-reloads systemd but intentionally **does not restart** the singleton or any
-template instance. Restart only the relations you choose, when ready:
+Unlike the `aismixer` update script, `nmea_sproxy/update.sh` updates installed
+files and reloads systemd but intentionally **does not restart** the singleton
+or any template instance. Restart only the relations you choose, when ready:
 
 ```bash
 systemctl restart nmea_sproxy.service
@@ -382,7 +391,8 @@ session behavior, endpoint policy, and troubleshooting.
 - Authenticated encrypted UDPSEC ingress compatible with `nmea_sproxy`.
 - Physical serial input through `nmea_sproxy`, including USB virtual serial
   devices exposed by the OS.
-- Optional outbound source-address binding for AISMixer and proxy outputs.
+- Optional outbound source-address binding for `aismixer` and `nmea_sproxy`
+  outputs.
 - UDP broadcast egress in legacy mode and named UDP targets in routing mode.
 
 ### ⚙️ Processing
@@ -422,7 +432,7 @@ AISMixer keeps the data plane and optional control plane separate.
 UDP and UDPSEC producers create immutable ingress frames in private bounded
 queues. Fan-in admits them to bounded processing before the one instance-owned
 processor scans NMEA data, assembles multipart messages, applies global or
-target-scoped deduplication, and builds controlled TAG metadata. Full AISMixer
+target-scoped deduplication, and builds controlled TAG metadata. Full `aismixer`
 stage queues wait with backpressure instead of dropping their queued items.
 
 Each admitted frame has one bound `ProcessingSnapshot`; routing mode adds one
@@ -485,7 +495,8 @@ disappear at restart. See the
 
 ## 🏷️ NMEA TAG behavior
 
-AISMixer reads ingress TAG metadata and emits controlled `s`/`c`/`g` metadata.
+The `aismixer` service reads ingress TAG metadata and emits controlled
+`s`/`c`/`g` metadata.
 The emitted `s` label is selected separately from the internal routing source ID
 and is sanitized for NMEA output. Depending on configuration, `c` can preserve
 valid ingress time or use server time, and multipart `g` can preserve an agreed
@@ -523,7 +534,7 @@ POSIX environment with asyncio Unix-socket support.
 
 ## ⚠️ Current limitations
 
-- UDP is the only implemented AISMixer egress adapter.
+- UDP is the only egress adapter implemented by the `aismixer` service.
 - Routing state, generations, and runtime statistics are process-local; runtime
   routing changes are not persisted.
 - Secure replay, session, and nonce state is process-local and non-durable;
@@ -565,7 +576,7 @@ so `docs/` is intentionally absent from `main`.
 
 **[English](#english) · Български · [Română](#romanian)**
 
-# 🇧🇬 AISMixer — обработка и маршрутизация на AIS NMEA 0183 потоци
+# 🇧🇬 AISMixer — платформа за обработка и маршрутизация на AIS NMEA 0183 потоци
 
 **Нормализация · Дедупликация · TAG метаданни · Маршрутизация · Препращане**
 
@@ -575,9 +586,14 @@ so `docs/` is intentionally absent from `main`.
 [🗺️ План за развитие](ROADMAP.md)
 
 > ### ⚡ Накратко
-> AISMixer приема AIS потоци от няколко приемника, извлича `!AIVDM` и `!AIVDO`,
-> сглобява multipart съобщения, премахва близки във времето дубликати, управлява
-> NMEA TAG метаданните и препраща един чист логически поток. По желание
+> AISMixer е екосистема с отворен код за обработка и маршрутизиране на AIS NMEA
+> 0183 потоци, защитен транспорт, внедряване и операторски инструменти. Основните
+> ѝ текущи компоненти са услугата `aismixer` за смесване и маршрутизиране в слоя
+> за данни, проксито при станцията `nmea_sproxy` и локалният операторски CLI
+> `aismixerctl`.
+> Услугата `aismixer` приема AIS потоци от няколко приемника, извлича `!AIVDM` и
+> `!AIVDO`, сглобява multipart съобщения, премахва близки във времето дубликати,
+> управлява NMEA TAG метаданните и препраща един чист логически поток. По желание
 > логическата маршрутизация насочва входните източници към именувани UDP цели, а
 > локалният интерфейс `aismixerctl` предоставя статус и статистика по време на
 > работа и атомарни промени на маршрутизацията.
@@ -612,8 +628,8 @@ systemctl status aismixer
 
 `install.sh` разполага runtime файловете в `/opt/aismixer`, създава липсващите
 файлове в `/etc/aismixer`, без да презаписва съществуващите конфигурации и
-ключове, инсталира `/usr/local/bin/aismixerctl` и включва AISMixer за автоматично
-стартиране при boot. Умишлено **не** стартира услугата. Прегледайте
+ключове, инсталира `/usr/local/bin/aismixerctl` и включва услугата `aismixer` за
+автоматично стартиране при boot. Умишлено **не** стартира услугата. Прегледайте
 `/etc/aismixer/config.yaml`, преди да изложите услугата извън доверена мрежа.
 
 #### Обновяване
@@ -629,7 +645,7 @@ systemctl status aismixer
 ```
 
 `update.sh` обновява инсталираните runtime файлове, systemd unit-а и
-`aismixerctl`, презарежда systemd и **рестартира AISMixer**. Операторските
+`aismixerctl`, презарежда systemd и **рестартира услугата `aismixer`**. Операторските
 конфигурации и ключове в `/etc/aismixer` остават непроменени. `uninstall.sh`
 запазва тази директория, освен ако изрично не е зададено `--purge-config`.
 
@@ -685,19 +701,20 @@ apk add nmea_sproxy
 ```
 
 Пакетното разполагане за `mips_24kc` е валидирано от край до край: физически
-сериен AIS вход → `nmea_sproxy` → автентикиран UDPSEC → AISMixer → обработка,
+сериен AIS вход → `nmea_sproxy` → автентикиран UDPSEC → `aismixer` → обработка,
 изход и работа на слоя за управление.
 
-При първото стартиране AISMixer автоматично генерира или поправя при
+При първото стартиране услугата `aismixer` автоматично генерира или поправя при
 необходимост локалната си сървърна идентичност, използва OpenWrt структурата за
 конфигурация и идентичност в `/etc/aismixer` и се стартира чрез procd.
 `nmea_sproxy` прави същото за локалната идентичност на станцията.
 
 При UDPSEC доверието към отсрещната страна никога не се настройва автоматично.
-Копирайте `/etc/aismixer/keys/aismixer_public.pem` от хоста с AISMixer на
-зададения в конфигурацията на проксито път `remote_public_key` (по подразбиране
+Копирайте `/etc/aismixer/keys/aismixer_public.pem` от хоста, на който работи
+услугата `aismixer`, към зададения в конфигурацията на проксито път
+`remote_public_key` (по подразбиране
 `/etc/nmea_sproxy/keys/aismixer_public.pem`), след което разрешете публичния
-ключ за идентичност на станцията в AISMixer според [ръководството за
+ключ за идентичност на станцията за услугата `aismixer` според [ръководството за
 `nmea_sproxy`](nmea_sproxy/README.md#authorize-the-station-in-aismixer). Ако
 публичният ключ на отсрещната страна, зададен в конфигурацията, липсва, не може
 да бъде прочетен или е невалиден, предварителната проверка умишлено оставя
@@ -744,11 +761,13 @@ stty -F /dev/ttyACM0 -a
 
 ## 🧭 Какво е AISMixer?
 
-**AISMixer** е ориентирана към реална експлоатация Python услуга за приемане,
-нормализиране, дедупликация, обработка на TAG метаданни, маршрутизация и
-препращане на AIS NMEA 0183 потоци.
+**AISMixer** е проект с отворен код и по-широка екосистема. Основните текущи
+компоненти са:
 
-- **`aismixer.py`** е дългосрочно работещата mixer услуга от слоя за данни.
+- **`aismixer`** е ориентираната към реална експлоатация, дългосрочно работеща
+  Python услуга за смесване и маршрутизиране в слоя за данни, реализирана в
+  `aismixer.py`; тя приема, нормализира, дедупликира, обработва TAG метаданни,
+  маршрутизира и препраща AIS NMEA 0183 потоци.
 - **`aismixerctl`** е инсталираната операторска команда за незадължителния локален
   сокет за управление.
 - **`nmea_sproxy`** е проксито при станцията за един локален UDP или сериен вход
@@ -757,7 +776,7 @@ stty -F /dev/ttyACM0 -a
 ```text
 AIS приемник UDP      \
 AIS приемник UDP       \        +----------------+       +----------------+
-nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP цели       |
+nmea_sproxy UDPSEC/UDP ------> |    aismixer    | ----> | UDP цели       |
                                 | слой за данни  |       +----------------+
                                 +----------------+
                                          ^
@@ -771,7 +790,7 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | UDP цели       |
 ## ⚙️ Основна конфигурация
 
 Инсталираната услуга чете `/etc/aismixer/config.yaml`. Ако няма секция
-`routing:` на най-горното ниво, AISMixer използва legacy broadcast режим:
+`routing:` на най-горното ниво, услугата `aismixer` използва legacy broadcast режим:
 дедупликацията е глобална и всяко прието изходно изречение отива към всеки
 конфигуриран forwarder.
 
@@ -819,7 +838,7 @@ forwarders:
 ### Включване на локалното управление
 
 Услугата за управление е изключена, докато не бъде включена изрично в
-конфигурацията на AISMixer:
+конфигурацията на услугата `aismixer`:
 
 ```yaml
 control:
@@ -869,8 +888,8 @@ sudo aismixerctl disable --expected-generation 4
 вход към един мрежов изход. Инструкциите по-долу за инсталиране, обновяване и
 systemd template instances описват стандартния Linux път; OpenWrt използва
 описания в „Бърз старт“ singleton модел с APK/procd. UDPSEC е защитеният
-транспорт по подразбиране към AISMixer; plain UDP трябва да се избере изрично и
-е предназначен само за доверени LAN/VPN връзки.
+транспорт по подразбиране към услугата `aismixer`; plain UDP трябва да се избере
+изрично и е предназначен само за доверени LAN/VPN връзки.
 
 ### Инсталиране и стартиране
 
@@ -886,7 +905,7 @@ chmod +x install.sh
 на станцията, като запазва съществуващите операторски данни, инсталира singleton
 и template unit-и, включва само singleton услугата и не стартира услуга.
 Завършете конфигурацията на връзката и, за UDPSEC режима по подразбиране,
-настройката на доверения публичен ключ на AISMixer, описани в [операторското
+настройката на доверения публичен ключ на услугата `aismixer`, описани в [операторското
 ръководство](nmea_sproxy/README.md), след което я стартирайте:
 
 ```bash
@@ -924,10 +943,10 @@ chmod +x update.sh
 ./update.sh
 ```
 
-За разлика от updater-а на AISMixer, `nmea_sproxy/update.sh` обновява
-инсталираните файлове и презарежда systemd, но умишлено **не рестартира**
-singleton услугата или template instances. Когато сте готови, рестартирайте
-само избраните връзки:
+За разлика от скрипта за обновяване на услугата `aismixer`,
+`nmea_sproxy/update.sh` обновява инсталираните файлове и презарежда systemd, но
+умишлено **не рестартира** singleton услугата или template instances. Когато
+сте готови, рестартирайте само избраните връзки:
 
 ```bash
 systemctl restart nmea_sproxy.service
@@ -959,7 +978,7 @@ UDPSEC е специфичният за AISMixer автентикиран и к�
 - Автентикиран и криптиран UDPSEC вход, съвместим с `nmea_sproxy`.
 - Физически сериен вход чрез `nmea_sproxy`, включително USB устройства с
   виртуален сериен порт, предоставени от операционната система.
-- Незадължително обвързване на изходния адрес за AISMixer и proxy изходите.
+- Незадължително обвързване на изходния адрес за изходите на `aismixer` и `nmea_sproxy`.
 - Broadcast UDP изход в legacy режим и именувани UDP цели в routing режим.
 
 ### ⚙️ Обработка
@@ -1001,8 +1020,8 @@ UDP и UDPSEC входовете създават неизменяеми ingress
 опашки. Fan-in ги допуска до ограничената обработка, преди единственият
 притежаващ състоянието процесор да сканира NMEA данните, да сглобява multipart
 съобщения, да прилага глобална или отделна за всяка цел дедупликация и да
-изгражда контролирани TAG метаданни. Пълните опашки между етапите на AISMixer
-изчакват с backpressure, вместо да отхвърлят елементите си.
+изгражда контролирани TAG метаданни. Пълните опашки между етапите на услугата
+`aismixer` изчакват с backpressure, вместо да отхвърлят елементите си.
 
 Всеки допуснат frame има един обвързан `ProcessingSnapshot`; routing режимът
 добавя едно съпоставяне на източника. Непразните `OutputBatch` стойности
@@ -1068,7 +1087,7 @@ payload-а](examples/routing-update.yaml).
 
 ## 🏷️ Поведение на NMEA TAG метаданните
 
-AISMixer чете входните TAG метаданни и излъчва контролирани `s`/`c`/`g`
+Услугата `aismixer` чете входните TAG метаданни и излъчва контролирани `s`/`c`/`g`
 метаданни. Излъченият `s` се избира отделно от вътрешния идентификатор за
 маршрутизация и се филтрира за NMEA изход. Според конфигурацията `c` може да
 запази валидно входно време или да използва сървърното време, а multipart `g`
@@ -1107,7 +1126,7 @@ OS или друга POSIX среда с поддръжка на asyncio Unix so
 
 ## ⚠️ Текущи ограничения
 
-- UDP е единственият реализиран изходен адаптер на AISMixer.
+- UDP е единственият изходен адаптер, реализиран от услугата `aismixer`.
 - Състоянието, поколенията и runtime статистиката на маршрутизацията са локални
   за процеса; промените по време на работа не се запазват.
 - Защитеното състояние за replay, сесии и nonce е локално за процеса и нетрайно;
@@ -1149,7 +1168,7 @@ OS или друга POSIX среда с поддръжка на asyncio Unix so
 
 **[English](#english) · [Български](#bulgarian) · Română**
 
-# 🇷🇴 AISMixer — procesarea și rutarea fluxurilor AIS NMEA 0183
+# 🇷🇴 AISMixer — platformă pentru procesarea și rutarea fluxurilor AIS NMEA 0183
 
 **Normalizează · Deduplică · Etichetează · Rutează · Redirecționează**
 
@@ -1158,9 +1177,15 @@ OS или друга POSIX среда с поддръжка на asyncio Unix so
 [🔐 Ghid `nmea_sproxy`](nmea_sproxy/README.md) · [🗺️ Foaie de parcurs](ROADMAP.md)
 
 > ### ⚡ Pe scurt
-> AISMixer primește fluxuri AIS de la mai multe receptoare, extrage `!AIVDM` și
-> `!AIVDO`, reasamblează mesajele multipart, elimină duplicatele aproape în timp
-> real, gestionează metadatele NMEA TAG și redirecționează un flux logic curat.
+> AISMixer este un ecosistem open-source pentru procesarea și rutarea fluxurilor
+> AIS NMEA 0183, transport securizat, implementare și instrumente operaționale.
+> Componentele sale principale actuale sunt serviciul `aismixer` de
+> mixare/rutare și plan de date, proxy-ul de la stație `nmea_sproxy` și CLI-ul
+> local pentru operatori `aismixerctl`.
+> Serviciul `aismixer` primește fluxuri AIS de la mai multe receptoare, extrage
+> `!AIVDM` și `!AIVDO`, reasamblează mesajele multipart, elimină duplicatele
+> aproape în timp real, gestionează metadatele NMEA TAG și redirecționează un
+> flux logic curat.
 > Rutarea logică opțională direcționează sursele de ingress către destinații UDP
 > denumite, iar interfața locală `aismixerctl` oferă stare și statistici runtime,
 > precum și actualizări atomice ale rutării.
@@ -1195,8 +1220,8 @@ systemctl status aismixer
 
 `install.sh` instalează runtime-ul în `/opt/aismixer`, creează fișierele lipsă
 din `/etc/aismixer` păstrând configurația și cheile existente, instalează
-`/usr/local/bin/aismixerctl` și activează AISMixer pentru pornire la boot. În mod
-intenționat, **nu** pornește serviciul. Verificați
+`/usr/local/bin/aismixerctl` și activează serviciul `aismixer` pentru pornire la
+boot. În mod intenționat, **nu** pornește serviciul. Verificați
 `/etc/aismixer/config.yaml` înainte de a expune serviciul în afara unei rețele de
 încredere.
 
@@ -1213,7 +1238,7 @@ systemctl status aismixer
 ```
 
 `update.sh` actualizează fișierele runtime instalate, unitatea systemd și
-`aismixerctl`, reîncarcă systemd și **repornește AISMixer**. Configurația și
+`aismixerctl`, reîncarcă systemd și **repornește serviciul `aismixer`**. Configurația și
 cheile operatorului din `/etc/aismixer` rămân nemodificate. `uninstall.sh`
 păstrează acel director dacă `--purge-config` nu este cerut explicit.
 
@@ -1270,18 +1295,18 @@ apk add nmea_sproxy
 
 Fluxul de implementare pentru pachetul `mips_24kc` a fost validat end-to-end:
 intrare AIS prin port serial fizic → `nmea_sproxy` → UDPSEC autentificat →
-AISMixer → procesare, ieșire și funcționarea planului de control.
+`aismixer` → procesare, ieșire și funcționarea planului de control.
 
-La prima pornire a serviciului, AISMixer generează sau repară automat, după caz,
+La prima pornire, serviciul `aismixer` generează sau repară automat, după caz,
 identitatea locală a serverului, folosește structura OpenWrt pentru configurare
 și identitate din `/etc/aismixer` și pornește prin procd. `nmea_sproxy` procedează
 la fel pentru identitatea locală a stației.
 
 Pentru UDPSEC, încrederea în peer nu este configurată niciodată automat. Copiați
-`/etc/aismixer/keys/aismixer_public.pem` de pe gazda AISMixer la calea
-`remote_public_key` configurată pe proxy (implicit
+`/etc/aismixer/keys/aismixer_public.pem` de pe gazda pe care rulează `aismixer`
+la calea `remote_public_key` configurată pe proxy (implicit
 `/etc/nmea_sproxy/keys/aismixer_public.pem`), apoi autorizați cheia publică de
-identitate a stației în AISMixer conform [ghidului
+identitate a stației în serviciul `aismixer` conform [ghidului
 `nmea_sproxy`](nmea_sproxy/README.md#authorize-the-station-in-aismixer). Dacă acea
 cheie publică configurată pentru peer lipsește, nu poate fi citită sau este
 invalidă, verificarea preliminară menține intenționat serviciul oprit în loc să
@@ -1329,12 +1354,13 @@ specifică hardware-ului.
 
 ## 🧭 Ce este AISMixer?
 
-**AISMixer** este un serviciu Python orientat spre exploatare reală pentru
-recepționarea, normalizarea, deduplicarea, etichetarea, rutarea și
-redirecționarea fluxurilor AIS NMEA 0183.
+**AISMixer** este un proiect open-source și un ecosistem mai amplu. Componentele
+sale principale actuale sunt:
 
-- **`aismixer.py`** este serviciul de mixare și plan de date care rulează
-  continuu.
+- **`aismixer`** este serviciul Python de mixare/rutare și plan de date, orientat
+  spre exploatare reală și cu funcționare continuă, implementat în `aismixer.py`;
+  acesta recepționează, normalizează, deduplică, etichetează, rutează și
+  redirecționează fluxuri AIS NMEA 0183.
 - **`aismixerctl`** este comanda instalată pentru operatori, destinată socket-ului
   local opțional de control.
 - **`nmea_sproxy`** este proxy-ul de la stație pentru o intrare UDP locală sau
@@ -1343,7 +1369,7 @@ redirecționarea fluxurilor AIS NMEA 0183.
 ```text
 Receptor AIS UDP      \
 Receptor AIS UDP       \        +----------------+       +----------------+
-nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | Destinații UDP |
+nmea_sproxy UDPSEC/UDP ------> |    aismixer    | ----> | Destinații UDP |
                                 |  plan de date  |       +----------------+
                                 +----------------+
                                          ^
@@ -1356,9 +1382,9 @@ nmea_sproxy UDPSEC/UDP ------> |    AISMixer    | ----> | Destinații UDP |
 ## ⚙️ Configurație de bază
 
 Serviciul instalat citește `/etc/aismixer/config.yaml`. Fără o secțiune
-top-level `routing:`, AISMixer folosește modul legacy broadcast: deduplicarea
-este globală, iar fiecare propoziție acceptată este trimisă către fiecare
-forwarder configurat.
+top-level `routing:`, serviciul `aismixer` folosește modul legacy broadcast:
+deduplicarea este globală, iar fiecare propoziție acceptată este trimisă către
+fiecare forwarder configurat.
 
 ```yaml
 station_id: mixstation_1
@@ -1405,7 +1431,7 @@ fișierele de configurație și nu persistă rutarea runtime după repornire.
 ### Activarea controlului local
 
 Serviciul de control rămâne dezactivat până când este activat explicit în
-configurația AISMixer:
+configurația serviciului `aismixer`:
 
 ```yaml
 control:
@@ -1457,8 +1483,8 @@ serviciu reprezintă o relație: o intrare UDP locală sau serială/USB fizică 
 o ieșire de rețea. Instrucțiunile de mai jos pentru instalare, actualizare și
 instanțe template systemd descriu calea Linux convențională; OpenWrt folosește
 modelul singleton APK/procd descris în secțiunea Pornire rapidă. UDPSEC este
-transportul securizat/implicit spre AISMixer; UDP simplu trebuie selectat
-explicit și este destinat numai conexiunilor LAN/VPN de încredere.
+transportul securizat/implicit spre serviciul `aismixer`; UDP simplu trebuie
+selectat explicit și este destinat numai conexiunilor LAN/VPN de încredere.
 
 ### Instalare și pornire
 
@@ -1474,8 +1500,9 @@ Programul de instalare al proxy-ului pregătește structura de configurare și
 perechea de chei a stației, păstrând materialul existent al operatorului,
 instalează unitățile singleton și template, activează numai singleton-ul și nu
 pornește niciun serviciu. Finalizați configurarea relației și, pentru modul
-UDPSEC implicit, configurarea cheii publice AISMixer de încredere descrisă în [ghidul
-operatorului](nmea_sproxy/README.md), apoi porniți serviciul:
+UDPSEC implicit, configurarea cheii publice de încredere a serviciului
+`aismixer` descrisă în [ghidul operatorului](nmea_sproxy/README.md), apoi porniți
+serviciul:
 
 ```bash
 systemctl start nmea_sproxy.service
@@ -1513,10 +1540,10 @@ chmod +x update.sh
 ./update.sh
 ```
 
-Spre deosebire de updater-ul AISMixer, `nmea_sproxy/update.sh` actualizează
-fișierele instalate și reîncarcă systemd, dar intenționat **nu repornește**
-singleton-ul sau nicio instanță template. Reporniți numai relațiile alese, când
-sunteți pregătit:
+Spre deosebire de updater-ul serviciului `aismixer`, `nmea_sproxy/update.sh`
+actualizează fișierele instalate și reîncarcă systemd, dar intenționat **nu
+repornește** singleton-ul sau nicio instanță template. Reporniți numai relațiile
+alese, când sunteți pregătit:
 
 ```bash
 systemctl restart nmea_sproxy.service
@@ -1549,7 +1576,8 @@ securitate](SECURITY.md), [contractul comportamental](BEHAVIORAL_CONTRACT.md) ș
 - Ingress UDPSEC autentificat și criptat, compatibil cu `nmea_sproxy`.
 - Intrare serială fizică prin `nmea_sproxy`, inclusiv dispozitive USB cu port
   serial virtual puse la dispoziție de sistemul de operare.
-- Asocierea opțională a adresei-sursă pentru ieșirile AISMixer și proxy.
+- Asocierea opțională a adresei-sursă pentru ieșirile serviciului `aismixer` și
+  ale `nmea_sproxy`.
 - Egress UDP broadcast în modul legacy și destinații UDP denumite în modul de
   rutare.
 
@@ -1592,8 +1620,8 @@ Producătorii UDP și UDPSEC creează cadre de ingress imuabile în cozi private
 limitate. Fan-in le admite în procesarea limitată înainte ca procesorul unic,
 care deține starea, să scaneze datele NMEA, să asambleze mesajele multipart, să
 aplice deduplicarea globală sau separată pe destinații și să construiască
-metadate TAG controlate. Cozile pline ale etapelor AISMixer așteaptă cu
-backpressure în loc să elimine elementele aflate în coadă.
+metadate TAG controlate. Cozile pline ale etapelor serviciului `aismixer`
+așteaptă cu backpressure în loc să elimine elementele aflate în coadă.
 
 Fiecare cadru admis are un `ProcessingSnapshot` asociat; modul de rutare adaugă
 o singură potrivire a sursei. Valorile `OutputBatch` ne-goale traversează
@@ -1660,12 +1688,13 @@ actualizare](examples/routing-update.yaml).
 
 ## 🏷️ Comportamentul metadatelor NMEA TAG
 
-AISMixer citește metadatele TAG de ingress și emite metadate `s`/`c`/`g`
-controlate. Eticheta `s` emisă este aleasă separat de ID-ul intern al sursei de
-rutare și este sanitizată pentru ieșirea NMEA. În funcție de configurație, `c`
-poate păstra un timp de ingress valid sau poate folosi timpul serverului, iar
-`g` multipart poate păstra un ID de grup ingress agreat sau poate genera un ID
-de ieșire. TAG `g` este metadată, nu cheia assemblerului multipart.
+Serviciul `aismixer` citește metadatele TAG de ingress și emite metadate
+`s`/`c`/`g` controlate. Eticheta `s` emisă este aleasă separat de ID-ul
+intern al sursei de rutare și este sanitizată pentru ieșirea NMEA. În funcție de
+configurație, `c` poate păstra un timp de ingress valid sau poate folosi timpul
+serverului, iar `g` multipart poate păstra un ID de grup ingress agreat sau
+poate genera un ID de ieșire. TAG `g` este metadată, nu cheia assemblerului
+multipart.
 
 ```yaml
 g_preserve_ingress_gid: true
@@ -1699,7 +1728,7 @@ Raspberry Pi OS sau alt mediu POSIX cu suport asyncio pentru socket-uri Unix.
 
 ## ⚠️ Limitări actuale
 
-- UDP este singurul adaptor egress AISMixer implementat.
+- UDP este singurul adaptor egress implementat de serviciul `aismixer`.
 - Starea, generațiile și statisticile runtime de rutare sunt locale procesului;
   modificările runtime nu sunt persistente.
 - Starea securizată pentru replay, sesiuni și nonce-uri este locală procesului și
