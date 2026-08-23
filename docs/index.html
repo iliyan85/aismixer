@@ -44,7 +44,6 @@
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "AISMixer",
-    "alternateName": "aismixer",
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu", "OpenWrt"],
@@ -141,7 +140,7 @@
       <div class="section-heading">
         <p class="eyebrow">AIS stream processing</p>
         <h2>From receiver traffic to a clean, source-aware feed</h2>
-        <p class="section-intro">AISMixer keeps transport, NMEA assembly, metadata, deduplication, and delivery in one near-real-time processing path.</p>
+        <p class="section-intro">AISMixer keeps transport, NMEA assembly, metadata, deduplication, and delivery in one near-real-time processing path. The AISMixer ecosystem combines the <span class="kbd">aismixer</span> stream-processing and routing service, <span class="kbd">nmea_sproxy</span>, <span class="kbd">aismixerctl</span>, secure transport, deployment tooling, and related components.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -424,7 +423,7 @@
       <div class="section-heading">
         <p class="eyebrow">UDPSEC lifecycle</p>
         <h2>Authenticated transport with bounded local state</h2>
-        <p class="section-intro">The current <span class="kbd">nmea_sproxy</span> and AISMixer UDPSEC path uses authenticated ephemeral ECDHE and independent directional keys, with encrypted sequence-zero confirmation before the client treats a new session as established.</p>
+        <p class="section-intro">The current UDPSEC path between <span class="kbd">nmea_sproxy</span> and <span class="kbd">aismixer</span> uses authenticated ephemeral ECDHE and independent directional keys, with encrypted sequence-zero confirmation before the client treats a new session as established.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="UDPSEC authenticated ECDHE session-establishment flow">
         <div class="pipeline-node">
@@ -483,9 +482,9 @@
       <div class="section-heading">
         <p class="eyebrow">nmea_sproxy and physical AIS receivers</p>
         <h2>Connect networked or physical AIS receivers through nmea_sproxy</h2>
-        <p class="section-intro"><span class="kbd">nmea_sproxy</span> is the station-side proxy that connects one local AIS source to one configured AISMixer destination.</p>
+        <p class="section-intro"><span class="kbd">nmea_sproxy</span> is the station-side proxy that connects one local AIS source to one configured <span class="kbd">aismixer</span> destination.</p>
       </div>
-      <div class="architecture-path" role="group" aria-label="Physical AIS receiver connection through nmea_sproxy to AISMixer">
+      <div class="architecture-path" role="group" aria-label="Physical AIS receiver connection through nmea_sproxy to aismixer">
         <div class="path-node">
           <span class="icons" aria-hidden="true">📻</span>
           <strong>Physical AIS receiver</strong>
@@ -504,7 +503,7 @@
         </div>
         <div class="path-node">
           <span class="icons" aria-hidden="true">🛰️</span>
-          <strong>AISMixer</strong>
+          <strong><span class="kbd">aismixer</span></strong>
         </div>
       </div>
       <div class="grid proxy-grid">
@@ -528,14 +527,14 @@
         </article>
       </div>
       <div class="callout">
-        <p>A networked receiver can feed local UDP into <span class="kbd">nmea_sproxy</span> or send UDP directly to AISMixer, depending on the deployment. The main AISMixer process does not read serial ports directly. Trusted plain UDP does not provide UDPSEC encryption, authentication, replay protection, or liveness.</p>
+        <p>A networked receiver can feed local UDP into <span class="kbd">nmea_sproxy</span> or send UDP directly to <span class="kbd">aismixer</span>, depending on the deployment. The main <span class="kbd">aismixer</span> process does not read serial ports directly. Trusted plain UDP does not provide UDPSEC encryption, authentication, replay protection, or liveness.</p>
       </div>
     </section>
 
     <section id="openwrt" class="section">
       <div class="section-heading">
         <p class="eyebrow">OpenWrt edge deployment</p>
-        <h2>Run AISMixer or nmea_sproxy on OpenWrt</h2>
+        <h2>Run <span class="kbd">aismixer</span> or <span class="kbd">nmea_sproxy</span> on OpenWrt</h2>
         <p class="section-intro">The signed AISMixer APK repository for OpenWrt 25.12 currently publishes the Python/procd deployment for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
@@ -554,18 +553,18 @@
         <article class="card">
           <div class="icons" aria-hidden="true">📡</div>
           <h3>Two edge deployment roles</h3>
-          <p>AISMixer can run on an OpenWrt edge/router host. <span class="kbd">nmea_sproxy</span> can run independently near a receiver with UDP or physical serial input, including USB virtual serial devices exposed by the OS. Its output can be plain UDP, or UDPSEC can protect the network hop to AISMixer.</p>
+          <p>The <span class="kbd">aismixer</span> service can run on an OpenWrt edge/router host. <span class="kbd">nmea_sproxy</span> can run independently near a receiver with UDP or physical serial input, including USB virtual serial devices exposed by the OS. Its output can be plain UDP, or UDPSEC can protect the network hop to the <span class="kbd">aismixer</span> service.</p>
           <p>CDC ACM devices commonly appear as <span class="kbd">/dev/ttyACM*</span>; USB-UART adapters commonly appear as <span class="kbd">/dev/ttyUSB*</span>. The required OpenWrt kernel driver may already be available in the image or may need the appropriate <span class="kbd">kmod</span> package, such as <span class="kbd">kmod-usb-acm</span> for CDC ACM. Native UART and UDP input do not require a USB serial driver.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Explicit UDPSEC trust</h3>
-          <p>AISMixer and <span class="kbd">nmea_sproxy</span> each generate their local identity key pair automatically on first installation or startup, as appropriate. UDPSEC peer trust material is never exchanged automatically: provision the AISMixer public key locally at the station and authorize the station public key on the AISMixer side.</p>
+          <p>The <span class="kbd">aismixer</span> and <span class="kbd">nmea_sproxy</span> services each generate their local identity key pair automatically on first installation or startup, as appropriate. UDPSEC peer trust material is never exchanged automatically: provision the <span class="kbd">aismixer</span> public key locally at the station and authorize the station public key on the <span class="kbd">aismixer</span> side.</p>
         </article>
       </div>
       <p class="boundary-note"><strong>Package architecture.</strong> Select the package architecture that matches the official OpenWrt package feeds configured on the device; do not derive this value from <span class="kbd">apk --print-arch</span>.</p>
       <p class="boundary-note"><strong>Writable space.</strong> The Python runtime and dependencies require materially more writable space than a minimal OpenWrt installation. Verify available overlay space before installation; extroot is an OpenWrt deployment option where internal writable storage is limited.</p>
-      <pre class="command-example" aria-label="Install AISMixer from the signed OpenWrt APK repository"><code># Supported package architectures: x86_64 or mips_24kc
+      <pre class="command-example" aria-label="Install the aismixer package from the signed AISMixer OpenWrt APK repository"><code># Supported package architectures: x86_64 or mips_24kc
 AISMIXER_ARCH='x86_64'
 
 wget -O /etc/apk/keys/aismixer-openwrt.pem \
@@ -581,7 +580,7 @@ grep -qxF "$REPO_URL" "$REPO_FILE" 2&gt;/dev/null || {
 
 apk update
 apk add aismixer</code></pre>
-      <p class="boundary-note"><strong>End-to-end validation.</strong> The <span class="kbd">mips_24kc</span> deployment path has been validated end to end with physical serial AIS ingress, <span class="kbd">nmea_sproxy</span>, authenticated UDPSEC, AISMixer processing, <span class="kbd">procd</span> service operation, and local runtime control and observability.</p>
+      <p class="boundary-note"><strong>End-to-end validation.</strong> The <span class="kbd">mips_24kc</span> deployment path has been validated end to end with physical serial AIS ingress, <span class="kbd">nmea_sproxy</span>, authenticated UDPSEC, processing by the <span class="kbd">aismixer</span> service, <span class="kbd">procd</span> service operation, and local runtime control and observability.</p>
       <p class="boundary-note"><strong>Receiver-side endpoint only.</strong> Use <span class="kbd">apk add nmea_sproxy</span> instead of <span class="kbd">apk add aismixer</span> to install the station proxy independently. See the <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> and <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a> for complete deployment and trust-provisioning steps.</p>
     </section>
 
@@ -595,7 +594,7 @@ apk add aismixer</code></pre>
         <article class="card">
           <div class="icons" aria-hidden="true">⚙️</div>
           <h3>Repository-managed systemd</h3>
-          <p>The service provisions <span class="kbd">/run/aismixer</span> while AISMixer is running and supports the optional local control socket.</p>
+          <p>The <span class="kbd">aismixer</span> service provisions <span class="kbd">/run/aismixer</span> while running and supports the optional local control socket.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔄</div>

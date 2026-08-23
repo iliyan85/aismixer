@@ -44,7 +44,6 @@
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "AISMixer",
-    "alternateName": "aismixer",
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu", "OpenWrt"],
@@ -141,7 +140,7 @@
       <div class="section-heading">
         <p class="eyebrow">Обработка на AIS потоци</p>
         <h2>От трафика на приемниците до чист поток с ясни източници</h2>
-        <p class="section-intro">AISMixer обединява транспорта, NMEA сглобяването, метаданните, дедупликацията и доставката в един път за обработка в почти реално време.</p>
+        <p class="section-intro">AISMixer обединява транспорта, NMEA сглобяването, метаданните, дедупликацията и доставката в един път за обработка в почти реално време. Екосистемата AISMixer включва услугата <span class="kbd">aismixer</span> за обработка и маршрутизиране на потоци, <span class="kbd">nmea_sproxy</span>, <span class="kbd">aismixerctl</span>, защитения транспорт, инструментите за внедряване и свързаните компоненти.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -424,7 +423,7 @@
       <div class="section-heading">
         <p class="eyebrow">Жизнен цикъл на UDPSEC</p>
         <h2>Автентикиран транспорт с ограничено локално състояние</h2>
-        <p class="section-intro">Текущият UDPSEC път през <span class="kbd">nmea_sproxy</span> и AISMixer използва автентикиран ефемерен ECDHE обмен и независими ключове за двете посоки, с криптирано потвърждение с пореден номер нула, преди клиентът да приеме новата сесия за установена.</p>
+        <p class="section-intro">Текущият UDPSEC път през <span class="kbd">nmea_sproxy</span> и услугата <span class="kbd">aismixer</span> използва автентикиран ефемерен ECDHE обмен и независими ключове за двете посоки, с криптирано потвърждение с пореден номер нула, преди клиентът да приеме новата сесия за установена.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="Поток за установяване на UDPSEC сесия чрез автентикиран ECDHE">
         <div class="pipeline-node">
@@ -483,9 +482,9 @@
       <div class="section-heading">
         <p class="eyebrow">nmea_sproxy и физически AIS приемници</p>
         <h2>Свържете мрежови или физически AIS приемници чрез nmea_sproxy</h2>
-        <p class="section-intro"><span class="kbd">nmea_sproxy</span> е проксито при станцията, което свързва един локален AIS източник с една конфигурирана AISMixer цел.</p>
+        <p class="section-intro"><span class="kbd">nmea_sproxy</span> е проксито при станцията, което свързва един локален AIS източник с една конфигурирана цел на услугата <span class="kbd">aismixer</span>.</p>
       </div>
-      <div class="architecture-path" role="group" aria-label="Свързване на физически AIS приемник чрез nmea_sproxy към AISMixer">
+      <div class="architecture-path" role="group" aria-label="Свързване на физически AIS приемник чрез nmea_sproxy към услугата aismixer">
         <div class="path-node">
           <span class="icons" aria-hidden="true">📻</span>
           <strong>Физически AIS приемник</strong>
@@ -504,7 +503,7 @@
         </div>
         <div class="path-node">
           <span class="icons" aria-hidden="true">🛰️</span>
-          <strong>AISMixer</strong>
+          <strong><span class="kbd">aismixer</span></strong>
         </div>
       </div>
       <div class="grid proxy-grid">
@@ -528,14 +527,14 @@
         </article>
       </div>
       <div class="callout">
-        <p>Мрежов приемник може да подава локален UDP към <span class="kbd">nmea_sproxy</span> или директно към AISMixer според внедряването. Основният AISMixer процес не чете серийни портове директно. Довереният некриптиран UDP не предоставя UDPSEC криптиране, автентикация, защита срещу повторение или проверка за активност.</p>
+        <p>Мрежов приемник може да подава локален UDP към <span class="kbd">nmea_sproxy</span> или директно към услугата <span class="kbd">aismixer</span> според внедряването. Основният процес на услугата <span class="kbd">aismixer</span> не чете серийни портове директно. Довереният некриптиран UDP не предоставя UDPSEC криптиране, автентикация, защита срещу повторение или проверка за активност.</p>
       </div>
     </section>
 
     <section id="openwrt" class="section">
       <div class="section-heading">
         <p class="eyebrow">Периферно внедряване с OpenWrt</p>
-        <h2>Стартирайте AISMixer или nmea_sproxy върху OpenWrt</h2>
+        <h2>Стартирайте услугата <span class="kbd">aismixer</span> или <span class="kbd">nmea_sproxy</span> върху OpenWrt</h2>
         <p class="section-intro">Подписаното AISMixer APK хранилище за OpenWrt 25.12 публикува Python/procd внедряването за архитектурите <span class="kbd">x86_64</span> и <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
@@ -554,18 +553,18 @@
         <article class="card">
           <div class="icons" aria-hidden="true">📡</div>
           <h3>Две роли в периферната мрежа</h3>
-          <p>AISMixer може да работи върху периферен хост или маршрутизатор с OpenWrt. <span class="kbd">nmea_sproxy</span> може да работи самостоятелно близо до приемника с UDP или сериен вход. Изходът му може да бъде некриптиран UDP, а UDPSEC може да защити мрежовата връзка до AISMixer.</p>
+          <p>Услугата <span class="kbd">aismixer</span> може да работи върху периферен хост или маршрутизатор с OpenWrt. <span class="kbd">nmea_sproxy</span> може да работи самостоятелно близо до приемника с UDP или сериен вход. Изходът му може да бъде некриптиран UDP, а UDPSEC може да защити мрежовата връзка до услугата <span class="kbd">aismixer</span>.</p>
           <p><span class="kbd">nmea_sproxy</span> поддържа физически сериен вход, включително виртуални серийни устройства през USB, предоставени от операционната система. CDC ACM устройствата обикновено се появяват като <span class="kbd">/dev/ttyACM*</span>, а USB-UART адаптерите — като <span class="kbd">/dev/ttyUSB*</span>. Необходимият драйвер за ядрото може вече да е включен в OpenWrt образа; в противен случай може да е необходим съответният <span class="kbd">kmod</span> пакет, например <span class="kbd">kmod-usb-acm</span> за CDC ACM. Вграденият UART и UDP входът не изискват USB сериен драйвер.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Изрично UDPSEC доверие</h3>
-          <p>AISMixer и <span class="kbd">nmea_sproxy</span> генерират автоматично собствените си двойки ключове за идентичност при първата инсталация или стартиране, според случая. UDPSEC материалът за доверие към отсрещната страна никога не се обменя автоматично: поставете публичния ключ на AISMixer локално при станцията и добавете публичния ключ на станцията към разрешените ключове в AISMixer.</p>
+          <p>Услугите <span class="kbd">aismixer</span> и <span class="kbd">nmea_sproxy</span> генерират автоматично собствените си двойки ключове за идентичност при първата инсталация или стартиране, според случая. UDPSEC материалът за доверие към отсрещната страна никога не се обменя автоматично: поставете публичния ключ на услугата <span class="kbd">aismixer</span> локално при станцията и добавете публичния ключ на станцията към разрешените ключове на услугата <span class="kbd">aismixer</span>.</p>
         </article>
       </div>
       <p class="boundary-note"><strong>Пакетна архитектура.</strong> Изберете пакетната архитектура, която съответства на официалните хранилища за пакети на OpenWrt, конфигурирани на устройството; не определяйте тази стойност чрез <span class="kbd">apk --print-arch</span>.</p>
       <p class="boundary-note"><strong>Записваемо пространство.</strong> Python средата за изпълнение и зависимостите изискват значително повече записваемо пространство от минимална OpenWrt инсталация. Проверете свободното място в overlay преди инсталиране; extroot е възможност за внедряване с OpenWrt, когато вътрешното записваемо пространство е ограничено.</p>
-      <pre class="command-example" aria-label="Инсталиране на AISMixer от подписаното OpenWrt APK хранилище"><code># Изберете 'x86_64' или 'mips_24kc':
+      <pre class="command-example" aria-label="Инсталиране на пакета aismixer от подписаното AISMixer APK хранилище"><code># Изберете 'x86_64' или 'mips_24kc':
 AISMIXER_ARCH='x86_64'
 
 wget -O /etc/apk/keys/aismixer-openwrt.pem \
@@ -581,7 +580,7 @@ grep -qxF "$REPO_URL" "$REPO_FILE" 2&gt;/dev/null || {
 
 apk update
 apk add aismixer</code></pre>
-      <p class="boundary-note"><strong>Валидация от край до край.</strong> Пътят за внедряване на <span class="kbd">mips_24kc</span> е валидиран от край до край с физически сериен AIS вход, <span class="kbd">nmea_sproxy</span>, автентикиран UDPSEC, обработка от AISMixer, работа на услугите чрез <span class="kbd">procd</span> и локален контрол и наблюдаемост по време на изпълнение.</p>
+      <p class="boundary-note"><strong>Валидация от край до край.</strong> Пътят за внедряване на <span class="kbd">mips_24kc</span> е валидиран от край до край с физически сериен AIS вход, <span class="kbd">nmea_sproxy</span>, автентикиран UDPSEC, обработка от услугата <span class="kbd">aismixer</span>, работа на услугите чрез <span class="kbd">procd</span> и локален контрол и наблюдаемост по време на изпълнение.</p>
       <p class="boundary-note"><strong>Само крайна точка при приемника.</strong> Използвайте <span class="kbd">apk add nmea_sproxy</span> вместо <span class="kbd">apk add aismixer</span>, за да инсталирате самостоятелно проксито при станцията. Вижте <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> и <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ръководството за <span class="kbd">nmea_sproxy</span></a> за пълните стъпки по внедряване и конфигуриране на доверието.</p>
     </section>
 
@@ -595,7 +594,7 @@ apk add aismixer</code></pre>
         <article class="card">
           <div class="icons" aria-hidden="true">⚙️</div>
           <h3>systemd услуга, управлявана от хранилището</h3>
-          <p>Услугата създава <span class="kbd">/run/aismixer</span>, докато AISMixer работи, и поддържа незадължителния локален управляващ сокет.</p>
+          <p>Услугата <span class="kbd">aismixer</span> създава <span class="kbd">/run/aismixer</span> по време на работа и поддържа незадължителния локален управляващ сокет.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔄</div>

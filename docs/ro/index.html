@@ -44,7 +44,6 @@
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "AISMixer",
-    "alternateName": "aismixer",
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu", "OpenWrt"],
@@ -142,7 +141,7 @@
       <div class="section-heading">
         <p class="eyebrow">Procesarea fluxurilor AIS</p>
         <h2>De la traficul receptoarelor la un flux curat, cu surse identificabile</h2>
-        <p class="section-intro">AISMixer reunește transportul, asamblarea NMEA, metadatele, deduplicarea și livrarea într-un singur traseu de procesare aproape în timp real.</p>
+        <p class="section-intro">AISMixer reunește transportul, asamblarea NMEA, metadatele, deduplicarea și livrarea într-un singur traseu de procesare aproape în timp real. Ecosistemul AISMixer include serviciul <span class="kbd">aismixer</span> pentru procesarea și rutarea fluxurilor, <span class="kbd">nmea_sproxy</span>, <span class="kbd">aismixerctl</span>, transportul securizat, instrumentele de implementare și componentele conexe.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -425,7 +424,7 @@
       <div class="section-heading">
         <p class="eyebrow">Ciclul de viață UDPSEC</p>
         <h2>Transport autentificat cu stare locală limitată</h2>
-        <p class="section-intro">Traseul UDPSEC actual dintre <span class="kbd">nmea_sproxy</span> și AISMixer folosește un schimb ECDHE efemer autentificat și chei direcționale independente, cu o confirmare criptată cu secvența zero înainte ca clientul să considere stabilită o sesiune nouă.</p>
+        <p class="section-intro">Traseul UDPSEC actual dintre <span class="kbd">nmea_sproxy</span> și serviciul <span class="kbd">aismixer</span> folosește un schimb ECDHE efemer autentificat și chei direcționale independente, cu o confirmare criptată cu secvența zero înainte ca clientul să considere stabilită o sesiune nouă.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="Fluxul de stabilire a unei sesiuni UDPSEC autentificate">
         <div class="pipeline-node">
@@ -484,9 +483,9 @@
       <div class="section-heading">
         <p class="eyebrow">nmea_sproxy și receptoare AIS fizice</p>
         <h2>Conectați receptoare AIS de rețea sau fizice prin nmea_sproxy</h2>
-        <p class="section-intro"><span class="kbd">nmea_sproxy</span> este proxy-ul de la stație care conectează o singură sursă AIS locală la o singură destinație AISMixer configurată.</p>
+        <p class="section-intro"><span class="kbd">nmea_sproxy</span> este proxy-ul de la stație care conectează o singură sursă AIS locală la o singură destinație configurată a serviciului <span class="kbd">aismixer</span>.</p>
       </div>
-      <div class="architecture-path" role="group" aria-label="Conectarea unui receptor AIS fizic prin nmea_sproxy la AISMixer">
+      <div class="architecture-path" role="group" aria-label="Conectarea unui receptor AIS fizic prin nmea_sproxy la serviciul aismixer">
         <div class="path-node">
           <span class="icons" aria-hidden="true">📻</span>
           <strong>Receptor AIS fizic</strong>
@@ -505,7 +504,7 @@
         </div>
         <div class="path-node">
           <span class="icons" aria-hidden="true">🛰️</span>
-          <strong>AISMixer</strong>
+          <strong><span class="kbd">aismixer</span></strong>
         </div>
       </div>
       <div class="grid proxy-grid">
@@ -529,14 +528,14 @@
         </article>
       </div>
       <div class="callout">
-        <p>Un receptor de rețea poate trimite UDP local către <span class="kbd">nmea_sproxy</span> sau direct către AISMixer, în funcție de instalare. Procesul principal AISMixer nu citește direct porturi seriale. UDP-ul simplu folosit într-o zonă declarată de încredere nu oferă criptare UDPSEC, autentificare, protecție anti-replay sau verificarea activității.</p>
+        <p>Un receptor de rețea poate trimite UDP local către <span class="kbd">nmea_sproxy</span> sau direct către serviciul <span class="kbd">aismixer</span>, în funcție de instalare. Procesul principal al serviciului <span class="kbd">aismixer</span> nu citește direct porturi seriale. UDP-ul simplu folosit într-o zonă declarată de încredere nu oferă criptare UDPSEC, autentificare, protecție anti-replay sau verificarea activității.</p>
       </div>
     </section>
 
     <section id="openwrt" class="section">
       <div class="section-heading">
         <p class="eyebrow">Implementare OpenWrt la marginea rețelei</p>
-        <h2>Rulați AISMixer sau nmea_sproxy pe OpenWrt</h2>
+        <h2>Rulați serviciul <span class="kbd">aismixer</span> sau serviciul <span class="kbd">nmea_sproxy</span> pe OpenWrt</h2>
         <p class="section-intro">Depozitul AISMixer APK semnat pentru OpenWrt 25.12 publică implementarea Python/procd pentru arhitecturile <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
@@ -555,18 +554,18 @@
         <article class="card">
           <div class="icons" aria-hidden="true">📡</div>
           <h3>Două roluri la marginea rețelei</h3>
-          <p>AISMixer poate rula pe un dispozitiv periferic sau router cu OpenWrt. <span class="kbd">nmea_sproxy</span> poate rula independent lângă un receptor cu intrare UDP sau serială. Ieșirea poate fi UDP simplu, iar UDPSEC poate proteja legătura de rețea către AISMixer.</p>
+          <p>Serviciul <span class="kbd">aismixer</span> poate rula pe un dispozitiv periferic sau router cu OpenWrt. <span class="kbd">nmea_sproxy</span> poate rula independent lângă un receptor cu intrare UDP sau serială. Ieșirea poate fi UDP simplu, iar UDPSEC poate proteja legătura de rețea către serviciul <span class="kbd">aismixer</span>.</p>
           <p><span class="kbd">nmea_sproxy</span> acceptă intrare serială fizică, inclusiv dispozitive seriale virtuale prin USB puse la dispoziție de sistemul de operare. Dispozitivele CDC ACM apar de obicei ca <span class="kbd">/dev/ttyACM*</span>, iar adaptoarele USB-UART ca <span class="kbd">/dev/ttyUSB*</span>. Driverul de nucleu necesar poate fi deja inclus în imaginea OpenWrt; în caz contrar, poate fi necesar pachetul <span class="kbd">kmod</span> corespunzător, de exemplu <span class="kbd">kmod-usb-acm</span> pentru CDC ACM. UART-ul nativ și intrarea UDP nu necesită un driver serial USB.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Încredere UDPSEC explicită</h3>
-          <p>AISMixer și <span class="kbd">nmea_sproxy</span> își generează automat perechile locale de chei de identitate la prima instalare sau pornire, după caz. Materialul de încredere UDPSEC nu este transferat niciodată automat între participanți: instalați local cheia publică AISMixer la stație și autorizați cheia publică a stației în AISMixer.</p>
+          <p>Serviciile <span class="kbd">aismixer</span> și <span class="kbd">nmea_sproxy</span> își generează automat perechile locale de chei de identitate la prima instalare sau pornire, după caz. Materialul de încredere UDPSEC nu este transferat niciodată automat între participanți: instalați local cheia publică a serviciului <span class="kbd">aismixer</span> la stație și autorizați cheia publică a stației în serviciul <span class="kbd">aismixer</span>.</p>
         </article>
       </div>
       <p class="boundary-note"><strong>Arhitectura pachetului.</strong> Selectați arhitectura pachetului care corespunde surselor oficiale de pachete OpenWrt configurate pe dispozitiv; nu determinați această valoare folosind <span class="kbd">apk --print-arch</span>.</p>
       <p class="boundary-note"><strong>Spațiu disponibil pentru scriere.</strong> Runtime-ul Python și dependențele necesită considerabil mai mult spațiu disponibil pentru scriere decât o instalare OpenWrt minimală. Verificați spațiul liber din overlay înainte de instalare; extroot este o opțiune de implementare OpenWrt atunci când spațiul intern disponibil pentru scriere este limitat.</p>
-      <pre class="command-example" aria-label="Instalarea AISMixer din depozitul APK OpenWrt semnat"><code># Selectați 'x86_64' sau 'mips_24kc':
+      <pre class="command-example" aria-label="Instalarea pachetului aismixer din depozitul AISMixer APK semnat"><code># Selectați 'x86_64' sau 'mips_24kc':
 AISMIXER_ARCH='x86_64'
 
 wget -O /etc/apk/keys/aismixer-openwrt.pem \
@@ -582,7 +581,7 @@ grep -qxF "$REPO_URL" "$REPO_FILE" 2&gt;/dev/null || {
 
 apk update
 apk add aismixer</code></pre>
-      <p class="boundary-note"><strong>Validare cap la cap.</strong> Calea de implementare pentru <span class="kbd">mips_24kc</span> a fost validată cap la cap cu intrare AIS serială fizică, <span class="kbd">nmea_sproxy</span>, UDPSEC autentificat, procesare AISMixer, funcționarea serviciilor prin <span class="kbd">procd</span>, control local și observabilitate runtime.</p>
+      <p class="boundary-note"><strong>Validare cap la cap.</strong> Calea de implementare pentru <span class="kbd">mips_24kc</span> a fost validată cap la cap cu intrare AIS serială fizică, <span class="kbd">nmea_sproxy</span>, UDPSEC autentificat, procesare prin serviciul <span class="kbd">aismixer</span>, funcționarea serviciilor prin <span class="kbd">procd</span>, control local și observabilitate runtime.</p>
       <p class="boundary-note"><strong>Doar punctul terminal de lângă receptor.</strong> Folosiți <span class="kbd">apk add nmea_sproxy</span> în loc de <span class="kbd">apk add aismixer</span> pentru a instala independent proxy-ul de la stație. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> și <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> pentru pașii compleți de implementare și configurare a încrederii.</p>
     </section>
 
@@ -596,7 +595,7 @@ apk add aismixer</code></pre>
         <article class="card">
           <div class="icons" aria-hidden="true">⚙️</div>
           <h3>Serviciu systemd gestionat din depozit</h3>
-          <p>Serviciul creează <span class="kbd">/run/aismixer</span> cât timp AISMixer rulează și acceptă socketul local opțional de control.</p>
+          <p>Serviciul <span class="kbd">aismixer</span> creează <span class="kbd">/run/aismixer</span> cât timp rulează și acceptă socketul local opțional de control.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🔄</div>
