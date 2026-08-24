@@ -72,7 +72,10 @@ def test_install_preflights_required_source_layout_before_privileged_writes():
     assert 'require_source_dir "$SCRIPT_DIR/bin"' in install
     assert 'require_source_file "$SCRIPT_DIR/bin/aismixerctl"' in install
     assert 'require_source_dir "$SCRIPT_DIR/core"' in install
+    assert 'require_source_file "$SCRIPT_DIR/core/key_material.py"' in install
+    assert 'require_source_file "$SCRIPT_DIR/core/udpsec_identity.py"' in install
     assert 'require_source_dir "$SCRIPT_DIR/tools"' in install
+    assert 'require_source_file "$SCRIPT_DIR/tools/aismixer_keys.py"' in install
     assert 'require_source_file "$SCRIPT_DIR/config.yaml"' in install
     assert 'require_source_file "$SCRIPT_DIR/udp_alias_map.yaml"' in install
     preflight_call = "\npreflight_source_layout\n\n"
@@ -81,7 +84,7 @@ def test_install_preflights_required_source_layout_before_privileged_writes():
     assert install.index(preflight_call) < install.index(first_privileged_install)
 
 
-def test_install_preserves_configs_and_keys_and_only_enables_service():
+def test_install_preserves_configs_and_key_directory_without_creating_identity():
     install = read_root_file("install.sh")
     commands = shell_commands(install)
 
@@ -93,9 +96,12 @@ def test_install_preserves_configs_and_keys_and_only_enables_service():
     assert 'run_as_root install -m 0644 "$source_path" "$dest_path"' in install
     assert 'run_as_root install -d -m 0700 "$KEYS_DIR"' in install
     assert (
-        'run_as_root python3 "$INSTALL_DIR/tools/aismixer_keys.py" server '
-        '--keys-dir "$KEYS_DIR"'
-    ) in install
+        'run_as_root python3 "$INSTALL_DIR/tools/aismixer_keys.py"'
+        not in install
+    )
+    assert "aismixer_private.pem" not in install
+    assert "aismixer_public.pem" not in install
+    assert "Incomplete server key pair" not in install
     assert 'printf \'%s\\n\' \'authorized_clients: []\' | run_as_root tee "$AUTHORIZED_KEYS_FILE" >/dev/null' in install
     assert 'run_as_root install -m 0644 "$SCRIPT_DIR/aismixer.service" "$SYSTEMD_UNIT"' in install
     assert 'run_as_root install -m 0755 "$SCRIPT_DIR/bin/aismixerctl" "$CLI_WRAPPER"' in install
@@ -125,11 +131,6 @@ def test_install_user_facing_examples_use_root_cmd_prefix():
     assert 'ROOT_CMD_PREFIX="sudo "' in install
     assert 'echo "    Run: ${ROOT_CMD_PREFIX}apt install $pkg"' in install
     assert (
-        'echo "    ${ROOT_CMD_PREFIX}python3 '
-        '\\"$INSTALL_DIR/tools/aismixer_keys.py\\" server --keys-dir '
-        '\\"$KEYS_DIR\\" --force" >&2'
-    ) in install
-    assert (
         'echo "[+] Done. You can now start the service with: '
         '${ROOT_CMD_PREFIX}systemctl start aismixer"'
     ) in install
@@ -147,7 +148,10 @@ def test_update_preflights_sources_updates_runtime_and_restarts_service():
     assert 'require_source_dir "$SCRIPT_DIR/bin"' in update
     assert 'require_source_file "$SCRIPT_DIR/bin/aismixerctl"' in update
     assert 'require_source_dir "$SCRIPT_DIR/core"' in update
+    assert 'require_source_file "$SCRIPT_DIR/core/key_material.py"' in update
+    assert 'require_source_file "$SCRIPT_DIR/core/udpsec_identity.py"' in update
     assert 'require_source_dir "$SCRIPT_DIR/tools"' in update
+    assert 'require_source_file "$SCRIPT_DIR/tools/aismixer_keys.py"' in update
     preflight_call = "\npreflight_source_layout\n\n"
     assert preflight_call in update
     assert update.index(aismixerctl_preflight) < update.index(preflight_call)

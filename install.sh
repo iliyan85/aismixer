@@ -9,8 +9,6 @@ CLI_WRAPPER=/usr/local/bin/aismixerctl
 CLI_WRAPPER_DIR=/usr/local/bin
 CONFIG_DIR=/etc/aismixer
 KEYS_DIR="$CONFIG_DIR/keys"
-PRIVATE_KEY="$KEYS_DIR/aismixer_private.pem"
-PUBLIC_KEY="$KEYS_DIR/aismixer_public.pem"
 AUTHORIZED_KEYS_FILE="$CONFIG_DIR/authorized_keys.yaml"
 
 if (( EUID == 0 )); then
@@ -57,7 +55,10 @@ preflight_source_layout() {
 	require_source_dir "$SCRIPT_DIR/bin"
 	require_source_file "$SCRIPT_DIR/bin/aismixerctl"
 	require_source_dir "$SCRIPT_DIR/core"
+	require_source_file "$SCRIPT_DIR/core/key_material.py"
+	require_source_file "$SCRIPT_DIR/core/udpsec_identity.py"
 	require_source_dir "$SCRIPT_DIR/tools"
+	require_source_file "$SCRIPT_DIR/tools/aismixer_keys.py"
 	require_source_file "$SCRIPT_DIR/config.yaml"
 	require_source_file "$SCRIPT_DIR/udp_alias_map.yaml"
 	find "$SCRIPT_DIR" -maxdepth 1 -type f -name '*.py' -print0 >/dev/null
@@ -125,33 +126,8 @@ for config_name in config.yaml udp_alias_map.yaml; do
 	fi
 done
 
-echo "[+] Preparing server keys in $KEYS_DIR"
+echo "[+] Preparing key directory at $KEYS_DIR"
 run_as_root install -d -m 0700 "$KEYS_DIR"
-private_key_exists=false
-public_key_exists=false
-if path_exists "$PRIVATE_KEY"; then
-	private_key_exists=true
-fi
-if path_exists "$PUBLIC_KEY"; then
-	public_key_exists=true
-fi
-
-if [ "$private_key_exists" = true ] && [ "$public_key_exists" = true ]; then
-	echo "  - Existing server key pair found; preserving it"
-elif [ "$private_key_exists" = false ] && [ "$public_key_exists" = false ]; then
-	echo "  - No server keys found; generating a new key pair"
-	run_as_root python3 "$INSTALL_DIR/tools/aismixer_keys.py" server --keys-dir "$KEYS_DIR"
-else
-	echo "[!] Incomplete server key pair in $KEYS_DIR; refusing to overwrite operator keys" >&2
-	if [ "$private_key_exists" = false ]; then
-		echo "    Missing: $PRIVATE_KEY" >&2
-	else
-		echo "    Missing: $PUBLIC_KEY" >&2
-	fi
-	echo "    Restore the missing key mate, or run the key tool manually with --force:" >&2
-	echo "    ${ROOT_CMD_PREFIX}python3 \"$INSTALL_DIR/tools/aismixer_keys.py\" server --keys-dir \"$KEYS_DIR\" --force" >&2
-	exit 1
-fi
 
 echo "[+] Preparing authorized client keys"
 if path_exists "$AUTHORIZED_KEYS_FILE"; then

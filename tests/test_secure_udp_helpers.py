@@ -37,15 +37,12 @@ from core.udpsec_protocol import (
 ROOT = Path(__file__).resolve().parents[1]
 NMEA_SPROXY_DIR = ROOT / "nmea_sproxy"
 
-SERVER_CANONICAL_PRIVATE_KEY_PATH = "/etc/aismixer/keys/aismixer_private.pem"
-SERVER_LEGACY_ETC_PRIVATE_KEY_PATH = "/etc/aismixer/aismixer_private.key"
-SERVER_LOCAL_CANONICAL_PRIVATE_KEY_FILENAME = "aismixer_private.pem"
-SERVER_PRIVATE_KEY_FILENAME = "aismixer_private.key"
 SERVER_PUBLIC_KEY_FOR_PROXY_FILENAME = "aismixer_public.pem"
 STATION_CANONICAL_PRIVATE_KEY_PATH = "/etc/nmea_sproxy/keys/station_private.pem"
 STATION_PRIVATE_KEY_FILENAME = "station_private.key"
 STATION_PUBLIC_KEY_FILENAME = "station_public.pem"
 REMOTE_CANONICAL_PUBLIC_KEY_PATH = "/etc/nmea_sproxy/keys/aismixer_public.pem"
+_PREPARED_SERVER_PRIVATE_KEY = ec.derive_private_key(23, ec.SECP256R1())
 
 
 def load_proxy_module():
@@ -68,15 +65,7 @@ def _normalize_path(path):
 def load_secure_module_with_fake_keys(
     monkeypatch,
     with_client_private_key=False,
-    existing_paths=None,
 ):
-    server_private_key = ec.generate_private_key(ec.SECP256R1())
-    server_private_bytes = server_private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-
     client_private_key = ec.generate_private_key(ec.SECP256R1())
     client_public_bytes = client_private_key.public_key().public_bytes(
         encoding=serialization.Encoding.X962,
@@ -94,20 +83,10 @@ def load_secure_module_with_fake_keys(
         name = os.path.basename(os.fspath(path))
         if name == "authorized_keys.yaml":
             return io.StringIO(authorized_yaml)
-        if name in (
-            SERVER_LOCAL_CANONICAL_PRIVATE_KEY_FILENAME,
-            SERVER_PRIVATE_KEY_FILENAME,
-        ):
-            return io.BytesIO(server_private_bytes)
         return real_open(path, mode, *args, **kwargs)
 
-    existing = {
-        _normalize_path(path)
-        for path in (existing_paths or ())
-    }
-
     with monkeypatch.context() as patch:
-        patch.setattr(os.path, "exists", lambda path: _normalize_path(path) in existing)
+        patch.setattr(os.path, "exists", lambda _path: False)
         patch.setattr("builtins.open", fake_open)
         spec = importlib.util.spec_from_file_location(
             "aismixer_secure_test_helpers", ROOT / "aismixer_secure.py"
@@ -126,6 +105,35 @@ def test_authorized_station_identity_keys_are_validated_once(monkeypatch):
 
     assert isinstance(public_key, ec.EllipticCurvePublicKey)
     assert isinstance(public_key.curve, ec.SECP256R1)
+
+
+def test_secure_module_has_no_default_server_private_key_loader(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert not hasattr(secure, "_load_default_server_private_key")
+    assert not hasattr(secure, "priv_key_path")
+    assert not hasattr(secure, "server_priv")
+
+
+def test_secure_loop_rejects_missing_identity_before_binding(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    fake_socket = _FakeSecureSocket()
+
+    with pytest.raises(
+        RuntimeError,
+        match="identity was not prepared before activation",
+    ):
+        asyncio.run(
+            secure._secure_server_loop(
+                fake_socket,
+                _FakeQueue(),
+                "127.0.0.1",
+                19999,
+            )
+        )
+
+    assert fake_socket.bound is None
+    assert fake_socket.blocking is None
 
 
 @pytest.mark.parametrize(
@@ -495,6 +503,7 @@ def _run_secure_server_with_packets(
     monotonic_clock=None,
     sec_input_id=None,
     ingress_policy=None,
+    server_private_key=_PREPARED_SERVER_PRIVATE_KEY,
 ):
     fake_socket = _FakeSecureSocket()
     fake_loop = _FakeSecureLoop(packets)
@@ -526,6 +535,7 @@ def _run_secure_server_with_packets(
                 state=state,
                 wall_clock=wall_clock,
                 monotonic_clock=monotonic_clock,
+                server_private_key=server_private_key,
             )
         )
 
@@ -556,6 +566,7 @@ def test_secure_server_closes_owned_socket_when_bind_fails(monkeypatch):
                 _FakeQueue(),
                 "127.0.0.1",
                 9999,
+                server_private_key=_PREPARED_SERVER_PRIVATE_KEY,
             )
         )
 
@@ -586,6 +597,7 @@ def test_secure_server_closes_owned_socket_when_runtime_fails(monkeypatch):
                 _FakeQueue(),
                 "127.0.0.1",
                 9999,
+                server_private_key=_PREPARED_SERVER_PRIVATE_KEY,
             )
         )
 
@@ -663,7 +675,7 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
         ),
     )
     assert secure.verify_transcript_signature(
-        secure.server_priv.public_key(),
+        _PREPARED_SERVER_PRIVATE_KEY.public_key(),
         server_hello.server_signature,
         server_digest,
     )
@@ -976,7 +988,7 @@ def test_server_ecdhe_uses_only_one_validated_ephemeral_private_key(
     assert len(parse_calls) == 1
     assert len(derive_calls) == 1
     assert derive_calls[0][0] is generated_server_private_key
-    assert derive_calls[0][0] is not secure.server_priv
+    assert derive_calls[0][0] is not _PREPARED_SERVER_PRIVATE_KEY
 
 
 def test_fresh_same_timestamp_hellos_get_fresh_server_state(monkeypatch):
@@ -1826,7 +1838,7 @@ def test_secure_server_keeps_replay_record_after_post_acceptance_failure(monkeyp
 
     assert fake_socket.sent == []
     assert len(sign_calls) == 1
-    assert sign_calls[0][0] is secure.server_priv
+    assert sign_calls[0][0] is _PREPARED_SERVER_PRIVATE_KEY
     stats = state.stats()
     assert stats.handshake_replay_accepted == 1
     assert stats.handshake_replay_rejected == 1
@@ -1834,6 +1846,44 @@ def test_secure_server_keeps_replay_record_after_post_acceptance_failure(monkeyp
     assert stats.sessions_created == 0
     assert stats.pending_sessions_created == 0
     assert stats.current_pending_sessions == 0
+
+
+def test_secure_server_signs_with_prepared_activation_identity(monkeypatch):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    packet = _signed_handshake_packet(
+        secure,
+        client_private_key,
+        "boat_001",
+        1000,
+    )
+    prepared_private_key = ec.derive_private_key(17, ec.SECP256R1())
+    sign_calls = []
+
+    def fail_after_recording(private_key, _digest):
+        sign_calls.append(private_key)
+        raise RuntimeError("stop after identity selection")
+
+    monkeypatch.setattr(
+        secure,
+        "sign_transcript_digest",
+        fail_after_recording,
+    )
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, ("127.0.0.1", 50123))],
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+        server_private_key=prepared_private_key,
+    )
+
+    assert fake_socket.sent == []
+    assert sign_calls == [prepared_private_key]
+    assert prepared_private_key is not _PREPARED_SERVER_PRIVATE_KEY
 
 
 def test_authenticated_hello_preserves_active_and_installs_pending_candidate(
@@ -3566,7 +3616,7 @@ def test_runtime_end_to_end_ecdhe_and_directional_encryption(monkeypatch):
         bridge_socket,
         {"station_id": "boat_001"},
         station_identity_private_key,
-        secure.server_priv.public_key(),
+        _PREPARED_SERVER_PRIVATE_KEY.public_key(),
         remote_addr,
     )
 
@@ -5387,35 +5437,6 @@ def test_secure_state_stats_do_not_read_clocks_or_cleanup(monkeypatch):
     assert stats.sessions_expired == 0
 
 
-def test_secure_server_private_key_prefers_canonical_path(monkeypatch):
-    secure = load_secure_module_with_fake_keys(
-        monkeypatch,
-        existing_paths=[
-            SERVER_CANONICAL_PRIVATE_KEY_PATH,
-            SERVER_LEGACY_ETC_PRIVATE_KEY_PATH,
-        ],
-    )
-
-    assert secure.priv_key_path == SERVER_CANONICAL_PRIVATE_KEY_PATH
-
-
-def test_secure_server_private_key_uses_legacy_etc_when_canonical_absent(monkeypatch):
-    secure = load_secure_module_with_fake_keys(
-        monkeypatch,
-        existing_paths=[SERVER_LEGACY_ETC_PRIVATE_KEY_PATH],
-    )
-
-    assert secure.priv_key_path == SERVER_LEGACY_ETC_PRIVATE_KEY_PATH
-
-
-def test_secure_server_private_key_uses_local_legacy_fallback(monkeypatch):
-    secure = load_secure_module_with_fake_keys(monkeypatch)
-
-    assert _normalize_path(secure.priv_key_path) == _normalize_path(
-        ROOT / SERVER_PRIVATE_KEY_FILENAME
-    )
-
-
 def test_proxy_default_station_private_key_prefers_canonical_path(monkeypatch, tmp_path):
     proxy = load_proxy_module()
     monkeypatch.setattr(
@@ -5721,8 +5742,6 @@ def test_proxy_main_rejects_missing_environment_config(monkeypatch, tmp_path, ca
 def test_current_secure_udp_key_filename_expectations():
     proxy = load_proxy_module()
 
-    assert SERVER_CANONICAL_PRIVATE_KEY_PATH.endswith("aismixer_private.pem")
-    assert SERVER_PRIVATE_KEY_FILENAME == "aismixer_private.key"
     assert SERVER_PUBLIC_KEY_FOR_PROXY_FILENAME == "aismixer_public.pem"
     assert STATION_CANONICAL_PRIVATE_KEY_PATH.endswith("station_private.pem")
     assert STATION_PRIVATE_KEY_FILENAME == "station_private.key"

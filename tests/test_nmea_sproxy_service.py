@@ -53,7 +53,7 @@ def assert_no_direct_privileged_commands(script):
 
 
 def assert_installs_shared_udpsec_modules(script):
-    for module in ("udpsec_crypto.py", "udpsec_protocol.py"):
+    for module in ("key_material.py", "udpsec_crypto.py", "udpsec_protocol.py"):
         assert (
             f'run_as_root install -m 0644 "$REPO_ROOT/core/{module}" '
             f'"$CORE_DIR/{module}"'

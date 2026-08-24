@@ -11,6 +11,9 @@ from core.runtime_statistics import InputTrafficMetrics
 from core.udpsec_protocol import ClientHello, build_client_hello_packet
 
 
+PREPARED_SERVER_PRIVATE_KEY = ec.derive_private_key(29, ec.SECP256R1())
+
+
 class _PacketLoop:
     def __init__(self, packets):
         self._packets = list(packets)
@@ -99,6 +102,7 @@ def _run_packets(
                 state=secure.SecureState() if state is None else state,
                 wall_clock=lambda: 1010.0,
                 monotonic_clock=lambda: 1010.0,
+                server_private_key=PREPARED_SERVER_PRIVATE_KEY,
             )
         )
 
@@ -127,12 +131,17 @@ def test_secure_server_passes_input_owner_to_owned_receive_loop(monkeypatch):
             "127.0.0.1",
             9999,
             input_traffic=traffic,
+            server_private_key=PREPARED_SERVER_PRIVATE_KEY,
         )
     )
 
     assert len(loop_calls) == 1
     assert loop_calls[0][0][0] is fake_socket
     assert loop_calls[0][1]["input_traffic"] is traffic
+    assert (
+        loop_calls[0][1]["server_private_key"]
+        is PREPARED_SERVER_PRIVATE_KEY
+    )
     assert fake_socket.close_count == 1
 
 

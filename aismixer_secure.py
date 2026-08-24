@@ -54,27 +54,11 @@ _HANDSHAKE_REPLAY_LABEL = b"HANDSHAKE-REPLAY"
 DEBUG = True  # Set to False in production
 
 
-SERVER_PRIVATE_KEY_PATHS = (
-    "/etc/aismixer/keys/aismixer_private.pem",
-    "/etc/aismixer/aismixer_private.key",
-    "aismixer_private.pem",
-    "aismixer_private.key",
-)
-
-
 def resolve_existing_path(candidates):
     for path in candidates:
         if os.path.exists(path):
             return path
     return candidates[-1]
-
-
-def resolve_local_path(path):
-    if os.path.isabs(path) or path.startswith("/"):
-        return path
-    return os.path.join(base_dir, path)
-
-
 def _load_authorized_identity_public_key(encoded_public_key):
     if not isinstance(encoded_public_key, str):
         raise TypeError(
@@ -141,10 +125,6 @@ auth_keys_path = resolve_existing_path(
     )
 )
 
-priv_key_path = resolve_existing_path(
-    tuple(resolve_local_path(path) for path in SERVER_PRIVATE_KEY_PATHS)
-)
-
 with open(auth_keys_path, 'r') as f:
     authorized_db = yaml.safe_load(f)
 
@@ -153,15 +133,16 @@ AUTHORIZED_KEYS = {
     for entry in authorized_db["authorized_clients"]
 }
 
-with open(priv_key_path, 'rb') as f:
-    server_priv = serialization.load_pem_private_key(
-        f.read(),
-        password=None,
-    )
-if not isinstance(server_priv, ec.EllipticCurvePrivateKey):
-    raise TypeError("server identity private key must be an EC private key")
-if not isinstance(server_priv.curve, ec.SECP256R1):
-    raise ValueError("server identity private key must use P-256")
+def _require_prepared_server_private_key(server_private_key):
+    if server_private_key is None:
+        raise RuntimeError(
+            "UDPSEC server identity was not prepared before activation"
+        )
+    if not isinstance(server_private_key, ec.EllipticCurvePrivateKey):
+        raise TypeError("server identity private key must be an EC private key")
+    if not isinstance(server_private_key.curve, ec.SECP256R1):
+        raise ValueError("server identity private key must use P-256")
+    return server_private_key
 
 
 def _validate_positive_int(name, value):
@@ -777,9 +758,17 @@ def _is_session_confirmation_ping(message, station_id):
     )
 
 
-def _build_server_handshake(client_hello, client_ephemeral_public_key):
+def _build_server_handshake(
+    client_hello,
+    client_ephemeral_public_key,
+    *,
+    server_private_key=None,
+):
     """Build one authenticated ServerHello and directional session ciphers."""
 
+    active_server_private_key = _require_prepared_server_private_key(
+        server_private_key
+    )
     server_random = os.urandom(32)
     server_ephemeral_private_key = generate_ephemeral_private_key()
     server_ephemeral_public_bytes = serialize_ephemeral_public_key(
@@ -797,7 +786,7 @@ def _build_server_handshake(client_hello, client_ephemeral_public_key):
         server_ephemeral_public_key=server_ephemeral_public_bytes,
     )
     server_signature = sign_transcript_digest(
-        server_priv,
+        active_server_private_key,
         server_auth_digest,
     )
     shared_secret = derive_ephemeral_shared_secret(
@@ -845,7 +834,12 @@ async def _secure_server_loop(
     state=None,
     wall_clock=None,
     monotonic_clock=None,
+    server_private_key=None,
 ):
+    active_server_private_key = _require_prepared_server_private_key(
+        server_private_key
+    )
+
     sock.bind((ip, port))
     sock.setblocking(False)
     loop = asyncio.get_running_loop()
@@ -919,6 +913,7 @@ async def _secure_server_loop(
                 ) = _build_server_handshake(
                     client_hello,
                     client_ephemeral_public_key,
+                    server_private_key=active_server_private_key,
                 )
                 state_owner.install_pending_session(
                     addr,
@@ -1122,6 +1117,7 @@ async def secure_server(
     state=None,
     wall_clock=None,
     monotonic_clock=None,
+    server_private_key=None,
 ):
     """Run one secure ingress producer and close its owned socket exactly once."""
 
@@ -1138,6 +1134,7 @@ async def secure_server(
             state=state,
             wall_clock=wall_clock,
             monotonic_clock=monotonic_clock,
+            server_private_key=server_private_key,
         )
     finally:
         sock.close()

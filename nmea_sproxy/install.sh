@@ -59,6 +59,7 @@ run_as_root install -m 0755 "$SCRIPT_DIR/nmea_sproxy.py" "$INSTALL_DIR/nmea_spro
 run_as_root install -m 0644 "$SCRIPT_DIR/input_adapters.py" "$INSTALL_DIR/input_adapters.py"
 run_as_root install -m 0644 "$SCRIPT_DIR/output_adapters.py" "$INSTALL_DIR/output_adapters.py"
 run_as_root install -m 0644 "$SCRIPT_DIR/meta_cleaner.py" "$INSTALL_DIR/meta_cleaner.py"
+run_as_root install -m 0644 "$REPO_ROOT/core/key_material.py" "$CORE_DIR/key_material.py"
 run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" "$CORE_DIR/network_policy.py"
 run_as_root install -m 0644 "$REPO_ROOT/core/udpsec_crypto.py" "$CORE_DIR/udpsec_crypto.py"
 run_as_root install -m 0644 "$REPO_ROOT/core/udpsec_protocol.py" "$CORE_DIR/udpsec_protocol.py"

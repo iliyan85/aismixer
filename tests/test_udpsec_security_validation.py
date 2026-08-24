@@ -59,11 +59,6 @@ def _load_proxy_module():
 
 
 def _load_secure_module(monkeypatch, server_private_key, station_public_key):
-    server_private_bytes = server_private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
     station_public_bytes = station_public_key.public_bytes(
         encoding=serialization.Encoding.X962,
         format=serialization.PublicFormat.CompressedPoint,
@@ -79,8 +74,6 @@ def _load_secure_module(monkeypatch, server_private_key, station_public_key):
         name = os.path.basename(os.fspath(path))
         if name == "authorized_keys.yaml":
             return io.StringIO(authorized_yaml)
-        if name in ("aismixer_private.pem", "aismixer_private.key"):
-            return io.BytesIO(server_private_bytes)
         return real_open(path, mode, *args, **kwargs)
 
     with monkeypatch.context() as patch:
@@ -108,6 +101,7 @@ def real_udpsec_endpoints(monkeypatch):
     return SimpleNamespace(
         secure=secure,
         proxy=proxy,
+        server_private_key=server_private_key,
         server_public_key=server_private_key.public_key(),
         station_private_key=station_private_key,
     )
@@ -128,8 +122,9 @@ class _ThreadSafeIngressSink:
 
 
 class _LoopbackSecureServer:
-    def __init__(self, secure, family, host):
+    def __init__(self, secure, server_private_key, family, host):
         self.secure = secure
+        self.server_private_key = server_private_key
         self.host = host
         self.socket = socket.socket(family, socket.SOCK_DGRAM)
         self.state = secure.SecureState()
@@ -166,6 +161,7 @@ class _LoopbackSecureServer:
                 0,
                 sec_input_id="loopback-validation",
                 state=self.state,
+                server_private_key=self.server_private_key,
             )
         )
         # create_task() and call_soon() are FIFO on this loop. The listener
@@ -260,8 +256,13 @@ class _LoopbackSecureServer:
 
 
 @contextmanager
-def _running_secure_server(secure, family, host):
-    server = _LoopbackSecureServer(secure, family, host)
+def _running_secure_server(secure, server_private_key, family, host):
+    server = _LoopbackSecureServer(
+        secure,
+        server_private_key,
+        family,
+        host,
+    )
     try:
         yield server.start()
     finally:
@@ -571,7 +572,12 @@ def test_real_udp_loopback_interoperability(
         _require_ipv6_loopback()
 
     endpoints = real_udpsec_endpoints
-    with _running_secure_server(endpoints.secure, family, host) as server:
+    with _running_secure_server(
+        endpoints.secure,
+        endpoints.server_private_key,
+        family,
+        host,
+    ) as server:
         with _client_socket(family, host) as client:
             key_material = _perform_real_handshake(
                 endpoints,
@@ -641,6 +647,7 @@ def test_real_confirmed_same_address_rekey_replaces_traffic_keys(
     endpoints = real_udpsec_endpoints
     with _running_secure_server(
         endpoints.secure,
+        endpoints.server_private_key,
         socket.AF_INET,
         "127.0.0.1",
     ) as server:
@@ -751,6 +758,7 @@ def test_real_packet_loss_requires_fresh_handshake_retry(
     endpoints = real_udpsec_endpoints
     with _running_secure_server(
         endpoints.secure,
+        endpoints.server_private_key,
         socket.AF_INET,
         "127.0.0.1",
     ) as server:
@@ -836,6 +844,7 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
     endpoints = real_udpsec_endpoints
     with _running_secure_server(
         endpoints.secure,
+        endpoints.server_private_key,
         socket.AF_INET,
         "127.0.0.1",
     ) as server:
@@ -1233,6 +1242,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
 
     with _running_secure_server(
         endpoints.secure,
+        endpoints.server_private_key,
         socket.AF_INET,
         "127.0.0.1",
     ) as server:
@@ -1275,6 +1285,7 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
     endpoints = real_udpsec_endpoints
     with _running_secure_server(
         endpoints.secure,
+        endpoints.server_private_key,
         socket.AF_INET,
         "127.0.0.1",
     ) as server:
@@ -1564,6 +1575,7 @@ def test_real_active_ping_sequence_requires_exact_positive_integer(
     endpoints = real_udpsec_endpoints
     with _running_secure_server(
         endpoints.secure,
+        endpoints.server_private_key,
         socket.AF_INET,
         "127.0.0.1",
     ) as server:

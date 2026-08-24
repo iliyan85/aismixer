@@ -46,7 +46,10 @@ preflight_source_layout() {
 	require_source_dir "$SCRIPT_DIR/bin"
 	require_source_file "$SCRIPT_DIR/bin/aismixerctl"
 	require_source_dir "$SCRIPT_DIR/core"
+	require_source_file "$SCRIPT_DIR/core/key_material.py"
+	require_source_file "$SCRIPT_DIR/core/udpsec_identity.py"
 	require_source_dir "$SCRIPT_DIR/tools"
+	require_source_file "$SCRIPT_DIR/tools/aismixer_keys.py"
 	find "$SCRIPT_DIR" -maxdepth 1 -type f -name '*.py' -print0 >/dev/null
 	find "$SCRIPT_DIR/core" -type f -print0 >/dev/null
 	find "$SCRIPT_DIR/tools" -type f -print0 >/dev/null

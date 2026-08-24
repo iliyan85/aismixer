@@ -2,7 +2,7 @@ import asyncio
 import yaml
 import os
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -21,13 +21,19 @@ from core.ingress_frame import (
 from core.metrics import EgressMetricsSnapshot, QueueMetricsSnapshot
 from core.network_policy import NetworkPolicy, compile_ingress_policy
 from core.python_data_plane import PythonDataPlaneProcessor
-from core.runtime_control import build_optional_routing_control_server
+from core.runtime_control import (
+    build_optional_routing_control_server,
+    load_optional_routing_control_unix_settings,
+)
 from core.runtime_statistics import InputTrafficMetrics, RuntimeStatisticsProvider
 from core.runtime_routing import load_optional_routing_table
 from core.routing_state import RoutingState
 from core.source_identity import build_udp_source_id
 from core.udp_listener import create_udp_listener_socket
-from aismixer_secure import secure_server
+from core.udpsec_identity import (
+    sec_inputs_require_udpsec,
+    udpsec_server_identity_service,
+)
 
 
 DEFAULT_INGRESS_QUEUE_MAXSIZE = 1024
@@ -38,6 +44,27 @@ try:
     setproctitle('aismixer')
 except ImportError:
     pass  # No effect on Windows or if not installed
+
+
+_secure_server_impl = None
+
+
+def _load_secure_server():
+    """Load UDPSEC transport code only for configurations that require it."""
+
+    global _secure_server_impl
+    if _secure_server_impl is None:
+        from aismixer_secure import secure_server as implementation
+
+        _secure_server_impl = implementation
+    return _secure_server_impl
+
+
+async def secure_server(*args, **kwargs):
+    """Run the lazily loaded UDPSEC producer."""
+
+    implementation = _load_secure_server()
+    await implementation(*args, **kwargs)
 
 
 def ts() -> str:
@@ -530,10 +557,49 @@ def _cancel_or_retrieve_completion(completion):
 
 
 def compile_input_policies(entries, kind):
+    if isinstance(entries, (str, bytes)) or not isinstance(entries, Sequence):
+        raise ValueError(f"{kind} must be a list of ingress mappings")
+
+    for index, entry in enumerate(entries):
+        context = f"{kind}[{index}]"
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"{context} must be a mapping")
+        listen_ip = entry.get("listen_ip")
+        if not isinstance(listen_ip, str):
+            raise ValueError(f"{context}.listen_ip must be a string")
+        listen_port = entry.get("listen_port")
+        if (
+            isinstance(listen_port, bool)
+            or not isinstance(listen_port, int)
+            or not 0 <= listen_port <= 65535
+        ):
+            raise ValueError(
+                f"{context}.listen_port must be an integer from 0 to 65535"
+            )
+
     return tuple(
         compile_ingress_policy(entry, context=f"{kind}[{index}]")
         for index, entry in enumerate(entries)
     )
+
+
+def prepare_udpsec_ingress_activation(
+    sec_inputs,
+    *,
+    identity_service=None,
+):
+    """Ensure and load identity before a UDPSEC configuration is activated."""
+
+    service = (
+        udpsec_server_identity_service
+        if identity_service is None
+        else identity_service
+    )
+    if not sec_inputs_require_udpsec(sec_inputs):
+        return None
+
+    _load_secure_server()
+    return service.ensure_for_sec_inputs(sec_inputs)
 
 
 async def processor_stage_loop(
@@ -737,6 +803,20 @@ async def main(
         ingress_queue_maxsize,
         name="ingress_queue_maxsize",
     )
+    processing_queue_maxsize = _validate_queue_capacity(
+        processing_queue_maxsize,
+        name="processing_queue_maxsize",
+    )
+    sec_input_policies = compile_input_policies(SEC_INPUTS, "sec_inputs")
+    udp_input_policies = compile_input_policies(UDP_INPUTS, "udp_inputs")
+    load_optional_routing_control_unix_settings(config)
+    udpsec_identity = prepare_udpsec_ingress_activation(SEC_INPUTS)
+    if udpsec_identity is not None and udpsec_identity.generated:
+        print(
+            "[+] Generated UDPSEC server identity: "
+            f"{udpsec_identity.public_path}"
+        )
+
     processor_queue = _BoundedProcessingQueue(processing_queue_maxsize)
     processor = create_data_plane_processor()
     input_queues = []
@@ -745,8 +825,6 @@ async def main(
     egress_metrics = _EgressMetrics()
     runtime_task_specs = []
     udp_sockets = []
-    sec_input_policies = compile_input_policies(SEC_INPUTS, "sec_inputs")
-    udp_input_policies = compile_input_policies(UDP_INPUTS, "udp_inputs")
     control_server = None
     control_server_started = False
 
@@ -784,6 +862,7 @@ async def main(
                         sec_input_id=sec_id,
                         ingress_policy=ingress_policy,
                         input_traffic=traffic,
+                        server_private_key=udpsec_identity.private_key,
                     ),
                 )
             )

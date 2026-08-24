@@ -3,6 +3,7 @@ import json
 import socket
 
 import pytest
+from cryptography.hazmat.primitives import serialization
 
 import aismixer
 from assembler import AIVDMAssembler
@@ -14,6 +15,7 @@ from core.routing_control_protocol import ROUTING_CONTROL_PROTOCOL_VERSION
 from core.routing_control_unix import RoutingControlUnixServer
 from core.routing_control_unix_client import RoutingControlUnixClient
 from core.routing_state import RoutingState
+from core.udpsec_identity import UdpsecServerIdentityService
 from core.runtime_control import (
     DEFAULT_CONTROL_MAX_REQUEST_BYTES,
     DEFAULT_CONTROL_SOCKET_MODE,
@@ -588,6 +590,12 @@ class _MainTestForwarder:
         self.close_count += 1
 
 
+class _MainTestIdentity:
+    generated = False
+    public_path = "unused"
+    private_key = object()
+
+
 def _configure_main_lifecycle_test(
     monkeypatch,
     *,
@@ -621,6 +629,13 @@ def _configure_main_lifecycle_test(
         "build_optional_routing_control_server",
         lambda *_args: control_server,
     )
+    monkeypatch.setattr(
+        aismixer,
+        "prepare_udpsec_ingress_activation",
+        lambda active_sec_inputs: (
+            _MainTestIdentity() if active_sec_inputs else None
+        ),
+    )
     if supervisor is not None:
         monkeypatch.setattr(
             aismixer,
@@ -629,6 +644,420 @@ def _configure_main_lifecycle_test(
         )
 
     return state, output_forwarder, processor
+
+
+def test_plain_activation_skips_udpsec_runtime_loading(monkeypatch):
+    calls = []
+
+    class IdentityService:
+        def ensure_for_sec_inputs(self, sec_inputs):
+            calls.append(tuple(sec_inputs))
+            return None
+
+    def fail_secure_load():
+        raise AssertionError("plain activation must not load UDPSEC runtime")
+
+    monkeypatch.setattr(aismixer, "_load_secure_server", fail_secure_load)
+
+    identity = aismixer.prepare_udpsec_ingress_activation(
+        [],
+        identity_service=IdentityService(),
+    )
+
+    assert identity is None
+    assert calls == []
+
+
+def test_udpsec_transport_preflight_precedes_identity_ensure(monkeypatch):
+    calls = []
+    expected_identity = _MainTestIdentity()
+
+    class IdentityService:
+        def ensure_for_sec_inputs(self, sec_inputs):
+            calls.append(("identity", tuple(sec_inputs)))
+            return expected_identity
+
+    monkeypatch.setattr(
+        aismixer,
+        "_load_secure_server",
+        lambda: calls.append(("transport",)),
+    )
+
+    identity = aismixer.prepare_udpsec_ingress_activation(
+        [{"listen_ip": "127.0.0.1", "listen_port": 19999}],
+        identity_service=IdentityService(),
+    )
+
+    assert identity is expected_identity
+    assert calls == [
+        ("transport",),
+        (
+            "identity",
+            ({"listen_ip": "127.0.0.1", "listen_port": 19999},),
+        ),
+    ]
+
+
+def test_udpsec_transport_preflight_failure_creates_no_identity(
+    monkeypatch,
+    tmp_path,
+):
+    keys_dir = tmp_path / "keys"
+    service = UdpsecServerIdentityService(keys_dir=keys_dir)
+
+    def fail_transport_preflight():
+        raise ValueError("invalid authorized identity configuration")
+
+    monkeypatch.setattr(
+        aismixer,
+        "_load_secure_server",
+        fail_transport_preflight,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="invalid authorized identity configuration",
+    ):
+        aismixer.prepare_udpsec_ingress_activation(
+            [{"listen_ip": "127.0.0.1", "listen_port": 19999}],
+            identity_service=service,
+        )
+
+    assert not keys_dir.exists()
+
+
+def test_udpsec_input_policy_preserves_hostname_compatibility():
+    policies = aismixer.compile_input_policies(
+        [{"listen_ip": "localhost", "listen_port": 19999}],
+        "sec_inputs",
+    )
+
+    assert len(policies) == 1
+
+
+@pytest.mark.parametrize("kind", ("udp_inputs", "sec_inputs"))
+def test_input_policy_preserves_empty_wildcard_compatibility(kind):
+    policies = aismixer.compile_input_policies(
+        [{"listen_ip": "", "listen_port": 19999}],
+        kind,
+    )
+
+    assert len(policies) == 1
+
+
+def test_plain_main_with_no_identity_starts_without_creating_keys(
+    monkeypatch,
+    tmp_path,
+):
+    async def scenario():
+        real_prepare = aismixer.prepare_udpsec_ingress_activation
+        service = UdpsecServerIdentityService(keys_dir=tmp_path / "keys")
+        supervision_calls = []
+
+        async def supervisor(task_specs):
+            supervision_calls.append(tuple(task_specs))
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            supervisor=supervisor,
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "prepare_udpsec_ingress_activation",
+            lambda sec_inputs: real_prepare(
+                sec_inputs,
+                identity_service=service,
+            ),
+        )
+
+        await aismixer.main()
+
+        assert len(supervision_calls) == 1
+        assert not (tmp_path / "keys").exists()
+
+    asyncio.run(scenario())
+
+
+def test_main_prepares_udpsec_identity_before_runtime_activation(monkeypatch):
+    async def scenario():
+        events = []
+        udp_socket = _MainTestSocket()
+
+        async def supervisor(_task_specs):
+            events.append("supervisor")
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10111,
+                },
+            ),
+            udp_inputs=(
+                {
+                    "id": "plain",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10110,
+                },
+            ),
+            sockets=(udp_socket,),
+            supervisor=supervisor,
+        )
+
+        def prepare(sec_inputs):
+            events.append(("identity", tuple(sec_inputs)))
+            return _MainTestIdentity()
+
+        def create_processor():
+            events.append("processor")
+            return object()
+
+        original_socket_factory = aismixer.create_udp_listener_socket
+
+        def create_socket(listen_ip, *, reuse_address):
+            events.append("listener")
+            return original_socket_factory(
+                listen_ip,
+                reuse_address=reuse_address,
+            )
+
+        monkeypatch.setattr(
+            aismixer,
+            "prepare_udpsec_ingress_activation",
+            prepare,
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "create_data_plane_processor",
+            create_processor,
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "create_udp_listener_socket",
+            create_socket,
+        )
+
+        await aismixer.main()
+
+        assert events[0][0] == "identity"
+        assert events[1:] == ["processor", "listener", "supervisor"]
+
+    asyncio.run(scenario())
+
+
+def test_udpsec_main_generates_and_injects_prepared_identity(
+    monkeypatch,
+    tmp_path,
+):
+    async def scenario():
+        real_prepare = aismixer.prepare_udpsec_ingress_activation
+        service = UdpsecServerIdentityService(keys_dir=tmp_path / "keys")
+        supervision_calls = []
+        transport_preflights = []
+
+        async def supervisor(task_specs):
+            supervision_calls.append(tuple(task_specs))
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10111,
+                },
+            ),
+            supervisor=supervisor,
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "_load_secure_server",
+            lambda: transport_preflights.append("transport"),
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "prepare_udpsec_ingress_activation",
+            lambda sec_inputs: real_prepare(
+                sec_inputs,
+                identity_service=service,
+            ),
+        )
+
+        await aismixer.main()
+
+        assert transport_preflights == ["transport"]
+        assert len(supervision_calls) == 1
+        secure_factory = supervision_calls[0][0].coroutine_factory
+        prepared_private_key = secure_factory.keywords["server_private_key"]
+        private_path = tmp_path / "keys" / "aismixer_private.pem"
+        public_path = tmp_path / "keys" / "aismixer_public.pem"
+        loaded_private_key = serialization.load_pem_private_key(
+            private_path.read_bytes(),
+            password=None,
+        )
+        loaded_public_key = serialization.load_pem_public_key(
+            public_path.read_bytes()
+        )
+        assert (
+            prepared_private_key.public_key().public_numbers()
+            == loaded_private_key.public_key().public_numbers()
+            == loaded_public_key.public_numbers()
+        )
+
+    asyncio.run(scenario())
+
+
+def test_udpsec_identity_failure_prevents_runtime_activation(
+    monkeypatch,
+    tmp_path,
+):
+    async def scenario():
+        real_prepare = aismixer.prepare_udpsec_ingress_activation
+        keys_dir = tmp_path / "keys"
+        keys_dir.mkdir()
+        private_path = keys_dir / "aismixer_private.pem"
+        private_path.write_bytes(b"preserve operator private material")
+        service = UdpsecServerIdentityService(keys_dir=keys_dir)
+        udp_socket = _MainTestSocket()
+        _, output_forwarder, _ = _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10111,
+                },
+            ),
+            udp_inputs=(
+                {
+                    "id": "plain",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10110,
+                },
+            ),
+            sockets=(udp_socket,),
+        )
+
+        def prepare_with_incomplete_identity(sec_inputs):
+            return real_prepare(sec_inputs, identity_service=service)
+
+        monkeypatch.setattr(
+            aismixer,
+            "prepare_udpsec_ingress_activation",
+            prepare_with_incomplete_identity,
+        )
+
+        with pytest.raises(RuntimeError, match="identity is incomplete"):
+            await aismixer.main()
+
+        assert udp_socket.bind_calls == []
+        assert udp_socket.close_count == 0
+        assert output_forwarder.close_count == 0
+        assert private_path.read_bytes() == b"preserve operator private material"
+        assert not (keys_dir / "aismixer_public.pem").exists()
+
+    asyncio.run(scenario())
+
+
+def test_invalid_udpsec_candidate_fails_before_identity_ensure(monkeypatch):
+    async def scenario():
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "invalid",
+                    "listen_ip": "127.0.0.1",
+                },
+            ),
+        )
+
+        def fail_if_called(_sec_inputs):
+            raise AssertionError("identity ensure ran before config validation")
+
+        monkeypatch.setattr(
+            aismixer,
+            "prepare_udpsec_ingress_activation",
+            fail_if_called,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"sec_inputs\[0\]\.listen_port",
+        ):
+            await aismixer.main()
+
+    asyncio.run(scenario())
+
+
+def test_invalid_runtime_capacity_fails_before_identity_ensure(monkeypatch):
+    async def scenario():
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10111,
+                },
+            ),
+        )
+
+        def fail_if_called(_sec_inputs):
+            raise AssertionError("identity ensure ran before runtime validation")
+
+        monkeypatch.setattr(
+            aismixer,
+            "prepare_udpsec_ingress_activation",
+            fail_if_called,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="processing_queue_maxsize must be at least 1",
+        ):
+            await aismixer.main(processing_queue_maxsize=0)
+
+    asyncio.run(scenario())
+
+
+def test_invalid_control_candidate_fails_before_udpsec_identity_ensure(
+    monkeypatch,
+):
+    async def scenario():
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10111,
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "config",
+            {"control": {"unix": {"enabled": True}}},
+        )
+
+        def fail_if_called(_sec_inputs):
+            raise AssertionError("identity ensure ran before config validation")
+
+        monkeypatch.setattr(
+            aismixer,
+            "prepare_udpsec_ingress_activation",
+            fail_if_called,
+        )
+
+        with pytest.raises(
+            RuntimeControlConfigError,
+            match="socket_path",
+        ):
+            await aismixer.main()
+
+    asyncio.run(scenario())
 
 
 def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
@@ -709,6 +1138,11 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
 
         assert all(
             factory.func is aismixer.secure_server
+            for factory in secure_factories
+        )
+        assert all(
+            factory.keywords["server_private_key"]
+            is not None
             for factory in secure_factories
         )
         assert [factory.args[1:] for factory in secure_factories] == [

@@ -55,6 +55,9 @@ under `/etc/aismixer` while preserving existing configuration and keys, installs
 `/usr/local/bin/aismixerctl`, and enables the `aismixer` service at boot. It
 intentionally does **not** start the service. Review
 `/etc/aismixer/config.yaml` before exposing the service outside a trusted network.
+The installer does not create the UDPSEC server key pair and always leaves any
+existing key material untouched. Runtime ensures that identity later only when
+an active configuration requires UDPSEC.
 
 #### Update
 
@@ -68,9 +71,12 @@ systemctl status aismixer
 ```
 
 `update.sh` refreshes installed runtime files, the systemd unit, and
-`aismixerctl`, reloads systemd, and **restarts the `aismixer` service**. It leaves
-operator configuration and keys under `/etc/aismixer` untouched. `uninstall.sh`
-preserves that directory unless `--purge-config` is explicitly requested.
+`aismixerctl`, reloads systemd, and **restarts the `aismixer` service**. The
+script does not directly modify operator configuration or key files under
+`/etc/aismixer`; after restart, the runtime may create a previously absent
+server pair when the active configuration requires UDPSEC. Existing key
+material remains untouched. `uninstall.sh` preserves that directory unless
+`--purge-config` is explicitly requested.
 
 ### OpenWrt 25.12
 
@@ -125,10 +131,13 @@ The `mips_24kc` package path has been validated end to end: physical serial AIS
 ingress → `nmea_sproxy` → authenticated UDPSEC → `aismixer` → processing, egress,
 and control-plane operation.
 
-On first start, the `aismixer` service automatically generates or repairs its
-local server identity when required, uses the OpenWrt configuration and identity
-layout under `/etc/aismixer`, and runs through procd. `nmea_sproxy` likewise
-generates or repairs its local station identity.
+The release-pinned OpenWrt v0.2 package retains its existing procd pre-start
+identity preparation, including public-key repair, and does not yet implement
+the demand-driven conventional Linux lifecycle described below. Its installed
+key tool is `/usr/lib/aismixer/tools/aismixer_keys.py`. The current source and
+systemd runtime never repairs existing server material; repair there is an
+explicit operator action. `nmea_sproxy` retains its separate station-identity
+lifecycle.
 
 For UDPSEC, peer trust is never provisioned automatically. Copy
 `/etc/aismixer/keys/aismixer_public.pem` from the mixer to the proxy's configured
@@ -224,6 +233,21 @@ forwarders:
     port: 19000
 ```
 
+UDPSEC server identity is configuration-driven. Before activating a validated
+configuration, AISMixer checks the active `sec_inputs` list. A plain-only
+configuration with that list omitted or empty starts without server keys and
+creates none. With non-empty `sec_inputs`, AISMixer creates the pair only when
+neither member exists. It preserves a complete, valid, matching pair unchanged
+and refuses activation without modifying key material when the pair is partial,
+invalid, or mismatched. Repair remains an explicit operator action through
+`python3 /opt/aismixer/tools/aismixer_keys.py server --repair-public` (or
+`python3 tools/aismixer_keys.py server --repair-public` from a checkout). This
+identity check is a shared, reusable pre-activation gate rather than a
+startup-only process action:
+any runtime configuration candidate that would activate UDPSEC must pass it
+before its ingress becomes active. The current live snapshot mechanism changes
+routing only and does not reload ingress configuration.
+
 The repository examples are inactive until copied or adapted. See
 [`examples/config-routing.yaml`](examples/config-routing.yaml) for static
 routing and
@@ -317,7 +341,9 @@ chmod +x install.sh
 ```
 
 The proxy installer prepares the configuration layout and station key pair while
-preserving existing operator material, installs singleton and template units,
+preserving an existing station private key. When that private key exists, the
+installer invokes the key tool's `--repair-public` operation, which may create
+or replace its derived public mate. It installs singleton and template units,
 enables only the singleton, and starts no service. Complete the relation
 configuration and, for the default UDPSEC mode, the trusted public-key setup for
 the `aismixer` service described in the [operator guide](nmea_sproxy/README.md),
@@ -631,6 +657,9 @@ systemctl status aismixer
 ключове, инсталира `/usr/local/bin/aismixerctl` и включва услугата `aismixer` за
 автоматично стартиране при boot. Умишлено **не** стартира услугата. Прегледайте
 `/etc/aismixer/config.yaml`, преди да изложите услугата извън доверена мрежа.
+Инсталаторът не създава ключовата двойка за UDPSEC сървърната идентичност и
+винаги оставя съществуващите ключови файлове непроменени. Runtime-ът осигурява
+тази идентичност по-късно само ако активната конфигурация изисква UDPSEC.
 
 #### Обновяване
 
@@ -645,9 +674,12 @@ systemctl status aismixer
 ```
 
 `update.sh` обновява инсталираните runtime файлове, systemd unit-а и
-`aismixerctl`, презарежда systemd и **рестартира услугата `aismixer`**. Операторските
-конфигурации и ключове в `/etc/aismixer` остават непроменени. `uninstall.sh`
-запазва тази директория, освен ако изрично не е зададено `--purge-config`.
+`aismixerctl`, презарежда systemd и **рестартира услугата `aismixer`**. Самият
+скрипт не променя операторската конфигурация или ключовите файлове в
+`/etc/aismixer`; след рестарта runtime-ът може да създаде липсваща сървърна
+двойка, ако активната конфигурация изисква UDPSEC. Съществуващият ключов материал
+остава непроменен. `uninstall.sh` запазва тази директория, освен ако изрично не е
+зададено `--purge-config`.
 
 ### OpenWrt 25.12
 
@@ -704,10 +736,14 @@ apk add nmea_sproxy
 сериен AIS вход → `nmea_sproxy` → автентикиран UDPSEC → `aismixer` → обработка,
 изход и работа на слоя за управление.
 
-При първото стартиране услугата `aismixer` автоматично генерира или поправя при
-необходимост локалната си сървърна идентичност, използва OpenWrt структурата за
-конфигурация и идентичност в `/etc/aismixer` и се стартира чрез procd.
-`nmea_sproxy` прави същото за локалната идентичност на станцията.
+Закованият към версия OpenWrt v0.2 пакет запазва съществуващата procd
+предварителна подготовка на идентичността, включително поправка на публичния
+ключ, и все още не прилага описания по-долу определян от конфигурацията жизнен
+цикъл за conventional Linux. Инсталираният инструмент за ключове е
+`/usr/lib/aismixer/tools/aismixer_keys.py`. Текущият source и systemd runtime
+никога не поправя съществуващ сървърен ключов материал; там поправката е изрично
+операторско действие. `nmea_sproxy` запазва отделния си жизнен цикъл за
+идентичността на станцията.
 
 При UDPSEC доверието към отсрещната страна никога не се настройва автоматично.
 Копирайте `/etc/aismixer/keys/aismixer_public.pem` от хоста, на който работи
@@ -808,6 +844,22 @@ forwarders:
     port: 19000
 ```
 
+Жизненият цикъл на UDPSEC сървърната идентичност се определя от конфигурацията.
+Преди да активира валидирана конфигурация, AISMixer проверява активния списък
+`sec_inputs`. Plain-only конфигурация с липсващ или празен списък стартира без
+сървърни ключове и не създава такива. При непразен `sec_inputs` AISMixer създава
+двойката само ако нито един от двата файла не съществува. Услугата запазва
+непроменена пълна, валидна и съответстваща ключова двойка и отказва активиране,
+без да променя ключовия материал, ако двойката е непълна, невалидна или ключовете
+не съответстват. Поправката остава изрично операторско действие чрез
+`python3 /opt/aismixer/tools/aismixer_keys.py server --repair-public` (или
+`python3 tools/aismixer_keys.py server --repair-public` от локално копие). Тази
+проверка на идентичността е споделена и преизползваема предварителна стъпка за
+активиране, а не действие само при стартиране на процеса: всеки кандидат за runtime
+конфигурация, който би активирал UDPSEC, трябва да я премине, преди входът му да
+стане активен. Текущият механизъм за live snapshots променя само маршрутизацията
+и не презарежда ingress конфигурацията.
+
 Примерите в хранилището са неактивни, докато не бъдат копирани или адаптирани.
 Вижте [`examples/config-routing.yaml`](examples/config-routing.yaml) за статична
 маршрутизация и
@@ -902,8 +954,10 @@ chmod +x install.sh
 ```
 
 Инсталаторът на проксито подготвя структурата за конфигурация и ключовата двойка
-на станцията, като запазва съществуващите операторски данни, инсталира singleton
-и template unit-и, включва само singleton услугата и не стартира услуга.
+на станцията, като запазва съществуващия частен ключ. Когато той съществува,
+инсталаторът извиква операцията `--repair-public` на инструмента за ключове,
+която може да създаде или замени изведения от него публичен ключ. Инсталира
+singleton и template unit-и, включва само singleton услугата и не стартира услуга.
 Завършете конфигурацията на връзката и, за UDPSEC режима по подразбиране,
 настройката на доверения публичен ключ на услугата `aismixer`, описани в [операторското
 ръководство](nmea_sproxy/README.md), след което я стартирайте:
@@ -1224,6 +1278,9 @@ din `/etc/aismixer` păstrând configurația și cheile existente, instalează
 boot. În mod intenționat, **nu** pornește serviciul. Verificați
 `/etc/aismixer/config.yaml` înainte de a expune serviciul în afara unei rețele de
 încredere.
+Instalatorul nu creează perechea de chei pentru identitatea serverului UDPSEC și
+lasă întotdeauna nemodificat orice material de cheie existent. Runtime-ul
+asigură identitatea ulterior numai dacă o configurație activă necesită UDPSEC.
 
 #### Actualizare
 
@@ -1238,9 +1295,12 @@ systemctl status aismixer
 ```
 
 `update.sh` actualizează fișierele runtime instalate, unitatea systemd și
-`aismixerctl`, reîncarcă systemd și **repornește serviciul `aismixer`**. Configurația și
-cheile operatorului din `/etc/aismixer` rămân nemodificate. `uninstall.sh`
-păstrează acel director dacă `--purge-config` nu este cerut explicit.
+`aismixerctl`, reîncarcă systemd și **repornește serviciul `aismixer`**. Scriptul
+nu modifică direct configurația sau fișierele de chei ale operatorului din
+`/etc/aismixer`; după repornire, runtime-ul poate crea o pereche de server care
+lipsea dacă configurația activă necesită UDPSEC. Materialul de cheie existent
+rămâne nemodificat. `uninstall.sh` păstrează acel director dacă
+`--purge-config` nu este cerut explicit.
 
 ### OpenWrt 25.12
 
@@ -1297,10 +1357,14 @@ Fluxul de implementare pentru pachetul `mips_24kc` a fost validat end-to-end:
 intrare AIS prin port serial fizic → `nmea_sproxy` → UDPSEC autentificat →
 `aismixer` → procesare, ieșire și funcționarea planului de control.
 
-La prima pornire, serviciul `aismixer` generează sau repară automat, după caz,
-identitatea locală a serverului, folosește structura OpenWrt pentru configurare
-și identitate din `/etc/aismixer` și pornește prin procd. `nmea_sproxy` procedează
-la fel pentru identitatea locală a stației.
+Pachetul OpenWrt v0.2 fixat la o versiune păstrează pregătirea existentă a
+identității înainte de pornire prin procd, inclusiv repararea cheii publice, și
+încă nu implementează ciclul determinat de configurație pentru Linux
+convențional descris mai jos. Instrumentul de chei instalat se află la
+`/usr/lib/aismixer/tools/aismixer_keys.py`. Runtime-ul curent din sursă și pentru
+systemd nu repară niciodată materialul existent al serverului; acolo repararea
+este o acțiune explicită a operatorului. `nmea_sproxy` își păstrează ciclul
+separat de viață pentru identitatea stației.
 
 Pentru UDPSEC, încrederea în peer nu este configurată niciodată automat. Copiați
 `/etc/aismixer/keys/aismixer_public.pem` de pe gazda pe care rulează `aismixer`
@@ -1400,6 +1464,23 @@ forwarders:
     port: 19000
 ```
 
+Ciclul de viață al identității serverului UDPSEC este determinat de
+configurație. Înainte de a activa o configurație validată, AISMixer verifică
+lista `sec_inputs` activă. O configurație numai cu UDP simplu, în care lista
+lipsește sau este goală, pornește fără chei de server și nu creează niciuna. Cu
+`sec_inputs` nevid, AISMixer creează perechea numai dacă niciun membru nu există.
+Păstrează nemodificată o pereche completă, validă și concordantă și refuză
+activarea, fără să modifice materialul de cheie, dacă perechea este parțială,
+nevalidă sau cheile nu corespund. Repararea rămâne o acțiune explicită a
+operatorului prin
+`python3 /opt/aismixer/tools/aismixer_keys.py server --repair-public` (sau
+`python3 tools/aismixer_keys.py server --repair-public` dintr-un checkout).
+Această verificare a identității este un control comun și reutilizabil înainte
+de activare, nu o acțiune legată doar de pornirea procesului: orice configurație
+runtime candidată care ar activa UDPSEC trebuie să treacă acest control înainte
+ca ingress-ul să devină activ. Mecanismul live actual de snapshot-uri modifică
+numai rutarea și nu reîncarcă configurația ingress.
+
 Exemplele din repository sunt inactive până când sunt copiate sau adaptate.
 Consultați [`examples/config-routing.yaml`](examples/config-routing.yaml) pentru
 rutare statică și
@@ -1497,9 +1578,11 @@ chmod +x install.sh
 ```
 
 Programul de instalare al proxy-ului pregătește structura de configurare și
-perechea de chei a stației, păstrând materialul existent al operatorului,
-instalează unitățile singleton și template, activează numai singleton-ul și nu
-pornește niciun serviciu. Finalizați configurarea relației și, pentru modul
+perechea de chei a stației, păstrând cheia privată existentă. Când aceasta
+există, programul de instalare invocă operația `--repair-public` a instrumentului
+de chei, care poate crea sau înlocui cheia publică derivată. Instalează unitățile
+singleton și template, activează numai singleton-ul și nu pornește niciun
+serviciu. Finalizați configurarea relației și, pentru modul
 UDPSEC implicit, configurarea cheii publice de încredere a serviciului
 `aismixer` descrisă în [ghidul operatorului](nmea_sproxy/README.md), apoi porniți
 serviciul:

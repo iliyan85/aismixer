@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import shutil
 import subprocess
 import stat
 import sys
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +51,23 @@ def run_station_wrapper(cwd, script, keys_dir, *extra_args):
     )
 
 
+def run_key_tool(cwd, script, keys_dir, *extra_args):
+    return subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "server",
+            "--keys-dir",
+            str(keys_dir),
+            *extra_args,
+        ],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_server_key_files_are_created(tmp_path):
     tool = load_key_tool()
 
@@ -64,6 +83,36 @@ def test_server_key_files_are_created(tmp_path):
     assert result.public_path.exists()
 
 
+def test_server_cli_runs_outside_repository_after_runtime_extraction(tmp_path):
+    installed_root = tmp_path / "installed"
+    installed_tools = installed_root / "tools"
+    installed_core = installed_root / "core"
+    installed_tools.mkdir(parents=True)
+    installed_core.mkdir()
+    installed_tool = installed_tools / "aismixer_keys.py"
+    shutil.copy2(KEY_TOOL_PATH, installed_tool)
+    shutil.copy2(ROOT / "core" / "key_material.py", installed_core)
+
+    unrelated_cwd = tmp_path / "unrelated-working-directory"
+    unrelated_cwd.mkdir()
+    keys_dir = tmp_path / "server-keys"
+
+    result = run_key_tool(unrelated_cwd, installed_tool, keys_dir)
+
+    assert result.returncode == 0, result.stderr
+    private_path = keys_dir / "aismixer_private.pem"
+    public_path = keys_dir / "aismixer_public.pem"
+    assert private_path.exists()
+    assert public_path.exists()
+    assert (
+        load_private_key(private_path).public_key().public_numbers()
+        == load_public_key(public_path).public_numbers()
+    )
+    assert "Generated AISMixer server key pair" in result.stdout
+    assert f"Private key: {private_path}" in result.stdout
+    assert f"Public key:  {public_path}" in result.stdout
+
+
 def test_generated_public_key_matches_private_key(tmp_path):
     tool = load_key_tool()
     result = tool.generate_key_pair(
@@ -76,6 +125,24 @@ def test_generated_public_key_matches_private_key(tmp_path):
     public_key = load_public_key(result.public_path)
 
     assert private_key.public_key().public_numbers() == public_key.public_numbers()
+
+
+def test_generated_key_format_and_curve_remain_udpsec_compatible(tmp_path):
+    tool = load_key_tool()
+    result = tool.generate_key_pair(
+        tmp_path,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+    )
+
+    assert result.private_path.read_bytes().startswith(
+        b"-----BEGIN EC PRIVATE KEY-----\n"
+    )
+    assert result.public_path.read_bytes().startswith(
+        b"-----BEGIN PUBLIC KEY-----\n"
+    )
+    assert isinstance(load_private_key(result.private_path).curve, ec.SECP256R1)
+    assert isinstance(load_public_key(result.public_path).curve, ec.SECP256R1)
 
 
 def test_existing_files_are_not_overwritten_without_force(tmp_path):
