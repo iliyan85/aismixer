@@ -62,6 +62,9 @@ define Package/aismixer/description
 endef
 
 
+# The matching OpenWrt 25.12 feeds do not provide Python setproctitle.
+# Named relation identity is therefore exposed through procd instance names,
+# not OS process titles.
 define Package/nmea_sproxy
   $(call Package/aismixer/Default)
   TITLE:=AIS/NMEA serial and UDP secure proxy

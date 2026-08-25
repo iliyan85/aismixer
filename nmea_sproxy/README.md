@@ -513,9 +513,9 @@ supervises the optional backward-compatible singleton and any named relations:
 
 ```text
 /etc/init.d/nmea_sproxy
-    ├── /etc/nmea_sproxy/config.yaml            -> nmea_sproxy
-    ├── /etc/nmea_sproxy/instances/boat.yaml    -> nmea_sproxy@boat
-    └── /etc/nmea_sproxy/instances/roof.yaml    -> nmea_sproxy@roof
+    |-- /etc/nmea_sproxy/config.yaml            -> unnamed/default procd instance
+    |-- /etc/nmea_sproxy/instances/boat.yaml    -> procd instance "boat"
+    `-- /etc/nmea_sproxy/instances/roof.yaml    -> procd instance "roof"
 ```
 
 The singleton starts when `/etc/nmea_sproxy/config.yaml` is a regular file. A
@@ -525,11 +525,18 @@ active named YAML. Operator-created files in that directory are not overwritten
 on package installation or update.
 
 Only regular files named `*.yaml` are discovered. The filename stem becomes the
-procd instance and process-title suffix; accepted names match
+named procd instance; accepted names match
 `[A-Za-z0-9][A-Za-z0-9_.-]*`. Unsafe names are logged and skipped rather than
 renamed or interpreted. Unrelated files are ignored. Each
 accepted YAML still defines exactly one local UDP or serial input and one
 UDPSEC or plain-UDP output.
+
+The matching OpenWrt 25.12 package feeds do not provide
+`python3-setproctitle`. The OpenWrt package therefore does not pass
+`--process-title` or promise custom OS process titles. Use the procd instance
+name as the relation identity; the exact `--config` path remains visible in the
+process command line. This limitation does not apply to the conventional
+Linux/systemd installer, which installs `setproctitle`.
 
 One procd name is conditionally reserved: OpenWrt internally calls a
 successfully started unnamed singleton `instance1`. When that singleton starts,
@@ -564,6 +571,7 @@ mkdir -p /etc/nmea_sproxy/instances
 cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
 vi /etc/nmea_sproxy/instances/boat.yaml
 /etc/init.d/nmea_sproxy restart
+ubus call service list '{"name":"nmea_sproxy"}'
 ps w | grep '[n]mea_sproxy'
 logread -e nmea_sproxy
 ```

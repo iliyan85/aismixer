@@ -61,8 +61,7 @@ valid_instance_name() {
 start_relation() {
 	local config="$1"
 	local instance_name="$2"
-	local process_title="$3"
-	local relation_label="$4"
+	local relation_label="$3"
 
 	if [ ! -f "$config" ]; then
 		logger -t nmea_sproxy \
@@ -84,8 +83,7 @@ start_relation() {
 
 	procd_set_param command \
 		"$PROG" \
-		--config "$config" \
-		--process-title "$process_title"
+		--config "$config"
 
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -106,7 +104,7 @@ start_service() {
 
 	if [ -e "$CONFIG" ]; then
 		configured=$((configured + 1))
-		if start_relation "$CONFIG" "" "nmea_sproxy" "singleton"; then
+		if start_relation "$CONFIG" "" "singleton"; then
 			started=$((started + 1))
 			singleton_started=1
 		fi
@@ -133,7 +131,6 @@ start_service() {
 		if start_relation \
 			"$config" \
 			"$instance_name" \
-			"nmea_sproxy@$instance_name" \
 			"named '$instance_name'"; then
 			started=$((started + 1))
 		fi

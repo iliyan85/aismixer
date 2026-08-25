@@ -311,7 +311,7 @@ exit 0
     )
 
 
-def relation_events(config, *, instance_name=None, process_title):
+def relation_events(config, *, instance_name=None):
     open_event = (
         ("open",)
         if instance_name is None
@@ -326,8 +326,6 @@ def relation_events(config, *, instance_name=None, process_title):
             "/mock/usr/bin/nmea_sproxy",
             "--config",
             config,
-            "--process-title",
-            process_title,
         ),
         ("param", "stdout", "1"),
         ("param", "stderr", "1"),
@@ -453,6 +451,16 @@ def test_openwrt_packages_pin_expected_release_source_metadata():
     ) == [EXPECTED_OPENWRT_MIRROR_HASH]
 
 
+def test_openwrt_nmea_sproxy_uses_procd_names_without_unavailable_title_dependency():
+    recipe = read_text(PACKAGE_DIR / "Makefile")
+    package = makefile_block(recipe, "Package/nmea_sproxy")
+    init = read_text(PACKAGE_FILES / "nmea_sproxy.init")
+
+    assert "python3-setproctitle" not in package
+    assert "OpenWrt 25.12 does not package Python setproctitle" in recipe
+    assert "--process-title" not in init
+
+
 def test_openwrt_common_package_copies_complete_core_tree():
     recipe = read_text(PACKAGE_DIR / "Makefile")
     install = makefile_block(recipe, "Package/aismixer-common/install")
@@ -545,7 +553,6 @@ def test_openwrt_nmea_sproxy_init_defines_multi_instance_contract():
     assert "valid_instance_name()" in init
     assert 'for config in "$INSTANCES_DIR"/*.yaml; do' in init
     assert 'instance_name="${filename%.yaml}"' in init
-    assert '"nmea_sproxy@$instance_name"' in init
     assert "[!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*" in init
     assert "config_load" not in init
     assert "config_foreach" not in init
@@ -586,14 +593,11 @@ def test_openwrt_nmea_sproxy_singleton_uses_unnamed_instance_and_exact_params(
     result = run_init_harness(tmp_path, singleton="file")
 
     assert result.service_status == 0
-    assert operational_events(result) == relation_events(
-        result.singleton_config,
-        process_title="nmea_sproxy",
-    )
+    assert operational_events(result) == relation_events(result.singleton_config)
     assert logger_messages(result) == []
 
 
-def test_openwrt_nmea_sproxy_named_relation_uses_stem_and_exact_title(tmp_path):
+def test_openwrt_nmea_sproxy_named_relation_uses_stem_as_procd_name(tmp_path):
     result = run_init_harness(tmp_path, instances=("boat.yaml",))
     config = result.instance_config("boat.yaml")
 
@@ -601,7 +605,6 @@ def test_openwrt_nmea_sproxy_named_relation_uses_stem_and_exact_title(tmp_path):
     assert operational_events(result) == relation_events(
         config,
         instance_name="boat",
-        process_title="nmea_sproxy@boat",
     )
     assert logger_messages(result) == []
 
@@ -622,7 +625,6 @@ def test_openwrt_nmea_sproxy_multiple_named_relations_use_glob_order(tmp_path):
         for event in relation_events(
             result.instance_config(f"{name}.yaml"),
             instance_name=name,
-            process_title=f"nmea_sproxy@{name}",
         )
     )
 
@@ -638,19 +640,14 @@ def test_openwrt_nmea_sproxy_singleton_precedes_named_relations(tmp_path):
         instances=("yacht.yaml", "balchik_roof.yaml"),
     )
     expected = (
-        *relation_events(
-            result.singleton_config,
-            process_title="nmea_sproxy",
-        ),
+        *relation_events(result.singleton_config),
         *relation_events(
             result.instance_config("balchik_roof.yaml"),
             instance_name="balchik_roof",
-            process_title="nmea_sproxy@balchik_roof",
         ),
         *relation_events(
             result.instance_config("yacht.yaml"),
             instance_name="yacht",
-            process_title="nmea_sproxy@yacht",
         ),
     )
 
@@ -668,14 +665,10 @@ def test_openwrt_nmea_sproxy_rejects_internal_default_name_with_singleton(
         instances=("instance1.yaml", "boat.yaml"),
     )
     expected = (
-        *relation_events(
-            result.singleton_config,
-            process_title="nmea_sproxy",
-        ),
+        *relation_events(result.singleton_config),
         *relation_events(
             result.instance_config("boat.yaml"),
             instance_name="boat",
-            process_title="nmea_sproxy@boat",
         ),
     )
 
@@ -699,7 +692,6 @@ def test_openwrt_nmea_sproxy_allows_instance1_without_started_singleton(
     assert operational_events(result) == relation_events(
         result.instance_config("instance1.yaml"),
         instance_name="instance1",
-        process_title="nmea_sproxy@instance1",
     )
     assert logger_messages(result) == []
 
@@ -720,7 +712,6 @@ def test_openwrt_nmea_sproxy_allows_instance1_after_singleton_preflight_failure(
         *relation_events(
             result.instance_config("instance1.yaml"),
             instance_name="instance1",
-            process_title="nmea_sproxy@instance1",
         ),
     )
     assert logger_messages(result) == [
@@ -742,7 +733,6 @@ def test_openwrt_nmea_sproxy_unsafe_names_are_logged_and_skipped(tmp_path):
     assert operational_events(result) == relation_events(
         result.instance_config("safe.yaml"),
         instance_name="safe",
-        process_title="nmea_sproxy@safe",
     )
     assert logger_messages(result) == [
         "Skipping named relation with unsafe instance name '-leading': "

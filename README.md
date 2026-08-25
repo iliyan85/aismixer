@@ -133,13 +133,16 @@ changes still require the post-merge router validation matrix.
 Current R2.1 OpenWrt uses one `/etc/init.d/nmea_sproxy` service to supervise an
 optional backward-compatible singleton at `/etc/nmea_sproxy/config.yaml` plus
 every valid regular `*.yaml` file under `/etc/nmea_sproxy/instances/`. Each YAML
-is one separate process and one relation. The singleton process title is
-`nmea_sproxy`; `boat.yaml` appears as `nmea_sproxy@boat`. OpenWrt internally
-names a successfully started unnamed singleton `instance1`, so a named
-`instance1.yaml` is skipped while that singleton runs; the filename is valid in
-a named-only deployment. Singleton and named relations may otherwise run
-together, and one invalid relation is skipped without suppressing independent
-valid relations. Startup fails only when none succeeds.
+is one separate process and one relation. Relation identity is exposed through
+procd: the singleton uses its unnamed/default instance and `boat.yaml` uses the
+named instance `boat`. The matching OpenWrt 25.12 feeds do not provide
+`python3-setproctitle`, so this package does not promise custom OS process
+titles; inspect procd/ubus state and the command's exact `--config` path instead.
+OpenWrt internally names a successfully started unnamed singleton `instance1`,
+so a named `instance1.yaml` is skipped while that singleton runs; the filename
+is valid in a named-only deployment. Singleton and named relations may otherwise
+run together, and one invalid relation is skipped without suppressing
+independent valid relations. Startup fails only when none succeeds.
 
 A fresh package seeds the canonical singleton and creates an empty named-instance
 directory. Existing legacy top-level YAML remains accepted but deprecated and
@@ -151,6 +154,7 @@ mkdir -p /etc/nmea_sproxy/instances
 cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
 vi /etc/nmea_sproxy/instances/boat.yaml
 /etc/init.d/nmea_sproxy restart
+ubus call service list '{"name":"nmea_sproxy"}'
 ps w | grep '[n]mea_sproxy'
 logread -e nmea_sproxy
 ```
@@ -782,11 +786,15 @@ v0.2. Неговата предварителна подготовка на ид
 управлява незадължителната обратно съвместима singleton връзка от
 `/etc/nmea_sproxy/config.yaml` и всеки валиден обикновен `*.yaml` файл в
 `/etc/nmea_sproxy/instances/`. Всеки YAML е отделен процес и една връзка.
-Заглавието на singleton процеса е `nmea_sproxy`, а `boat.yaml` се показва като
-`nmea_sproxy@boat`. OpenWrt вътрешно именува успешно стартиралия неназован
-singleton `instance1`, затова именуваният `instance1.yaml` се пропуска, докато
-singleton връзката работи; името е допустимо при разполагане само с именувани
-инстанции. Иначе singleton и именувани връзки могат да работят заедно; една
+Идентичността на връзката се показва чрез procd: singleton използва неназованата
+инстанция по подразбиране, а `boat.yaml` използва именуваната инстанция `boat`.
+Съответстващите OpenWrt 25.12 feeds не предоставят `python3-setproctitle`, затова
+пакетът не обещава персонализирани заглавия на OS процесите; проверявайте
+procd/ubus състоянието и точния `--config` път на командата. OpenWrt вътрешно
+именува успешно стартиралия неназован singleton `instance1`, затова именуваният
+`instance1.yaml` се пропуска, докато singleton връзката работи; името е допустимо
+при разполагане само с именувани инстанции. Иначе singleton и именувани връзки
+могат да работят заедно; една
 невалидна връзка се пропуска, без да спира независимите валидни връзки.
 Стартирането е неуспешно само когато нито една връзка не успее.
 
@@ -801,6 +809,7 @@ mkdir -p /etc/nmea_sproxy/instances
 cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
 vi /etc/nmea_sproxy/instances/boat.yaml
 /etc/init.d/nmea_sproxy restart
+ubus call service list '{"name":"nmea_sproxy"}'
 ps w | grep '[n]mea_sproxy'
 logread -e nmea_sproxy
 ```
@@ -1449,11 +1458,15 @@ OpenWrt R2.1 actual folosește un singur serviciu `/etc/init.d/nmea_sproxy` pent
 a superviza singleton-ul opțional compatibil cu versiunile anterioare din
 `/etc/nmea_sproxy/config.yaml` și fiecare fișier obișnuit `*.yaml` valid din
 `/etc/nmea_sproxy/instances/`. Fiecare YAML este un proces separat și o relație.
-Titlul procesului singleton este `nmea_sproxy`, iar `boat.yaml` apare ca
-`nmea_sproxy@boat`. OpenWrt denumește intern `instance1` un singleton fără nume
-care a pornit cu succes, astfel că relația denumită `instance1.yaml` este omisă
-cât timp acel singleton rulează; numele este valid într-o implementare numai cu
-instanțe denumite. În rest, relațiile singleton și denumite pot rula împreună;
+Identitatea relației este expusă prin procd: singleton-ul folosește instanța
+implicită fără nume, iar `boat.yaml` folosește instanța denumită `boat`.
+Feed-urile OpenWrt 25.12 corespunzătoare nu furnizează `python3-setproctitle`,
+deci pachetul nu promite titluri OS personalizate pentru procese; inspectați
+starea procd/ubus și calea exactă `--config` din comandă. OpenWrt denumește
+intern `instance1` un singleton fără nume care a pornit cu succes, astfel că
+relația denumită `instance1.yaml` este omisă cât timp acel singleton rulează;
+numele este valid într-o implementare numai cu instanțe denumite. În rest,
+relațiile singleton și denumite pot rula împreună;
 o relație invalidă este omisă fără a suprima relațiile valide independente.
 Pornirea eșuează numai dacă niciuna nu reușește.
 
@@ -1468,6 +1481,7 @@ mkdir -p /etc/nmea_sproxy/instances
 cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
 vi /etc/nmea_sproxy/instances/boat.yaml
 /etc/init.d/nmea_sproxy restart
+ubus call service list '{"name":"nmea_sproxy"}'
 ps w | grep '[n]mea_sproxy'
 logread -e nmea_sproxy
 ```
