@@ -129,6 +129,19 @@ DEFAULT_CONFIG = {
     "log_level": "INFO",
 }
 
+LEGACY_INPUT_CONFIG_FIELDS = frozenset({"listen_ip", "listen_port", "allow_from"})
+LEGACY_OUTPUT_CONFIG_FIELDS = frozenset({"remote_host", "remote_port", "source_ip"})
+LEGACY_INPUT_DEPRECATION_MESSAGE = (
+    "DEPRECATION: legacy nmea_sproxy input configuration (omitted input or "
+    "top-level listen_ip/listen_port/allow_from) is deprecated; use explicit "
+    "input.type with input.listen_ip/input.listen_port/input.allow_from."
+)
+LEGACY_OUTPUT_DEPRECATION_MESSAGE = (
+    "DEPRECATION: legacy nmea_sproxy UDPSEC output configuration (omitted output "
+    "or top-level remote_host/remote_port/source_ip) is deprecated; use explicit "
+    "output.type with output.host/output.port/output.source_ip."
+)
+
 
 class ProxyConfigError(ValueError):
     """Raised for operator-facing proxy configuration errors."""
@@ -251,6 +264,23 @@ def resolve_config_path(cli_path=None, environ=None):
     return None
 
 
+def report_legacy_config_deprecations(user_config):
+    if not isinstance(user_config, dict):
+        return
+
+    if (
+        "input" not in user_config
+        or LEGACY_INPUT_CONFIG_FIELDS.intersection(user_config)
+    ):
+        print(LEGACY_INPUT_DEPRECATION_MESSAGE, file=sys.stderr)
+
+    if (
+        "output" not in user_config
+        or LEGACY_OUTPUT_CONFIG_FIELDS.intersection(user_config)
+    ):
+        print(LEGACY_OUTPUT_DEPRECATION_MESSAGE, file=sys.stderr)
+
+
 def load_config(path=None):
     config = dict(DEFAULT_CONFIG)
     user_config = None
@@ -258,6 +288,9 @@ def load_config(path=None):
     if selected_path and os.path.exists(selected_path):
         with open(selected_path, 'r') as f:
             user_config = yaml.safe_load(f)
+            if user_config is None:
+                user_config = {}
+            report_legacy_config_deprecations(user_config)
             if user_config:
                 config.update(user_config)
                 if (

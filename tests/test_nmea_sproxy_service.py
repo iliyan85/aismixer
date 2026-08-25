@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -154,23 +155,33 @@ def test_configs_include_inactive_serial_examples_with_placeholder_device_id():
     assert "#   type: serial" in combined
     assert "#   port: COM4" in combined
     assert "# output:" in combined
-    assert "#   type: udpsec" in combined
     assert "#   type: udp" in combined
+    assert "output.type: udpsec" in combined
     assert "Virtual_COM_Port_<device-id>-if00" in combined
 
 
-def test_configs_include_canonical_explicit_udp_input_example():
-    combined = "\n".join(
-        read_proxy_file(name)
-        for name in ("config.yaml", "config.system.yaml")
-    )
+@pytest.mark.parametrize("name", ("config.yaml", "config.system.yaml"))
+def test_shipped_configs_use_canonical_active_endpoints(name):
+    config = yaml.safe_load(read_proxy_file(name))
 
-    assert "# Canonical explicit UDP input example." in combined
-    assert "# input:" in combined
-    assert "#   type: udp" in combined
-    assert "#   listen_ip: '::'" in combined
-    assert "#   listen_port: 50000" in combined
-    assert "#   allow_from:" in combined
+    assert config["input"] == {
+        "type": "udp",
+        "listen_ip": "::",
+        "listen_port": 50000,
+    }
+    assert config["output"] == {
+        "type": "udpsec",
+        "host": "192.0.2.10",
+        "port": 17777,
+    }
+    assert not {
+        "listen_ip",
+        "listen_port",
+        "allow_from",
+        "remote_host",
+        "remote_port",
+        "source_ip",
+    }.intersection(config)
 
 
 def test_install_preserves_existing_system_config():

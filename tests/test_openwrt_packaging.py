@@ -12,6 +12,18 @@ from cryptography.hazmat.primitives.asymmetric import ec
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_DIR = ROOT / "packaging" / "openwrt" / "aismixer"
 PACKAGE_FILES = PACKAGE_DIR / "files"
+CANONICAL_PROXY_UDP_INPUT = (
+    "input:\n"
+    "  type: udp\n"
+    "  listen_ip: '::'\n"
+    "  listen_port: 50000\n"
+)
+CANONICAL_PROXY_UDPSEC_OUTPUT = (
+    "output:\n"
+    "  type: udpsec\n"
+    "  host: 192.168.190.53\n"
+    "  port: 19999\n"
+)
 
 
 def read_text(path):
@@ -225,7 +237,9 @@ def test_openwrt_nmea_sproxy_preflight_rejects_missing_udpsec_peer_key(
 ):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "remote_public_key: trust/custom-peer.pem\n",
+        CANONICAL_PROXY_UDP_INPUT
+        + CANONICAL_PROXY_UDPSEC_OUTPUT
+        + "remote_public_key: trust/custom-peer.pem\n",
         encoding="utf-8",
     )
 
@@ -245,7 +259,8 @@ def test_openwrt_nmea_sproxy_preflight_does_not_require_peer_key_for_udp(
 ):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "remote_public_key: trust/missing-peer.pem\n"
+        CANONICAL_PROXY_UDP_INPUT
+        + "remote_public_key: trust/missing-peer.pem\n"
         "output:\n"
         "  type: udp\n"
         "  host: 192.0.2.20\n"
@@ -267,7 +282,9 @@ def test_openwrt_nmea_sproxy_preflight_accepts_parseable_custom_peer_key(
     write_public_key(peer_key_path)
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "remote_public_key: trust/mixer.pem\n",
+        CANONICAL_PROXY_UDP_INPUT
+        + CANONICAL_PROXY_UDPSEC_OUTPUT
+        + "remote_public_key: trust/mixer.pem\n",
         encoding="utf-8",
     )
 
@@ -284,7 +301,9 @@ def test_openwrt_nmea_sproxy_preflight_rejects_invalid_peer_key(tmp_path):
     peer_key_path.write_text("not a PEM public key\n", encoding="utf-8")
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "remote_public_key: trust/mixer.pem\n",
+        CANONICAL_PROXY_UDP_INPUT
+        + CANONICAL_PROXY_UDPSEC_OUTPUT
+        + "remote_public_key: trust/mixer.pem\n",
         encoding="utf-8",
     )
 
@@ -301,7 +320,8 @@ def test_openwrt_nmea_sproxy_preflight_rejects_invalid_peer_key(tmp_path):
 def test_openwrt_nmea_sproxy_preflight_rejects_invalid_config(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "output:\n"
+        CANONICAL_PROXY_UDP_INPUT
+        + "output:\n"
         "  type: tcp\n"
         "  host: 192.0.2.20\n"
         "  port: 17777\n",

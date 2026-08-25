@@ -2,9 +2,9 @@
 
 `nmea_sproxy` is a station-side network proxy. UDPSEC is AISMixer's
 authenticated encrypted UDP transport; it is not an external standardized
-protocol. UDPSEC remains the secure default and the legacy top-level output
-behavior. Plain UDP output must be selected explicitly and is intended only
-for trusted LAN/VPN compatibility deployments.
+protocol. The shipped configuration selects UDPSEC explicitly. Plain UDP
+output must also be selected explicitly and is intended only for trusted
+LAN/VPN compatibility deployments.
 `nmea_sproxy` does not mix inputs, assemble multipart AIS, deduplicate, rewrite
 TAG metadata, route streams, or fan out to egress targets. AISMixer performs
 those jobs.
@@ -13,7 +13,7 @@ Each `nmea_sproxy` process represents exactly one relation:
 
 ```text
 one local input (UDP or serial) -> one network output (UDPSEC or UDP)
-top-level UDP fields or input.type: udp/serial -> remote_host/remote_port or output
+input.type: udp/serial -> output.type: udpsec/udp
 ```
 
 Run separate processes or systemd template instances for separate relations.
@@ -34,9 +34,9 @@ shared key tooling, and configuration layout while preserving all existing
 operator files under `/etc/nmea_sproxy`; it does not generate, inspect, repair,
 or rotate station identity or peer-trust material.
 
-For explicit plain UDP, configure `output.type: udp`; no station identity or
-trusted peer key is needed. For UDPSEC, including legacy configuration with an
-omitted `output`, complete this pre-start workflow:
+For plain UDP, configure `output.type: udp`; no station identity or trusted peer
+key is needed. For canonical UDPSEC with `output.type: udpsec`, complete this
+pre-start workflow:
 
 1. Edit `/etc/nmea_sproxy/config.yaml` and set the intended `station_id` and
    UDPSEC endpoint.
@@ -105,6 +105,9 @@ source and the conventional Linux/systemd path. The release-pinned OpenWrt v0.2
 package is unchanged: its procd hook still prepares and may repair station
 identity before start, including for a plain-UDP relation. See the root
 [OpenWrt section](../README.md#openwrt-2512) for that distinction.
+This carve-out also covers configuration syntax: the source/systemd
+deprecation described below does not retroactively change the pinned package
+configuration or procd behavior.
 
 ### Guide map
 
@@ -168,10 +171,16 @@ address; `nmea_sproxy` does not authenticate `station_id` in plain UDP mode.
 A minimal relation looks like this:
 
 ```yaml
-listen_ip: "::"
-listen_port: 50000
-remote_host: 192.0.2.10
-remote_port: 17777
+input:
+  type: udp
+  listen_ip: "::"
+  listen_port: 50000
+
+output:
+  type: udpsec
+  host: 192.0.2.10
+  port: 17777
+
 station_id: boat_001
 
 keepalive_interval: 30
@@ -182,23 +191,64 @@ station_private_key: station_private.pem
 remote_public_key: aismixer_public.pem
 ```
 
-When `input:` is omitted, `listen_ip` / `listen_port` select UDP input through
-the backward-compatible top-level configuration form.
-When `output:` is omitted, `remote_host` / `remote_port` select the legacy
-AISMixer UDPSEC output and behavior is unchanged.
+Explicit `input:` and `output:` mappings are the canonical configuration form.
 
-### Local input modes
+### Deprecated top-level endpoint syntax
 
-UDP and serial are both first-class local input types. For compatibility, UDP
-remains the default when `input:` is omitted and uses the top-level listener
-fields:
+Existing configurations that use the old top-level endpoint fields remain
+functional during this compatibility period, but loading them prints concise
+operator-visible deprecation messages. Migrate the endpoint fields as follows:
+
+OLD (deprecated):
 
 ```yaml
 listen_ip: "::"
 listen_port: 50000
+allow_from:
+  - 2001:db8:42::/64
+
+remote_host: mixer.example.net
+remote_port: 19999
+source_ip: 192.0.2.20
 ```
 
-The canonical explicit UDP form is:
+NEW (canonical):
+
+```yaml
+input:
+  type: udp
+  listen_ip: "::"
+  listen_port: 50000
+  allow_from:
+    - 2001:db8:42::/64
+
+output:
+  type: udpsec
+  host: mixer.example.net
+  port: 19999
+  source_ip: 192.0.2.20
+```
+
+Thus top-level `allow_from` moves to `input.allow_from`, and top-level
+`source_ip` moves to `output.source_ip`. Omitting `input` still selects the old
+top-level UDP input, and omitting `output` still selects UDPSEC; deprecation
+does not change either transport. A fully old configuration receives at most
+one input and one output notice per load, not messages from packet or session
+loops.
+
+If an explicit mapping and obsolete top-level endpoint fields coexist, the
+obsolete fields still trigger the applicable notice while existing
+precedence and validation rules remain in force. This deprecation applies only
+to top-level `listen_ip`, `listen_port`, `allow_from`, `remote_host`,
+`remote_port`, and `source_ip`. Relation settings such as `station_id`,
+`station_private_key`, `remote_public_key`, `reconnect_delay`,
+`keepalive_interval`, `peer_timeout`, `session_refresh_interval`, and
+`log_level` remain legitimate top-level settings.
+
+### Local input modes
+
+UDP and serial are both first-class local input types. The canonical UDP form
+is:
 
 ```yaml
 input:
@@ -211,8 +261,8 @@ input:
 ```
 
 The explicit UDP form does not borrow missing listener fields from the
-top-level compatibility form. `input.listen_ip` and `input.listen_port` are
-required, and `input.allow_from` is optional.
+deprecated top-level compatibility form. `input.listen_ip` and
+`input.listen_port` are required, and `input.allow_from` is optional.
 
 Serial input also uses an explicit `input:` mapping. In serial mode no local
 UDP listener is created, and the configured `port` string is passed unchanged
@@ -264,16 +314,7 @@ the oldest queued line is dropped so fresher real-time AIS traffic can continue.
 
 ### Output modes
 
-The legacy UDPSEC output remains the default and uses the top-level endpoint
-fields:
-
-```yaml
-remote_host: mixer.example.net
-remote_port: 19999
-source_ip: 192.0.2.20
-```
-
-Explicit UDPSEC output uses the same station identity, key files, handshake,
+Canonical UDPSEC output uses the station identity, key files, handshake,
 session, ping/pong, and `NOSESSION` behavior:
 
 ```yaml
@@ -303,13 +344,14 @@ drives activation:
   configuration.
 - `udpsec` ensures or validates the local station identity, then loads and
   validates the manually provisioned trusted server public key before creating
-  the UDPSEC transport. The legacy form with omitted `output` counts as
-  `udpsec`.
+  the UDPSEC transport. The deprecated form with omitted `output` still counts
+  as `udpsec`.
 
 `output.type` must be either `udpsec` or `udp`. Explicit output mappings require
 both `output.host` and `output.port`; they do not borrow missing endpoint fields
-from legacy `remote_host` / `remote_port`. When both explicit output settings
-and legacy endpoint fields are present, the explicit `output:` endpoint is used.
+from deprecated top-level `remote_host` / `remote_port`. When both explicit
+output settings and those obsolete fields are present, the explicit `output:`
+endpoint is used and the obsolete fields produce a deprecation notice.
 Explicit nulls, unknown output keys, blank hosts, invalid ports, invalid
 `output.source_ip`, and address-family mismatches fail startup validation.
 
@@ -317,19 +359,18 @@ Explicit nulls, unknown output keys, blank hosts, invalid ports, invalid
 
 Two optional network controls are available for the station-side proxy:
 
-- `allow_from` is an application-level ACL for the local UDP sender. Use the
-  top-level key with the backward-compatible top-level UDP form, or
-  `input.allow_from` with explicit `input.type: udp`. When the key is omitted,
-  no application ACL is applied and the current unrestricted local-input
-  behavior is preserved. `allow_from: []` denies all local UDP input packets.
-  Entries must be literal IPv4 or IPv6 addresses, or IPv4 or IPv6 CIDR
+- `input.allow_from` is an application-level ACL for the local UDP sender. When
+  omitted, no application ACL is applied and the current unrestricted
+  local-input behavior is preserved. `input.allow_from: []` denies all local
+  UDP input packets. Entries must be literal IPv4 or IPv6 addresses, or IPv4 or
+  IPv6 CIDR
   networks. Hostnames and malformed entries fail startup validation.
-  `allow_from` applies only to UDP input and is rejected for
-  `input.type: serial`. A top-level `allow_from` is rejected when any explicit
-  `input:` mapping is present, so an ACL cannot be silently ignored.
-- `source_ip` binds the legacy outbound UDPSEC socket to a literal IPv4 or IPv6
-  source address and an automatically selected source port. In explicit output
-  mode, use `output.source_ip` for either UDPSEC or plain UDP output. When
+  `input.allow_from` applies only to UDP input and is rejected for
+  `input.type: serial`. The deprecated top-level `allow_from` remains rejected
+  when any explicit `input:` mapping is present, so an ACL cannot be silently
+  ignored.
+- `output.source_ip` binds the outbound UDPSEC or plain UDP socket to a literal
+  IPv4 or IPv6 source address and an automatically selected source port. When
   omitted, the operating system chooses the outbound source address as before.
   Source binding does not select an interface, routing table, socket mark, or
   fixed source port.
@@ -351,29 +392,37 @@ controls the outbound socket, not the local receiver.
 IPv4 example:
 
 ```yaml
-listen_ip: "0.0.0.0"
-listen_port: 50000
-allow_from:
-  - 192.0.2.15
-  - 198.51.100.0/24
+input:
+  type: udp
+  listen_ip: "0.0.0.0"
+  listen_port: 50000
+  allow_from:
+    - 192.0.2.15
+    - 198.51.100.0/24
 
-remote_host: mixer.example.net
-remote_port: 19999
-source_ip: 192.0.2.20
+output:
+  type: udpsec
+  host: mixer.example.net
+  port: 19999
+  source_ip: 192.0.2.20
 ```
 
 IPv6 example:
 
 ```yaml
-listen_ip: "::"
-listen_port: 50000
-allow_from:
-  - 2001:db8:42::15
-  - 2001:db8:42::/64
+input:
+  type: udp
+  listen_ip: "::"
+  listen_port: 50000
+  allow_from:
+    - 2001:db8:42::15
+    - 2001:db8:42::/64
 
-remote_host: 2001:db8:77::10
-remote_port: 19999
-source_ip: 2001:db8:42::20
+output:
+  type: udpsec
+  host: 2001:db8:77::10
+  port: 19999
+  source_ip: 2001:db8:42::20
 ```
 
 ### Config resolution order
@@ -633,8 +682,8 @@ There is no session migration between addresses.
 
 The configured `aismixer_public.pem` does not verify the responding server.
 Confirm that the station has the trusted public key matching the AISMixer
-private key and that `remote_host` / `remote_port` point to the intended
-server. Do not bypass this check.
+private key and that `output.host` / `output.port` point to the intended server.
+Do not bypass this check.
 
 ### `No response from server during handshake`
 
@@ -645,7 +694,7 @@ Check:
 - The station `station_id` and public key are present in AISMixer's
   `authorized_keys.yaml`.
 - Station and server clocks are reasonably synchronized.
-- `remote_host` / `remote_port` are correct.
+- `output.host` / `output.port` are correct.
 
 ### `NOSESSION` or repeated reconnects
 

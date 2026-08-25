@@ -561,8 +561,10 @@ def test_plain_udp_main_does_not_open_keys_or_handshake(monkeypatch, tmp_path):
     )
     config_path = tmp_path / "plain.yaml"
     config_path.write_text(
-        "listen_ip: '127.0.0.1'\n"
-        "listen_port: 50000\n"
+        "input:\n"
+        "  type: udp\n"
+        "  listen_ip: '127.0.0.1'\n"
+        "  listen_port: 50000\n"
         "output:\n"
         "  type: udp\n"
         "  host: 192.168.10.20\n"
@@ -676,6 +678,7 @@ def test_explicit_udp_main_passes_nested_allow_from_policy_to_adapter(monkeypatc
 def test_legacy_udpsec_main_ensures_identity_and_loads_peer_trust(
     monkeypatch,
     tmp_path,
+    capsys,
 ):
     proxy = load_proxy_module()
     config_path = tmp_path / "udpsec.yaml"
@@ -746,6 +749,10 @@ def test_legacy_udpsec_main_ensures_identity_and_loads_peer_trust(
     assert calls[0][2].endswith("station.pem")
     assert calls[1][0] == "peer"
     assert calls[1][1].endswith("server.pem")
+    assert capsys.readouterr().err.splitlines() == [
+        proxy.LEGACY_INPUT_DEPRECATION_MESSAGE,
+        proxy.LEGACY_OUTPUT_DEPRECATION_MESSAGE,
+    ]
 
 
 def test_udpsec_main_reports_missing_peer_trust_before_activation(
@@ -757,8 +764,10 @@ def test_udpsec_main_reports_missing_peer_trust_before_activation(
     config_path = tmp_path / "udpsec.yaml"
     missing_peer = tmp_path / "trust" / "missing-server.pem"
     config_path.write_text(
-        "listen_ip: '127.0.0.1'\n"
-        "listen_port: 50000\n"
+        "input:\n"
+        "  type: udp\n"
+        "  listen_ip: '127.0.0.1'\n"
+        "  listen_port: 50000\n"
         "station_private_key: operator-station.pem\n"
         "remote_public_key: trust/missing-server.pem\n"
         "output:\n"
@@ -806,8 +815,10 @@ def test_plain_udp_main_does_not_process_no_session_or_send_ping(
     proxy = load_proxy_module()
     config_path = tmp_path / "plain.yaml"
     config_path.write_text(
-        "listen_ip: '127.0.0.1'\n"
-        "listen_port: 50000\n"
+        "input:\n"
+        "  type: udp\n"
+        "  listen_ip: '127.0.0.1'\n"
+        "  listen_port: 50000\n"
         "output:\n"
         "  type: udp\n"
         "  host: 192.168.10.20\n"

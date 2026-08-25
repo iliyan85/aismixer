@@ -1,47 +1,36 @@
 # Singleton systemd service config: one local input (UDP or serial) -> one
 # network output (UDPSEC or UDP).
 #
-# Leave input omitted for the backward-compatible top-level UDP form.
-# Leave output omitted for the legacy UDPSEC egress form.
-listen_ip: '::'
-listen_port: 50000
-# Optional application-level ACL for local UDP senders. Omit for unrestricted.
-# An empty list denies all local UDP packets.
-# allow_from:
-#   - 2001:db8:42::15
-#   - 2001:db8:42::/64
-# Canonical explicit UDP input example. When input is present, keep allow_from
-# inside this mapping rather than at the top level.
-# input:
-#   type: udp
-#   listen_ip: '::'
-#   listen_port: 50000
-#   allow_from:
-#     - 2001:db8:42::15
-#     - 2001:db8:42::/64
-remote_host: 192.0.2.10
-remote_port: 17777
-# Optional legacy UDPSEC outbound source bind. Omit to let the OS choose.
-# source_ip: 192.0.2.20
+# Canonical configuration uses explicit input/output mappings. The deprecated
+# top-level endpoint form remains temporarily supported for existing configs.
+input:
+  type: udp
+  listen_ip: '::'
+  listen_port: 50000
+  # Optional application-level ACL for local UDP senders. Omit for unrestricted.
+  # An empty list denies all local UDP packets.
+  # allow_from:
+  #   - 2001:db8:42::15
+  #   - 2001:db8:42::/64
+
+output:
+  type: udpsec
+  host: 192.0.2.10
+  port: 17777
+  # Optional outbound source bind. Omit to let the OS choose.
+  # source_ip: 192.0.2.20
 #
-# Inactive explicit UDPSEC output example. It uses the same station keys and
-# UDPSEC session settings as legacy remote_host/remote_port.
-# output:
-#   type: udpsec
-#   host: mixer.example.net
-#   port: 19999
-#   source_ip: 192.0.2.20
-#
-# Inactive local UDP input -> plain UDP output example. Leave input omitted.
-# Plain UDP is for trusted LAN/VPN environments only.
+# Inactive local UDP input -> plain UDP output example. Replace the active
+# output mapping above; plain UDP is for trusted LAN/VPN environments only.
 # output:
 #   type: udp
 #   host: 192.168.10.20
 #   port: 17777
 #   source_ip: 192.168.10.15
 #
-# Inactive Linux serial input example. The port string is passed unchanged to
-# pySerial; replace <device-id> with the receiver-specific value.
+# Inactive Linux serial input example. Replace the active input mapping above.
+# The port string is passed unchanged to pySerial; replace <device-id> with the
+# receiver-specific value.
 # input:
 #   type: serial
 #   port: /dev/serial/by-id/usb-SRT_Marine_Technology_Ltd._AIS_Virtual_COM_Port_<device-id>-if00
@@ -53,7 +42,7 @@ remote_port: 17777
 #   reconnect_delay: 5
 #   max_line_bytes: 4096
 #
-# Inactive Windows serial input example.
+# Inactive Windows serial input example. Replace the active input mapping above.
 # input:
 #   type: serial
 #   port: COM4
@@ -66,11 +55,12 @@ remote_port: 17777
 #   max_line_bytes: 4096
 #
 # Inactive serial input -> UDPSEC output example:
-#   uncomment one serial input block above and either keep the legacy
-#   remote_host/remote_port fields or uncomment output.type: udpsec above.
+#   replace the active input mapping with one serial block and keep the active
+#   output.type: udpsec mapping.
 #
 # Inactive serial input -> plain UDP output example:
-#   uncomment one serial input block above and uncomment this output block.
+#   replace the active input and output mappings with one serial block and this
+#   output block.
 # output:
 #   type: udp
 #   host: 192.168.10.20

@@ -138,6 +138,8 @@ conventional Linux lifecycle described below. Their installed key tool is
 `/usr/lib/aismixer/tools/aismixer_keys.py`. With current source and systemd,
 identity is ensured only when the normalized configuration requires it, and
 repair is an explicit operator action.
+The source/systemd configuration-syntax deprecation described below does not
+retroactively change those pinned package templates or their procd behavior.
 
 For UDPSEC, peer trust is never provisioned automatically. Copy
 `/etc/aismixer/keys/aismixer_public.pem` from the mixer to the proxy's configured
@@ -330,6 +332,15 @@ path in Quick start. UDPSEC is the secure/default transport to the `aismixer`
 service; plain UDP must be selected explicitly and is intended only for trusted
 LAN/VPN paths.
 
+Current source/systemd configurations use explicit `input:` and `output:`
+mappings: `input.type: udp` or `serial`, and `output.type: udpsec` or `udp`. The
+old top-level `listen_ip` / `listen_port` and `remote_host` / `remote_port`
+fields are deprecated compatibility syntax and now emit operator notices.
+While compatibility remains, an omitted `output` still means UDPSEC, so
+transport behavior does not change. Move top-level `allow_from` to
+`input.allow_from` and `source_ip` to `output.source_ip`; station identity,
+key, and session-timing settings remain valid top-level relation settings.
+
 ### Install and start
 
 From the AISMixer checkout:
@@ -347,10 +358,11 @@ service.
 
 Identity handling is driven by the normalized effective output. Explicit
 `output.type: udp` does not inspect, generate, repair, or load station identity
-and does not require or load `remote_public_key`. UDPSEC, including legacy
-syntax with omitted `output`, ensures local station identity immediately before
-activation. If both canonical station files are absent, runtime generates one
-P-256 pair; a valid matching pair is preserved byte-for-byte, while partial,
+and does not require or load `remote_public_key`. UDPSEC, including the
+deprecated compatibility syntax with omitted `output`, ensures local station
+identity immediately before activation. If both canonical station files are
+absent, runtime generates one P-256 pair; a valid matching pair is preserved
+byte-for-byte, while partial,
 invalid, or mismatched material fails without automatic repair. Custom and
 existing legacy private-key paths remain operator-owned.
 
@@ -757,6 +769,9 @@ apk add nmea_sproxy
 `/usr/lib/aismixer/tools/aismixer_keys.py`. При текущия source и systemd
 идентичността се осигурява само когато нормализираната конфигурация я изисква, а
 поправката е изрично операторско действие.
+Маркирането на конфигурационния синтаксис като deprecated за source/systemd,
+описано по-долу, не променя със задна дата закованите пакетни шаблони или procd
+поведението им.
 
 При UDPSEC доверието към отсрещната страна никога не се настройва автоматично.
 Копирайте `/etc/aismixer/keys/aismixer_public.pem` от хоста, на който работи
@@ -956,6 +971,16 @@ systemd template instances описват стандартния Linux път; O
 транспорт по подразбиране към услугата `aismixer`; plain UDP трябва да се избере
 изрично и е предназначен само за доверени LAN/VPN връзки.
 
+Текущите source/systemd конфигурации използват изрични секции `input:` и
+`output:`: `input.type: udp` или `serial` и `output.type: udpsec` или `udp`.
+Старите top-level endpoint полета `listen_ip` / `listen_port` и `remote_host` /
+`remote_port` са deprecated синтаксис за съвместимост и вече извеждат
+операторски съобщения. Докато тази съвместимост се поддържа, пропуснат `output`
+продължава да означава UDPSEC, така че транспортът не се променя. Преместете
+top-level `allow_from` в `input.allow_from`, а `source_ip` в
+`output.source_ip`; настройките за идентичност, ключове и времена на сесията
+остават валидни top-level настройки на връзката.
+
 ### Инсталиране и стартиране
 
 От локалното копие на AISMixer:
@@ -974,9 +999,10 @@ cd nmea_sproxy
 Работата с идентичността се определя от нормализирания ефективен изход. Изрично
 зададеният `output.type: udp` не проверява, генерира, поправя или зарежда
 идентичност на станцията и не изисква или зарежда `remote_public_key`. UDPSEC,
-включително legacy синтаксисът без `output`, осигурява локалната идентичност на
-станцията непосредствено преди активиране. Ако и двата канонични файла на
-станцията липсват, runtime-ът генерира една P-256 двойка; валидната съвпадаща
+включително deprecated синтаксисът за съвместимост без `output`, осигурява
+локалната идентичност на станцията непосредствено преди активиране. Ако и двата
+канонични файла на станцията липсват, runtime-ът генерира една P-256 двойка;
+валидната съвпадаща
 двойка се запазва байт по байт, а частичният, невалидният или несъвпадащият
 материал води до грешка без автоматична поправка. Потребителските (custom) и
 съществуващите legacy пътища към частен ключ остават собственост и отговорност
@@ -1394,6 +1420,8 @@ descris mai jos. Instrumentul lor de chei instalat se află la
 `/usr/lib/aismixer/tools/aismixer_keys.py`. Cu sursa curentă și systemd,
 identitatea este asigurată numai când configurația normalizată o cere, iar
 repararea este o acțiune explicită a operatorului.
+Deprecarea sintaxei de configurare pentru sursă/systemd descrisă mai jos nu
+modifică retroactiv șabloanele pachetelor fixate sau comportamentul lor procd.
 
 Pentru UDPSEC, încrederea în peer nu este configurată niciodată automat. Copiați
 `/etc/aismixer/keys/aismixer_public.pem` de pe gazda pe care rulează `aismixer`
@@ -1596,6 +1624,16 @@ modelul singleton APK/procd descris în secțiunea Pornire rapidă. UDPSEC este
 transportul securizat/implicit spre serviciul `aismixer`; UDP simplu trebuie
 selectat explicit și este destinat numai conexiunilor LAN/VPN de încredere.
 
+Configurațiile sursă/systemd actuale folosesc mapări explicite `input:` și
+`output:`: `input.type: udp` sau `serial`, respectiv `output.type: udpsec` sau
+`udp`. Vechile câmpuri endpoint top-level `listen_ip` / `listen_port` și
+`remote_host` / `remote_port` sunt sintaxă de compatibilitate deprecated și
+afișează acum mesaje pentru operator. Cât timp această compatibilitate este
+păstrată, omiterea lui `output` înseamnă în continuare UDPSEC, deci transportul
+nu se schimbă. Mutați `allow_from` top-level în `input.allow_from` și `source_ip`
+în `output.source_ip`; setările top-level de identitate, chei și temporizare a
+sesiunii rămân valabile pentru relație.
+
 ### Instalare și pornire
 
 Din checkout-ul AISMixer:
@@ -1614,9 +1652,10 @@ activează numai singleton-ul și nu pornește niciun serviciu.
 Gestionarea identității este determinată de ieșirea efectivă normalizată. Un
 `output.type: udp` explicit nu inspectează, generează, repară sau încarcă
 identitatea stației și nu necesită sau încarcă `remote_public_key`. UDPSEC,
-inclusiv sintaxa legacy cu `output` omis, asigură identitatea locală a stației
-imediat înainte de activare. Dacă ambele fișiere canonice ale stației lipsesc,
-runtime-ul generează o singură pereche P-256; o pereche validă și concordantă
+inclusiv sintaxa deprecated de compatibilitate cu `output` omis, asigură
+identitatea locală a stației imediat înainte de activare. Dacă ambele fișiere
+canonice ale stației lipsesc, runtime-ul generează o singură pereche P-256; o
+pereche validă și concordantă
 este păstrată octet cu octet, iar materialul parțial, invalid sau neconcordant
 produce o eroare fără reparare automată. Căile personalizate (custom) și cele
 legacy existente către cheia privată rămân în proprietatea și responsabilitatea
