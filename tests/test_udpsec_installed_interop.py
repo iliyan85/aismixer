@@ -13,6 +13,7 @@ DEPLOYED_PYTHON_FILES = {
     "input_adapters.py": ROOT / "nmea_sproxy" / "input_adapters.py",
     "output_adapters.py": ROOT / "nmea_sproxy" / "output_adapters.py",
     "meta_cleaner.py": ROOT / "nmea_sproxy" / "meta_cleaner.py",
+    "core/key_material.py": ROOT / "core" / "key_material.py",
     "core/network_policy.py": ROOT / "core" / "network_policy.py",
     "core/udpsec_crypto.py": ROOT / "core" / "udpsec_crypto.py",
     "core/udpsec_protocol.py": ROOT / "core" / "udpsec_protocol.py",
@@ -113,16 +114,19 @@ def test_installed_layout_imports_shared_udpsec_modules_in_isolation(tmp_path):
             compiled.append(source.relative_to(staged_root).as_posix())
 
         import nmea_sproxy
+        import core.key_material as key_material
         import core.udpsec_crypto as udpsec_crypto
         import core.udpsec_protocol as udpsec_protocol
 
         expected_origins = {
             "nmea_sproxy": staged_root / "nmea_sproxy.py",
+            "key_material": staged_root / "core" / "key_material.py",
             "udpsec_crypto": staged_root / "core" / "udpsec_crypto.py",
             "udpsec_protocol": staged_root / "core" / "udpsec_protocol.py",
         }
         actual_origins = {
             "nmea_sproxy": Path(nmea_sproxy.__file__).resolve(),
+            "key_material": Path(key_material.__file__).resolve(),
             "udpsec_crypto": Path(udpsec_crypto.__file__).resolve(),
             "udpsec_protocol": Path(udpsec_protocol.__file__).resolve(),
         }
@@ -178,6 +182,9 @@ def test_installed_layout_imports_shared_udpsec_modules_in_isolation(tmp_path):
     assert set(report["compiled"]) == expected_files
     assert Path(report["origins"]["nmea_sproxy"]) == (
         install_dir / "nmea_sproxy.py"
+    ).resolve()
+    assert Path(report["origins"]["key_material"]) == (
+        install_dir / "core" / "key_material.py"
     ).resolve()
     assert Path(report["origins"]["udpsec_crypto"]) == (
         install_dir / "core" / "udpsec_crypto.py"

@@ -44,7 +44,6 @@ On a systemd-based Debian or Raspberry Pi OS host:
 ```bash
 git clone https://github.com/iliyan85/aismixer
 cd aismixer
-chmod +x install.sh
 ./install.sh
 systemctl start aismixer
 systemctl status aismixer
@@ -61,8 +60,7 @@ an active configuration requires UDPSEC.
 
 #### Update
 
-The repository tracks lifecycle scripts without an executable bit. Before the
-first update, run `chmod +x update.sh` once. Then update from the checkout:
+Update directly from the checkout:
 
 ```bash
 git pull --ff-only
@@ -131,13 +129,15 @@ The `mips_24kc` package path has been validated end to end: physical serial AIS
 ingress → `nmea_sproxy` → authenticated UDPSEC → `aismixer` → processing, egress,
 and control-plane operation.
 
-The release-pinned OpenWrt v0.2 package retains its existing procd pre-start
-identity preparation, including public-key repair, and does not yet implement
-the demand-driven conventional Linux lifecycle described below. Its installed
-key tool is `/usr/lib/aismixer/tools/aismixer_keys.py`. The current source and
-systemd runtime never repairs existing server material; repair there is an
-explicit operator action. `nmea_sproxy` retains its separate station-identity
-lifecycle.
+The release-pinned OpenWrt v0.2 packages retain their existing procd pre-start
+identity preparation, including automatic derived-public-key repair, for both
+the AISMixer server and the `nmea_sproxy` station. In particular, the pinned
+`nmea_sproxy` hook still prepares station identity before starting even for a
+plain-UDP relation. Those packages are unchanged by the demand-driven
+conventional Linux lifecycle described below. Their installed key tool is
+`/usr/lib/aismixer/tools/aismixer_keys.py`. With current source and systemd,
+identity is ensured only when the normalized configuration requires it, and
+repair is an explicit operator action.
 
 For UDPSEC, peer trust is never provisioned automatically. Copy
 `/etc/aismixer/keys/aismixer_public.pem` from the mixer to the proxy's configured
@@ -336,18 +336,32 @@ From the AISMixer checkout:
 
 ```bash
 cd nmea_sproxy
-chmod +x install.sh
 ./install.sh
 ```
 
-The proxy installer prepares the configuration layout and station key pair while
-preserving an existing station private key. When that private key exists, the
-installer invokes the key tool's `--repair-public` operation, which may create
-or replace its derived public mate. It installs singleton and template units,
-enables only the singleton, and starts no service. Complete the relation
-configuration and, for the default UDPSEC mode, the trusted public-key setup for
-the `aismixer` service described in the [operator guide](nmea_sproxy/README.md),
-then start it:
+The proxy installer prepares the configuration layout and installed key tooling
+while preserving all operator configuration, identity, and trust material under
+`/etc/nmea_sproxy`. It does not generate, repair, or rotate station keys. It
+installs singleton and template units, enables only the singleton, and starts no
+service.
+
+Identity handling is driven by the normalized effective output. Explicit
+`output.type: udp` does not inspect, generate, repair, or load station identity
+and does not require or load `remote_public_key`. UDPSEC, including legacy
+syntax with omitted `output`, ensures local station identity immediately before
+activation. If both canonical station files are absent, runtime generates one
+P-256 pair; a valid matching pair is preserved byte-for-byte, while partial,
+invalid, or mismatched material fails without automatic repair. Custom and
+existing legacy private-key paths remain operator-owned.
+
+For a fresh UDPSEC relation, follow the [operator guide's pre-start key and trust
+workflow](nmea_sproxy/README.md#keys-and-trust-setup): deliberately generate the
+canonical pair so its public value can be authorized in AISMixer, manually copy
+the trusted AISMixer public key, and only then start the relation. Runtime can
+generate an entirely absent canonical pair, but never repairs one; public-key
+repair is an explicit `aismixer_keys.py station --repair-public` action. Because
+the systemd units use `Restart=always`, do not knowingly start UDPSEC with
+missing or invalid peer trust.
 
 ```bash
 systemctl start nmea_sproxy.service
@@ -373,19 +387,19 @@ template-only deployment should disable and stop the unused singleton with
 
 ### Update
 
-The proxy updater is also tracked without an executable bit. From the repository
-root, make it executable once and run it after pulling changes:
+From the repository root, run the updater directly after pulling changes:
 
 ```bash
 git pull --ff-only
 cd nmea_sproxy
-chmod +x update.sh
 ./update.sh
 ```
 
 Unlike the `aismixer` update script, `nmea_sproxy/update.sh` updates installed
 files and reloads systemd but intentionally **does not restart** the singleton
-or any template instance. Restart only the relations you choose, when ready:
+or any template instance. It does not generate, repair, rotate, or otherwise
+modify operator identity or trust material. Restart only the relations you
+choose, when ready:
 
 ```bash
 systemctl restart nmea_sproxy.service
@@ -646,7 +660,6 @@ so `docs/` is intentionally absent from `main`.
 ```bash
 git clone https://github.com/iliyan85/aismixer
 cd aismixer
-chmod +x install.sh
 ./install.sh
 systemctl start aismixer
 systemctl status aismixer
@@ -663,9 +676,7 @@ systemctl status aismixer
 
 #### Обновяване
 
-Хранилището проследява скриптовете за жизнения цикъл без executable bit. Преди
-първото обновяване изпълнете еднократно `chmod +x update.sh`. След това обновете
-от локалното копие:
+Обновете директно от локалното копие:
 
 ```bash
 git pull --ff-only
@@ -736,14 +747,16 @@ apk add nmea_sproxy
 сериен AIS вход → `nmea_sproxy` → автентикиран UDPSEC → `aismixer` → обработка,
 изход и работа на слоя за управление.
 
-Закованият към версия OpenWrt v0.2 пакет запазва съществуващата procd
-предварителна подготовка на идентичността, включително поправка на публичния
-ключ, и все още не прилага описания по-долу определян от конфигурацията жизнен
-цикъл за conventional Linux. Инсталираният инструмент за ключове е
-`/usr/lib/aismixer/tools/aismixer_keys.py`. Текущият source и systemd runtime
-никога не поправя съществуващ сървърен ключов материал; там поправката е изрично
-операторско действие. `nmea_sproxy` запазва отделния си жизнен цикъл за
-идентичността на станцията.
+Пакетите за OpenWrt v0.2, заковани към конкретна версия, запазват procd
+предварителна подготовка на идентичността, включително автоматичната поправка
+на изведения публичен ключ, както за сървъра AISMixer, така и за станцията с
+`nmea_sproxy`. По-конкретно, закованият hook на `nmea_sproxy` все още подготвя
+идентичност на станцията преди стартиране дори за plain-UDP връзка. Тези пакети
+не се променят от описания по-долу жизнен цикъл според необходимостта за
+стандартен Linux. Инсталираният им инструмент за ключове е
+`/usr/lib/aismixer/tools/aismixer_keys.py`. При текущия source и systemd
+идентичността се осигурява само когато нормализираната конфигурация я изисква, а
+поправката е изрично операторско действие.
 
 При UDPSEC доверието към отсрещната страна никога не се настройва автоматично.
 Копирайте `/etc/aismixer/keys/aismixer_public.pem` от хоста, на който работи
@@ -949,18 +962,35 @@ systemd template instances описват стандартния Linux път; O
 
 ```bash
 cd nmea_sproxy
-chmod +x install.sh
 ./install.sh
 ```
 
-Инсталаторът на проксито подготвя структурата за конфигурация и ключовата двойка
-на станцията, като запазва съществуващия частен ключ. Когато той съществува,
-инсталаторът извиква операцията `--repair-public` на инструмента за ключове,
-която може да създаде или замени изведения от него публичен ключ. Инсталира
-singleton и template unit-и, включва само singleton услугата и не стартира услуга.
-Завършете конфигурацията на връзката и, за UDPSEC режима по подразбиране,
-настройката на доверения публичен ключ на услугата `aismixer`, описани в [операторското
-ръководство](nmea_sproxy/README.md), след което я стартирайте:
+Инсталаторът на проксито подготвя структурата за конфигурация и инсталираните
+инструменти за ключове, като запазва цялата операторска конфигурация и
+материалите за идентичност и доверие в `/etc/nmea_sproxy`. Той не генерира,
+поправя или сменя ключове на станцията. Инсталира singleton и template unit-и,
+включва само singleton услугата и не стартира услуга.
+
+Работата с идентичността се определя от нормализирания ефективен изход. Изрично
+зададеният `output.type: udp` не проверява, генерира, поправя или зарежда
+идентичност на станцията и не изисква или зарежда `remote_public_key`. UDPSEC,
+включително legacy синтаксисът без `output`, осигурява локалната идентичност на
+станцията непосредствено преди активиране. Ако и двата канонични файла на
+станцията липсват, runtime-ът генерира една P-256 двойка; валидната съвпадаща
+двойка се запазва байт по байт, а частичният, невалидният или несъвпадащият
+материал води до грешка без автоматична поправка. Потребителските (custom) и
+съществуващите legacy пътища към частен ключ остават собственост и отговорност
+на оператора.
+
+За нова UDPSEC връзка следвайте [процедурата преди стартиране за ключове и
+доверие](nmea_sproxy/README.md#keys-and-trust-setup) от операторското ръководство:
+създайте каноничната двойка изрично, за да може публичната ѝ стойност да бъде
+разрешена в AISMixer, копирайте ръчно доверения публичен ключ на AISMixer и едва
+тогава стартирайте връзката. Runtime-ът може да генерира изцяло липсваща
+канонична двойка, но никога не я поправя; поправката на публичния ключ е изрично
+действие чрез `aismixer_keys.py station --repair-public`. Тъй като systemd
+unit-ите използват `Restart=always`, не стартирайте съзнателно UDPSEC при липсващо
+или невалидно доверие към отсрещната страна.
 
 ```bash
 systemctl start nmea_sproxy.service
@@ -986,21 +1016,20 @@ singleton услуга с `systemctl disable --now nmea_sproxy.service`.
 
 ### Обновяване
 
-Updater-ът на проксито също се проследява без executable bit. От корена на
-хранилището го направете изпълним еднократно и го стартирайте след изтегляне на
+От корена на хранилището стартирайте updater-а директно след изтегляне на
 промените:
 
 ```bash
 git pull --ff-only
 cd nmea_sproxy
-chmod +x update.sh
 ./update.sh
 ```
 
 За разлика от скрипта за обновяване на услугата `aismixer`,
 `nmea_sproxy/update.sh` обновява инсталираните файлове и презарежда systemd, но
-умишлено **не рестартира** singleton услугата или template instances. Когато
-сте готови, рестартирайте само избраните връзки:
+умишлено **не рестартира** singleton услугата или template instances. Той не
+генерира, поправя, сменя или променя по друг начин операторските материали за
+идентичност или доверие. Когато сте готови, рестартирайте само избраните връзки:
 
 ```bash
 systemctl restart nmea_sproxy.service
@@ -1266,7 +1295,6 @@ Pe o gazdă Debian sau Raspberry Pi OS bazată pe systemd:
 ```bash
 git clone https://github.com/iliyan85/aismixer
 cd aismixer
-chmod +x install.sh
 ./install.sh
 systemctl start aismixer
 systemctl status aismixer
@@ -1284,9 +1312,7 @@ asigură identitatea ulterior numai dacă o configurație activă necesită UDPS
 
 #### Actualizare
 
-Repository-ul urmărește scripturile ciclului de viață fără bitul executabil.
-Înainte de prima actualizare, rulați o singură dată `chmod +x update.sh`. Apoi
-actualizați din checkout:
+Actualizați direct din checkout:
 
 ```bash
 git pull --ff-only
@@ -1357,14 +1383,17 @@ Fluxul de implementare pentru pachetul `mips_24kc` a fost validat end-to-end:
 intrare AIS prin port serial fizic → `nmea_sproxy` → UDPSEC autentificat →
 `aismixer` → procesare, ieșire și funcționarea planului de control.
 
-Pachetul OpenWrt v0.2 fixat la o versiune păstrează pregătirea existentă a
-identității înainte de pornire prin procd, inclusiv repararea cheii publice, și
-încă nu implementează ciclul determinat de configurație pentru Linux
-convențional descris mai jos. Instrumentul de chei instalat se află la
-`/usr/lib/aismixer/tools/aismixer_keys.py`. Runtime-ul curent din sursă și pentru
-systemd nu repară niciodată materialul existent al serverului; acolo repararea
-este o acțiune explicită a operatorului. `nmea_sproxy` își păstrează ciclul
-separat de viață pentru identitatea stației.
+Pachetele OpenWrt v0.2 fixate la o versiune păstrează pregătirea existentă a
+identității înainte de pornire prin procd, inclusiv repararea automată a cheii
+publice derivate, atât pentru serverul AISMixer, cât și pentru stația
+`nmea_sproxy`. În particular, hook-ul procd fixat al `nmea_sproxy` pregătește în
+continuare identitatea stației înainte de pornire chiar și pentru o relație
+plain UDP.
+Aceste pachete nu sunt modificate de ciclul la cerere pentru Linux convențional
+descris mai jos. Instrumentul lor de chei instalat se află la
+`/usr/lib/aismixer/tools/aismixer_keys.py`. Cu sursa curentă și systemd,
+identitatea este asigurată numai când configurația normalizată o cere, iar
+repararea este o acțiune explicită a operatorului.
 
 Pentru UDPSEC, încrederea în peer nu este configurată niciodată automat. Copiați
 `/etc/aismixer/keys/aismixer_public.pem` de pe gazda pe care rulează `aismixer`
@@ -1573,19 +1602,35 @@ Din checkout-ul AISMixer:
 
 ```bash
 cd nmea_sproxy
-chmod +x install.sh
 ./install.sh
 ```
 
 Programul de instalare al proxy-ului pregătește structura de configurare și
-perechea de chei a stației, păstrând cheia privată existentă. Când aceasta
-există, programul de instalare invocă operația `--repair-public` a instrumentului
-de chei, care poate crea sau înlocui cheia publică derivată. Instalează unitățile
-singleton și template, activează numai singleton-ul și nu pornește niciun
-serviciu. Finalizați configurarea relației și, pentru modul
-UDPSEC implicit, configurarea cheii publice de încredere a serviciului
-`aismixer` descrisă în [ghidul operatorului](nmea_sproxy/README.md), apoi porniți
-serviciul:
+instrumentele de chei instalate, păstrând întreaga configurație a operatorului
+și materialele de identitate și încredere din `/etc/nmea_sproxy`. Nu generează,
+repară sau rotește cheile stației. Instalează unitățile singleton și template,
+activează numai singleton-ul și nu pornește niciun serviciu.
+
+Gestionarea identității este determinată de ieșirea efectivă normalizată. Un
+`output.type: udp` explicit nu inspectează, generează, repară sau încarcă
+identitatea stației și nu necesită sau încarcă `remote_public_key`. UDPSEC,
+inclusiv sintaxa legacy cu `output` omis, asigură identitatea locală a stației
+imediat înainte de activare. Dacă ambele fișiere canonice ale stației lipsesc,
+runtime-ul generează o singură pereche P-256; o pereche validă și concordantă
+este păstrată octet cu octet, iar materialul parțial, invalid sau neconcordant
+produce o eroare fără reparare automată. Căile personalizate (custom) și cele
+legacy existente către cheia privată rămân în proprietatea și responsabilitatea
+operatorului.
+
+Pentru o relație UDPSEC nouă, urmați [fluxul dinaintea pornirii pentru chei și
+încredere](nmea_sproxy/README.md#keys-and-trust-setup) din ghidul operatorului:
+generați deliberat perechea canonică pentru ca valoarea sa publică să poată fi
+autorizată în AISMixer, copiați manual cheia publică AISMixer de încredere și
+abia apoi porniți relația. Runtime-ul poate genera o pereche canonică absentă în
+întregime, dar nu o repară niciodată; repararea cheii publice este o acțiune
+explicită prin `aismixer_keys.py station --repair-public`. Deoarece unitățile
+systemd folosesc `Restart=always`, nu porniți în mod deliberat UDPSEC cu
+încrederea în peer lipsă sau invalidă.
 
 ```bash
 systemctl start nmea_sproxy.service
@@ -1612,21 +1657,20 @@ dezactiveze și să oprească singleton-ul nefolosit cu
 
 ### Actualizare
 
-Updater-ul proxy-ului este, de asemenea, urmărit fără bit executabil. Din
-rădăcina repository-ului, faceți-l executabil o singură dată și rulați-l după
-preluarea modificărilor:
+Din rădăcina repository-ului, rulați updater-ul direct după preluarea
+modificărilor:
 
 ```bash
 git pull --ff-only
 cd nmea_sproxy
-chmod +x update.sh
 ./update.sh
 ```
 
 Spre deosebire de updater-ul serviciului `aismixer`, `nmea_sproxy/update.sh`
 actualizează fișierele instalate și reîncarcă systemd, dar intenționat **nu
-repornește** singleton-ul sau nicio instanță template. Reporniți numai relațiile
-alese, când sunteți pregătit:
+repornește** singleton-ul sau nicio instanță template. Nu generează, repară,
+rotește și nu modifică în alt fel materialele de identitate sau încredere ale
+operatorului. Reporniți numai relațiile alese, când sunteți pregătit:
 
 ```bash
 systemctl restart nmea_sproxy.service

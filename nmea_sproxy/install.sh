@@ -11,9 +11,6 @@ CONFIG_DIR=/etc/nmea_sproxy
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 INSTANCES_DIR="$CONFIG_DIR/instances"
 KEYS_DIR="$CONFIG_DIR/keys"
-PRIVATE_KEY="$KEYS_DIR/station_private.pem"
-PUBLIC_KEY="$KEYS_DIR/station_public.pem"
-REMOTE_PUBLIC_KEY="$KEYS_DIR/aismixer_public.pem"
 SYSTEMD_DIR=/etc/systemd/system
 SINGLETON_UNIT="$SYSTEMD_DIR/nmea_sproxy.service"
 TEMPLATE_UNIT="$SYSTEMD_DIR/nmea_sproxy@.service"
@@ -53,7 +50,7 @@ for pkg in python3-setproctitle python3-yaml python3-cryptography python3-serial
 	fi
 done
 
-echo "[+] Installing secure proxy runtime to $INSTALL_DIR"
+echo "[+] Installing nmea_sproxy runtime to $INSTALL_DIR"
 run_as_root install -d -m 0755 "$INSTALL_DIR" "$TOOLS_DIR" "$CORE_DIR"
 run_as_root install -m 0755 "$SCRIPT_DIR/nmea_sproxy.py" "$INSTALL_DIR/nmea_sproxy.py"
 run_as_root install -m 0644 "$SCRIPT_DIR/input_adapters.py" "$INSTALL_DIR/input_adapters.py"
@@ -76,24 +73,6 @@ else
 fi
 echo "  - Instance configs are operator-created under: $INSTANCES_DIR"
 
-echo "[+] Preparing station keys"
-if path_exists "$PRIVATE_KEY"; then
-	echo "  - Preserving station private key and checking public key"
-	run_as_root python3 "$KEY_TOOL" station --keys-dir "$KEYS_DIR" --repair-public
-elif path_exists "$PUBLIC_KEY"; then
-	echo "[!] Found $PUBLIC_KEY without $PRIVATE_KEY" >&2
-	echo "    Refusing to generate or overwrite station private-key material." >&2
-	exit 1
-else
-	echo "  - No station keys found; generating a new station key pair"
-	run_as_root python3 "$KEY_TOOL" station --keys-dir "$KEYS_DIR"
-fi
-
-if ! path_exists "$REMOTE_PUBLIC_KEY"; then
-	echo "[!] Missing AISMixer public key: $REMOTE_PUBLIC_KEY" >&2
-	echo "    Copy the trusted server public key there before starting a proxy." >&2
-fi
-
 echo "[+] Installing singleton and template systemd units"
 run_as_root install -m 0644 "$SCRIPT_DIR/nmea_sproxy.service" "$SINGLETON_UNIT"
 run_as_root install -m 0644 "$SCRIPT_DIR/nmea_sproxy@.service" "$TEMPLATE_UNIT"
@@ -103,5 +82,6 @@ run_as_root systemctl daemon-reload
 run_as_root systemctl enable nmea_sproxy.service
 
 echo "[+] Install complete; no services were started"
+echo "    Configure each relation and provision peer trust for UDPSEC before starting it."
 echo "    Singleton: ${ROOT_CMD_PREFIX}systemctl start nmea_sproxy.service"
 echo "    Template example: ${ROOT_CMD_PREFIX}systemctl enable --now nmea_sproxy@boat.service"

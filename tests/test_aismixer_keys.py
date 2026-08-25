@@ -113,6 +113,50 @@ def test_server_cli_runs_outside_repository_after_runtime_extraction(tmp_path):
     assert f"Public key:  {public_path}" in result.stdout
 
 
+def test_station_cli_runs_outside_repository_after_runtime_extraction(tmp_path):
+    installed_root = tmp_path / "installed"
+    installed_tools = installed_root / "tools"
+    installed_core = installed_root / "core"
+    installed_tools.mkdir(parents=True)
+    installed_core.mkdir()
+    installed_tool = installed_tools / "aismixer_keys.py"
+    shutil.copy2(KEY_TOOL_PATH, installed_tool)
+    shutil.copy2(ROOT / "core" / "key_material.py", installed_core)
+
+    unrelated_cwd = tmp_path / "unrelated-working-directory"
+    unrelated_cwd.mkdir()
+    keys_dir = tmp_path / "station-keys"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(installed_tool),
+            "station",
+            "--keys-dir",
+            str(keys_dir),
+            "--station-id",
+            "dock_001",
+        ],
+        cwd=unrelated_cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    private_path = keys_dir / "station_private.pem"
+    public_path = keys_dir / "station_public.pem"
+    loaded_private = load_private_key(private_path)
+    loaded_public = load_public_key(public_path)
+    assert isinstance(loaded_private.curve, ec.SECP256R1)
+    assert isinstance(loaded_public.curve, ec.SECP256R1)
+    assert (
+        loaded_private.public_key().public_numbers()
+        == loaded_public.public_numbers()
+    )
+    assert "Generated nmea_sproxy station key pair" in result.stdout
+    assert "name: dock_001" in result.stdout
+
+
 def test_generated_public_key_matches_private_key(tmp_path):
     tool = load_key_tool()
     result = tool.generate_key_pair(

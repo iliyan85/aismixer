@@ -1,8 +1,10 @@
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -533,6 +535,30 @@ def test_plain_udp_reconnect_reuses_pinned_resolved_destination(monkeypatch):
 
 def test_plain_udp_main_does_not_open_keys_or_handshake(monkeypatch, tmp_path):
     proxy = load_proxy_module()
+    keys_dir = tmp_path / "keys"
+    station_private = keys_dir / "station_private.pem"
+    station_public = keys_dir / "station_public.pem"
+    missing_peer = keys_dir / "aismixer_public.pem"
+    monkeypatch.setitem(
+        proxy.DEFAULT_CONFIG,
+        "station_private_key",
+        str(station_private),
+    )
+    monkeypatch.setitem(
+        proxy.DEFAULT_CONFIG,
+        "remote_public_key",
+        str(missing_peer),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "CANONICAL_STATION_PRIVATE_KEY_PATH",
+        str(station_private),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "CANONICAL_STATION_PUBLIC_KEY_PATH",
+        str(station_public),
+    )
     config_path = tmp_path / "plain.yaml"
     config_path.write_text(
         "listen_ip: '127.0.0.1'\n"
@@ -561,8 +587,16 @@ def test_plain_udp_main_does_not_open_keys_or_handshake(monkeypatch, tmp_path):
     def fail_handshake(*_args, **_kwargs):
         raise AssertionError("plain UDP must not perform UDPSEC handshake")
 
+    def fail_identity_ensure(_config):
+        raise AssertionError("plain UDP must not ensure station identity")
+
+    def fail_peer_load(_path):
+        raise AssertionError("plain UDP must not load peer trust")
+
     monkeypatch.setattr(proxy, "load_private_key", fail_key_load)
     monkeypatch.setattr(proxy, "load_public_key", fail_key_load)
+    monkeypatch.setattr(proxy, "ensure_station_identity", fail_identity_ensure)
+    monkeypatch.setattr(proxy, "load_peer_public_key", fail_peer_load)
     monkeypatch.setattr(proxy, "perform_handshake", fail_handshake)
     monkeypatch.setattr(
         proxy,
@@ -581,6 +615,10 @@ def test_plain_udp_main_does_not_open_keys_or_handshake(monkeypatch, tmp_path):
     )
 
     assert proxy.main(["--config", str(config_path)]) == 0
+    assert not keys_dir.exists()
+    assert not station_private.exists()
+    assert not station_public.exists()
+    assert not missing_peer.exists()
 
 
 def test_explicit_udp_main_passes_nested_allow_from_policy_to_adapter(monkeypatch):
@@ -635,7 +673,10 @@ def test_explicit_udp_main_passes_nested_allow_from_policy_to_adapter(monkeypatc
     assert not captured["policy"].allows("2001:db8:43::15")
 
 
-def test_legacy_udpsec_main_loads_keys(monkeypatch, tmp_path):
+def test_legacy_udpsec_main_ensures_identity_and_loads_peer_trust(
+    monkeypatch,
+    tmp_path,
+):
     proxy = load_proxy_module()
     config_path = tmp_path / "udpsec.yaml"
     config_path.write_text(
@@ -647,7 +688,9 @@ def test_legacy_udpsec_main_loads_keys(monkeypatch, tmp_path):
         "remote_public_key: server.pem\n",
         encoding="utf-8",
     )
-    loaded = []
+    calls = []
+    station_private_key = ec.generate_private_key(ec.SECP256R1())
+    server_public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
 
     class OutSocket:
         def settimeout(self, _timeout):
@@ -663,8 +706,21 @@ def test_legacy_udpsec_main_loads_keys(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    monkeypatch.setattr(proxy, "load_private_key", lambda path: loaded.append(path) or "private")
-    monkeypatch.setattr(proxy, "load_public_key", lambda path: loaded.append(path) or "public")
+    def ensure_station_identity(config):
+        calls.append(("identity", config["output"]["type"], config["station_private_key"]))
+        return SimpleNamespace(
+            private_key=station_private_key,
+            generated=False,
+            private_path=Path(config["station_private_key"]),
+            public_path=None,
+        )
+
+    def load_peer_public_key(path):
+        calls.append(("peer", path))
+        return server_public_key
+
+    monkeypatch.setattr(proxy, "ensure_station_identity", ensure_station_identity)
+    monkeypatch.setattr(proxy, "load_peer_public_key", load_peer_public_key)
     monkeypatch.setattr(
         proxy,
         "create_output_socket",
@@ -685,9 +741,62 @@ def test_legacy_udpsec_main_loads_keys(monkeypatch, tmp_path):
     with pytest.raises(KeyboardInterrupt):
         proxy.main(["--config", str(config_path)])
 
-    assert len(loaded) == 2
-    assert loaded[0].endswith("station.pem")
-    assert loaded[1].endswith("server.pem")
+    assert len(calls) == 2
+    assert calls[0][0:2] == ("identity", "udpsec")
+    assert calls[0][2].endswith("station.pem")
+    assert calls[1][0] == "peer"
+    assert calls[1][1].endswith("server.pem")
+
+
+def test_udpsec_main_reports_missing_peer_trust_before_activation(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    proxy = load_proxy_module()
+    config_path = tmp_path / "udpsec.yaml"
+    missing_peer = tmp_path / "trust" / "missing-server.pem"
+    config_path.write_text(
+        "listen_ip: '127.0.0.1'\n"
+        "listen_port: 50000\n"
+        "station_private_key: operator-station.pem\n"
+        "remote_public_key: trust/missing-server.pem\n"
+        "output:\n"
+        "  type: udpsec\n"
+        "  host: 192.0.2.10\n"
+        "  port: 19999\n",
+        encoding="utf-8",
+    )
+    station_private_key = ec.generate_private_key(ec.SECP256R1())
+    identity_calls = []
+
+    def ensure_station_identity(config):
+        identity_calls.append(config["output"]["type"])
+        return SimpleNamespace(
+            private_key=station_private_key,
+            generated=False,
+            private_path=Path(config["station_private_key"]),
+            public_path=None,
+        )
+
+    def fail_activation(*_args, **_kwargs):
+        raise AssertionError("missing peer trust must prevent runtime activation")
+
+    monkeypatch.setattr(proxy, "ensure_station_identity", ensure_station_identity)
+    monkeypatch.setattr(
+        proxy,
+        "resolve_output_endpoint",
+        lambda _output: (("192.0.2.10", 19999), proxy.socket.AF_INET),
+    )
+    monkeypatch.setattr(proxy, "create_output_socket", fail_activation)
+    monkeypatch.setattr(proxy, "create_local_input_adapter", fail_activation)
+
+    assert proxy.main(["--config", str(config_path)]) == 1
+
+    captured = capsys.readouterr()
+    assert identity_calls == ["udpsec"]
+    assert "public key" in captured.err.lower()
+    assert str(missing_peer).lower() in captured.err.lower()
 
 
 def test_plain_udp_main_does_not_process_no_session_or_send_ping(

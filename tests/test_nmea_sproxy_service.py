@@ -79,7 +79,7 @@ def test_systemd_units_align_process_titles_and_syslog_identifiers():
     assert "SyslogIdentifier=nmea_sproxy@%i" in template
 
 
-def test_install_creates_layout_repairs_keys_and_only_enables_singleton():
+def test_install_creates_layout_without_mutating_identity_and_only_enables_singleton():
     install = read_proxy_file("install.sh")
     commands = shell_commands(install)
 
@@ -104,10 +104,14 @@ def test_install_creates_layout_repairs_keys_and_only_enables_singleton():
     assert 'run_as_root install -d -m 0755 "$CONFIG_DIR" "$INSTANCES_DIR"' in install
     assert 'run_as_root install -d -m 0700 "$KEYS_DIR"' in install
     assert (
-        'run_as_root python3 "$KEY_TOOL" station --keys-dir "$KEYS_DIR" '
-        "--repair-public"
+        'run_as_root install -m 0755 "$REPO_ROOT/tools/aismixer_keys.py" '
+        '"$KEY_TOOL"'
     ) in commands
-    assert 'run_as_root python3 "$KEY_TOOL" station --keys-dir "$KEYS_DIR"' in commands
+    assert not any(
+        command.startswith('run_as_root python3 "$KEY_TOOL"')
+        for command in commands
+    )
+    assert "--repair-public" not in install
     assert "python3-setproctitle" in install
     assert "python3-serial" in install
     assert "run_as_root systemctl enable nmea_sproxy.service" in commands
@@ -233,6 +237,10 @@ def test_update_routes_runtime_and_unit_updates_through_helper():
     ) in update
     assert_installs_shared_udpsec_modules(update)
     assert (
+        'run_as_root install -m 0755 "$REPO_ROOT/tools/aismixer_keys.py" '
+        '"$TOOLS_DIR/aismixer_keys.py"'
+    ) in update
+    assert (
         'run_as_root install -m 0644 "$SCRIPT_DIR/nmea_sproxy.service" '
         '"$SYSTEMD_DIR/nmea_sproxy.service"'
     ) in update
@@ -255,9 +263,12 @@ def test_uninstall_routes_systemd_and_filesystem_operations_through_helper():
 
 
 def test_update_does_not_write_proxy_configs_or_keys():
-    commands = shell_commands(read_proxy_file("update.sh"))
+    update = read_proxy_file("update.sh")
+    commands = shell_commands(update)
 
     assert not any("/etc/nmea_sproxy" in command for command in commands)
+    assert not any("aismixer_keys.py" in command and "python3" in command for command in commands)
+    assert "--repair-public" not in update
 
 
 def test_uninstall_removes_both_units_and_preserves_config_by_default():

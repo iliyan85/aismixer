@@ -26,7 +26,7 @@ run_as_root() {
 	fi
 }
 
-echo "[+] Updating secure proxy runtime in $INSTALL_DIR"
+echo "[+] Updating nmea_sproxy runtime in $INSTALL_DIR"
 run_as_root install -d -m 0755 "$INSTALL_DIR" "$TOOLS_DIR" "$CORE_DIR"
 run_as_root install -m 0755 "$SCRIPT_DIR/nmea_sproxy.py" "$INSTALL_DIR/nmea_sproxy.py"
 run_as_root install -m 0644 "$SCRIPT_DIR/input_adapters.py" "$INSTALL_DIR/input_adapters.py"

@@ -25,16 +25,49 @@ From a fresh checkout, install the singleton and template systemd units with:
 ```bash
 git clone https://github.com/iliyan85/aismixer
 cd aismixer
-chmod +x nmea_sproxy/install.sh nmea_sproxy/update.sh
 ./nmea_sproxy/install.sh
 ```
 
 The installer enables the singleton `nmea_sproxy.service`, but intentionally
-starts no service and enables no template instance. Before starting a UDPSEC
-relation, edit `/etc/nmea_sproxy/config.yaml`, copy the trusted AISMixer public
-key to `/etc/nmea_sproxy/keys/aismixer_public.pem`, and authorize the station
-public key in AISMixer as described in [Keys and trust
-setup](#keys-and-trust-setup).
+starts no service and enables no template instance. It installs the runtime,
+shared key tooling, and configuration layout while preserving all existing
+operator files under `/etc/nmea_sproxy`; it does not generate, inspect, repair,
+or rotate station identity or peer-trust material.
+
+For explicit plain UDP, configure `output.type: udp`; no station identity or
+trusted peer key is needed. For UDPSEC, including legacy configuration with an
+omitted `output`, complete this pre-start workflow:
+
+1. Edit `/etc/nmea_sproxy/config.yaml` and set the intended `station_id` and
+   UDPSEC endpoint.
+2. On a fresh station where both canonical station files are absent, deliberately
+   generate the canonical P-256 pair before the first service start:
+
+   ```bash
+   sudo python3 /opt/nmea_sproxy/tools/aismixer_keys.py station \
+     --keys-dir /etc/nmea_sproxy/keys \
+     --station-id boat_001
+   ```
+
+   Replace `boat_001` with the configured `station_id`. The command has no
+   `--force` or `--repair-public`; it refuses to overwrite existing material and
+   prints the public value needed by AISMixer.
+3. Add that printed public value to AISMixer's `authorized_keys.yaml`, using the
+   same `station_id`.
+4. Manually copy the trusted AISMixer public key to the configured
+   `remote_public_key` path, normally
+   `/etc/nmea_sproxy/keys/aismixer_public.pem`.
+
+Runtime can automatically generate the canonical pair if both files are still
+absent when UDPSEC activates. Pre-generating it is the safer systemd workflow
+because the public identity can be authorized before the first connection.
+Automatic repair is never performed; repair remains an explicit operator
+action described in [Keys and trust setup](#keys-and-trust-setup).
+
+Do not start a UDPSEC unit until its peer-trust file is present, readable, and
+valid. Both supplied units use `Restart=always`, so knowingly starting with
+missing or unusable trust causes repeated restart attempts. If this has already
+happened, stop the unit, provision trust, and then start it again.
 
 Start and inspect the singleton after configuration and trust setup:
 
@@ -66,6 +99,12 @@ use `sudo` for privileged operations when it is available; root users can omit
 files but intentionally restarts nothing, so the operator must restart the
 singleton or each selected template instance. See [Update and
 uninstall](#update-and-uninstall) for the compact update flow.
+
+These installer, updater, and demand-driven identity rules describe current
+source and the conventional Linux/systemd path. The release-pinned OpenWrt v0.2
+package is unchanged: its procd hook still prepares and may repair station
+identity before start, including for a plain-UDP relation. See the root
+[OpenWrt section](../README.md#openwrt-2512) for that distinction.
 
 ### Guide map
 
@@ -255,6 +294,18 @@ output:
   source_ip: 192.168.10.15
 ```
 
+The proxy normalizes and validates the input and output configuration before
+performing identity side effects. The normalized effective output type then
+drives activation:
+
+- `udp` does not inspect, generate, repair, or load local station identity and
+  does not require or load `remote_public_key`, even if key fields remain in the
+  configuration.
+- `udpsec` ensures or validates the local station identity, then loads and
+  validates the manually provisioned trusted server public key before creating
+  the UDPSEC transport. The legacy form with omitted `output` counts as
+  `udpsec`.
+
 `output.type` must be either `udpsec` or `udp`. Explicit output mappings require
 both `output.host` and `output.port`; they do not borrow missing endpoint fields
 from legacy `remote_host` / `remote_port`. When both explicit output settings
@@ -336,11 +387,24 @@ The proxy selects configuration in this order:
 5. built-in defaults
 
 An explicitly selected `--config` or `NMEA_SPROXY_CONFIG` path must exist or
-the process exits. Relative `station_private_key`, `remote_public_key`, and
-legacy `aismixer_public_key` paths are resolved from the directory containing
-the selected YAML file, not from the process working directory. For
-compatibility, if a configured `station_private.pem` is absent, an existing
-`station_private.key` beside it is accepted.
+the process exits. For UDPSEC output, relative `station_private_key`,
+`remote_public_key`, and legacy `aismixer_public_key` paths are resolved from
+the directory containing the selected YAML file, not from the process working
+directory. Plain UDP leaves these key settings inactive and does not inspect
+their files.
+
+For compatibility, if a configured `station_private.pem` is absent, an actually
+existing `station_private.key` beside it is accepted. When neither canonical
+nor legacy material exists, new managed identity uses the canonical
+`station_private.pem` path rather than a nonexistent legacy path. An explicitly
+configured custom private-key path remains operator-owned: runtime may validate
+and use the existing private key for UDPSEC, but does not invent a public-key
+filename or automatically generate or repair that custom identity.
+
+The historical legacy layout shares `station_public.pem` with the canonical
+layout. When that legacy private key actually exists and `station_private.pem`
+does not, runtime continues to select the legacy private key; it does not treat
+the shared public file alone as a reason to replace or repair either identity.
 
 The repository files have separate purposes:
 
@@ -400,7 +464,7 @@ integration is provided by this installer; the systemd scripts are Linux-only.
 From the `nmea_sproxy` directory:
 
 ```bash
-bash ./install.sh
+./install.sh
 sudo systemctl start nmea_sproxy
 ```
 
@@ -463,25 +527,52 @@ The standard system key files are:
 - `aismixer_public.pem` is the trusted AISMixer server public key copied to the
   station. It lets the station verify the server handshake.
 
-Plain UDP output does not load or require `station_private.pem` or
-`aismixer_public.pem`.
+Plain UDP output does not inspect, generate, repair, or load either station key
+and does not require or load `aismixer_public.pem`. Key settings may remain in a
+shared configuration, but they are inactive for that relation.
 
 ### Generation, preservation, and repair
 
-During installation:
+On conventional Linux, both `install.sh` and `update.sh` preserve existing
+configuration, identity, and trust files under `/etc/nmea_sproxy`. They install
+the shared key-management code and tool, but never generate, validate, repair,
+rotate, or otherwise modify station identity or peer-trust material. A fresh
+installation with no key files therefore succeeds.
 
-- If both station key files are absent, a new station key pair is generated.
-- If `station_private.pem` exists, it is preserved and
-  `station_public.pem` is checked and repaired from it when needed.
-- If only `station_public.pem` exists, installation stops rather than
-  generating or overwriting private-key material.
-- Existing configuration, station private key, and trusted AISMixer public key
-  are preserved. The derived station public key may be repaired from the
-  preserved private key.
-- A missing `aismixer_public.pem` produces a warning; copy the trusted server
-  public key before starting the proxy.
+After configuration has been normalized and validated, runtime applies these
+rules only when the effective output is UDPSEC:
 
-To repair the public key manually without replacing the private key:
+- If neither canonical station file exists, runtime generates one P-256 key
+  pair at `station_private.pem` and `station_public.pem`.
+- A complete, valid, matching canonical pair is preserved byte-for-byte.
+- If only one canonical member exists, activation fails clearly without
+  creating, repairing, or overwriting either file.
+- Complete but invalid or mismatched canonical material also fails clearly and
+  remains unchanged.
+
+Runtime never repairs canonical material automatically. The fresh-generation
+case is deliberately narrow: both canonical members must be absent. To create
+that pair before the first systemd start and obtain its authorization value, use
+the generation command in [Quick Start](#quick-start). It refuses existing
+material unless an operator explicitly adds a force-overwrite option.
+
+An actually existing legacy `station_private.key` remains accepted where the
+default-path fallback supports it. An explicitly configured custom
+`station_private_key` is also supported, but both cases are operator-owned:
+runtime validates and uses an existing usable private key for UDPSEC, does not
+invent a corresponding public-key filename, and does not generate or repair the
+custom or legacy path. A missing or unusable operator-owned private key fails
+activation clearly.
+
+The configured `remote_public_key` is peer trust, not local identity. It is
+never generated, fetched, replaced, or repaired by the proxy, installer, or
+updater. For UDPSEC, a missing, unreadable, invalid, or incompatible peer key
+fails before transport activation. Provision it manually before starting a
+systemd unit; plain UDP does not require or load it.
+
+If the canonical private key is known to be valid and the operator deliberately
+wants to recreate its missing, invalid, or mismatched public mate, repair it
+explicitly without replacing the private key:
 
 ```bash
 sudo python3 /opt/nmea_sproxy/tools/aismixer_keys.py station \
@@ -490,9 +581,11 @@ sudo python3 /opt/nmea_sproxy/tools/aismixer_keys.py station \
   --repair-public
 ```
 
-The key tool prints the compressed public key value needed by AISMixer.
-Do not use force-overwrite options casually; replacing the station private key
-changes its identity and requires updating AISMixer authorization.
+This `--repair-public` command is the explicit operator repair path; runtime and
+lifecycle scripts never invoke it automatically. The tool prints the compressed
+public key value needed by AISMixer. Do not use force-overwrite options casually;
+replacing the station private key changes its identity and requires updating
+AISMixer authorization.
 
 ### Authorize the station in AISMixer
 
@@ -566,17 +659,31 @@ logs. Remember that `NOSESSION` itself is not authenticated.
 
 ### Missing key files
 
-For UDPSEC mode, check that all three standard key files exist and that the
-service user can read the station private key and AISMixer public key:
+Plain UDP does not use UDPSEC key files. For UDPSEC, stop a systemd unit before
+correcting startup key errors so `Restart=always` does not keep retrying:
 
 ```bash
+sudo systemctl stop nmea_sproxy.service
 sudo ls -l /etc/nmea_sproxy/keys
 ```
 
-From the `nmea_sproxy` directory, re-run `bash ./install.sh` to generate a
-missing station key pair or repair a station public key while preserving an
-existing private key. Copy the trusted AISMixer public key separately; the
-installer does not fetch it.
+Then distinguish local identity from peer trust:
+
+- If both canonical station files are absent, runtime can generate the pair at
+  UDPSEC activation. Prefer the [Quick Start](#quick-start) pre-generation
+  command when the public value still needs to be authorized before first use.
+- If one canonical member is missing, or a complete pair is invalid or
+  mismatched, runtime fails without changing either file. Diagnose the material;
+  use the explicit `--repair-public` command only when the private key is known
+  to be the identity that should be retained.
+- A configured legacy or custom private-key path must already exist and contain
+  a usable P-256 private key. Runtime does not generate or repair it.
+- The trusted AISMixer public key must be copied manually to the configured
+  `remote_public_key` path. The installer and updater do not fetch, replace, or
+  validate that trust file.
+
+After correcting and verifying the configuration and peer trust, start the
+selected unit again.
 
 ### systemd status and logs
 
@@ -601,23 +708,21 @@ sudo systemctl status nmea_sproxy.service
 ```
 
 `update.sh` does not modify `/etc/nmea_sproxy` configs or keys and intentionally
-does not restart any service. For template deployments, restart and inspect
-only the selected instances, for example:
+does not generate, repair, rotate, or otherwise modify operator identity or
+trust material, and intentionally does not restart any service. For template
+deployments, restart and inspect only the selected instances, for example:
 
 ```bash
 sudo systemctl restart nmea_sproxy@boat.service
 sudo systemctl status nmea_sproxy@boat.service
 ```
 
-If this checkout predates the Quick Start permission step, run
-`chmod +x nmea_sproxy/update.sh` once before invoking the updater.
-
 Uninstall from the repository root with:
 
 ```bash
-bash ./nmea_sproxy/uninstall.sh
+./nmea_sproxy/uninstall.sh
 ```
 
 `uninstall.sh` preserves `/etc/nmea_sproxy` by default; use
-`bash ./nmea_sproxy/uninstall.sh --purge-config` only when operator configs and
+`./nmea_sproxy/uninstall.sh --purge-config` only when operator configs and
 keys should also be removed.

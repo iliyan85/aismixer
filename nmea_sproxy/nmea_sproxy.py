@@ -1,4 +1,6 @@
 import argparse
+from dataclasses import dataclass, field
+from pathlib import Path
 import socket
 import yaml
 import os
@@ -6,7 +8,9 @@ import time
 import sys
 import json
 import select
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from input_adapters import (
@@ -34,6 +38,7 @@ from output_adapters import (
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 _SHARED_CORE_MODULES = (
+    "key_material.py",
     "network_policy.py",
     "udpsec_crypto.py",
     "udpsec_protocol.py",
@@ -54,6 +59,10 @@ def add_shared_module_path():
 
 add_shared_module_path()
 
+from core.key_material import (  # noqa: E402
+    KeyFileExistsError,
+    generate_key_pair,
+)
 from core.network_policy import (  # noqa: E402
     NetworkPolicy,
     NetworkPolicyConfigError,
@@ -100,6 +109,7 @@ LOCAL_CONFIG_PATH = os.path.join(
     "config.yaml",
 )
 CANONICAL_STATION_PRIVATE_KEY_PATH = "/etc/nmea_sproxy/keys/station_private.pem"
+CANONICAL_STATION_PUBLIC_KEY_PATH = "/etc/nmea_sproxy/keys/station_public.pem"
 LEGACY_STATION_PRIVATE_KEY_PATH = "station_private.key"
 CANONICAL_REMOTE_PUBLIC_KEY_PATH = "/etc/nmea_sproxy/keys/aismixer_public.pem"
 LEGACY_REMOTE_PUBLIC_KEY_PATH = "aismixer_public.pem"
@@ -124,6 +134,25 @@ class ProxyConfigError(ValueError):
     """Raised for operator-facing proxy configuration errors."""
 
 
+class StationIdentityError(RuntimeError):
+    """Raised when a required local UDPSEC station identity is unusable."""
+
+
+class PeerTrustError(RuntimeError):
+    """Raised when configured UDPSEC peer trust cannot be used safely."""
+
+
+@dataclass(frozen=True)
+class StationIdentity:
+    private_path: Path
+    public_path: Path | None
+    generated: bool
+    private_key: ec.EllipticCurvePrivateKey = field(
+        repr=False,
+        compare=False,
+    )
+
+
 def resolve_existing_path(candidates):
     for path in candidates:
         if os.path.exists(path):
@@ -131,15 +160,28 @@ def resolve_existing_path(candidates):
     return candidates[-1]
 
 
+def _path_present(path):
+    return os.path.lexists(os.fspath(path))
+
+
+def _paths_match(first, second):
+    return os.path.normcase(os.path.abspath(os.fspath(first))) == os.path.normcase(
+        os.path.abspath(os.fspath(second))
+    )
+
+
+def resolve_default_station_private_key_path():
+    if _path_present(CANONICAL_STATION_PRIVATE_KEY_PATH):
+        return CANONICAL_STATION_PRIVATE_KEY_PATH
+    if _path_present(LEGACY_STATION_PRIVATE_KEY_PATH):
+        return LEGACY_STATION_PRIVATE_KEY_PATH
+    return CANONICAL_STATION_PRIVATE_KEY_PATH
+
+
 def apply_default_key_paths(config, user_config=None):
     user_config = user_config or {}
     if "station_private_key" not in user_config:
-        config["station_private_key"] = resolve_existing_path(
-            (
-                CANONICAL_STATION_PRIVATE_KEY_PATH,
-                LEGACY_STATION_PRIVATE_KEY_PATH,
-            )
-        )
+        config["station_private_key"] = resolve_default_station_private_key_path()
 
     remote_key_configured = (
         "remote_public_key" in user_config
@@ -155,6 +197,16 @@ def apply_default_key_paths(config, user_config=None):
     return config
 
 
+def _configured_key_path(config, key):
+    try:
+        path = os.fspath(config[key])
+    except (KeyError, TypeError) as exc:
+        raise ProxyConfigError(f"{key}: must be a non-empty path string") from exc
+    if not isinstance(path, str) or not path.strip():
+        raise ProxyConfigError(f"{key}: must be a non-empty path string")
+    return path
+
+
 def resolve_configured_key_paths(config, user_config, config_path):
     if not user_config or not config_path:
         return config
@@ -167,19 +219,19 @@ def resolve_configured_key_paths(config, user_config, config_path):
         configured_keys.append("remote_public_key")
 
     for key in configured_keys:
-        path = os.fspath(config[key])
+        path = _configured_key_path(config, key)
         if not os.path.isabs(path) and not path.startswith("/"):
             config[key] = os.path.normpath(os.path.join(config_dir, path))
 
-    station_path = os.fspath(config["station_private_key"])
+    station_path = _configured_key_path(config, "station_private_key")
     if (
         os.path.basename(station_path) == "station_private.pem"
-        and not os.path.exists(station_path)
+        and not _path_present(station_path)
     ):
         legacy_path = os.path.join(
             os.path.dirname(station_path), LEGACY_STATION_PRIVATE_KEY_PATH
         )
-        if os.path.exists(legacy_path):
+        if _path_present(legacy_path):
             config["station_private_key"] = legacy_path
     return config
 
@@ -217,10 +269,11 @@ def load_config(path=None):
         print(f"⚠️ Config file not found: {selected_path}. Using defaults.")
     else:
         print("⚠️ No config file found. Using built-in defaults.")
-    apply_default_key_paths(config, user_config)
-    resolve_configured_key_paths(config, user_config, selected_path)
     validate_local_input_config(config)
-    validate_output_config(config)
+    output_config = validate_output_config(config)
+    if output_config["type"] == UDPSEC_OUTPUT_TYPE:
+        apply_default_key_paths(config, user_config)
+        resolve_configured_key_paths(config, user_config, selected_path)
     return config
 
 
@@ -270,6 +323,200 @@ def load_private_key(path):
 def load_public_key(path):
     with open(path, "rb") as f:
         return serialization.load_pem_public_key(f.read())
+
+
+def _require_key_file(path, *, description, error_type):
+    if not _path_present(path):
+        raise error_type(f"{description} is missing: {path}")
+    if not path.exists() or not path.is_file():
+        raise error_type(
+            f"{description} path exists but is not a usable file: {path}. "
+            "Refusing to replace operator key material."
+        )
+
+
+def _load_station_private_key(path):
+    path = Path(path)
+    _require_key_file(
+        path,
+        description="UDPSEC station private key",
+        error_type=StationIdentityError,
+    )
+    try:
+        private_key = load_private_key(path)
+    except (OSError, TypeError, ValueError, UnsupportedAlgorithm) as exc:
+        raise StationIdentityError(
+            f"Unable to load UDPSEC station private key {path}: {exc}. "
+            "Refusing to generate, repair, or replace operator key material."
+        ) from exc
+    if not isinstance(private_key, ec.EllipticCurvePrivateKey) or not isinstance(
+        private_key.curve, ec.SECP256R1
+    ):
+        raise StationIdentityError(
+            f"UDPSEC station private key must be an EC P-256 key: {path}. "
+            "Refusing to generate, repair, or replace operator key material."
+        )
+    return private_key
+
+
+def _load_station_public_key(path):
+    path = Path(path)
+    _require_key_file(
+        path,
+        description="UDPSEC station public key",
+        error_type=StationIdentityError,
+    )
+    try:
+        public_key = load_public_key(path)
+    except (OSError, TypeError, ValueError, UnsupportedAlgorithm) as exc:
+        raise StationIdentityError(
+            f"Unable to load UDPSEC station public key {path}: {exc}. "
+            "Refusing to repair or replace operator key material."
+        ) from exc
+    if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(
+        public_key.curve, ec.SECP256R1
+    ):
+        raise StationIdentityError(
+            f"UDPSEC station public key must be an EC P-256 key: {path}. "
+            "Refusing to repair or replace operator key material."
+        )
+    return public_key
+
+
+def _load_canonical_station_identity(private_path, public_path, *, generated):
+    private_key = _load_station_private_key(private_path)
+    public_key = _load_station_public_key(public_path)
+    if private_key.public_key().public_numbers() != public_key.public_numbers():
+        raise StationIdentityError(
+            "UDPSEC station public key does not match its private key: "
+            f"{public_path}. Refusing to repair or replace operator key material."
+        )
+    return StationIdentity(
+        private_path=private_path,
+        public_path=public_path,
+        generated=generated,
+        private_key=private_key,
+    )
+
+
+def _incomplete_station_identity_error(existing_path, missing_path):
+    return StationIdentityError(
+        "UDPSEC station identity is incomplete: "
+        f"found {existing_path}, but {missing_path} is missing. "
+        "Refusing to generate, repair, or overwrite operator key material."
+    )
+
+
+def _inspect_canonical_station_identity(private_path, public_path):
+    private_present = _path_present(private_path)
+    public_present = _path_present(public_path)
+    if private_present and not public_present:
+        raise _incomplete_station_identity_error(private_path, public_path)
+    if public_present and not private_present:
+        raise _incomplete_station_identity_error(public_path, private_path)
+    return private_present and public_present
+
+
+def _ensure_canonical_station_identity():
+    private_path = Path(CANONICAL_STATION_PRIVATE_KEY_PATH)
+    public_path = Path(CANONICAL_STATION_PUBLIC_KEY_PATH)
+    if _inspect_canonical_station_identity(private_path, public_path):
+        return _load_canonical_station_identity(
+            private_path,
+            public_path,
+            generated=False,
+        )
+
+    try:
+        private_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        generate_key_pair(
+            private_path.parent,
+            private_path.name,
+            public_path.name,
+        )
+    except (KeyFileExistsError, OSError) as exc:
+        try:
+            pair_exists = _inspect_canonical_station_identity(
+                private_path,
+                public_path,
+            )
+        except StationIdentityError:
+            raise
+        if not pair_exists:
+            raise StationIdentityError(
+                "Unable to generate the required UDPSEC station identity at "
+                f"{private_path.parent}: {exc}"
+            ) from exc
+        return _load_canonical_station_identity(
+            private_path,
+            public_path,
+            generated=False,
+        )
+
+    return _load_canonical_station_identity(
+        private_path,
+        public_path,
+        generated=True,
+    )
+
+
+def ensure_station_identity(config):
+    """Ensure or validate the identity required by one UDPSEC relation."""
+
+    output_config = config.get("output")
+    if not isinstance(output_config, dict) or output_config.get("type") not in {
+        UDPSEC_OUTPUT_TYPE,
+        UDP_OUTPUT_TYPE,
+    }:
+        raise ProxyConfigError(
+            "station identity requires a normalized output configuration"
+        )
+    if output_config["type"] == UDP_OUTPUT_TYPE:
+        return None
+
+    station_private_path = Path(
+        _configured_key_path(config, "station_private_key")
+    )
+    if _paths_match(
+        station_private_path,
+        CANONICAL_STATION_PRIVATE_KEY_PATH,
+    ):
+        return _ensure_canonical_station_identity()
+
+    private_key = _load_station_private_key(station_private_path)
+    return StationIdentity(
+        private_path=station_private_path,
+        public_path=None,
+        generated=False,
+        private_key=private_key,
+    )
+
+
+def load_peer_public_key(path):
+    """Load configured AISMixer trust without provisioning or mutation."""
+
+    peer_path = Path(path)
+    _require_key_file(
+        peer_path,
+        description="trusted AISMixer public key",
+        error_type=PeerTrustError,
+    )
+    try:
+        public_key = load_public_key(peer_path)
+    except (OSError, TypeError, ValueError, UnsupportedAlgorithm) as exc:
+        raise PeerTrustError(
+            f"Unable to load trusted AISMixer public key {peer_path}: {exc}. "
+            "Provision the correct peer trust explicitly; it is never generated "
+            "or repaired automatically."
+        ) from exc
+    if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(
+        public_key.curve, ec.SECP256R1
+    ):
+        raise PeerTrustError(
+            f"Trusted AISMixer public key must be an EC P-256 key: {peer_path}. "
+            "Provision the correct peer trust explicitly."
+        )
+    return public_key
 
 
 def encrypt_message_aes_gcm(plaintext, key):
@@ -947,12 +1194,20 @@ def main(argv=None):
             print(f"Configuration error: {e}", file=sys.stderr)
             return 1
 
-        station_identity_private_key = load_private_key(
-            config["station_private_key"]
-        )
-        server_identity_public_key = load_public_key(
-            config["remote_public_key"]
-        )
+        try:
+            station_identity = ensure_station_identity(config)
+            if station_identity.generated:
+                print(
+                    "[+] Generated UDPSEC station identity: "
+                    f"{station_identity.public_path}"
+                )
+            server_identity_public_key = load_peer_public_key(
+                config["remote_public_key"]
+            )
+        except (StationIdentityError, PeerTrustError) as e:
+            print(f"Configuration error: {e}", file=sys.stderr)
+            return 1
+        station_identity_private_key = station_identity.private_key
         try:
             out_sock = create_output_socket(output_config, out_family)
         except OutputConfigError as e:

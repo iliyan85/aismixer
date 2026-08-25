@@ -5437,19 +5437,135 @@ def test_secure_state_stats_do_not_read_clocks_or_cleanup(monkeypatch):
     assert stats.sessions_expired == 0
 
 
-def test_proxy_default_station_private_key_prefers_canonical_path(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("existing_member", "legacy_exists", "expected_path"),
+    (
+        ("private", True, "canonical"),
+        ("public", False, "canonical"),
+        ("public", True, "legacy"),
+    ),
+)
+def test_proxy_default_station_identity_honors_canonical_and_legacy_precedence(
+    monkeypatch,
+    tmp_path,
+    existing_member,
+    legacy_exists,
+    expected_path,
+):
     proxy = load_proxy_module()
+    keys_dir = tmp_path / "keys"
+    keys_dir.mkdir()
+    canonical_private = keys_dir / "station_private.pem"
+    canonical_public = keys_dir / "station_public.pem"
+    legacy_private = keys_dir / "station_private.key"
+    existing_path = (
+        canonical_private if existing_member == "private" else canonical_public
+    )
+    existing_path.write_bytes(b"operator canonical material")
+    if legacy_exists:
+        legacy_private.write_bytes(b"operator legacy material")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "remote_host: 192.0.2.10\n"
+        "remote_port: 19999\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        proxy,
+        "CANONICAL_STATION_PRIVATE_KEY_PATH",
+        str(canonical_private),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "CANONICAL_STATION_PUBLIC_KEY_PATH",
+        str(canonical_public),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "LEGACY_STATION_PRIVATE_KEY_PATH",
+        str(legacy_private),
+    )
+
+    config = proxy.load_config(str(config_path))
+
+    expected = canonical_private if expected_path == "canonical" else legacy_private
+    assert config["station_private_key"] == str(expected)
+
+
+def test_proxy_default_station_private_key_uses_canonical_when_no_key_exists(
+    monkeypatch,
+    tmp_path,
+):
+    proxy = load_proxy_module()
+    canonical_path = tmp_path / "keys" / "station_private.pem"
+    canonical_public_path = tmp_path / "keys" / "station_public.pem"
+    legacy_path = tmp_path / "keys" / "station_private.key"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "remote_host: 192.0.2.10\n"
+        "remote_port: 19999\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        proxy,
+        "CANONICAL_STATION_PRIVATE_KEY_PATH",
+        str(canonical_path),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "CANONICAL_STATION_PUBLIC_KEY_PATH",
+        str(canonical_public_path),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "LEGACY_STATION_PRIVATE_KEY_PATH",
+        str(legacy_path),
+    )
+
+    config = proxy.load_config(str(config_path))
+
+    assert not canonical_path.exists()
+    assert not legacy_path.exists()
+    assert config["output"]["type"] == "udpsec"
+    assert config["station_private_key"] == str(canonical_path)
+
+
+def test_proxy_plain_output_does_not_inspect_or_resolve_udpsec_key_paths(
+    monkeypatch,
+    tmp_path,
+):
+    proxy = load_proxy_module()
+    config_path = tmp_path / "plain.yaml"
+    config_path.write_text(
+        "station_private_key: operator/station.pem\n"
+        "remote_public_key: trust/aismixer.pem\n"
+        "output:\n"
+        "  type: udp\n"
+        "  host: 192.0.2.10\n"
+        "  port: 17777\n",
+        encoding="utf-8",
+    )
+    real_exists = proxy.os.path.exists
+
+    def guarded_exists(path):
+        if os.path.normpath(os.fspath(path)) == os.path.normpath(str(config_path)):
+            return real_exists(path)
+        raise AssertionError(f"plain UDP inspected UDPSEC path: {path}")
+
+    monkeypatch.setattr(proxy.os.path, "exists", guarded_exists)
     monkeypatch.setattr(
         proxy.os.path,
-        "exists",
-        lambda path: _normalize_path(path) == _normalize_path(
-            STATION_CANONICAL_PRIVATE_KEY_PATH
+        "lexists",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError(f"plain UDP inspected UDPSEC path: {path}")
         ),
     )
 
-    config = proxy.load_config(str(tmp_path / "missing.yaml"))
+    config = proxy.load_config(str(config_path))
 
-    assert config["station_private_key"] == STATION_CANONICAL_PRIVATE_KEY_PATH
+    assert config["output"]["type"] == "udp"
+    assert config["station_private_key"] == "operator/station.pem"
+    assert config["remote_public_key"] == "trust/aismixer.pem"
 
 
 def test_proxy_configured_legacy_station_private_key_still_works(tmp_path):
@@ -5463,7 +5579,6 @@ def test_proxy_configured_legacy_station_private_key_still_works(tmp_path):
 
 
 def test_proxy_canonical_station_private_key_falls_back_to_legacy_sibling(
-    monkeypatch,
     tmp_path,
 ):
     proxy = load_proxy_module()
@@ -5474,15 +5589,7 @@ def test_proxy_canonical_station_private_key_falls_back_to_legacy_sibling(
         "station_private_key: station_private.pem\n",
         encoding="utf-8",
     )
-    real_exists = proxy.os.path.exists
-    monkeypatch.setattr(
-        proxy.os.path,
-        "exists",
-        lambda path: (
-            os.path.normpath(os.fspath(path)) == os.path.normpath(str(legacy_path))
-            or real_exists(path)
-        ),
-    )
+    legacy_path.write_bytes(b"existing legacy operator key")
 
     config = proxy.load_config(str(config_path))
 
