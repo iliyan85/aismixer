@@ -132,6 +132,7 @@ define Package/aismixer/install
 	# Identity material is generated locally on the router.
 	# Private keys must never be shipped inside the package.
 	$(INSTALL_DIR) $(1)/etc/aismixer/keys
+	chmod 0700 $(1)/etc/aismixer/keys
 endef
 
 
