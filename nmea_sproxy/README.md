@@ -100,14 +100,13 @@ files but intentionally restarts nothing, so the operator must restart the
 singleton or each selected template instance. See [Update and
 uninstall](#update-and-uninstall) for the compact update flow.
 
-These installer, updater, and demand-driven identity rules describe current
-source and the conventional Linux/systemd path. The release-pinned OpenWrt v0.2
-package is unchanged: its procd hook still prepares and may repair station
-identity before start, including for a plain-UDP relation. See the root
-[OpenWrt section](../README.md#openwrt-2512) for that distinction.
-This carve-out also covers configuration syntax: the source/systemd
-deprecation described below does not retroactively change the pinned package
-configuration or procd behavior.
+The installer and updater instructions above describe conventional
+Linux/systemd. Current R2.1 OpenWrt uses the same demand-driven runtime rules
+through per-relation procd preflight; its named-instance workflow is documented
+below. The older v0.2.0-r2 package's eager identity preparation and automatic
+public-key repair are historical behavior, not current R2.1 behavior. Current
+OpenWrt also accepts deprecated legacy endpoint syntax under the same runtime
+compatibility rules described below.
 
 ### Guide map
 
@@ -115,6 +114,7 @@ configuration or procd behavior.
 - [UDP and serial local inputs](#local-input-modes)
 - [UDPSEC and plain UDP outputs](#output-modes)
 - [Network endpoint controls](#network-endpoint-controls)
+- [OpenWrt/procd services](#openwrtprocd-services)
 - [Singleton and template services](#systemd-services)
 - [Keys and trust setup](#keys-and-trust-setup)
 - [UDPSEC session lifecycle](#udpsec-session-lifecycle)
@@ -505,6 +505,104 @@ py -m serial.tools.list_ports
 
 Use the shown COM name, such as `COM4`, as `input.port`. No Windows Service
 integration is provided by this installer; the systemd scripts are Linux-only.
+
+## OpenWrt/procd services
+
+R2.1 keeps the same one-process-per-relation model on OpenWrt. One init service
+supervises the optional backward-compatible singleton and any named relations:
+
+```text
+/etc/init.d/nmea_sproxy
+    ├── /etc/nmea_sproxy/config.yaml            -> nmea_sproxy
+    ├── /etc/nmea_sproxy/instances/boat.yaml    -> nmea_sproxy@boat
+    └── /etc/nmea_sproxy/instances/roof.yaml    -> nmea_sproxy@roof
+```
+
+The singleton starts when `/etc/nmea_sproxy/config.yaml` is a regular file. A
+fresh package installation seeds that canonical config as an upgrade-preserved
+conffile. The package also creates `/etc/nmea_sproxy/instances/`, but ships no
+active named YAML. Operator-created files in that directory are not overwritten
+on package installation or update.
+
+Only regular files named `*.yaml` are discovered. The filename stem becomes the
+procd instance and process-title suffix; accepted names match
+`[A-Za-z0-9][A-Za-z0-9_.-]*`. Unsafe names are logged and skipped rather than
+renamed or interpreted. Unrelated files are ignored. Each
+accepted YAML still defines exactly one local UDP or serial input and one
+UDPSEC or plain-UDP output.
+
+One procd name is conditionally reserved: OpenWrt internally calls a
+successfully started unnamed singleton `instance1`. When that singleton starts,
+`instances/instance1.yaml` is skipped to avoid an internal instance-name
+collision. The same filename is valid in a named-only deployment where no
+singleton starts successfully.
+
+A named file uses the same canonical syntax as the singleton. For example,
+`/etc/nmea_sproxy/instances/boat.yaml` may contain:
+
+```yaml
+input:
+  type: udp
+  listen_ip: "::"
+  listen_port: 50001
+
+output:
+  type: udpsec
+  host: mixer.example.net
+  port: 19999
+
+station_id: boat_001
+station_private_key: /etc/nmea_sproxy/keys/station_private.pem
+remote_public_key: /etc/nmea_sproxy/keys/aismixer_public.pem
+```
+
+Replace the example addresses, ports, and station ID. To create and inspect a
+named relation, run as root:
+
+```sh
+mkdir -p /etc/nmea_sproxy/instances
+cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
+vi /etc/nmea_sproxy/instances/boat.yaml
+/etc/init.d/nmea_sproxy restart
+ps w | grep '[n]mea_sproxy'
+logread -e nmea_sproxy
+```
+
+Adding, removing, or renaming an instance file requires
+`/etc/init.d/nmea_sproxy restart`; there is no directory watcher. OpenWrt has no
+systemd-style `systemctl enable nmea_sproxy@boat` command. The singleton and
+named relations can run together when their local inputs do not contend for the
+same socket or serial device.
+
+Each config is preflighted independently before its procd process is opened:
+
+- Plain `output.type: udp` performs no station-identity inspection or creation
+  and does not require or load peer trust.
+- `output.type: udpsec`, including deprecated legacy output syntax, uses the
+  current runtime to ensure or validate station identity and then validate the
+  manually provisioned `remote_public_key`. An entirely absent canonical pair
+  may be generated sequentially during preflight; partial, invalid, or
+  mismatched material fails without repair.
+
+One invalid config or unusable peer key skips only that relation; independent
+valid singleton and named relations still start. The init operation fails with
+a summary only when no relation is configured successfully. The init script
+does not invoke the key CLI or automatically repair, fetch, or replace identity
+or peer-trust material.
+
+Relations that use `/etc/nmea_sproxy/keys/station_private.pem` intentionally
+share the canonical station pair. A named file does not acquire a new identity
+from its filename. Each config may instead select its own custom station private
+key and trusted `remote_public_key` path. Custom and legacy private-key paths
+remain operator-owned, and relative key paths resolve from the directory
+containing that relation's YAML file. Existing legacy top-level endpoint YAML
+remains functional but emits the normal deprecation notices; migrate it to
+explicit `input:` / `output:` mappings when practical.
+
+Packaging note: the R2.1 development recipe intentionally pins runtime source
+commit `cd68b202e362712fe0503ea2b4b8d55ef88a609a`. At final R2.1 release closure,
+repin `PKG_SOURCE_VERSION` if needed and recompute `PKG_MIRROR_HASH` from that
+exact final source through the normal OpenWrt download/hash workflow.
 
 ## systemd services
 

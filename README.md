@@ -125,32 +125,49 @@ station-side package instead:
 apk add nmea_sproxy
 ```
 
-The `mips_24kc` package path has been validated end to end: physical serial AIS
-ingress → `nmea_sproxy` → authenticated UDPSEC → `aismixer` → processing, egress,
-and control-plane operation.
+The physical `mips_24kc` path was validated end to end with the earlier v0.2
+package. Its eager station-identity preparation and automatic public-key repair
+are historical behavior, not the current R2.1 lifecycle; the R2.1 named-instance
+changes still require the post-merge router validation matrix.
 
-The release-pinned OpenWrt v0.2 packages retain their existing procd pre-start
-identity preparation, including automatic derived-public-key repair, for both
-the AISMixer server and the `nmea_sproxy` station. In particular, the pinned
-`nmea_sproxy` hook still prepares station identity before starting even for a
-plain-UDP relation. Those packages are unchanged by the demand-driven
-conventional Linux lifecycle described below. Their installed key tool is
-`/usr/lib/aismixer/tools/aismixer_keys.py`. With current source and systemd,
-identity is ensured only when the normalized configuration requires it, and
-repair is an explicit operator action.
-The source/systemd configuration-syntax deprecation described below does not
-retroactively change those pinned package templates or their procd behavior.
+Current R2.1 OpenWrt uses one `/etc/init.d/nmea_sproxy` service to supervise an
+optional backward-compatible singleton at `/etc/nmea_sproxy/config.yaml` plus
+every valid regular `*.yaml` file under `/etc/nmea_sproxy/instances/`. Each YAML
+is one separate process and one relation. The singleton process title is
+`nmea_sproxy`; `boat.yaml` appears as `nmea_sproxy@boat`. OpenWrt internally
+names a successfully started unnamed singleton `instance1`, so a named
+`instance1.yaml` is skipped while that singleton runs; the filename is valid in
+a named-only deployment. Singleton and named relations may otherwise run
+together, and one invalid relation is skipped without suppressing independent
+valid relations. Startup fails only when none succeeds.
 
-For UDPSEC, peer trust is never provisioned automatically. Copy
-`/etc/aismixer/keys/aismixer_public.pem` from the mixer to the proxy's configured
-`remote_public_key` path (by default
-`/etc/nmea_sproxy/keys/aismixer_public.pem`), then authorize the station public
-identity key for the `aismixer` service as described in the
+A fresh package seeds the canonical singleton and creates an empty named-instance
+directory. Existing legacy top-level YAML remains accepted but deprecated and
+emits the same operator notices as current source. To add a named relation, run
+as root, edit its canonical `input:` / `output:` mappings, then restart procd:
+
+```sh
+mkdir -p /etc/nmea_sproxy/instances
+cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
+vi /etc/nmea_sproxy/instances/boat.yaml
+/etc/init.d/nmea_sproxy restart
+ps w | grep '[n]mea_sproxy'
+logread -e nmea_sproxy
+```
+
+Adding, removing, or renaming an instance file requires a service restart.
+OpenWrt has no systemd-style `nmea_sproxy@boat` unit command.
+
+R2.1 preflights each relation with the current runtime. Plain UDP does not read
+or create station identity and does not require peer trust. UDPSEC ensures or
+validates identity and validates the manually provisioned peer key; invalid
+trust material skips only that relation. Copy the mixer's public key to each
+configured `remote_public_key` path and authorize each station identity as
+described in the
 [`nmea_sproxy` guide](nmea_sproxy/README.md#authorize-the-station-in-aismixer).
-If the configured peer key is missing, unreadable, or invalid, preflight
-intentionally keeps the service stopped instead of entering a respawn loop.
-This is expected safe behavior, not a failed package installation. Explicit
-plain UDP does not require a peer key.
+Relations using the default key paths intentionally share the canonical station
+pair; custom paths remain operator-owned, and relative paths resolve from that
+relation's YAML directory.
 
 **OpenWrt serial hardware.** `nmea_sproxy` consumes an OS-provided serial
 device; it does not access USB devices directly. A native UART needs no USB
@@ -327,10 +344,10 @@ from overwriting newer state. The CLI does not retry automatically.
 `nmea_sproxy` is the station-side network proxy. One process or service instance
 represents one relation: one local UDP or physical serial/USB input to one
 network output. The install, update, and systemd template-instance instructions
-below describe the conventional Linux path; OpenWrt uses the singleton APK/procd
-path in Quick start. UDPSEC is the secure/default transport to the `aismixer`
-service; plain UDP must be selected explicitly and is intended only for trusted
-LAN/VPN paths.
+below describe the conventional Linux path; OpenWrt uses the singleton-plus-named
+APK/procd path in Quick start. UDPSEC is the secure/default transport to the
+`aismixer` service; plain UDP must be selected explicitly and is intended only
+for trusted LAN/VPN paths.
 
 Current source/systemd configurations use explicit `input:` and `output:`
 mappings: `input.type: udp` or `serial`, and `output.type: udpsec` or `udp`. The
@@ -755,36 +772,53 @@ apk add aismixer
 apk add nmea_sproxy
 ```
 
-Пакетното разполагане за `mips_24kc` е валидирано от край до край: физически
-сериен AIS вход → `nmea_sproxy` → автентикиран UDPSEC → `aismixer` → обработка,
-изход и работа на слоя за управление.
+Физическият път за `mips_24kc` е валидиран от край до край с по-стария пакет
+v0.2. Неговата предварителна подготовка на идентичността и автоматична поправка
+на публичния ключ са историческо поведение, а не текущият R2.1 жизнен цикъл;
+промените за именувани R2.1 инстанции все още изискват матрицата за валидиране
+върху физически рутер след сливането.
 
-Пакетите за OpenWrt v0.2, заковани към конкретна версия, запазват procd
-предварителна подготовка на идентичността, включително автоматичната поправка
-на изведения публичен ключ, както за сървъра AISMixer, така и за станцията с
-`nmea_sproxy`. По-конкретно, закованият hook на `nmea_sproxy` все още подготвя
-идентичност на станцията преди стартиране дори за plain-UDP връзка. Тези пакети
-не се променят от описания по-долу жизнен цикъл според необходимостта за
-стандартен Linux. Инсталираният им инструмент за ключове е
-`/usr/lib/aismixer/tools/aismixer_keys.py`. При текущия source и systemd
-идентичността се осигурява само когато нормализираната конфигурация я изисква, а
-поправката е изрично операторско действие.
-Маркирането на конфигурационния синтаксис като deprecated за source/systemd,
-описано по-долу, не променя със задна дата закованите пакетни шаблони или procd
-поведението им.
+Текущият R2.1 OpenWrt използва една услуга `/etc/init.d/nmea_sproxy`, която
+управлява незадължителната обратно съвместима singleton връзка от
+`/etc/nmea_sproxy/config.yaml` и всеки валиден обикновен `*.yaml` файл в
+`/etc/nmea_sproxy/instances/`. Всеки YAML е отделен процес и една връзка.
+Заглавието на singleton процеса е `nmea_sproxy`, а `boat.yaml` се показва като
+`nmea_sproxy@boat`. OpenWrt вътрешно именува успешно стартиралия неназован
+singleton `instance1`, затова именуваният `instance1.yaml` се пропуска, докато
+singleton връзката работи; името е допустимо при разполагане само с именувани
+инстанции. Иначе singleton и именувани връзки могат да работят заедно; една
+невалидна връзка се пропуска, без да спира независимите валидни връзки.
+Стартирането е неуспешно само когато нито една връзка не успее.
 
-При UDPSEC доверието към отсрещната страна никога не се настройва автоматично.
-Копирайте `/etc/aismixer/keys/aismixer_public.pem` от хоста, на който работи
-услугата `aismixer`, към зададения в конфигурацията на проксито път
-`remote_public_key` (по подразбиране
-`/etc/nmea_sproxy/keys/aismixer_public.pem`), след което разрешете публичния
-ключ за идентичност на станцията за услугата `aismixer` според [ръководството за
-`nmea_sproxy`](nmea_sproxy/README.md#authorize-the-station-in-aismixer). Ако
-публичният ключ на отсрещната страна, зададен в конфигурацията, липсва, не може
-да бъде прочетен или е невалиден, предварителната проверка умишлено оставя
-услугата спряна, вместо да допусне respawn loop. Това е очаквано безопасно
-поведение, а не неуспешна инсталация на пакета. Изрично конфигурираният plain UDP
-не изисква публичен ключ на отсрещната страна.
+Нова инсталация на пакета създава каноничния singleton файл и празна директория
+за именувани инстанции. Съществуващият legacy top-level YAML остава приет, но е
+deprecated и извежда същите операторски съобщения като текущия source. За нова
+именувана връзка изпълнете като root, редактирайте каноничните ѝ секции `input:` /
+`output:` и рестартирайте procd услугата:
+
+```sh
+mkdir -p /etc/nmea_sproxy/instances
+cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
+vi /etc/nmea_sproxy/instances/boat.yaml
+/etc/init.d/nmea_sproxy restart
+ps w | grep '[n]mea_sproxy'
+logread -e nmea_sproxy
+```
+
+Добавянето, премахването или преименуването на файл на инстанция изисква рестарт
+на услугата. Под OpenWrt няма systemd команда от вида `nmea_sproxy@boat`.
+
+R2.1 проверява предварително всяка връзка чрез текущия runtime. Plain UDP не
+чете и не създава идентичност на станцията и не изисква доверие към отсрещната
+страна. UDPSEC осигурява или валидира идентичността и валидира ръчно настроения
+ключ за доверие; невалидното доверие пропуска само тази връзка. Копирайте
+публичния ключ на миксера към зададения за всяка връзка `remote_public_key` и
+разрешете всяка станционна идентичност според [ръководството за
+`nmea_sproxy`](nmea_sproxy/README.md#authorize-the-station-in-aismixer).
+Връзките с пътищата по подразбиране умишлено споделят каноничната станционна
+двойка; потребителските (custom) пътища остават собственост на оператора, а
+относителните пътища се разрешават спрямо директорията на YAML файла за
+съответната връзка.
 
 **Сериен хардуер под OpenWrt.** `nmea_sproxy` използва предоставено от
 операционната система серийно устройство и няма пряк достъп до USB устройства.
@@ -967,7 +1001,8 @@ sudo aismixerctl disable --expected-generation 4
 услугата представлява една връзка: един локален UDP или физически сериен/USB
 вход към един мрежов изход. Инструкциите по-долу за инсталиране, обновяване и
 systemd template instances описват стандартния Linux път; OpenWrt използва
-описания в „Бърз старт“ singleton модел с APK/procd. UDPSEC е защитеният
+описания в „Бърз старт“ APK/procd модел със singleton и именувани инстанции.
+UDPSEC е защитеният
 транспорт по подразбиране към услугата `aismixer`; plain UDP трябва да се избере
 изрично и е предназначен само за доверени LAN/VPN връзки.
 
@@ -1405,35 +1440,51 @@ pachetul de la stație:
 apk add nmea_sproxy
 ```
 
-Fluxul de implementare pentru pachetul `mips_24kc` a fost validat end-to-end:
-intrare AIS prin port serial fizic → `nmea_sproxy` → UDPSEC autentificat →
-`aismixer` → procesare, ieșire și funcționarea planului de control.
+Calea fizică `mips_24kc` a fost validată end-to-end cu pachetul v0.2 anterior.
+Pregătirea sa anticipată a identității și repararea automată a cheii publice
+sunt comportament istoric, nu ciclul R2.1 actual; modificările R2.1 pentru
+instanțe denumite necesită încă matricea de validare post-merge pe router fizic.
 
-Pachetele OpenWrt v0.2 fixate la o versiune păstrează pregătirea existentă a
-identității înainte de pornire prin procd, inclusiv repararea automată a cheii
-publice derivate, atât pentru serverul AISMixer, cât și pentru stația
-`nmea_sproxy`. În particular, hook-ul procd fixat al `nmea_sproxy` pregătește în
-continuare identitatea stației înainte de pornire chiar și pentru o relație
-plain UDP.
-Aceste pachete nu sunt modificate de ciclul la cerere pentru Linux convențional
-descris mai jos. Instrumentul lor de chei instalat se află la
-`/usr/lib/aismixer/tools/aismixer_keys.py`. Cu sursa curentă și systemd,
-identitatea este asigurată numai când configurația normalizată o cere, iar
-repararea este o acțiune explicită a operatorului.
-Deprecarea sintaxei de configurare pentru sursă/systemd descrisă mai jos nu
-modifică retroactiv șabloanele pachetelor fixate sau comportamentul lor procd.
+OpenWrt R2.1 actual folosește un singur serviciu `/etc/init.d/nmea_sproxy` pentru
+a superviza singleton-ul opțional compatibil cu versiunile anterioare din
+`/etc/nmea_sproxy/config.yaml` și fiecare fișier obișnuit `*.yaml` valid din
+`/etc/nmea_sproxy/instances/`. Fiecare YAML este un proces separat și o relație.
+Titlul procesului singleton este `nmea_sproxy`, iar `boat.yaml` apare ca
+`nmea_sproxy@boat`. OpenWrt denumește intern `instance1` un singleton fără nume
+care a pornit cu succes, astfel că relația denumită `instance1.yaml` este omisă
+cât timp acel singleton rulează; numele este valid într-o implementare numai cu
+instanțe denumite. În rest, relațiile singleton și denumite pot rula împreună;
+o relație invalidă este omisă fără a suprima relațiile valide independente.
+Pornirea eșuează numai dacă niciuna nu reușește.
 
-Pentru UDPSEC, încrederea în peer nu este configurată niciodată automat. Copiați
-`/etc/aismixer/keys/aismixer_public.pem` de pe gazda pe care rulează `aismixer`
-la calea `remote_public_key` configurată pe proxy (implicit
-`/etc/nmea_sproxy/keys/aismixer_public.pem`), apoi autorizați cheia publică de
-identitate a stației în serviciul `aismixer` conform [ghidului
-`nmea_sproxy`](nmea_sproxy/README.md#authorize-the-station-in-aismixer). Dacă acea
-cheie publică configurată pentru peer lipsește, nu poate fi citită sau este
-invalidă, verificarea preliminară menține intenționat serviciul oprit în loc să
-permită o buclă de respawn. Acesta este un comportament sigur așteptat, nu un
-eșec al instalării pachetului. UDP simplu configurat explicit nu necesită o
-cheie publică pentru peer.
+O instalare nouă a pachetului creează singleton-ul canonic și un director gol
+pentru instanțe denumite. YAML-ul top-level legacy existent rămâne acceptat, dar
+este deprecated și afișează aceleași mesaje pentru operator ca sursa actuală.
+Pentru a adăuga o relație denumită, rulați ca root, editați mapările sale
+canonice `input:` / `output:`, apoi reporniți serviciul procd:
+
+```sh
+mkdir -p /etc/nmea_sproxy/instances
+cp /etc/nmea_sproxy/config.yaml /etc/nmea_sproxy/instances/boat.yaml
+vi /etc/nmea_sproxy/instances/boat.yaml
+/etc/init.d/nmea_sproxy restart
+ps w | grep '[n]mea_sproxy'
+logread -e nmea_sproxy
+```
+
+Adăugarea, eliminarea sau redenumirea unui fișier de instanță necesită repornirea
+serviciului. OpenWrt nu are o comandă systemd de forma `nmea_sproxy@boat`.
+
+R2.1 verifică preliminar fiecare relație prin runtime-ul actual. UDP simplu nu
+citește sau creează identitatea stației și nu necesită încredere în peer. UDPSEC
+asigură sau validează identitatea și validează cheia peer furnizată manual;
+încrederea invalidă omite numai acea relație. Copiați cheia publică a mixerului
+la calea `remote_public_key` configurată pentru fiecare relație și autorizați
+fiecare identitate de stație conform [ghidului
+`nmea_sproxy`](nmea_sproxy/README.md#authorize-the-station-in-aismixer). Relațiile
+care folosesc căile implicite partajează intenționat perechea canonică a stației;
+căile custom rămân în responsabilitatea operatorului, iar căile relative se
+rezolvă din directorul YAML al relației respective.
 
 **Hardware serial în OpenWrt.** `nmea_sproxy` folosește un dispozitiv serial
 furnizat de sistemul de operare; nu accesează direct dispozitive USB. Un UART
@@ -1620,7 +1671,8 @@ automat.
 serviciu reprezintă o relație: o intrare UDP locală sau serială/USB fizică spre
 o ieșire de rețea. Instrucțiunile de mai jos pentru instalare, actualizare și
 instanțe template systemd descriu calea Linux convențională; OpenWrt folosește
-modelul singleton APK/procd descris în secțiunea Pornire rapidă. UDPSEC este
+modelul APK/procd cu singleton și instanțe denumite descris în Pornire rapidă.
+UDPSEC este
 transportul securizat/implicit spre serviciul `aismixer`; UDP simplu trebuie
 selectat explicit și este destinat numai conexiunilor LAN/VPN de încredere.
 

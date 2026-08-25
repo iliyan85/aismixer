@@ -5,18 +5,17 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=aismixer
-PKG_VERSION:=0.2.0
-PKG_RELEASE:=2
+PKG_VERSION:=0.2.1
+PKG_RELEASE:=1
 
-# Pin the exact upstream source revision used for the first OpenWrt
-# packaging/runtime validation. Do not follow a moving branch here.
+# Pin the task-start R2.1 runtime revision; do not follow a moving branch.
+# At final release closure, repin the source revision and mirror hash together.
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/iliyan85/aismixer.git
-PKG_SOURCE_DATE:=2026-08-13
-PKG_SOURCE_VERSION:=10df1265b4226debe06815202ed88a4010a567fc
+PKG_SOURCE_DATE:=2026-08-25
+PKG_SOURCE_VERSION:=cd68b202e362712fe0503ea2b4b8d55ef88a609a
 
-# Add PKG_MIRROR_HASH before treating this as a reproducible public package.
-PKG_MIRROR_HASH:=f4cf3d8fa68b338b58db38d4919d6f01c4027bef2b7db3108d48ad9c30db10c1
+PKG_MIRROR_HASH:=5e7136994d302df0399841e2e6aba3ce48889f21510dac2c8197d8f27413c941
 
 PKG_MAINTAINER:=Iliyan Iliev
 PKG_LICENSE:=CC-BY-NC-4.0
@@ -147,12 +146,17 @@ define Package/nmea_sproxy/install
 		$(1)/etc/init.d/nmea_sproxy
 
 	$(INSTALL_DIR) $(1)/etc/nmea_sproxy
-	$(INSTALL_CONF) $(PKG_BUILD_DIR)/nmea_sproxy/config.system.yaml \
+	$(INSTALL_CONF) ./files/nmea_sproxy.config.yaml \
 		$(1)/etc/nmea_sproxy/config.yaml
+
+	# Each regular YAML file placed here by the operator becomes one named
+	# procd instance. The package intentionally ships this directory empty.
+	$(INSTALL_DIR) $(1)/etc/nmea_sproxy/instances
 
 	# Station identity and trusted server public key are provisioned
 	# locally and are not package payload.
 	$(INSTALL_DIR) $(1)/etc/nmea_sproxy/keys
+	chmod 0700 $(1)/etc/nmea_sproxy/keys
 endef
 
 

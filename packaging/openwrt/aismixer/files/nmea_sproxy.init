@@ -7,44 +7,19 @@ STOP=10
 
 PROG=/usr/bin/nmea_sproxy
 CONFIG=/etc/nmea_sproxy/config.yaml
+INSTANCES_DIR=/etc/nmea_sproxy/instances
 RUNTIME_DIR=/usr/lib/aismixer/nmea_sproxy
 
-KEY_TOOL=/usr/lib/aismixer/tools/aismixer_keys.py
-KEYS_DIR=/etc/nmea_sproxy/keys
-PRIVATE_KEY="$KEYS_DIR/station_private.pem"
-PUBLIC_KEY="$KEYS_DIR/station_public.pem"
-
-
-prepare_station_identity() {
-	mkdir -p "$KEYS_DIR" || return 1
-	chmod 0700 "$KEYS_DIR" || return 1
-
-	if [ -f "$PRIVATE_KEY" ]; then
-		/usr/bin/python3 "$KEY_TOOL" station \
-			--keys-dir "$KEYS_DIR" \
-			--repair-public || return 1
-		return 0
-	fi
-
-	if [ -e "$PUBLIC_KEY" ]; then
-		logger -t nmea_sproxy \
-			"Refusing to replace incomplete station identity: public key exists without private key"
-		return 1
-	fi
-
-	logger -t nmea_sproxy "Generating local nmea_sproxy station identity"
-
-	/usr/bin/python3 "$KEY_TOOL" station \
-		--keys-dir "$KEYS_DIR" || return 1
-}
+LC_ALL=C
+export LC_ALL
 
 
 check_runtime_readiness() {
+	local config="$1"
 	local readiness_error
 
 	readiness_error="$(
-		/usr/bin/python3 - "$CONFIG" "$RUNTIME_DIR" 2>&1 <<'PY'
-import os
+		/usr/bin/python3 - "$config" "$RUNTIME_DIR" 2>&1 <<'PY'
 import sys
 
 config_path = sys.argv[1]
@@ -55,36 +30,12 @@ try:
     import nmea_sproxy as runtime
 
     config = runtime.load_config(config_path)
-    output_type = config["output"]["type"]
+    if config["output"]["type"] == runtime.UDPSEC_OUTPUT_TYPE:
+        runtime.ensure_station_identity(config)
+        runtime.load_peer_public_key(config["remote_public_key"])
 except Exception as exc:
     detail = " ".join(str(exc).split()) or exc.__class__.__name__
     print(f"Configuration preflight failed; service not started: {detail}")
-    raise SystemExit(1)
-
-if output_type != runtime.UDPSEC_OUTPUT_TYPE:
-    raise SystemExit(0)
-
-try:
-    peer_key_path = os.fspath(config["remote_public_key"])
-except Exception as exc:
-    detail = " ".join(str(exc).split()) or exc.__class__.__name__
-    print(f"Configuration preflight failed; service not started: {detail}")
-    raise SystemExit(1)
-
-if not os.path.isfile(peer_key_path) or not os.access(peer_key_path, os.R_OK):
-    print(
-        "UDPSEC peer public key not provisioned; service not started: "
-        f"{peer_key_path}"
-    )
-    raise SystemExit(1)
-
-try:
-    runtime.load_public_key(peer_key_path)
-except Exception:
-    print(
-        "UDPSEC peer public key invalid or unreadable; service not started: "
-        f"{peer_key_path}"
-    )
     raise SystemExit(1)
 PY
 	)" || {
@@ -97,27 +48,111 @@ PY
 }
 
 
-start_service() {
-	if [ ! -f "$CONFIG" ]; then
-		logger -t nmea_sproxy "Configuration not found: $CONFIG"
+valid_instance_name() {
+	case "$1" in
+		""|[!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*)
+			return 1
+			;;
+	esac
+	return 0
+}
+
+
+start_relation() {
+	local config="$1"
+	local instance_name="$2"
+	local process_title="$3"
+	local relation_label="$4"
+
+	if [ ! -f "$config" ]; then
+		logger -t nmea_sproxy \
+			"Skipping $relation_label relation; config is not a regular file: $config"
 		return 1
 	fi
 
-	prepare_station_identity || return 1
-	check_runtime_readiness || return 1
+	if ! check_runtime_readiness "$config"; then
+		logger -t nmea_sproxy \
+			"Skipping $relation_label relation after failed preflight: $config"
+		return 1
+	fi
 
-	procd_open_instance
+	if [ -n "$instance_name" ]; then
+		procd_open_instance "$instance_name"
+	else
+		procd_open_instance
+	fi
 
 	procd_set_param command \
 		"$PROG" \
-		--config "$CONFIG"
+		--config "$config" \
+		--process-title "$process_title"
 
 	procd_set_param stdout 1
 	procd_set_param stderr 1
-
 	procd_set_param respawn 3600 5 5
-
-	procd_set_param file "$CONFIG"
+	procd_set_param file "$config"
 
 	procd_close_instance
+}
+
+
+start_service() {
+	local configured=0
+	local started=0
+	local singleton_started=0
+	local config
+	local filename
+	local instance_name
+
+	if [ -e "$CONFIG" ]; then
+		configured=$((configured + 1))
+		if start_relation "$CONFIG" "" "nmea_sproxy" "singleton"; then
+			started=$((started + 1))
+			singleton_started=1
+		fi
+	fi
+
+	for config in "$INSTANCES_DIR"/*.yaml; do
+		[ -f "$config" ] || continue
+		configured=$((configured + 1))
+
+		filename="${config##*/}"
+		instance_name="${filename%.yaml}"
+		if ! valid_instance_name "$instance_name"; then
+			logger -t nmea_sproxy \
+				"Skipping named relation with unsafe instance name '$instance_name': $config"
+			continue
+		fi
+		# procd internally names the first unnamed instance "instance1".
+		if [ "$singleton_started" -eq 1 ] && [ "$instance_name" = "instance1" ]; then
+			logger -t nmea_sproxy \
+				"Skipping named relation 'instance1'; its name conflicts with the unnamed singleton's internal procd instance name: $config"
+			continue
+		fi
+
+		if start_relation \
+			"$config" \
+			"$instance_name" \
+			"nmea_sproxy@$instance_name" \
+			"named '$instance_name'"; then
+			started=$((started + 1))
+		fi
+	done
+
+	if [ "$started" -gt 0 ]; then
+		if [ "$started" -lt "$configured" ]; then
+			logger -t nmea_sproxy \
+				"Started $started of $configured configured nmea_sproxy relations; invalid relations were skipped"
+		fi
+		return 0
+	fi
+
+	if [ "$configured" -eq 0 ]; then
+		logger -t nmea_sproxy \
+			"No nmea_sproxy relations configured; expected $CONFIG or regular $INSTANCES_DIR/*.yaml files"
+	else
+		logger -t nmea_sproxy \
+			"No nmea_sproxy relations started; all $configured configured relations were invalid"
+	fi
+	return 1
 }
