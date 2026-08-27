@@ -1,10 +1,11 @@
-"""Canonical wire values and codecs for the UDPSEC ECDHE handshake.
+"""Canonical wire values, codecs, and control validation for UDPSEC.
 
 ClientHello and ServerHello packets use pipe-delimited ASCII framing with
 strict UTF-8 for the station identifier, canonical unsigned decimal for the
-timestamp, and canonical standard base64 for binary fields.  This module is
+timestamp, and canonical standard base64 for binary fields. Encrypted ping and
+pong JSON objects use the shared structural helpers below. This module is
 transport-neutral and deliberately performs no signing, verification, ECDHE,
-HKDF, or elliptic-curve point validation.
+HKDF, encryption, or elliptic-curve point validation.
 """
 
 from __future__ import annotations
@@ -35,8 +36,12 @@ __all__ = (
     "SESSION_CONFIRMATION_SEQUENCE",
     "ServerHello",
     "build_client_hello_packet",
+    "build_ping_message",
+    "build_pong_message",
     "build_session_close_message",
     "build_server_hello_packet",
+    "is_matching_pong_message",
+    "is_ping_message",
     "is_session_close_message",
     "parse_client_hello_packet",
     "parse_server_hello_packet",
@@ -99,6 +104,107 @@ def _validate_timestamp(timestamp: object) -> None:
         raise TypeError("timestamp must be an integer")
     if not 0 <= timestamp <= _MAX_TIMESTAMP:
         raise ValueError("timestamp must fit in an unsigned 64-bit integer")
+
+
+def _validate_liveness_timestamp(timestamp: object) -> None:
+    if type(timestamp) is not int:
+        raise TypeError("timestamp must be an integer")
+
+
+def _validate_liveness_sequence(sequence: object) -> None:
+    if type(sequence) is not int:
+        raise TypeError("sequence must be an integer")
+    if sequence < SESSION_CONFIRMATION_SEQUENCE:
+        raise ValueError("sequence must be zero or greater")
+
+
+def _build_liveness_message(
+    message_type: str,
+    station_id: str,
+    sequence: int,
+    timestamp: int,
+) -> dict:
+    _station_id_bytes(station_id)
+    _validate_liveness_sequence(sequence)
+    _validate_liveness_timestamp(timestamp)
+    return {
+        "type": message_type,
+        "seq": sequence,
+        "timestamp": timestamp,
+        "source_id": station_id,
+    }
+
+
+def build_ping_message(
+    station_id: str,
+    sequence: int,
+    timestamp: int,
+) -> dict:
+    """Build one encrypted UDPSEC liveness ping message."""
+
+    return _build_liveness_message("ping", station_id, sequence, timestamp)
+
+
+def build_pong_message(
+    station_id: str,
+    sequence: int,
+    timestamp: int,
+) -> dict:
+    """Build one encrypted UDPSEC liveness pong message."""
+
+    return _build_liveness_message("pong", station_id, sequence, timestamp)
+
+
+def _is_liveness_message(
+    message: object,
+    station_id: str,
+    *,
+    message_type: str,
+) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if not {"type", "seq", "timestamp", "source_id"} <= message.keys():
+        return False
+    return (
+        message.get("type") == message_type
+        and message.get("source_id") == station_id
+        and type(message.get("seq")) is int
+        and type(message.get("timestamp")) is int
+    )
+
+
+def is_ping_message(
+    message: object,
+    station_id: str,
+    *,
+    confirmation: bool = False,
+) -> bool:
+    """Return whether an authenticated JSON value is a valid UDPSEC ping."""
+
+    if not _is_liveness_message(message, station_id, message_type="ping"):
+        return False
+    sequence = message["seq"]
+    if confirmation:
+        return sequence == SESSION_CONFIRMATION_SEQUENCE
+    return sequence > SESSION_CONFIRMATION_SEQUENCE
+
+
+def is_matching_pong_message(
+    message: object,
+    station_id: str,
+    expected_sequence: object,
+) -> bool:
+    """Return whether a UDPSEC pong matches the currently outstanding ping."""
+
+    if (
+        type(expected_sequence) is not int
+        or expected_sequence < SESSION_CONFIRMATION_SEQUENCE
+    ):
+        return False
+    return (
+        _is_liveness_message(message, station_id, message_type="pong")
+        and message["seq"] == expected_sequence
+    )
 
 
 def build_session_close_message(station_id: str, timestamp: int) -> dict:

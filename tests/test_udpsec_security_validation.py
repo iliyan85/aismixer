@@ -1677,6 +1677,7 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                         {
                             "type": "ping",
                             "seq": 0,
+                            "timestamp": 1000,
                             "source_id": STATION_ID,
                         },
                     ),
@@ -1691,6 +1692,7 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                                 {
                                     "type": "ping",
                                     "seq": sequence,
+                                    "timestamp": 1000,
                                     "source_id": STATION_ID,
                                 },
                             ),
@@ -1714,6 +1716,7 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                             _nonce(826),
                             {
                                 "type": "ping",
+                                "timestamp": 1000,
                                 "source_id": STATION_ID,
                             },
                         ),
@@ -1808,7 +1811,125 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                 invalid_semantic_nonce
                 in session.seen_data_nonces._live_by_key
             )
+            assert all(
+                _nonce(marker)
+                not in session.seen_data_nonces._live_by_key
+                for marker in (813, *range(820, 827))
+            )
             assert received_sequences == [41]
+
+
+def test_real_active_ping_timestamp_requires_exact_integer_before_mutation(
+    real_udpsec_endpoints,
+):
+    endpoints = real_udpsec_endpoints
+    with _running_secure_server(
+        endpoints.secure,
+        endpoints.server_private_key,
+        socket.AF_INET,
+        "127.0.0.1",
+    ) as server:
+        with _client_socket(socket.AF_INET, "127.0.0.1") as client:
+            key_material = _perform_real_handshake(
+                endpoints,
+                client,
+                server.remote_addr,
+            )
+            session = _assert_single_confirmed_session(server)
+            before = server.call_in_loop(server.state.stats)
+            invalid_messages = [
+                {
+                    "type": "ping",
+                    "seq": 51,
+                    "source_id": STATION_ID,
+                },
+                *[
+                    {
+                        "type": "ping",
+                        "seq": 51,
+                        "timestamp": timestamp,
+                        "source_id": STATION_ID,
+                    }
+                    for timestamp in (
+                        True,
+                        1.0,
+                        "1000",
+                        [1000],
+                        {"value": 1000},
+                        None,
+                    )
+                ],
+            ]
+            invalid_nonces = [
+                _nonce(870 + index)
+                for index in range(len(invalid_messages))
+            ]
+
+            for nonce, message in zip(
+                invalid_nonces,
+                invalid_messages,
+                strict=True,
+            ):
+                client.sendto(
+                    _encrypted_json_packet(
+                        endpoints.proxy,
+                        key_material.client_to_server_key,
+                        nonce,
+                        message,
+                    ),
+                    server.remote_addr,
+                )
+
+            valid_nonce = _nonce(879)
+            client.sendto(
+                _encrypted_json_packet(
+                    endpoints.proxy,
+                    key_material.client_to_server_key,
+                    valid_nonce,
+                    {
+                        "type": "ping",
+                        "seq": 52,
+                        "timestamp": 1000,
+                        "source_id": STATION_ID,
+                    },
+                ),
+                server.remote_addr,
+            )
+
+            packet, sender = client.recvfrom(8192)
+            assert endpoints.proxy.remote_addresses_match(
+                sender,
+                server.remote_addr,
+            )
+            message = endpoints.proxy.decrypt_secure_json_message(
+                packet,
+                key_material.server_to_client_key,
+            )
+            assert message["type"] == "pong"
+            assert message["seq"] == 52
+            assert type(message["timestamp"]) is int
+            assert message["source_id"] == STATION_ID
+            client.settimeout(0.05)
+            with pytest.raises(socket.timeout):
+                client.recvfrom(8192)
+
+            after = server.call_in_loop(server.state.stats)
+            assert after.sessions_touched == before.sessions_touched + 1
+            assert (
+                after.data_nonces_accepted
+                == before.data_nonces_accepted + 1
+            )
+            assert after.data_nonce_replays == before.data_nonce_replays
+            assert (
+                after.current_data_nonces
+                == before.current_data_nonces + 1
+            )
+            assert valid_nonce in session.seen_data_nonces._live_by_key
+            assert all(
+                nonce not in session.seen_data_nonces._live_by_key
+                for nonce in invalid_nonces
+            )
+            assert server.ingress.empty()
 
 
 def test_real_active_ping_sequence_requires_exact_positive_integer(
@@ -1827,21 +1948,30 @@ def test_real_active_ping_sequence_requires_exact_positive_integer(
                 client,
                 server.remote_addr,
             )
+            session = _assert_single_confirmed_session(server)
             before = server.call_in_loop(server.state.stats)
             negative_sequences = (-1, -(2**31))
             positive_sequences = (1, 2**31)
+            sequences = (*negative_sequences, *positive_sequences)
+            nonces = [
+                _nonce(860 + index)
+                for index in range(len(sequences))
+            ]
 
-            for index, sequence in enumerate(
-                (*negative_sequences, *positive_sequences)
+            for nonce, sequence in zip(
+                nonces,
+                sequences,
+                strict=True,
             ):
                 client.sendto(
                     _encrypted_json_packet(
                         endpoints.proxy,
                         key_material.client_to_server_key,
-                        _nonce(860 + index),
+                        nonce,
                         {
                             "type": "ping",
                             "seq": sequence,
+                            "timestamp": 1000,
                             "source_id": STATION_ID,
                         },
                     ),
@@ -1872,6 +2002,14 @@ def test_real_active_ping_sequence_requires_exact_positive_integer(
                 after.data_nonces_accepted
                 == before.data_nonces_accepted + 2
             )
+            assert all(
+                nonce not in session.seen_data_nonces._live_by_key
+                for nonce in nonces[: len(negative_sequences)]
+            )
+            assert all(
+                nonce in session.seen_data_nonces._live_by_key
+                for nonce in nonces[len(negative_sequences) :]
+            )
             assert server.ingress.empty()
 
 
@@ -1893,6 +2031,7 @@ def test_proxy_rejects_non_integer_authenticated_pong_sequence(
         {
             "type": "pong",
             "seq": invalid_sequence,
+            "timestamp": 1000,
             "source_id": STATION_ID,
         },
     )

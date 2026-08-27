@@ -3183,6 +3183,158 @@ def test_proxy_accepts_only_authenticated_matching_pong_as_liveness():
     ) == proxy.SERVER_PACKET_IGNORED
 
 
+@pytest.mark.parametrize(
+    "message",
+    (
+        {"type": "pong", "seq": 123, "source_id": "boat_001"},
+        {
+            "type": "pong",
+            "seq": 123,
+            "timestamp": True,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "pong",
+            "seq": 123,
+            "timestamp": 1000.0,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "pong",
+            "seq": 123,
+            "timestamp": "1000",
+            "source_id": "boat_001",
+        },
+        {
+            "type": "pong",
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "pong",
+            "seq": True,
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "pong",
+            "seq": 123,
+            "timestamp": 1000,
+        },
+        {
+            "type": "pong",
+            "seq": 123,
+            "timestamp": 1000,
+            "source_id": "other_station",
+        },
+        {
+            "type": "status",
+            "seq": 123,
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+        ["pong", 123, 1000, "boat_001"],
+    ),
+)
+def test_proxy_rejects_authenticated_structurally_invalid_pong(message):
+    proxy = load_proxy_module()
+    key = b"\x02" * 32
+    remote_addr = ("192.0.2.10", 17777)
+    packet = proxy.encrypt_secure_json_message(message, key)
+
+    assert proxy.handle_server_packet(
+        packet,
+        remote_addr,
+        remote_addr,
+        key,
+        "boat_001",
+        123,
+    ) == proxy.SERVER_PACKET_IGNORED
+
+
+@pytest.mark.parametrize("sequence", (122, 124, 0, -1))
+def test_proxy_rejects_stale_future_reserved_or_negative_pong_sequence(
+    sequence,
+):
+    proxy = load_proxy_module()
+    key = b"\x02" * 32
+    remote_addr = ("192.0.2.10", 17777)
+    packet = proxy.encrypt_secure_json_message(
+        {
+            "type": "pong",
+            "seq": sequence,
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+        key,
+    )
+
+    assert proxy.handle_server_packet(
+        packet,
+        remote_addr,
+        remote_addr,
+        key,
+        "boat_001",
+        123,
+    ) == proxy.SERVER_PACKET_IGNORED
+
+
+def test_proxy_cleared_expectation_rejects_duplicate_matching_pong():
+    proxy = load_proxy_module()
+    key = b"\x02" * 32
+    remote_addr = ("192.0.2.10", 17777)
+    packet = proxy.encrypt_secure_json_message(
+        {
+            "type": "pong",
+            "seq": 123,
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+        key,
+    )
+
+    assert proxy.handle_server_packet(
+        packet,
+        remote_addr,
+        remote_addr,
+        key,
+        "boat_001",
+        123,
+    ) == proxy.SERVER_PACKET_AUTHENTICATED
+    assert proxy.handle_server_packet(
+        packet,
+        remote_addr,
+        remote_addr,
+        key,
+        "boat_001",
+        None,
+    ) == proxy.SERVER_PACKET_IGNORED
+
+
+def test_proxy_authenticated_nmea_is_not_server_liveness():
+    proxy = load_proxy_module()
+    key = b"\x02" * 32
+    remote_addr = ("192.0.2.10", 17777)
+    packet = proxy.encrypt_secure_json_message(
+        {
+            "type": "nmea",
+            "payload": "!AIVDM,1,1,,A,payload,0*00",
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+        key,
+    )
+
+    assert proxy.handle_server_packet(
+        packet,
+        remote_addr,
+        remote_addr,
+        key,
+        "boat_001",
+        123,
+    ) == proxy.SERVER_PACKET_IGNORED
+
+
 def test_proxy_distinguishes_authenticated_peer_close_from_matching_pong():
     proxy = load_proxy_module()
     server_to_client_key = b"\x02" * 32
@@ -4097,6 +4249,9 @@ def test_proxy_handshake_ignores_stale_active_pong_before_confirmation(
         "reverse-direction-key",
         "wrong-sequence",
         "bool-sequence",
+        "missing-timestamp",
+        "bool-timestamp",
+        "string-timestamp",
         "wrong-source",
         "wrong-type",
         "malformed-json",
@@ -4143,6 +4298,12 @@ def test_proxy_handshake_ignores_invalid_confirmation_before_valid(
             pong["seq"] = 1
         elif mutation == "bool-sequence":
             pong["seq"] = False
+        elif mutation == "missing-timestamp":
+            pong.pop("timestamp")
+        elif mutation == "bool-timestamp":
+            pong["timestamp"] = True
+        elif mutation == "string-timestamp":
+            pong["timestamp"] = str(pong["timestamp"])
         elif mutation == "wrong-source":
             pong["source_id"] = "other_station"
         elif mutation == "wrong-type":
@@ -4553,6 +4714,60 @@ def test_proxy_session_refresh_interval_zero_disables_planned_refresh():
     assert proxy.session_expiration_reason(10000, 100, 9990, config) is None
 
 
+def test_proxy_deadline_action_has_deterministic_exact_boundary_priority():
+    proxy = load_proxy_module()
+    config = {
+        "keepalive_interval": 30,
+        "peer_timeout": 60,
+        "session_refresh_interval": 60,
+    }
+
+    assert proxy.session_deadline_action(
+        29.999,
+        0,
+        0,
+        0,
+        None,
+        config,
+    ) is None
+    assert proxy.session_deadline_action(
+        30,
+        0,
+        0,
+        0,
+        None,
+        config,
+    ) == proxy.SESSION_ACTION_SEND_PING
+    assert proxy.session_deadline_action(
+        60,
+        0,
+        0,
+        30,
+        1,
+        config,
+    ) == proxy.SESSION_END_PEER_TIMEOUT
+
+    config["peer_timeout"] = 90
+    assert proxy.session_deadline_action(
+        60,
+        0,
+        0,
+        30,
+        1,
+        config,
+    ) == proxy.SESSION_END_PLANNED_REFRESH
+
+    config["session_refresh_interval"] = 0
+    assert proxy.session_deadline_action(
+        60,
+        0,
+        0,
+        30,
+        1,
+        config,
+    ) == proxy.SESSION_END_PROACTIVE_REKEY
+
+
 def test_proxy_normal_ping_pong_does_not_trigger_periodic_reconnect():
     proxy = load_proxy_module()
     config = {
@@ -4603,9 +4818,11 @@ def _run_idle_proxy_session(monkeypatch, config):
     class FakeSocket:
         def __init__(self):
             self.sent = []
+            self.sent_at = []
 
         def sendto(self, data, addr):
             self.sent.append((data, addr))
+            self.sent_at.append(clock[0])
 
     def fake_select(readable, writable, exceptional, timeout):
         clock[0] += timeout
@@ -4644,12 +4861,328 @@ def test_proxy_outstanding_ping_is_not_overwritten_and_proactively_rekeys(
     assert ended_at == 2 * config["keepalive_interval"]
     assert ended_at < config["peer_timeout"]
     assert len(out_sock.sent) == 1
+    assert out_sock.sent_at == [config["keepalive_interval"]]
     ping = proxy.decrypt_secure_json_message(
         out_sock.sent[0][0],
         b"\x01" * 32,
     )
     assert ping["type"] == "ping"
     assert ping["seq"] == 1
+
+
+def test_proxy_exact_keepalive_deadline_rekeys_before_ready_matching_pong(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    client_key = b"\x01" * 32
+    server_key = b"\x02" * 32
+    remote_addr = ("192.0.2.10", 17777)
+    clock = [0.0]
+
+    class IdleInput:
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return None
+
+        def read_ready(self, _ready_socket):
+            raise AssertionError("idle input must not become readable")
+
+        def read_pending(self):
+            return ()
+
+    class FakeOutSocket:
+        def __init__(self):
+            self.response = None
+            self.recv_calls = 0
+            self.sent = []
+
+        def sendto(self, packet, addr):
+            ping = proxy.decrypt_secure_json_message(packet, client_key)
+            self.sent.append((ping, clock[0], addr))
+            self.response = proxy.encrypt_secure_json_message(
+                {
+                    "type": "pong",
+                    "seq": ping["seq"],
+                    "timestamp": int(clock[0]),
+                    "source_id": "boat_001",
+                },
+                server_key,
+            )
+
+        def recvfrom(self, _size):
+            self.recv_calls += 1
+            return self.response, remote_addr
+
+    out_sock = FakeOutSocket()
+    select_calls = [0]
+
+    def fake_select(_readable, _writable, _exceptional, timeout):
+        select_calls[0] += 1
+        clock[0] += timeout
+        if select_calls[0] == 2:
+            return [out_sock], [], []
+        return [], [], []
+
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    reason = proxy.forward_loop(
+        IdleInput(),
+        out_sock,
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 30,
+            "peer_timeout": 90,
+            "session_refresh_interval": 0,
+        },
+        _proxy_session_key_material(
+            proxy,
+            client_to_server_key=client_key,
+            server_to_client_key=server_key,
+        ),
+        remote_addr,
+    )
+
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
+    assert clock[0] == 60
+    assert [item[0]["seq"] for item in out_sock.sent] == [1]
+    assert out_sock.recv_calls == 0
+
+
+def test_proxy_matching_pong_before_deadline_schedules_next_normal_ping(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    client_key = b"\x01" * 32
+    server_key = b"\x02" * 32
+    remote_addr = ("192.0.2.10", 17777)
+    clock = [0.0]
+
+    class IdleInput:
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return None
+
+        def read_ready(self, _ready_socket):
+            raise AssertionError("idle input must not become readable")
+
+        def read_pending(self):
+            return ()
+
+    class FakeOutSocket:
+        def __init__(self):
+            self.response = None
+            self.sent = []
+
+        def sendto(self, packet, addr):
+            ping = proxy.decrypt_secure_json_message(packet, client_key)
+            self.sent.append((ping, clock[0], addr))
+            if ping["seq"] == 1:
+                self.response = proxy.encrypt_secure_json_message(
+                    {
+                        "type": "pong",
+                        "seq": ping["seq"],
+                        "timestamp": int(clock[0]),
+                        "source_id": "boat_001",
+                    },
+                    server_key,
+                )
+            else:
+                raise OSError("end test after second ping")
+
+        def recvfrom(self, _size):
+            return self.response, remote_addr
+
+    out_sock = FakeOutSocket()
+    select_calls = [0]
+
+    def fake_select(_readable, _writable, _exceptional, timeout):
+        select_calls[0] += 1
+        if select_calls[0] == 1:
+            clock[0] += timeout
+            return [], [], []
+        if select_calls[0] == 2:
+            clock[0] = 59.999
+            return [out_sock], [], []
+        clock[0] += timeout
+        return [], [], []
+
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    reason = proxy.forward_loop(
+        IdleInput(),
+        out_sock,
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 30,
+            "peer_timeout": 90,
+            "session_refresh_interval": 0,
+        },
+        _proxy_session_key_material(
+            proxy,
+            client_to_server_key=client_key,
+            server_to_client_key=server_key,
+        ),
+        remote_addr,
+    )
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    assert [item[0]["seq"] for item in out_sock.sent] == [1, 2]
+    assert [item[1] for item in out_sock.sent] == [30, 60]
+
+
+def test_proxy_duplicate_pong_after_acceptance_does_not_refresh_liveness(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    client_key = b"\x01" * 32
+    server_key = b"\x02" * 32
+    remote_addr = ("192.0.2.10", 17777)
+    clock = [0.0]
+
+    class IdleInput:
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return None
+
+        def read_ready(self, _ready_socket):
+            raise AssertionError("idle input must not become readable")
+
+        def read_pending(self):
+            return ()
+
+    class FakeOutSocket:
+        def __init__(self):
+            self.response = None
+            self.sent = []
+            self.recv_calls = 0
+
+        def sendto(self, packet, addr):
+            ping = proxy.decrypt_secure_json_message(packet, client_key)
+            self.sent.append((ping, clock[0], addr))
+            if ping["seq"] == 1:
+                self.response = proxy.encrypt_secure_json_message(
+                    {
+                        "type": "pong",
+                        "seq": ping["seq"],
+                        "timestamp": int(clock[0]),
+                        "source_id": "boat_001",
+                    },
+                    server_key,
+                )
+
+        def recvfrom(self, _size):
+            self.recv_calls += 1
+            return self.response, remote_addr
+
+    out_sock = FakeOutSocket()
+    select_calls = [0]
+
+    def fake_select(_readable, _writable, _exceptional, timeout):
+        select_calls[0] += 1
+        if select_calls[0] == 1:
+            clock[0] += timeout
+            return [], [], []
+        if select_calls[0] == 2:
+            clock[0] = 10.5
+            return [out_sock], [], []
+        if select_calls[0] == 3:
+            clock[0] = 19
+            return [out_sock], [], []
+        clock[0] += timeout
+        return [], [], []
+
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    reason = proxy.forward_loop(
+        IdleInput(),
+        out_sock,
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 10,
+            "peer_timeout": 15,
+            "session_refresh_interval": 0,
+        },
+        _proxy_session_key_material(
+            proxy,
+            client_to_server_key=client_key,
+            server_to_client_key=server_key,
+        ),
+        remote_addr,
+    )
+
+    assert reason == proxy.SESSION_END_PEER_TIMEOUT
+    assert clock[0] == 25.5
+    assert [item[0]["seq"] for item in out_sock.sent] == [1, 2]
+    assert out_sock.recv_calls == 2
+
+
+def test_proxy_recomputes_poll_deadline_after_slow_pending_input(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    clock = [0.0]
+
+    class SlowPendingInput:
+        def __init__(self):
+            self.drained = False
+
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return None
+
+        def read_ready(self, _ready_socket):
+            raise AssertionError("input must not become readable")
+
+        def read_pending(self):
+            if not self.drained:
+                self.drained = True
+                clock[0] = 30
+            return ()
+
+    class FakeOutSocket:
+        def __init__(self):
+            self.sent_at = []
+
+        def sendto(self, _packet, _addr):
+            self.sent_at.append(clock[0])
+
+    out_sock = FakeOutSocket()
+    poll_timeouts = []
+
+    def fake_select(_readable, _writable, _exceptional, timeout):
+        poll_timeouts.append(timeout)
+        raise OSError("end test after fresh timeout calculation")
+
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    reason = proxy.forward_loop(
+        SlowPendingInput(),
+        out_sock,
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 30,
+            "peer_timeout": 90,
+            "session_refresh_interval": 0,
+        },
+        _proxy_session_key_material(proxy),
+        ("192.0.2.10", 17777),
+    )
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    assert out_sock.sent_at == [30]
+    assert poll_timeouts == [30]
 
 
 def test_proxy_peer_timeout_remains_fallback_before_first_ping(monkeypatch):

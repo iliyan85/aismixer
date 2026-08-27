@@ -34,8 +34,10 @@ from core.udpsec_protocol import (
     SESSION_CLOSE_TYPE,
     SESSION_CONFIRMATION_SEQUENCE,
     ServerHello,
+    build_pong_message,
     build_session_close_message,
     build_server_hello_packet,
+    is_ping_message,
     is_session_close_message,
     parse_client_hello_packet,
 )
@@ -801,22 +803,6 @@ def close_owned_sessions(
             state_owner.close_session(addr, session, local_now)
 
 
-def _is_session_confirmation_ping(message, station_id):
-    if not isinstance(message, dict):
-        return False
-    sequence = message.get("seq")
-    timestamp = message.get("timestamp")
-    return (
-        message.get("type") == "ping"
-        and isinstance(sequence, int)
-        and not isinstance(sequence, bool)
-        and sequence == SESSION_CONFIRMATION_SEQUENCE
-        and isinstance(timestamp, int)
-        and not isinstance(timestamp, bool)
-        and message.get("source_id") == station_id
-    )
-
-
 def _build_server_handshake(
     client_hello,
     client_ephemeral_public_key,
@@ -1031,9 +1017,10 @@ async def _secure_server_loop(
                         pending_message = json.loads(
                             pending_plaintext.decode()
                         )
-                        if not _is_session_confirmation_ping(
+                        if not is_ping_message(
                             pending_message,
                             pending.station_id,
+                            confirmation=True,
                         ):
                             print(
                                 f"[!] Invalid session confirmation "
@@ -1068,12 +1055,11 @@ async def _secure_server_loop(
                         if owned_sessions is not None:
                             owned_sessions[addr] = session
 
-                        response = {
-                            "type": "pong",
-                            "seq": SESSION_CONFIRMATION_SEQUENCE,
-                            "timestamp": int(wall_now()),
-                            "source_id": session.station_id,
-                        }
+                        response = build_pong_message(
+                            session.station_id,
+                            SESSION_CONFIRMATION_SEQUENCE,
+                            int(wall_now()),
+                        )
                         sock.sendto(
                             encrypt_secure_json_message(
                                 session.server_to_client_aesgcm,
@@ -1111,11 +1097,7 @@ async def _secure_server_loop(
 
                 message_type = msg.get("type")
                 if message_type == "ping":
-                    sequence = msg.get("seq")
-                    if (
-                        type(sequence) is not int
-                        or sequence <= SESSION_CONFIRMATION_SEQUENCE
-                    ):
+                    if not is_ping_message(msg, station_id):
                         print(f"[!] Invalid ping from {addr}")
                         continue
                 elif message_type == "nmea":
@@ -1148,12 +1130,11 @@ async def _secure_server_loop(
                 state_owner.touch_session(addr, session, local_now)
 
                 if message_type == "ping":
-                    response = {
-                        "type": "pong",
-                        "seq": msg["seq"],
-                        "timestamp": int(wall_now()),
-                        "source_id": station_id,
-                    }
+                    response = build_pong_message(
+                        station_id,
+                        msg["seq"],
+                        int(wall_now()),
+                    )
                     sock.sendto(
                         encrypt_secure_json_message(
                             session.server_to_client_aesgcm,

@@ -307,8 +307,8 @@ is neither durable nor shared across processes.
 
 Wall time and monotonic time have separate ownership. Wall time is used only
 for externally meaningful protocol or diagnostic timestamps: the transmitted
-handshake timestamp check, pong and graceful-close timestamps, and timestamped
-debug output.
+handshake timestamp check, ping, pong, and graceful-close timestamps, and
+timestamped debug output.
 Handshake freshness remains inclusive at the boundary:
 `abs(wall_now - transmitted_timestamp) <= 30`. Monotonic time owns handshake
 replay TTL, pending-session creation and TTL, active-session creation and
@@ -388,12 +388,26 @@ its locally owned TTL remains the only state effect an allowed unknown packet
 may trigger, as specified above; that cleanup is not peer-supplied lifecycle
 evidence.
 
+Sequence `0` is reserved for the encrypted confirmation ping and pong. Every
+ordinary active-session ping and pong sequence has exact built-in `int` type
+and is strictly greater than zero; ordinary sequences begin at `1` in each
+confirmed session and are not reused within that session. Every ping and pong
+requires a `timestamp` whose exact type is built-in `int`, not `bool`; this
+field has no freshness semantics and is not compared with wall or monotonic
+time. Ping and pong objects remain open-schema: additional JSON object members
+do not alter validation of the required fields.
+
 On `nmea_sproxy`, only a matching authenticated encrypted pong from the pinned
 remote tuple advances peer liveness. The pong must decrypt under the current
 server-to-client owner, match the configured station identity, and carry the
-exact outstanding ping sequence. An accepted pong clears that outstanding
-expectation. Plaintext, wrong-key, wrong-address, wrong-source, malformed, and
-wrong-sequence packets provide no liveness evidence.
+exact sequence of the one outstanding ping. No pong is accepted when no ping
+is outstanding. An accepted pong clears that expectation and advances liveness.
+After it is cleared, a duplicate replay has no outstanding sequence to match;
+the sequence is not reused later in that session. Stale or other-sequence pongs
+therefore cannot refresh liveness, and ciphertext from an earlier session
+cannot authenticate under the fresh directional keys. Plaintext, wrong-key,
+wrong-address, wrong-source, malformed, and wrong-sequence packets provide no
+liveness evidence.
 
 At a keepalive deadline with no outstanding ping, the proxy sends one encrypted
 ping and retains its expected sequence. It does not overwrite an unresolved
@@ -405,34 +419,52 @@ handshake attempt. A failure of that attempt returns to normal
 ultimate fallback and retains priority when its deadline is reached. With the
 defaults `keepalive_interval: 30` and `peer_timeout: 90`, the first ping is due
 at about 30 seconds and an unanswered ping normally selects proactive rekey at
-about 60 seconds, before the 90-second timeout. UDPSEC configuration rejects a
-non-finite or non-positive `keepalive_interval` rather than permitting a
-zero-deadline re-handshake loop.
+about 60 seconds, before the 90-second timeout.
+
+Forwarding-loop deadlines use monotonic time and become due at equality. When
+deadlines coincide, deterministic priority is `peer_timeout`, then planned
+session refresh, then the keepalive action: proactive rekey for an unresolved
+ping or a new ping when none is outstanding. A due deadline is resolved before
+poll-ready packets, so a matching pong must be fully authenticated and accepted
+before its boundary to refresh liveness or prevent proactive rekey. Deadline
+checks use fresh monotonic observations. After any pending local-input
+forwarding, the final poll timeout is recomputed from another fresh monotonic
+observation immediately before `select()`.
+
+Timing values must be finite integer or float values, excluding booleans and
+numeric strings. UDPSEC requires `keepalive_interval > 0`,
+`peer_timeout > 0`, `session_refresh_interval >= 0`, and
+`reconnect_delay >= 0`; a zero session refresh interval disables planned
+refresh. These constraints are independent: there is no cross-field ordering
+or ratio requirement. Plain UDP shares only the `reconnect_delay >= 0`
+validation; the other three fields are UDPSEC-only.
 
 Proactive recovery and configured planned refresh both reuse the normal signed
 ClientHello, authenticated ServerHello, directional ECDHE-derived traffic keys,
 and encrypted sequence-zero confirmation. They add no reset, probe, or separate
-recovery protocol. The fresh ClientHello installs or replaces only pending
-state; the old active server session remains usable while confirmation is
-pending, failed confirmation does not destroy it, and successful confirmation
-atomically promotes the candidate and replaces the old active state as specified
-below. Planned refresh and the first proactive-rekey attempt are immediate;
-peer graceful close, `peer_timeout`, handshake failure, local forwarding
-failure, and socket failure use `reconnect_delay`. No NMEA payload is buffered
-or replayed as part of any recovery path.
+recovery protocol. Every attempt generates fresh ephemeral ECDHE material, so
+each confirmed replacement has fresh directional traffic keys. The fresh
+ClientHello installs or replaces only pending state; the old active server
+session remains usable while confirmation is pending, failed confirmation does
+not destroy it, and successful confirmation atomically promotes the candidate
+and replaces the old active state as specified below. Planned refresh and the
+first proactive-rekey attempt are immediate; peer graceful close,
+`peer_timeout`, handshake failure, local forwarding failure, and socket failure
+use `reconnect_delay`. No NMEA payload is buffered or replayed as part of any
+recovery path.
 
 A pending session is promoted only when a DATA packet decrypts under its
 client-to-server AES-GCM owner and decodes to a confirmation ping. Confirmation
 requires type `"ping"`, reserved sequence `0` as a built-in integer and not a
-boolean, an integer timestamp that is not a boolean, and a source identity equal
-to the pending station ID. The packet nonce is admitted to the pending session
-before promotion. Promotion removes the pending entry and, as one state-model
+boolean, a built-in-integer timestamp, and a source identity equal to the
+pending station ID. The packet nonce is admitted to the pending session before
+promotion. Promotion removes the pending entry and, as one state-model
 transition, replaces any live active session at the same address.
 The station identity, both directional AES-GCM owners, and the pending nonce
 set become the new active state; active creation and last-seen time begin at
 promotion. The server then returns an encrypted sequence-zero pong using the
-promoted server-to-client owner. Ordinary active-session ping sequences must
-be exact built-in integers strictly greater than zero.
+promoted server-to-client owner; the proxy requires the same sequence and
+timestamp rules before accepting that confirmation pong.
 
 For promotion at a new address, expired active sessions are removed before
 active capacity is considered; if capacity remains full, the

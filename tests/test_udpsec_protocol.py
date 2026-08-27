@@ -13,8 +13,12 @@ from core.udpsec_protocol import (
     SERVER_HELLO_PREFIX,
     ServerHello,
     build_client_hello_packet,
+    build_ping_message,
+    build_pong_message,
     build_session_close_message,
     build_server_hello_packet,
+    is_matching_pong_message,
+    is_ping_message,
     is_session_close_message,
     parse_client_hello_packet,
     parse_server_hello_packet,
@@ -184,8 +188,12 @@ def test_protocol_api_and_wire_prefixes_are_public():
         "SERVER_HELLO_PREFIX",
         "ServerHello",
         "build_client_hello_packet",
+        "build_ping_message",
+        "build_pong_message",
         "build_session_close_message",
         "build_server_hello_packet",
+        "is_matching_pong_message",
+        "is_ping_message",
         "is_session_close_message",
         "parse_client_hello_packet",
         "parse_server_hello_packet",
@@ -195,6 +203,232 @@ def test_protocol_api_and_wire_prefixes_are_public():
     assert SESSION_CLOSE_TYPE == "close"
     assert SESSION_CONFIRMATION_SEQUENCE == 0
     assert SERVER_HELLO_PREFIX == b"OK"
+
+
+@pytest.mark.parametrize(
+    ("builder", "message_type"),
+    (
+        pytest.param(build_ping_message, "ping", id="ping"),
+        pytest.param(build_pong_message, "pong", id="pong"),
+    ),
+)
+@pytest.mark.parametrize(
+    ("sequence", "timestamp"),
+    (
+        pytest.param(SESSION_CONFIRMATION_SEQUENCE, -1, id="confirmation"),
+        pytest.param(1, MAX_TIMESTAMP + 1, id="ordinary"),
+    ),
+)
+def test_liveness_builders_preserve_wire_shape_without_timestamp_range_rules(
+    builder,
+    message_type,
+    sequence,
+    timestamp,
+):
+    assert builder("boat_001", sequence, timestamp) == {
+        "type": message_type,
+        "seq": sequence,
+        "timestamp": timestamp,
+        "source_id": "boat_001",
+    }
+
+
+@pytest.mark.parametrize("builder", (build_ping_message, build_pong_message))
+@pytest.mark.parametrize(
+    ("station_id", "sequence", "timestamp", "error"),
+    (
+        pytest.param("", 1, 1, ValueError, id="empty-station"),
+        pytest.param("boat_001", True, 1, TypeError, id="bool-sequence"),
+        pytest.param("boat_001", 1.0, 1, TypeError, id="float-sequence"),
+        pytest.param("boat_001", -1, 1, ValueError, id="negative-sequence"),
+        pytest.param("boat_001", 1, True, TypeError, id="bool-timestamp"),
+        pytest.param("boat_001", 1, 1.0, TypeError, id="float-timestamp"),
+    ),
+)
+def test_liveness_builders_reject_invalid_field_types(
+    builder,
+    station_id,
+    sequence,
+    timestamp,
+    error,
+):
+    with pytest.raises(error):
+        builder(station_id, sequence, timestamp)
+
+
+def test_ping_validator_distinguishes_confirmation_and_ordinary_sequences():
+    confirmation = build_ping_message("boat_001", 0, -1)
+    ordinary = build_ping_message("boat_001", 1, MAX_TIMESTAMP + 1)
+
+    assert is_ping_message(confirmation, "boat_001", confirmation=True)
+    assert not is_ping_message(confirmation, "boat_001")
+    assert is_ping_message(ordinary, "boat_001")
+    assert not is_ping_message(ordinary, "boat_001", confirmation=True)
+
+
+def test_liveness_validators_allow_unknown_fields():
+    ping = build_ping_message("boat_001", 1, 1)
+    pong = build_pong_message("boat_001", 1, 1)
+    ping["extension"] = {"future": True}
+    pong["extension"] = {"future": True}
+
+    assert is_ping_message(ping, "boat_001")
+    assert is_matching_pong_message(pong, "boat_001", 1)
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        None,
+        "ping",
+        {},
+        {"type": "ping", "seq": 1, "timestamp": 1},
+        {"type": "ping", "seq": 1, "source_id": "boat_001"},
+        {
+            "type": "ping",
+            "timestamp": 1,
+            "source_id": "boat_001",
+        },
+        {
+            "seq": 1,
+            "timestamp": 1,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "pong",
+            "seq": 1,
+            "timestamp": 1,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "ping",
+            "seq": True,
+            "timestamp": 1,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "ping",
+            "seq": 1,
+            "timestamp": True,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "ping",
+            "seq": 1,
+            "timestamp": 1,
+            "source_id": "other_station",
+        },
+    ),
+)
+def test_ping_validator_rejects_invalid_messages(message):
+    assert not is_ping_message(message, "boat_001")
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_sequence"),
+    (
+        pytest.param(None, 1, id="not-a-dict"),
+        pytest.param({}, 1, id="missing-fields"),
+        pytest.param(
+            {
+                "type": "ping",
+                "seq": 1,
+                "timestamp": 1,
+                "source_id": "boat_001",
+            },
+            1,
+            id="wrong-type",
+        ),
+        pytest.param(
+            {
+                "type": "pong",
+                "seq": 1,
+                "timestamp": 1,
+                "source_id": "other_station",
+            },
+            1,
+            id="wrong-source",
+        ),
+        pytest.param(
+            {
+                "type": "pong",
+                "seq": True,
+                "timestamp": 1,
+                "source_id": "boat_001",
+            },
+            1,
+            id="bool-message-sequence",
+        ),
+        pytest.param(
+            {
+                "type": "pong",
+                "seq": 1,
+                "timestamp": True,
+                "source_id": "boat_001",
+            },
+            1,
+            id="bool-timestamp",
+        ),
+        pytest.param(
+            {
+                "type": "pong",
+                "seq": 1,
+                "timestamp": 1,
+                "source_id": "boat_001",
+            },
+            None,
+            id="no-outstanding-ping",
+        ),
+        pytest.param(
+            {
+                "type": "pong",
+                "seq": 1,
+                "timestamp": 1,
+                "source_id": "boat_001",
+            },
+            True,
+            id="bool-expected-sequence",
+        ),
+        pytest.param(
+            {
+                "type": "pong",
+                "seq": 1,
+                "timestamp": 1,
+                "source_id": "boat_001",
+            },
+            2,
+            id="nonmatching-sequence",
+        ),
+        pytest.param(
+            {
+                "type": "pong",
+                "seq": 0,
+                "timestamp": 1,
+                "source_id": "boat_001",
+            },
+            1,
+            id="unexpected-confirmation-sequence",
+        ),
+    ),
+)
+def test_matching_pong_validator_rejects_invalid_messages(
+    message,
+    expected_sequence,
+):
+    assert not is_matching_pong_message(
+        message,
+        "boat_001",
+        expected_sequence,
+    )
+
+
+@pytest.mark.parametrize("sequence", (SESSION_CONFIRMATION_SEQUENCE, 1, 17))
+def test_matching_pong_validator_requires_the_exact_outstanding_sequence(
+    sequence,
+):
+    pong = build_pong_message("boat_001", sequence, -100)
+
+    assert is_matching_pong_message(pong, "boat_001", sequence)
 
 
 def test_session_close_helper_builds_exact_canonical_control_shape():

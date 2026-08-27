@@ -66,7 +66,17 @@ def canonical_output(output_type="udpsec", **overrides):
 
 @pytest.mark.parametrize(
     "keepalive_interval",
-    (0, -1, True, float("inf"), float("nan"), "not-a-number"),
+    (
+        0,
+        -1,
+        True,
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+        "30",
+        "not-a-number",
+        object(),
+    ),
 )
 def test_udpsec_config_rejects_unsafe_keepalive_interval(
     keepalive_interval,
@@ -80,6 +90,184 @@ def test_udpsec_config_rejects_unsafe_keepalive_interval(
         proxy.validate_udpsec_lifecycle_config(
             {"keepalive_interval": keepalive_interval}
         )
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "constraint"),
+    (
+        pytest.param("peer_timeout", 0, "greater than 0", id="peer-zero"),
+        pytest.param("peer_timeout", -1, "greater than 0", id="peer-negative"),
+        pytest.param("peer_timeout", True, "greater than 0", id="peer-bool"),
+        pytest.param("peer_timeout", float("nan"), "greater than 0", id="peer-nan"),
+        pytest.param("peer_timeout", float("inf"), "greater than 0", id="peer-pos-inf"),
+        pytest.param("peer_timeout", float("-inf"), "greater than 0", id="peer-neg-inf"),
+        pytest.param("peer_timeout", "90", "greater than 0", id="peer-string"),
+        pytest.param("peer_timeout", object(), "greater than 0", id="peer-object"),
+        pytest.param(
+            "session_refresh_interval",
+            -1,
+            "greater than or equal to 0",
+            id="refresh-negative",
+        ),
+        pytest.param(
+            "session_refresh_interval",
+            True,
+            "greater than or equal to 0",
+            id="refresh-bool",
+        ),
+        pytest.param(
+            "session_refresh_interval",
+            float("nan"),
+            "greater than or equal to 0",
+            id="refresh-nan",
+        ),
+        pytest.param(
+            "session_refresh_interval",
+            float("inf"),
+            "greater than or equal to 0",
+            id="refresh-pos-inf",
+        ),
+        pytest.param(
+            "session_refresh_interval",
+            float("-inf"),
+            "greater than or equal to 0",
+            id="refresh-neg-inf",
+        ),
+        pytest.param(
+            "session_refresh_interval",
+            "0",
+            "greater than or equal to 0",
+            id="refresh-string",
+        ),
+        pytest.param(
+            "session_refresh_interval",
+            object(),
+            "greater than or equal to 0",
+            id="refresh-object",
+        ),
+        pytest.param(
+            "reconnect_delay",
+            -1,
+            "greater than or equal to 0",
+            id="reconnect-negative",
+        ),
+        pytest.param(
+            "reconnect_delay",
+            True,
+            "greater than or equal to 0",
+            id="reconnect-bool",
+        ),
+        pytest.param(
+            "reconnect_delay",
+            float("nan"),
+            "greater than or equal to 0",
+            id="reconnect-nan",
+        ),
+        pytest.param(
+            "reconnect_delay",
+            float("inf"),
+            "greater than or equal to 0",
+            id="reconnect-pos-inf",
+        ),
+        pytest.param(
+            "reconnect_delay",
+            float("-inf"),
+            "greater than or equal to 0",
+            id="reconnect-neg-inf",
+        ),
+        pytest.param(
+            "reconnect_delay",
+            "5",
+            "greater than or equal to 0",
+            id="reconnect-string",
+        ),
+        pytest.param(
+            "reconnect_delay",
+            object(),
+            "greater than or equal to 0",
+            id="reconnect-object",
+        ),
+    ),
+)
+def test_udpsec_config_rejects_invalid_lifecycle_timing(
+    name,
+    value,
+    constraint,
+):
+    proxy = load_proxy_module()
+    config = {
+        "keepalive_interval": 30,
+        "peer_timeout": 90,
+        "session_refresh_interval": 0,
+        "reconnect_delay": 5,
+    }
+    config[name] = value
+
+    with pytest.raises(
+        proxy.ProxyConfigError,
+        match=rf"{name} must be a finite number {constraint}",
+    ):
+        proxy.validate_udpsec_lifecycle_config(config)
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        {
+            "keepalive_interval": 1,
+            "peer_timeout": 2.5,
+            "session_refresh_interval": 0,
+            "reconnect_delay": 0.0,
+        },
+        {
+            "keepalive_interval": 1.5,
+            "peer_timeout": 1,
+            "session_refresh_interval": 2.5,
+            "reconnect_delay": 3,
+        },
+    ),
+)
+def test_udpsec_config_accepts_valid_integer_and_float_timings(config):
+    proxy = load_proxy_module()
+
+    proxy.validate_udpsec_lifecycle_config(config)
+
+
+def test_plain_udp_ignores_udpsec_only_lifecycle_timings(tmp_path):
+    proxy = load_proxy_module()
+    config_path = write_config(
+        tmp_path / "plain.yaml",
+        {
+            "input": canonical_input(),
+            "output": canonical_output("udp"),
+            "keepalive_interval": "not-used",
+            "peer_timeout": False,
+            "session_refresh_interval": -1,
+            "reconnect_delay": 0,
+        },
+    )
+
+    config = proxy.load_config(config_path)
+
+    assert config["output"]["type"] == "udp"
+    assert config["keepalive_interval"] == "not-used"
+    assert config["peer_timeout"] is False
+    assert config["session_refresh_interval"] == -1
+
+
+def test_plain_udp_rejects_invalid_used_reconnect_delay(tmp_path):
+    proxy = load_proxy_module()
+    config_path = write_config(
+        tmp_path / "plain.yaml",
+        {
+            "input": canonical_input(),
+            "output": canonical_output("udp"),
+            "reconnect_delay": -1,
+        },
+    )
+
+    with pytest.raises(proxy.ProxyConfigError, match="reconnect_delay"):
+        proxy.load_config(config_path)
 
 
 @pytest.mark.parametrize("output_type", ["udpsec", "udp"])

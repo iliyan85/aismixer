@@ -87,7 +87,9 @@ from core.udpsec_protocol import (  # noqa: E402
     ClientHello,
     SESSION_CONFIRMATION_SEQUENCE,
     build_client_hello_packet,
+    build_ping_message,
     build_session_close_message,
+    is_matching_pong_message,
     is_session_close_message,
     parse_server_hello_packet,
 )
@@ -104,6 +106,7 @@ SESSION_END_PROACTIVE_REKEY = "proactive_rekey"
 SESSION_END_PEER_GRACEFUL_CLOSE = "peer_graceful_close"
 SESSION_END_PEER_TIMEOUT = "peer_timeout"
 SESSION_END_SOCKET_ERROR = "socket_error"
+SESSION_ACTION_SEND_PING = "send_ping"
 HANDSHAKE_FAILURE = "handshake_failure"
 CONFIG_ENV_VAR = "NMEA_SPROXY_CONFIG"
 DEFAULT_PROCESS_TITLE = "nmea_sproxy"
@@ -312,25 +315,54 @@ def load_config(path=None):
         validate_udpsec_lifecycle_config(config)
         apply_default_key_paths(config, user_config)
         resolve_configured_key_paths(config, user_config, selected_path)
+    else:
+        validate_reconnect_delay_config(config)
     return config
 
 
-def validate_udpsec_lifecycle_config(config):
-    keepalive_interval = config.get("keepalive_interval")
-    if isinstance(keepalive_interval, bool):
-        raise ProxyConfigError(
-            "keepalive_interval must be a finite number greater than 0"
-        )
+def _validate_timing_value(config, name, *, strictly_positive):
+    value = config.get(name)
+    comparison = (
+        "greater than 0"
+        if strictly_positive
+        else "greater than or equal to 0"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProxyConfigError(f"{name} must be a finite number {comparison}")
     try:
-        normalized_interval = float(keepalive_interval)
-    except (TypeError, ValueError):
-        raise ProxyConfigError(
-            "keepalive_interval must be a finite number greater than 0"
-        ) from None
-    if not math.isfinite(normalized_interval) or normalized_interval <= 0:
-        raise ProxyConfigError(
-            "keepalive_interval must be a finite number greater than 0"
-        )
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError):
+        normalized = math.nan
+    valid_range = normalized > 0 if strictly_positive else normalized >= 0
+    if not math.isfinite(normalized) or not valid_range:
+        raise ProxyConfigError(f"{name} must be a finite number {comparison}")
+
+
+def validate_reconnect_delay_config(config):
+    _validate_timing_value(
+        config,
+        "reconnect_delay",
+        strictly_positive=False,
+    )
+
+
+def validate_udpsec_lifecycle_config(config):
+    _validate_timing_value(
+        config,
+        "keepalive_interval",
+        strictly_positive=True,
+    )
+    _validate_timing_value(
+        config,
+        "peer_timeout",
+        strictly_positive=True,
+    )
+    _validate_timing_value(
+        config,
+        "session_refresh_interval",
+        strictly_positive=False,
+    )
+    validate_reconnect_delay_config(config)
 
 
 def validate_local_input_config(config):
@@ -698,13 +730,10 @@ def handle_server_packet(
         return SERVER_PACKET_IGNORED
     if is_session_close_message(message, station_id):
         return SERVER_PACKET_PEER_CLOSE
-    message_sequence = message.get("seq")
-    if type(message_sequence) is not int:
-        return SERVER_PACKET_IGNORED
-    if (
-        message.get("type") == "pong"
-        and message.get("source_id") == station_id
-        and message_sequence == expected_ping_seq
+    if is_matching_pong_message(
+        message,
+        station_id,
+        expected_ping_seq,
     ):
         return SERVER_PACKET_AUTHENTICATED
     return SERVER_PACKET_IGNORED
@@ -716,11 +745,34 @@ def session_expiration_reason(
     last_authenticated_peer,
     config,
 ):
-    if now - last_authenticated_peer >= float(config["peer_timeout"]):
+    if now >= last_authenticated_peer + float(config["peer_timeout"]):
         return SESSION_END_PEER_TIMEOUT
     refresh_interval = float(config["session_refresh_interval"])
-    if refresh_interval > 0 and now - session_started_at >= refresh_interval:
+    if refresh_interval > 0 and now >= session_started_at + refresh_interval:
         return SESSION_END_PLANNED_REFRESH
+    return None
+
+
+def session_deadline_action(
+    now,
+    session_started_at,
+    last_authenticated_peer,
+    last_ping_at,
+    expected_ping_seq,
+    config,
+):
+    expiration_reason = session_expiration_reason(
+        now,
+        session_started_at,
+        last_authenticated_peer,
+        config,
+    )
+    if expiration_reason is not None:
+        return expiration_reason
+    if now >= last_ping_at + float(config["keepalive_interval"]):
+        if expected_ping_seq is not None:
+            return SESSION_END_PROACTIVE_REKEY
+        return SESSION_ACTION_SEND_PING
     return None
 
 
@@ -799,12 +851,7 @@ def forward_pending_input(input_adapter, send_sentence):
 
 
 def send_ping(sock, remote_addr, client_to_server_key, station_id, seq):
-    message = {
-        "type": "ping",
-        "seq": seq,
-        "timestamp": int(time.time()),
-        "source_id": station_id,
-    }
+    message = build_ping_message(station_id, seq, int(time.time()))
     sock.sendto(
         encrypt_secure_json_message(message, client_to_server_key),
         remote_addr,
@@ -1036,29 +1083,51 @@ def forward_loop(
         remote_addr,
     )
 
-    while True:
-        now = time.monotonic()
-        expiration_reason = session_expiration_reason(
-            now, session_started_at, last_authenticated_peer, config
-        )
-        if expiration_reason:
-            if expiration_reason == SESSION_END_PLANNED_REFRESH:
-                print("Secure session planned refresh due.")
-            else:
-                print(f"Secure session invalidated: {expiration_reason}")
-            return expiration_reason
+    def apply_due_deadline(now):
+        nonlocal expected_ping_seq, last_ping_at, next_ping_seq
 
-        keepalive_interval = float(config["keepalive_interval"])
-        poll_timeout = session_poll_timeout(
+        action = session_deadline_action(
             now,
             session_started_at,
             last_authenticated_peer,
             last_ping_at,
+            expected_ping_seq,
             config,
         )
-        input_poll_interval = input_adapter.poll_interval()
-        if input_poll_interval is not None:
-            poll_timeout = min(poll_timeout, input_poll_interval)
+        if action == SESSION_ACTION_SEND_PING:
+            try:
+                send_ping(
+                    out_sock,
+                    remote_addr,
+                    client_to_server_key,
+                    config["station_id"],
+                    next_ping_seq,
+                )
+            except Exception as e:
+                print(f"❌ Secure ping error: {e}")
+                return SESSION_END_SOCKET_ERROR
+            expected_ping_seq = next_ping_seq
+            next_ping_seq += 1
+            last_ping_at = now
+            return None
+        if action == SESSION_END_PROACTIVE_REKEY:
+            print(
+                "Secure session liveness unresolved; "
+                "starting authenticated re-handshake."
+            )
+            return action
+        if action == SESSION_END_PLANNED_REFRESH:
+            print("Secure session planned refresh due.")
+            return action
+        if action is not None:
+            print(f"Secure session invalidated: {action}")
+        return action
+
+    while True:
+        now = time.monotonic()
+        deadline_reason = apply_due_deadline(now)
+        if deadline_reason is not None:
+            return deadline_reason
 
         try:
             forward_pending_input(
@@ -1070,7 +1139,22 @@ def forward_loop(
             return SESSION_END_SOCKET_ERROR
 
         input_sockets = input_adapter.selectable_sockets()
+        input_poll_interval = input_adapter.poll_interval()
         readable_sockets = input_sockets + [out_sock]
+
+        now = time.monotonic()
+        deadline_reason = apply_due_deadline(now)
+        if deadline_reason is not None:
+            return deadline_reason
+        poll_timeout = session_poll_timeout(
+            now,
+            session_started_at,
+            last_authenticated_peer,
+            last_ping_at,
+            config,
+        )
+        if input_poll_interval is not None:
+            poll_timeout = min(poll_timeout, input_poll_interval)
 
         try:
             readable, _, _ = select.select(
@@ -1079,6 +1163,11 @@ def forward_loop(
         except Exception as e:
             print(f"❌ Forwarding error: {e}")
             return SESSION_END_SOCKET_ERROR
+
+        now = time.monotonic()
+        deadline_reason = apply_due_deadline(now)
+        if deadline_reason is not None:
+            return deadline_reason
 
         if out_sock in readable:
             try:
@@ -1095,8 +1184,12 @@ def forward_loop(
                 config["station_id"],
                 expected_ping_seq,
             )
+            now = time.monotonic()
+            deadline_reason = apply_due_deadline(now)
+            if deadline_reason is not None:
+                return deadline_reason
             if result == SERVER_PACKET_AUTHENTICATED:
-                last_authenticated_peer = time.monotonic()
+                last_authenticated_peer = now
                 expected_ping_seq = None
             elif result == SERVER_PACKET_PEER_CLOSE:
                 print("Secure peer closed the current session gracefully.")
@@ -1114,40 +1207,6 @@ def forward_loop(
             except Exception as e:
                 print(f"❌ Forwarding error: {e}")
                 return SESSION_END_SOCKET_ERROR
-
-        now = time.monotonic()
-        expiration_reason = session_expiration_reason(
-            now, session_started_at, last_authenticated_peer, config
-        )
-        if expiration_reason:
-            if expiration_reason == SESSION_END_PLANNED_REFRESH:
-                print("Secure session planned refresh due.")
-            else:
-                print(f"Secure session invalidated: {expiration_reason}")
-            return expiration_reason
-
-        if now - last_ping_at >= keepalive_interval:
-            if expected_ping_seq is not None:
-                print(
-                    "Secure session liveness unresolved; "
-                    "starting authenticated re-handshake."
-                )
-                return SESSION_END_PROACTIVE_REKEY
-            try:
-                send_ping(
-                    out_sock,
-                    remote_addr,
-                    client_to_server_key,
-                    config["station_id"],
-                    next_ping_seq,
-                )
-            except Exception as e:
-                print(f"❌ Secure ping error: {e}")
-                return SESSION_END_SOCKET_ERROR
-            expected_ping_seq = next_ping_seq
-            next_ping_seq += 1
-            last_ping_at = now
-
 
 def plain_udp_forward_loop(local_input, output_adapter, ingress_policy=None):
     input_adapter = _coerce_input_adapter(local_input, ingress_policy)

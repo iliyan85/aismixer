@@ -133,6 +133,10 @@ prove that the AIS payload itself is semantically true or physically accurate.
 The proxy sends authenticated encrypted pings and accepts matching
 authenticated encrypted pongs from the configured remote peer. These messages
 provide liveness and help keep NAT, CGNAT, and mobile-client UDP mappings alive.
+Sequence `0` is reserved for handshake confirmation. Ordinary pings start at
+sequence `1`, remain positive, and are not reused within a confirmed session.
+Every ping and pong also carries a required integer timestamp, but control
+timestamps have no freshness check and do not determine peer liveness.
 
 UDPSEC has no plaintext `NOSESSION` packet or equivalent unauthenticated
 session-control message. AISMixer silently drops encrypted data or pings for a
@@ -790,6 +794,7 @@ The defaults are:
 keepalive_interval: 30
 peer_timeout: 90
 session_refresh_interval: 0
+reconnect_delay: 5
 ```
 
 - `keepalive_interval` schedules authenticated encrypted pings. The proxy keeps
@@ -797,13 +802,35 @@ session_refresh_interval: 0
   ping. It must be a finite number greater than zero.
 - `peer_timeout` ends the session and reconnects when matching authenticated
   pongs stop arriving; it remains the fallback if proactive recovery cannot be
-  selected first.
+  selected first. It must be a finite number greater than zero.
 - `session_refresh_interval` optionally schedules a planned re-handshake.
-  The default `0` disables planned periodic refresh.
+  It must be a finite number greater than or equal to zero; the default `0`
+  disables planned periodic refresh.
 - `reconnect_delay` controls the delay after handshake failures, socket
   failures, `peer_timeout`, and an authenticated server close. A planned
   refresh or the first proactive recovery attempt re-handshakes immediately;
-  failure of that attempt returns to this delay.
+  failure of that attempt returns to this delay. It must be a finite number
+  greater than or equal to zero.
+
+These fields require YAML numeric values, not booleans or quoted numeric
+strings. There is no required ordering or ratio between them. Explicit plain
+UDP validates and uses only `reconnect_delay`; the other three timings are
+UDPSEC-only.
+
+Sequence `0` is used only by the encrypted confirmation ping and pong. In each
+confirmed session, ordinary ping/pong sequences start at `1`, must be real
+built-in integers rather than booleans, stay positive, and are not reused. A
+ping or pong also requires a built-in-integer `timestamp`; its value is not
+checked for freshness and does not extend a deadline by itself. Additional
+JSON object fields do not replace or relax these required fields.
+
+The proxy retains exactly one outstanding ordinary ping sequence. Only a pong
+from the pinned remote tuple that authenticates under the current keys, matches
+the station identity, and exactly matches that sequence clears the expectation
+and refreshes liveness. Duplicate or stale pongs cannot refresh liveness after
+the expectation is cleared or changed. Fresh ECDHE material gives each
+confirmed session fresh directional keys, so captured traffic from an earlier
+session cannot authenticate in its replacement.
 
 When one ping remains unanswered through the next keepalive deadline, the
 proxy reuses the normal signed handshake and encrypted sequence-zero
@@ -812,13 +839,25 @@ seconds after the last session start or ping and proactive rekey is selected
 around 60 seconds, before the 90-second `peer_timeout`. No AIS sentence is
 replayed during the transition.
 
+Deadlines use monotonic time and are due at equality. When more than one is due,
+the proxy applies `peer_timeout` first, planned session refresh second, and the
+keepalive action last: proactive rekey for an unanswered ping or a new ping when
+none is outstanding. Due deadlines are handled before poll-ready datagrams, so
+a matching pong must be authenticated and accepted before the applicable
+deadline. The proxy takes fresh monotonic readings for these decisions and
+recomputes its final polling timeout immediately before `select()`, after any
+pending local-input forwarding.
+
 The server keeps the old active session while the replacement is pending.
 Failed confirmation leaves the old session intact; successful confirmation
-atomically installs the new directional keys. Graceful shutdown instead uses
-an encrypted, unacknowledged close under the current keys. A validated client
-close removes only that active server session. A validated server close makes
-the proxy use normal reconnect backoff. A crash or lost UDP close falls back to
-proactive liveness recovery, `peer_timeout`, and server session TTL.
+atomically installs the new directional keys when the server validates the
+confirmation ping, then sends the encrypted sequence-zero confirmation pong.
+The proxy treats the replacement session as confirmed only after authenticating
+and accepting that pong. Graceful shutdown instead uses an encrypted,
+unacknowledged close under the current keys. A validated client close removes
+only that active server session. A validated server close makes the proxy use
+normal reconnect backoff. A crash or lost UDP close falls back to proactive
+liveness recovery, `peer_timeout`, and server session TTL.
 
 The ping traffic helps preserve a NAT mapping, but the server associates a
 session with the observed client source IP and port. NAT rebinding, changing
