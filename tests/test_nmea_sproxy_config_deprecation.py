@@ -64,6 +64,24 @@ def canonical_output(output_type="udpsec", **overrides):
     return config
 
 
+@pytest.mark.parametrize(
+    "keepalive_interval",
+    (0, -1, True, float("inf"), float("nan"), "not-a-number"),
+)
+def test_udpsec_config_rejects_unsafe_keepalive_interval(
+    keepalive_interval,
+):
+    proxy = load_proxy_module()
+
+    with pytest.raises(
+        proxy.ProxyConfigError,
+        match="keepalive_interval must be a finite number greater than 0",
+    ):
+        proxy.validate_udpsec_lifecycle_config(
+            {"keepalive_interval": keepalive_interval}
+        )
+
+
 @pytest.mark.parametrize("output_type", ["udpsec", "udp"])
 def test_canonical_config_emits_no_deprecation_notice(
     tmp_path,

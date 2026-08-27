@@ -134,10 +134,33 @@ The proxy sends authenticated encrypted pings and accepts matching
 authenticated encrypted pongs from the configured remote peer. These messages
 provide liveness and help keep NAT, CGNAT, and mobile-client UDP mappings alive.
 
-AISMixer may send `NOSESSION` when it receives traffic for a session it no
-longer has. `NOSESSION` is unauthenticated and is only a reconnect hint; the
-proxy accepts it only from the configured remote address, ends the local
-session, and attempts a new handshake after `reconnect_delay`.
+UDPSEC has no plaintext `NOSESSION` packet or equivalent unauthenticated
+session-control message. AISMixer silently drops encrypted data or pings for a
+session it does not have. The proxy ignores unauthenticated datagrams, even
+when they appear to come from the configured remote address.
+
+If AISMixer loses session state, matching authenticated pongs stop arriving.
+The proxy sends one encrypted ping and retains its expected pong sequence. If
+that pong is still missing at the next keepalive deadline, it starts one fresh
+signed ECDHE handshake immediately instead of replacing the outstanding ping.
+If that handshake fails, later attempts use `reconnect_delay`.
+`peer_timeout` remains the fallback. With the 30-second keepalive and 90-second
+peer-timeout defaults, proactive recovery normally starts at about 60 seconds.
+
+A fresh handshake creates only pending server state until encrypted
+sequence-zero confirmation succeeds. Any old active session remains intact if
+confirmation fails and is replaced only after successful confirmation. Planned
+refresh uses the same safe pending-session transition. Recovery adds no reset
+or probe protocol, and UDP data sent during recovery is not replayed.
+
+On normal shutdown, each endpoint sends an encrypted authenticated `close`
+control message with its established directional session key before closing
+the UDP socket. The message is best-effort and unacknowledged. A validated
+station close lets AISMixer remove that exact active session immediately; a
+validated AISMixer close makes the proxy leave the session and wait
+`reconnect_delay`. SIGTERM from systemd or procd follows this graceful path.
+Crashes and lost close datagrams fall back to liveness and session TTL. A close
+from an old session cannot authenticate under fresh ECDHE traffic keys.
 
 UDPSEC session recovery does not make UDP reliable:
 
@@ -315,7 +338,7 @@ the oldest queued line is dropped so fresher real-time AIS traffic can continue.
 ### Output modes
 
 Canonical UDPSEC output uses the station identity, key files, handshake,
-session, ping/pong, and `NOSESSION` behavior:
+session, and authenticated ping/pong behavior:
 
 ```yaml
 output:
@@ -378,8 +401,9 @@ Two optional network controls are available for the station-side proxy:
 When source binding is configured, it selects the outbound socket address
 family. A literal destination must use the same family, and a hostname
 destination is resolved only within that family. The selected destination tuple
-is pinned for the process lifetime. In UDPSEC mode, handshake replies, pongs,
-and `NOSESSION` hints are accepted only from that tuple.
+is pinned for the process lifetime. In UDPSEC mode, handshake replies and
+encrypted pongs are considered only from that tuple and must still pass their
+cryptographic authentication checks before they affect session state.
 
 The local ACL complements the host firewall; it does not replace firewall,
 routing, or interface-level policy. Because the server session is bound to the
@@ -768,14 +792,33 @@ peer_timeout: 90
 session_refresh_interval: 0
 ```
 
-- `keepalive_interval` is the interval between authenticated encrypted pings.
+- `keepalive_interval` schedules authenticated encrypted pings. The proxy keeps
+  one expected pong outstanding rather than replacing its sequence with a new
+  ping. It must be a finite number greater than zero.
 - `peer_timeout` ends the session and reconnects when matching authenticated
-  pongs stop arriving.
+  pongs stop arriving; it remains the fallback if proactive recovery cannot be
+  selected first.
 - `session_refresh_interval` optionally schedules a planned re-handshake.
   The default `0` disables planned periodic refresh.
 - `reconnect_delay` controls the delay after handshake failures, socket
-  failures, `peer_timeout`, and `NOSESSION`. A planned refresh re-handshakes
-  immediately.
+  failures, `peer_timeout`, and an authenticated server close. A planned
+  refresh or the first proactive recovery attempt re-handshakes immediately;
+  failure of that attempt returns to this delay.
+
+When one ping remains unanswered through the next keepalive deadline, the
+proxy reuses the normal signed handshake and encrypted sequence-zero
+confirmation. With the defaults above, a ping is normally sent around 30
+seconds after the last session start or ping and proactive rekey is selected
+around 60 seconds, before the 90-second `peer_timeout`. No AIS sentence is
+replayed during the transition.
+
+The server keeps the old active session while the replacement is pending.
+Failed confirmation leaves the old session intact; successful confirmation
+atomically installs the new directional keys. Graceful shutdown instead uses
+an encrypted, unacknowledged close under the current keys. A validated client
+close removes only that active server session. A validated server close makes
+the proxy use normal reconnect backoff. A crash or lost UDP close falls back to
+proactive liveness recovery, `peer_timeout`, and server session TTL.
 
 The ping traffic helps preserve a NAT mapping, but the server associates a
 session with the observed client source IP and port. NAT rebinding, changing
@@ -802,15 +845,18 @@ Check:
 - Station and server clocks are reasonably synchronized.
 - `output.host` / `output.port` are correct.
 
-### `NOSESSION` or repeated reconnects
+### Liveness recovery or repeated reconnects
 
-An occasional `NOSESSION` can follow an AISMixer restart, server-side session
-expiry, or a client source-address change. The proxy treats it as a reconnect
-hint and performs a new handshake after `reconnect_delay`.
+After an AISMixer restart, server-side session expiry, or a client
+source-address change, the server silently drops traffic protected by the old
+session. The proxy normally detects one unanswered ping at the next keepalive
+deadline and immediately tries a fresh authenticated handshake. A failed
+attempt waits `reconnect_delay`; `peer_timeout` remains the fallback. No
+plaintext reset hint is used.
 
 For repeated reconnects, verify bidirectional UDP reachability, NAT timeout
 behavior, the configured `keepalive_interval` / `peer_timeout`, and AISMixer
-logs. Remember that `NOSESSION` itself is not authenticated.
+logs.
 
 ### Missing key files
 

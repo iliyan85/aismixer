@@ -47,6 +47,90 @@ def legacy_config(**overrides):
     return config
 
 
+def _install_udpsec_main_fakes(monkeypatch, proxy, events):
+    remote_addr = ("192.0.2.10", 19999)
+    key_material = SimpleNamespace(
+        client_to_server_key=b"\x11" * 32,
+        server_to_client_key=b"\x22" * 32,
+    )
+    config = {
+        "input": {
+            "type": "udp",
+            "listen_ip": "127.0.0.1",
+            "listen_port": 50000,
+        },
+        "output": {
+            "type": "udpsec",
+            "host": remote_addr[0],
+            "port": remote_addr[1],
+            "legacy": False,
+        },
+        "station_id": "boat_001",
+        "station_private_key": "station.pem",
+        "remote_public_key": "server.pem",
+        "reconnect_delay": 5,
+        "keepalive_interval": 30,
+        "peer_timeout": 90,
+        "session_refresh_interval": 0,
+    }
+
+    class OutSocket:
+        def settimeout(self, timeout):
+            events.append(("timeout", timeout))
+
+        def sendto(self, packet, destination):
+            events.append(("send", packet, destination))
+
+        def close(self):
+            events.append(("out-close",))
+
+    class LocalInput:
+        def start(self):
+            events.append(("input-start",))
+
+        def close(self):
+            events.append(("input-close",))
+
+    out_socket = OutSocket()
+    local_input = LocalInput()
+    station_identity = SimpleNamespace(
+        private_key=object(),
+        generated=False,
+        private_path=Path("station.pem"),
+        public_path=Path("station-public.pem"),
+    )
+
+    monkeypatch.setattr(proxy, "resolve_config_path", lambda _path=None: None)
+    monkeypatch.setattr(proxy, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(
+        proxy,
+        "resolve_output_endpoint",
+        lambda _output: (remote_addr, proxy.socket.AF_INET),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "ensure_station_identity",
+        lambda _config: station_identity,
+    )
+    monkeypatch.setattr(proxy, "load_peer_public_key", lambda _path: object())
+    monkeypatch.setattr(
+        proxy,
+        "create_output_socket",
+        lambda _output, _family: out_socket,
+    )
+    monkeypatch.setattr(
+        proxy,
+        "create_local_input_adapter",
+        lambda _config, _policy: local_input,
+    )
+    monkeypatch.setattr(
+        proxy,
+        "perform_handshake",
+        lambda *_args: key_material,
+    )
+    return config, remote_addr, key_material
+
+
 def test_output_omitted_preserves_legacy_udpsec_behavior():
     proxy = load_proxy_module()
     config = legacy_config(source_ip="192.0.2.20")
@@ -808,7 +892,7 @@ def test_udpsec_main_reports_missing_peer_trust_before_activation(
     assert str(missing_peer).lower() in captured.err.lower()
 
 
-def test_plain_udp_main_does_not_process_no_session_or_send_ping(
+def test_plain_udp_main_does_not_process_udpsec_packets_or_send_ping(
     monkeypatch,
     tmp_path,
 ):
@@ -844,3 +928,141 @@ def test_plain_udp_main_does_not_process_no_session_or_send_ping(
     monkeypatch.setattr(proxy, "run_plain_udp_relation", lambda *_args, **_kwargs: 0)
 
     assert proxy.main(["--config", str(config_path)]) == 0
+
+
+def test_udpsec_main_sends_one_authenticated_close_before_socket_close(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    events = []
+    config, remote_addr, key_material = _install_udpsec_main_fakes(
+        monkeypatch,
+        proxy,
+        events,
+    )
+    monkeypatch.setattr(proxy.time, "time", lambda: 1234)
+
+    def interrupt_active_session(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(proxy, "forward_loop", interrupt_active_session)
+
+    with pytest.raises(KeyboardInterrupt):
+        proxy.main([])
+
+    sends = [event for event in events if event[0] == "send"]
+    assert len(sends) == 1
+    _, packet, destination = sends[0]
+    assert destination == remote_addr
+    assert proxy.decrypt_secure_json_message(
+        packet,
+        key_material.client_to_server_key,
+    ) == {
+        "type": "close",
+        "reason": "shutdown",
+        "timestamp": 1234,
+        "source_id": config["station_id"],
+    }
+    assert events.index(sends[0]) < events.index(("out-close",))
+    assert events.index(("input-close",)) < events.index(("out-close",))
+
+
+def test_udpsec_peer_close_clears_active_handle_and_uses_reconnect_delay(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    events = []
+    config, _, _ = _install_udpsec_main_fakes(
+        monkeypatch,
+        proxy,
+        events,
+    )
+    monkeypatch.setattr(
+        proxy,
+        "forward_loop",
+        lambda *_args, **_kwargs: proxy.SESSION_END_PEER_GRACEFUL_CLOSE,
+    )
+
+    def stop_after_backoff(delay):
+        events.append(("sleep", delay))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(proxy.time, "sleep", stop_after_backoff)
+
+    with pytest.raises(KeyboardInterrupt):
+        proxy.main([])
+
+    assert ("sleep", config["reconnect_delay"]) in events
+    assert not [event for event in events if event[0] == "send"]
+    assert events[-2:] == [("input-close",), ("out-close",)]
+
+
+def test_udpsec_main_proactive_rekey_is_immediate_then_failure_backs_off(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    socket_events = []
+    config, _, key_material = _install_udpsec_main_fakes(
+        monkeypatch,
+        proxy,
+        socket_events,
+    )
+    lifecycle = []
+    handshake_results = iter((key_material, None))
+
+    def perform_handshake(*_args):
+        lifecycle.append("handshake")
+        return next(handshake_results)
+
+    def forward_loop(*_args, **_kwargs):
+        lifecycle.append("forward")
+        return proxy.SESSION_END_PROACTIVE_REKEY
+
+    def stop_after_backoff(delay):
+        lifecycle.append(("sleep", delay))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(proxy, "perform_handshake", perform_handshake)
+    monkeypatch.setattr(proxy, "forward_loop", forward_loop)
+    monkeypatch.setattr(proxy.time, "sleep", stop_after_backoff)
+
+    with pytest.raises(KeyboardInterrupt):
+        proxy.main([])
+
+    assert lifecycle == [
+        "handshake",
+        "forward",
+        "handshake",
+        ("sleep", config["reconnect_delay"]),
+    ]
+
+
+def test_proxy_run_service_installs_and_restores_sigterm_handler(
+    monkeypatch,
+):
+    proxy = load_proxy_module()
+    previous_handler = object()
+    signal_calls = []
+
+    def fake_signal(signum, handler):
+        signal_calls.append((signum, handler))
+        return previous_handler
+
+    def interrupt(_argv):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(proxy.signal, "signal", fake_signal)
+    monkeypatch.setattr(proxy, "main", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        proxy.run_service(["--config", "unused.yaml"])
+
+    assert signal_calls == [
+        (proxy.signal.SIGTERM, proxy._raise_keyboard_interrupt_for_sigterm),
+        (proxy.signal.SIGTERM, previous_handler),
+    ]
+    with pytest.raises(KeyboardInterrupt):
+        proxy._raise_keyboard_interrupt_for_sigterm(
+            proxy.signal.SIGTERM,
+            None,
+        )

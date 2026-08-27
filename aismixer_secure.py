@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import time
+import weakref
 import yaml
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -30,15 +31,17 @@ from core.udpsec_crypto import (
 )
 from core.udpsec_protocol import (
     CLIENT_HELLO_PREFIX,
+    SESSION_CLOSE_TYPE,
     SESSION_CONFIRMATION_SEQUENCE,
     ServerHello,
+    build_session_close_message,
     build_server_hello_packet,
+    is_session_close_message,
     parse_client_hello_packet,
 )
 
 
 DATA_PREFIX = b"NMEA-D"
-NOSESSION_PREFIX = b"NOSESSION"
 DATA_AAD = b"NMEA"
 SESSION_TTL_SECONDS = 300
 SESSION_MAX = 100000
@@ -265,6 +268,7 @@ class SecureStateStats:
     sessions_replaced: int
     sessions_touched: int
     sessions_expired: int
+    sessions_closed: int
     sessions_capacity_evicted: int
 
     pending_sessions_created: int
@@ -334,6 +338,7 @@ class SecureState:
         self._sessions_replaced = 0
         self._sessions_touched = 0
         self._sessions_expired = 0
+        self._sessions_closed = 0
         self._sessions_capacity_evicted = 0
 
         self._pending_sessions_created = 0
@@ -366,6 +371,7 @@ class SecureState:
             sessions_replaced=self._sessions_replaced,
             sessions_touched=self._sessions_touched,
             sessions_expired=self._sessions_expired,
+            sessions_closed=self._sessions_closed,
             sessions_capacity_evicted=self._sessions_capacity_evicted,
             pending_sessions_created=self._pending_sessions_created,
             pending_sessions_replaced=self._pending_sessions_replaced,
@@ -421,6 +427,8 @@ class SecureState:
 
         if reason == "expired":
             self._sessions_expired += 1
+        elif reason == "closed":
+            self._sessions_closed += 1
         elif reason == "capacity":
             self._sessions_capacity_evicted += 1
         elif reason == "replaced":
@@ -573,6 +581,15 @@ class SecureState:
         if self._get_live_session_handle(addr, session, now) is None:
             return False
         self._touch_active_session(addr, session, now)
+        return True
+
+    def is_live_session_handle(self, addr, session, now):
+        return self._get_live_session_handle(addr, session, now) is not None
+
+    def close_session(self, addr, session, now):
+        if self._get_live_session_handle(addr, session, now) is None:
+            return False
+        self._remove_session(addr, "closed")
         return True
 
     def promote_pending_session(self, addr, pending, now):
@@ -730,16 +747,58 @@ def parse_secure_data_packet(data):
     return nonce, ciphertext
 
 
-def build_no_session_hint(station_id=None):
-    if station_id:
-        return NOSESSION_PREFIX + b"|" + station_id.encode()
-    return NOSESSION_PREFIX
-
-
 def encrypt_secure_json_message(aesgcm, message):
     nonce = os.urandom(12)
     plaintext = json.dumps(message, separators=(",", ":")).encode()
     return DATA_PREFIX + nonce + aesgcm.encrypt(nonce, plaintext, DATA_AAD)
+
+
+def close_owned_sessions(
+    sock,
+    state_owner,
+    owned_sessions,
+    *,
+    wall_clock=None,
+    monotonic_clock=None,
+):
+    """Best-effort close exact active sessions owned by one listener socket."""
+
+    if not owned_sessions:
+        return
+
+    wall_now = time.time if wall_clock is None else wall_clock
+    monotonic_now = (
+        time.monotonic
+        if monotonic_clock is None
+        else monotonic_clock
+    )
+    for addr, session in list(owned_sessions.items()):
+        local_now = monotonic_now()
+        if not state_owner.is_live_session_handle(
+            addr,
+            session,
+            local_now,
+        ):
+            continue
+        try:
+            message = build_session_close_message(
+                session.station_id,
+                int(wall_now()),
+            )
+            sock.sendto(
+                encrypt_secure_json_message(
+                    session.server_to_client_aesgcm,
+                    message,
+                ),
+                addr,
+            )
+        except Exception as exc:
+            print(
+                f"[!] Best-effort secure close failed for {addr}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        finally:
+            state_owner.close_session(addr, session, local_now)
 
 
 def _is_session_confirmation_ping(message, station_id):
@@ -835,6 +894,8 @@ async def _secure_server_loop(
     wall_clock=None,
     monotonic_clock=None,
     server_private_key=None,
+    owned_sessions=None,
+    owned_pending_sessions=None,
 ):
     active_server_private_key = _require_prepared_server_private_key(
         server_private_key
@@ -915,13 +976,15 @@ async def _secure_server_loop(
                     client_ephemeral_public_key,
                     server_private_key=active_server_private_key,
                 )
-                state_owner.install_pending_session(
+                pending = state_owner.install_pending_session(
                     addr,
                     station_id,
                     client_to_server_aesgcm,
                     server_to_client_aesgcm,
                     local_now,
                 )
+                if owned_pending_sessions is not None:
+                    owned_pending_sessions[addr] = pending
 
                 sock.sendto(response_packet, addr)
                 print(
@@ -938,10 +1001,13 @@ async def _secure_server_loop(
                 pending = state_owner.get_pending_session(
                     addr, local_now
                 )
+                if (
+                    owned_pending_sessions is not None
+                    and owned_pending_sessions.get(addr) is not pending
+                ):
+                    pending = None
                 session = state_owner.get_active_session(addr, local_now)
                 if pending is None and session is None:
-                    print(f"[!] No session for {addr}")
-                    sock.sendto(build_no_session_hint(), addr)
                     continue
 
                 nonce, ciphertext = parse_secure_data_packet(data)
@@ -994,6 +1060,13 @@ async def _secure_server_loop(
                             addr, session, local_now
                         ):
                             continue
+                        if (
+                            owned_pending_sessions is not None
+                            and owned_pending_sessions.get(addr) is pending
+                        ):
+                            owned_pending_sessions.pop(addr, None)
+                        if owned_sessions is not None:
+                            owned_sessions[addr] = session
 
                         response = {
                             "type": "pong",
@@ -1049,6 +1122,15 @@ async def _secure_server_loop(
                     if "payload" not in msg:
                         print(f"[!] Invalid NMEA data from {addr}")
                         continue
+                elif message_type == SESSION_CLOSE_TYPE:
+                    if not is_session_close_message(msg, station_id):
+                        print(f"[!] Invalid session close from {addr}")
+                        continue
+                    if (
+                        owned_sessions is not None
+                        and owned_sessions.get(addr) is not session
+                    ):
+                        continue
                 else:
                     print(f"[!] Unknown secure message type from {addr}")
                     continue
@@ -1057,6 +1139,10 @@ async def _secure_server_loop(
                     session, nonce, local_now
                 ):
                     print(f"[!] Duplicate secure data nonce from {addr}")
+                    continue
+
+                if message_type == SESSION_CLOSE_TYPE:
+                    state_owner.close_session(addr, session, local_now)
                     continue
 
                 state_owner.touch_session(addr, session, local_now)
@@ -1122,6 +1208,12 @@ async def secure_server(
     """Run one secure ingress producer and close its owned socket exactly once."""
 
     sock = create_udp_listener_socket(ip, reuse_address=False)
+    state_owner = secure_state if state is None else state
+    # SecureState may be shared by multiple listeners. Weak exact handles keep
+    # handshake and shutdown ownership local to this socket without retaining
+    # removed state.
+    owned_sessions = weakref.WeakValueDictionary()
+    owned_pending_sessions = weakref.WeakValueDictionary()
     try:
         await _secure_server_loop(
             sock,
@@ -1131,10 +1223,21 @@ async def secure_server(
             sec_input_id=sec_input_id,
             ingress_policy=ingress_policy,
             input_traffic=input_traffic,
-            state=state,
+            state=state_owner,
             wall_clock=wall_clock,
             monotonic_clock=monotonic_clock,
             server_private_key=server_private_key,
+            owned_sessions=owned_sessions,
+            owned_pending_sessions=owned_pending_sessions,
         )
     finally:
-        sock.close()
+        try:
+            close_owned_sessions(
+                sock,
+                state_owner,
+                owned_sessions,
+                wall_clock=wall_clock,
+                monotonic_clock=monotonic_clock,
+            )
+        finally:
+            sock.close()

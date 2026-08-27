@@ -7,11 +7,15 @@ import core.udpsec_protocol as udpsec_protocol
 from core.udpsec_protocol import (
     CLIENT_HELLO_PREFIX,
     ClientHello,
+    SESSION_CLOSE_REASON_SHUTDOWN,
+    SESSION_CLOSE_TYPE,
     SESSION_CONFIRMATION_SEQUENCE,
     SERVER_HELLO_PREFIX,
     ServerHello,
     build_client_hello_packet,
+    build_session_close_message,
     build_server_hello_packet,
+    is_session_close_message,
     parse_client_hello_packet,
     parse_server_hello_packet,
 )
@@ -174,17 +178,118 @@ def test_protocol_api_and_wire_prefixes_are_public():
     assert {
         "CLIENT_HELLO_PREFIX",
         "ClientHello",
+        "SESSION_CLOSE_REASON_SHUTDOWN",
+        "SESSION_CLOSE_TYPE",
         "SESSION_CONFIRMATION_SEQUENCE",
         "SERVER_HELLO_PREFIX",
         "ServerHello",
         "build_client_hello_packet",
+        "build_session_close_message",
         "build_server_hello_packet",
+        "is_session_close_message",
         "parse_client_hello_packet",
         "parse_server_hello_packet",
     } <= set(udpsec_protocol.__all__)
     assert CLIENT_HELLO_PREFIX == b"NMEA-H"
+    assert SESSION_CLOSE_REASON_SHUTDOWN == "shutdown"
+    assert SESSION_CLOSE_TYPE == "close"
     assert SESSION_CONFIRMATION_SEQUENCE == 0
     assert SERVER_HELLO_PREFIX == b"OK"
+
+
+def test_session_close_helper_builds_exact_canonical_control_shape():
+    message = build_session_close_message("boat_001", MAX_TIMESTAMP)
+
+    assert message == {
+        "type": "close",
+        "reason": "shutdown",
+        "timestamp": MAX_TIMESTAMP,
+        "source_id": "boat_001",
+    }
+    assert is_session_close_message(message, "boat_001")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        None,
+        "close",
+        {},
+        {
+            "type": "close",
+            "reason": "shutdown",
+            "timestamp": 1,
+        },
+        {
+            "type": "close",
+            "reason": "shutdown",
+            "timestamp": 1,
+            "source_id": "boat_001",
+            "seq": 1,
+        },
+        {
+            "type": "pong",
+            "reason": "shutdown",
+            "timestamp": 1,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "close",
+            "reason": "restart",
+            "timestamp": 1,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "close",
+            "reason": "shutdown",
+            "timestamp": True,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "close",
+            "reason": "shutdown",
+            "timestamp": -1,
+            "source_id": "boat_001",
+        },
+        {
+            "type": "close",
+            "reason": "shutdown",
+            "timestamp": MAX_TIMESTAMP + 1,
+            "source_id": "boat_001",
+        },
+    ),
+)
+def test_session_close_helper_rejects_noncanonical_shapes(message):
+    assert not is_session_close_message(message, "boat_001")
+
+
+def test_session_close_helper_binds_expected_source_identity():
+    message = build_session_close_message("boat_001", 1)
+
+    assert not is_session_close_message(message, "other_station")
+
+
+@pytest.mark.parametrize(
+    ("station_id", "timestamp", "error"),
+    (
+        pytest.param("", 1, ValueError, id="empty-station"),
+        pytest.param("boat_001", True, TypeError, id="bool-timestamp"),
+        pytest.param("boat_001", -1, ValueError, id="negative-timestamp"),
+        pytest.param(
+            "boat_001",
+            MAX_TIMESTAMP + 1,
+            ValueError,
+            id="oversized-timestamp",
+        ),
+    ),
+)
+def test_session_close_builder_reuses_strict_identity_and_timestamp_rules(
+    station_id,
+    timestamp,
+    error,
+):
+    with pytest.raises(error):
+        build_session_close_message(station_id, timestamp)
 
 
 def test_exact_client_hello_wire_vector():

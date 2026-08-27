@@ -4,6 +4,8 @@ from pathlib import Path
 import socket
 import yaml
 import os
+import math
+import signal
 import time
 import sys
 import json
@@ -85,22 +87,24 @@ from core.udpsec_protocol import (  # noqa: E402
     ClientHello,
     SESSION_CONFIRMATION_SEQUENCE,
     build_client_hello_packet,
+    build_session_close_message,
+    is_session_close_message,
     parse_server_hello_packet,
 )
 
 
 # Константи
 DATA_PREFIX = b"NMEA-D"
-NOSESSION_PREFIX = b"NOSESSION"
 DATA_AAD = b"NMEA"
 SERVER_PACKET_IGNORED = "ignored"
 SERVER_PACKET_AUTHENTICATED = "authenticated"
+SERVER_PACKET_PEER_CLOSE = "peer_close"
 SESSION_END_PLANNED_REFRESH = "planned_refresh"
+SESSION_END_PROACTIVE_REKEY = "proactive_rekey"
+SESSION_END_PEER_GRACEFUL_CLOSE = "peer_graceful_close"
 SESSION_END_PEER_TIMEOUT = "peer_timeout"
-SESSION_END_NOSESSION = "nosession"
 SESSION_END_SOCKET_ERROR = "socket_error"
 HANDSHAKE_FAILURE = "handshake_failure"
-SERVER_PACKET_NO_SESSION = SESSION_END_NOSESSION
 CONFIG_ENV_VAR = "NMEA_SPROXY_CONFIG"
 DEFAULT_PROCESS_TITLE = "nmea_sproxy"
 SYSTEM_CONFIG_PATH = "/etc/nmea_sproxy/config.yaml"
@@ -305,9 +309,28 @@ def load_config(path=None):
     validate_local_input_config(config)
     output_config = validate_output_config(config)
     if output_config["type"] == UDPSEC_OUTPUT_TYPE:
+        validate_udpsec_lifecycle_config(config)
         apply_default_key_paths(config, user_config)
         resolve_configured_key_paths(config, user_config, selected_path)
     return config
+
+
+def validate_udpsec_lifecycle_config(config):
+    keepalive_interval = config.get("keepalive_interval")
+    if isinstance(keepalive_interval, bool):
+        raise ProxyConfigError(
+            "keepalive_interval must be a finite number greater than 0"
+        )
+    try:
+        normalized_interval = float(keepalive_interval)
+    except (TypeError, ValueError):
+        raise ProxyConfigError(
+            "keepalive_interval must be a finite number greater than 0"
+        ) from None
+    if not math.isfinite(normalized_interval) or normalized_interval <= 0:
+        raise ProxyConfigError(
+            "keepalive_interval must be a finite number greater than 0"
+        )
 
 
 def validate_local_input_config(config):
@@ -655,10 +678,6 @@ def create_outbound_socket(family, source_address=None):
         raise ProxyConfigError(str(exc)) from exc
 
 
-def is_no_session_hint(data):
-    return data == NOSESSION_PREFIX or data.startswith(NOSESSION_PREFIX + b"|")
-
-
 def handle_server_packet(
     data,
     addr,
@@ -670,9 +689,6 @@ def handle_server_packet(
     if not remote_addresses_match(addr, remote_addr):
         return SERVER_PACKET_IGNORED
 
-    if is_no_session_hint(data):
-        return SERVER_PACKET_NO_SESSION
-
     try:
         message = decrypt_secure_json_message(data, server_to_client_key)
     except Exception:
@@ -680,6 +696,8 @@ def handle_server_packet(
 
     if not isinstance(message, dict):
         return SERVER_PACKET_IGNORED
+    if is_session_close_message(message, station_id):
+        return SERVER_PACKET_PEER_CLOSE
     message_sequence = message.get("seq")
     if type(message_sequence) is not int:
         return SERVER_PACKET_IGNORED
@@ -724,7 +742,10 @@ def session_poll_timeout(
 
 
 def retry_delay_for_reason(reason, config):
-    if reason == SESSION_END_PLANNED_REFRESH:
+    if reason in (
+        SESSION_END_PLANNED_REFRESH,
+        SESSION_END_PROACTIVE_REKEY,
+    ):
         return None
     return config["reconnect_delay"]
 
@@ -784,6 +805,22 @@ def send_ping(sock, remote_addr, client_to_server_key, station_id, seq):
         "timestamp": int(time.time()),
         "source_id": station_id,
     }
+    sock.sendto(
+        encrypt_secure_json_message(message, client_to_server_key),
+        remote_addr,
+    )
+
+
+def send_session_close(
+    sock,
+    remote_addr,
+    client_to_server_key,
+    station_id,
+):
+    message = build_session_close_message(
+        station_id,
+        int(time.time()),
+    )
     sock.sendto(
         encrypt_secure_json_message(message, client_to_server_key),
         remote_addr,
@@ -962,9 +999,6 @@ def perform_handshake(
                     station_id,
                     SESSION_CONFIRMATION_SEQUENCE,
                 )
-                if confirmation_result == SERVER_PACKET_NO_SESSION:
-                    print("❌ Server rejected pending secure session.")
-                    return None
                 if confirmation_result == SERVER_PACKET_IGNORED:
                     continue
                 if confirmation_result != SERVER_PACKET_AUTHENTICATED:
@@ -1061,12 +1095,12 @@ def forward_loop(
                 config["station_id"],
                 expected_ping_seq,
             )
-            if result == SERVER_PACKET_NO_SESSION:
-                print("Secure server reported NOSESSION.")
-                return SERVER_PACKET_NO_SESSION
             if result == SERVER_PACKET_AUTHENTICATED:
                 last_authenticated_peer = time.monotonic()
                 expected_ping_seq = None
+            elif result == SERVER_PACKET_PEER_CLOSE:
+                print("Secure peer closed the current session gracefully.")
+                return SESSION_END_PEER_GRACEFUL_CLOSE
 
         for ready_socket in input_sockets:
             if ready_socket not in readable:
@@ -1082,7 +1116,23 @@ def forward_loop(
                 return SESSION_END_SOCKET_ERROR
 
         now = time.monotonic()
+        expiration_reason = session_expiration_reason(
+            now, session_started_at, last_authenticated_peer, config
+        )
+        if expiration_reason:
+            if expiration_reason == SESSION_END_PLANNED_REFRESH:
+                print("Secure session planned refresh due.")
+            else:
+                print(f"Secure session invalidated: {expiration_reason}")
+            return expiration_reason
+
         if now - last_ping_at >= keepalive_interval:
+            if expected_ping_seq is not None:
+                print(
+                    "Secure session liveness unresolved; "
+                    "starting authenticated re-handshake."
+                )
+                return SESSION_END_PROACTIVE_REKEY
             try:
                 send_ping(
                     out_sock,
@@ -1286,6 +1336,7 @@ def main(argv=None):
             f"{output_config['host']}:{output_config['port']}"
         )
 
+    active_session_key_material = None
     local_input.start()
     try:
         if output_config["type"] == UDP_OUTPUT_TYPE:
@@ -1306,6 +1357,7 @@ def main(argv=None):
                 remote_addr,
             )
             if session_key_material:
+                active_session_key_material = session_key_material
                 reason = forward_loop(
                     local_input,
                     out_sock,
@@ -1314,6 +1366,8 @@ def main(argv=None):
                     remote_addr,
                     ingress_policy,
                 )
+                if reason == SESSION_END_PEER_GRACEFUL_CLOSE:
+                    active_session_key_material = None
             else:
                 reason = HANDSHAKE_FAILURE
 
@@ -1325,13 +1379,48 @@ def main(argv=None):
             print(f"🔁 Retrying in {retry_delay} seconds...")
             time.sleep(retry_delay)
     finally:
-        local_input.close()
-        if output_config["type"] == UDPSEC_OUTPUT_TYPE:
-            out_sock.close()
+        try:
+            if (
+                output_config["type"] == UDPSEC_OUTPUT_TYPE
+                and active_session_key_material is not None
+            ):
+                try:
+                    send_session_close(
+                        out_sock,
+                        remote_addr,
+                        active_session_key_material.client_to_server_key,
+                        config["station_id"],
+                    )
+                except Exception as exc:
+                    print(
+                        "Best-effort secure close failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+        finally:
+            try:
+                local_input.close()
+            finally:
+                if output_config["type"] == UDPSEC_OUTPUT_TYPE:
+                    out_sock.close()
+
+
+def _raise_keyboard_interrupt_for_sigterm(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+def run_service(argv=None):
+    previous_sigterm = signal.signal(
+        signal.SIGTERM,
+        _raise_keyboard_interrupt_for_sigterm,
+    )
+    try:
+        return main(argv)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(run_service())
     except KeyboardInterrupt:
         print("👋 Exit by user.")

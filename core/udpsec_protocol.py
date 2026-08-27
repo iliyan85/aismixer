@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 CLIENT_HELLO_PREFIX = b"NMEA-H"
 SERVER_HELLO_PREFIX = b"OK"
 SESSION_CONFIRMATION_SEQUENCE = 0
+SESSION_CLOSE_TYPE = "close"
+SESSION_CLOSE_REASON_SHUTDOWN = "shutdown"
 
 _MAX_TIMESTAMP = (1 << 64) - 1
 _MAX_TIMESTAMP_ASCII = str(_MAX_TIMESTAMP).encode("ascii")
@@ -28,10 +30,14 @@ __all__ = (
     "CLIENT_HELLO_PREFIX",
     "ClientHello",
     "SERVER_HELLO_PREFIX",
+    "SESSION_CLOSE_REASON_SHUTDOWN",
+    "SESSION_CLOSE_TYPE",
     "SESSION_CONFIRMATION_SEQUENCE",
     "ServerHello",
     "build_client_hello_packet",
+    "build_session_close_message",
     "build_server_hello_packet",
+    "is_session_close_message",
     "parse_client_hello_packet",
     "parse_server_hello_packet",
 )
@@ -93,6 +99,37 @@ def _validate_timestamp(timestamp: object) -> None:
         raise TypeError("timestamp must be an integer")
     if not 0 <= timestamp <= _MAX_TIMESTAMP:
         raise ValueError("timestamp must fit in an unsigned 64-bit integer")
+
+
+def build_session_close_message(station_id: str, timestamp: int) -> dict:
+    """Build the canonical encrypted UDPSEC graceful-close message."""
+
+    _station_id_bytes(station_id)
+    _validate_timestamp(timestamp)
+    return {
+        "type": SESSION_CLOSE_TYPE,
+        "reason": SESSION_CLOSE_REASON_SHUTDOWN,
+        "timestamp": timestamp,
+        "source_id": station_id,
+    }
+
+
+def is_session_close_message(message: object, station_id: str) -> bool:
+    """Return whether an authenticated JSON value is a canonical close."""
+
+    if not isinstance(message, dict):
+        return False
+    if set(message) != {"type", "reason", "timestamp", "source_id"}:
+        return False
+    timestamp = message.get("timestamp")
+    return (
+        message.get("type") == SESSION_CLOSE_TYPE
+        and message.get("reason") == SESSION_CLOSE_REASON_SHUTDOWN
+        and message.get("source_id") == station_id
+        and isinstance(timestamp, int)
+        and not isinstance(timestamp, bool)
+        and 0 <= timestamp <= _MAX_TIMESTAMP
+    )
 
 
 def _require_immutable_bytes(name: str, value: object) -> bytes:

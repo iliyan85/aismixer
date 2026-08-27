@@ -307,7 +307,8 @@ is neither durable nor shared across processes.
 
 Wall time and monotonic time have separate ownership. Wall time is used only
 for externally meaningful protocol or diagnostic timestamps: the transmitted
-handshake timestamp check, pong timestamps, and timestamped debug output.
+handshake timestamp check, pong and graceful-close timestamps, and timestamped
+debug output.
 Handshake freshness remains inclusive at the boundary:
 `abs(wall_now - transmitted_timestamp) <= 30`. Monotonic time owns handshake
 replay TTL, pending-session creation and TTL, active-session creation and
@@ -354,6 +355,12 @@ server-side pending state. Pending expiry, same-address replacement, or capacity
 eviction discards only that pending entry and its nonce state and does not itself
 alter an active session at that address.
 
+When multiple listeners share one `SecureState`, each listener retains the
+exact pending object created through its socket. Only that listener may confirm
+and promote that still-current object. A missing, stale, or replaced
+listener-local handle cannot consume the candidate nonce or transfer promotion
+ownership across listener sockets.
+
 An active session is identified by the exact peer socket address and retains
 its authenticated station ID, separate client-to-server and server-to-client
 AES-GCM owners, monotonic creation and last-seen times, and a private
@@ -371,6 +378,48 @@ expired directly addressed session is never treated as live. State operations
 receiving an active or pending handle first require exact retained-object
 identity at its address. A replaced, capacity-evicted, promoted, expired, or
 otherwise stale handle cannot mutate state or trigger unrelated cleanup.
+
+UDPSEC has no plaintext session-reset or other unauthenticated session-control
+packet. A DATA packet received for an address with no live pending or active
+session is dropped without a wire response. Plaintext, malformed, unknown, or
+otherwise unauthenticated datagrams cannot touch, promote, replace, extend, or
+delete a live session. The monotonic cleanup of state that has already reached
+its locally owned TTL remains the only state effect an allowed unknown packet
+may trigger, as specified above; that cleanup is not peer-supplied lifecycle
+evidence.
+
+On `nmea_sproxy`, only a matching authenticated encrypted pong from the pinned
+remote tuple advances peer liveness. The pong must decrypt under the current
+server-to-client owner, match the configured station identity, and carry the
+exact outstanding ping sequence. An accepted pong clears that outstanding
+expectation. Plaintext, wrong-key, wrong-address, wrong-source, malformed, and
+wrong-sequence packets provide no liveness evidence.
+
+At a keepalive deadline with no outstanding ping, the proxy sends one encrypted
+ping and retains its expected sequence. It does not overwrite an unresolved
+expectation with later ping sequences. If that expectation is still unresolved
+when the next keepalive deadline is reached, the proxy ends the local forwarding
+loop with a proactive-rekey reason and immediately makes one fresh signed ECDHE
+handshake attempt. A failure of that attempt returns to normal
+`reconnect_delay`; it cannot create a busy retry loop. `peer_timeout` remains an
+ultimate fallback and retains priority when its deadline is reached. With the
+defaults `keepalive_interval: 30` and `peer_timeout: 90`, the first ping is due
+at about 30 seconds and an unanswered ping normally selects proactive rekey at
+about 60 seconds, before the 90-second timeout. UDPSEC configuration rejects a
+non-finite or non-positive `keepalive_interval` rather than permitting a
+zero-deadline re-handshake loop.
+
+Proactive recovery and configured planned refresh both reuse the normal signed
+ClientHello, authenticated ServerHello, directional ECDHE-derived traffic keys,
+and encrypted sequence-zero confirmation. They add no reset, probe, or separate
+recovery protocol. The fresh ClientHello installs or replaces only pending
+state; the old active server session remains usable while confirmation is
+pending, failed confirmation does not destroy it, and successful confirmation
+atomically promotes the candidate and replaces the old active state as specified
+below. Planned refresh and the first proactive-rekey attempt are immediate;
+peer graceful close, `peer_timeout`, handshake failure, local forwarding
+failure, and socket failure use `reconnect_delay`. No NMEA payload is buffered
+or replayed as part of any recovery path.
 
 A pending session is promoted only when a DATA packet decrypts under its
 client-to-server AES-GCM owner and decodes to a confirmation ping. Confirmation
@@ -405,6 +454,38 @@ and evicts the oldest live nonce deterministically when capacity remains full.
 Promotion transfers the pending nonce set without discarding it; other removal
 of its owning session discards it.
 
+Graceful close is a canonical JSON control message with type `"close"`, reason
+`"shutdown"`, an unsigned integer timestamp, and the authenticated station
+identity in `source_id`. It is carried inside the existing encrypted DATA
+channel; there is no plaintext close prefix. It is best-effort and
+unacknowledged, and neither endpoint waits for a reply.
+
+A client close is encrypted under the current client-to-server AES-GCM owner.
+The server accepts it only at the exact active peer address and through the
+listener that retained that exact live session object. Source identity and the
+complete canonical message shape must match. Decryption and the normal active
+data-nonce replay checks occur before state changes; only after nonce admission
+does the server remove that exact active session and discard its nonce state.
+Pending state at the same address and sessions owned by other listeners remain
+unchanged. Forged, plaintext, wrong-key, replayed, stale-handle, or cross-listener
+close attempts cannot remove a session.
+
+A server close is encrypted under the current server-to-client AES-GCM owner
+and sent only through the listener socket that owns the exact retained live
+session. The proxy considers it only from its pinned remote tuple and leaves the
+current session only after successful decryption and canonical source and shape
+validation. A validated peer close selects normal `reconnect_delay`, not an
+immediate re-handshake. It does not require or carry a ping sequence.
+
+Normal endpoint shutdown sends at most one such close per live relation before
+its UDP socket is closed. This includes proxy SIGINT or SIGTERM and AISMixer
+async cancellation reached through SIGINT, SIGTERM, systemd, or procd service
+termination. Process crashes cannot send it, and UDP may lose it; active-session
+TTL, authenticated liveness, proactive re-handshake, and `peer_timeout` remain
+the fallbacks. Each fresh confirmed ECDHE session has fresh traffic keys, so a
+close captured under an older session cannot authenticate against or terminate
+the replacement session.
+
 An NMEA message that contains the required `payload` key but whose value is not
 a string retains that accepted nonce and touches its active session before
 frame construction is attempted. It produces no frame or queue item and is not
@@ -412,13 +493,16 @@ promoted to a protocol exception; later packets continue to be processed.
 
 `stats()` returns an immutable point-in-time `SecureStateStats` snapshot. It
 reports replay, pending-session, active-session, and data-nonce lifecycle
-counts, plus current and peak sizes. Every removed record has exactly one
-removal reason. Reading statistics invokes neither clock, performs no cleanup,
-exposes no mutable state, and does not change an earlier snapshot.
+counts, including `sessions_closed` for normal active-session removal, plus
+current and peak sizes. Active-session removal distinguishes normal close from
+expiry, replacement, and capacity eviction; every removed record has exactly
+one removal reason. Reading statistics invokes neither clock, performs no
+cleanup, exposes no mutable state, and does not change an earlier snapshot.
 
-This section governs only process-local secure state. It does not redefine
-secure packet formats, cryptographic algorithms, the signed handshake
-transcript, session-key derivation, or `nmea_sproxy` protocol compatibility.
+This section governs only process-local secure state and the encrypted graceful
+close described above. It does not otherwise redefine secure packet formats,
+cryptographic algorithms, the signed handshake transcript, session-key
+derivation, or `nmea_sproxy` protocol compatibility.
 
 ## 12. Routing snapshot boundary
 

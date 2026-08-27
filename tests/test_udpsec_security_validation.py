@@ -121,13 +121,40 @@ class _ThreadSafeIngressSink:
         return self._items.empty()
 
 
+class _IdleInput:
+    def selectable_sockets(self):
+        return []
+
+    def poll_interval(self):
+        return None
+
+    def read_ready(self, _ready_socket):
+        raise AssertionError("idle input must not become readable")
+
+    def read_pending(self):
+        return ()
+
+
 class _LoopbackSecureServer:
-    def __init__(self, secure, server_private_key, family, host):
+    def __init__(
+        self,
+        secure,
+        server_private_key,
+        family,
+        host,
+        port=0,
+        *,
+        graceful_close=False,
+    ):
         self.secure = secure
         self.server_private_key = server_private_key
         self.host = host
+        self.port = port
+        self.graceful_close = graceful_close
         self.socket = socket.socket(family, socket.SOCK_DGRAM)
         self.state = secure.SecureState()
+        self.owned_sessions = {}
+        self.owned_pending_sessions = {}
         self.ingress = _ThreadSafeIngressSink()
         self.remote_addr = None
 
@@ -158,10 +185,12 @@ class _LoopbackSecureServer:
                 self.socket,
                 self.ingress,
                 self.host,
-                0,
+                self.port,
                 sec_input_id="loopback-validation",
                 state=self.state,
                 server_private_key=self.server_private_key,
+                owned_sessions=self.owned_sessions,
+                owned_pending_sessions=self.owned_pending_sessions,
             )
         )
         # create_task() and call_soon() are FIFO on this loop. The listener
@@ -172,6 +201,13 @@ class _LoopbackSecureServer:
             await self._task
         except asyncio.CancelledError:
             pass
+        finally:
+            if self.graceful_close:
+                self.secure.close_owned_sessions(
+                    self.socket,
+                    self.state,
+                    self.owned_sessions,
+                )
 
     def _thread_main(self):
         loop = asyncio.new_event_loop()
@@ -256,12 +292,22 @@ class _LoopbackSecureServer:
 
 
 @contextmanager
-def _running_secure_server(secure, server_private_key, family, host):
+def _running_secure_server(
+    secure,
+    server_private_key,
+    family,
+    host,
+    port=0,
+    *,
+    graceful_close=False,
+):
     server = _LoopbackSecureServer(
         secure,
         server_private_key,
         family,
         host,
+        port,
+        graceful_close=graceful_close,
     )
     try:
         yield server.start()
@@ -641,6 +687,204 @@ def test_real_udp_loopback_interoperability(
                 )
 
 
+def test_real_client_graceful_close_removes_server_session_without_ack(
+    real_udpsec_endpoints,
+):
+    endpoints = real_udpsec_endpoints
+    with _running_secure_server(
+        endpoints.secure,
+        endpoints.server_private_key,
+        socket.AF_INET,
+        "127.0.0.1",
+    ) as server:
+        with _client_socket(socket.AF_INET, "127.0.0.1") as client:
+            key_material = _perform_real_handshake(
+                endpoints,
+                client,
+                server.remote_addr,
+            )
+            _assert_single_confirmed_session(server)
+
+            endpoints.proxy.send_session_close(
+                client,
+                server.remote_addr,
+                key_material.client_to_server_key,
+                STATION_ID,
+            )
+
+            deadline = time.monotonic() + NETWORK_TIMEOUT
+            while True:
+                stats = server.call_in_loop(server.state.stats)
+                if stats.current_sessions == 0:
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        "server did not consume authenticated client close"
+                    )
+                time.sleep(0.01)
+
+            assert stats.sessions_closed == 1
+            assert stats.current_pending_sessions == 0
+            assert stats.current_data_nonces == 0
+            client.settimeout(0.1)
+            with pytest.raises(socket.timeout):
+                client.recvfrom(8192)
+
+
+def test_real_server_graceful_close_ends_proxy_session_with_backoff(
+    real_udpsec_endpoints,
+):
+    endpoints = real_udpsec_endpoints
+    server = _LoopbackSecureServer(
+        endpoints.secure,
+        endpoints.server_private_key,
+        socket.AF_INET,
+        "127.0.0.1",
+        graceful_close=True,
+    ).start()
+    try:
+        with _client_socket(socket.AF_INET, "127.0.0.1") as client:
+            key_material = _perform_real_handshake(
+                endpoints,
+                client,
+                server.remote_addr,
+            )
+            _assert_single_confirmed_session(server)
+
+            server.close()
+
+            config = {
+                "station_id": STATION_ID,
+                "keepalive_interval": 30,
+                "peer_timeout": 90,
+                "session_refresh_interval": 0,
+                "reconnect_delay": 0.01,
+            }
+            reason = endpoints.proxy.forward_loop(
+                _IdleInput(),
+                client,
+                config,
+                key_material,
+                server.remote_addr,
+            )
+
+            assert reason == (
+                endpoints.proxy.SESSION_END_PEER_GRACEFUL_CLOSE
+            )
+            assert (
+                endpoints.proxy.retry_delay_for_reason(reason, config)
+                == config["reconnect_delay"]
+            )
+            assert server.state.stats().sessions_closed == 1
+            assert server.state.stats().current_sessions == 0
+    finally:
+        server.close()
+
+
+def test_real_client_proactively_recovers_after_server_restart(
+    real_udpsec_endpoints,
+):
+    endpoints = real_udpsec_endpoints
+
+    with _client_socket(socket.AF_INET, "127.0.0.1") as client:
+        with _running_secure_server(
+            endpoints.secure,
+            endpoints.server_private_key,
+            socket.AF_INET,
+            "127.0.0.1",
+        ) as initial_server:
+            initial_remote_addr = initial_server.remote_addr
+            initial_material = _perform_real_handshake(
+                endpoints,
+                client,
+                initial_remote_addr,
+            )
+            _assert_single_confirmed_session(initial_server)
+
+        with _running_secure_server(
+            endpoints.secure,
+            endpoints.server_private_key,
+            socket.AF_INET,
+            "127.0.0.1",
+            initial_remote_addr[1],
+        ) as restarted_server:
+            assert restarted_server.remote_addr == initial_remote_addr
+            config = {
+                "station_id": STATION_ID,
+                "keepalive_interval": 0.03,
+                "peer_timeout": 0.12,
+                "session_refresh_interval": 0,
+                "reconnect_delay": 0.01,
+            }
+
+            recovery_started = time.monotonic()
+            reason = endpoints.proxy.forward_loop(
+                _IdleInput(),
+                client,
+                config,
+                initial_material,
+                restarted_server.remote_addr,
+            )
+            recovery_elapsed = time.monotonic() - recovery_started
+
+            assert reason == endpoints.proxy.SESSION_END_PROACTIVE_REKEY
+            assert (
+                endpoints.proxy.retry_delay_for_reason(reason, config)
+                is None
+            )
+            assert recovery_elapsed < config["peer_timeout"]
+            lost_state_stats = restarted_server.call_in_loop(
+                restarted_server.state.stats
+            )
+            assert lost_state_stats.current_sessions == 0
+            assert lost_state_stats.current_pending_sessions == 0
+            assert lost_state_stats.data_nonces_accepted == 0
+            assert restarted_server.ingress.empty()
+
+            recovered_material = _perform_real_handshake(
+                endpoints,
+                client,
+                restarted_server.remote_addr,
+            )
+            recovered_session = _assert_single_confirmed_session(
+                restarted_server
+            )
+            assert recovered_session._address == client.getsockname()
+            assert recovered_material != initial_material
+
+            recovered_payload = (
+                "!AIVDM,1,1,,A,recovered-after-server-restart,0*00"
+            )
+            endpoints.proxy.send_udpsec_nmea_sentence(
+                recovered_payload,
+                client,
+                {"station_id": STATION_ID},
+                recovered_material.client_to_server_key,
+                restarted_server.remote_addr,
+            )
+            frame = restarted_server.ingress.get()
+            assert (
+                decode_frame_slice(frame, 0, len(frame.payload))
+                == recovered_payload
+            )
+
+            sequence = 18
+            endpoints.proxy.send_ping(
+                client,
+                restarted_server.remote_addr,
+                recovered_material.client_to_server_key,
+                STATION_ID,
+                sequence,
+            )
+            _receive_authenticated_pong(
+                endpoints.proxy,
+                client,
+                restarted_server.remote_addr,
+                recovered_material,
+                sequence,
+            )
+
+
 def test_real_confirmed_same_address_rekey_replaces_traffic_keys(
     real_udpsec_endpoints,
 ):
@@ -960,12 +1204,10 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
 
             before_port_change = server.call_in_loop(server.state.stats)
             client_c.sendto(packet_a, server.remote_addr)
-            no_session, sender = client_c.recvfrom(8192)
-            assert endpoints.proxy.remote_addresses_match(
-                sender,
-                server.remote_addr,
-            )
-            assert endpoints.proxy.is_no_session_hint(no_session)
+            client_c.settimeout(0.1)
+            with pytest.raises(socket.timeout):
+                client_c.recvfrom(8192)
+            client_c.settimeout(NETWORK_TIMEOUT)
             assert server.ingress.empty()
             after_port_change = server.call_in_loop(server.state.stats)
             assert (
@@ -1975,12 +2217,17 @@ def test_static_runtime_has_no_legacy_helpers_or_secret_logging():
     obsolete_identifiers = {
         "CONTEXT_STRING",
         "KEEPALIVE_PREFIX",
+        "NOSESSION_PREFIX",
+        "SERVER_PACKET_NO_SESSION",
+        "SESSION_END_NOSESSION",
+        "build_no_session_hint",
         "build_current_handshake_payload",
         "build_handshake_context_v1",
         "build_session_transcript_v1",
         "compute_session_hash",
         "derive_session_key",
         "handle_keepalive",
+        "is_no_session_hint",
         "parse_keepalive_packet",
         "parse_keepalive_station_id",
         "server_pub_bytes",
@@ -2023,13 +2270,14 @@ def test_static_runtime_has_no_legacy_helpers_or_secret_logging():
         identifiers = _referenced_identifiers(tree)
         assert "session_key" not in identifiers
         assert not (obsolete_identifiers & identifiers)
-        assert not [
-            value
-            for value in ast.walk(tree)
-            if isinstance(value, ast.Constant)
-            and isinstance(value.value, str)
-            and "KEEPALIVE" in value.value
-        ]
+        for obsolete_wire_text in ("KEEPALIVE", "NOSESSION"):
+            assert not [
+                value
+                for value in ast.walk(tree)
+                if isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+                and obsolete_wire_text in value.value
+            ]
 
         for call in (
             node

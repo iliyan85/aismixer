@@ -1,5 +1,6 @@
 import asyncio
 import json
+import weakref
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -52,6 +53,23 @@ class _Socket:
         self.close_count += 1
 
 
+class _OrderedSocket(_Socket):
+    def __init__(self, *, send_error=None):
+        super().__init__()
+        self.events = []
+        self.send_error = send_error
+
+    def sendto(self, data, address):
+        self.events.append(("send", address, self.close_count))
+        if self.send_error is not None:
+            raise self.send_error
+        super().sendto(data, address)
+
+    def close(self):
+        self.events.append(("close", self.close_count))
+        super().close()
+
+
 class _Queue:
     def __init__(self):
         self.items = []
@@ -74,6 +92,37 @@ def _secure_data_packet(key, nonce, message):
     plaintext = json.dumps(message).encode()
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, secure.DATA_AAD)
     return secure.DATA_PREFIX + nonce + ciphertext
+
+
+def _decrypt_server_message(packet, server_to_client_key):
+    nonce, ciphertext = secure.parse_secure_data_packet(packet)
+    plaintext = AESGCM(server_to_client_key).decrypt(
+        nonce,
+        ciphertext,
+        secure.DATA_AAD,
+    )
+    return json.loads(plaintext.decode())
+
+
+def _install_owned_session(
+    state,
+    owned_sessions,
+    address,
+    *,
+    station_id="boat_001",
+    client_key=b"\x01" * 32,
+    server_key=b"\x02" * 32,
+    now=1000.0,
+):
+    session = state.install_session(
+        address,
+        station_id,
+        AESGCM(client_key),
+        AESGCM(server_key),
+        now=now,
+    )
+    owned_sessions[address] = session
+    return session
 
 
 def _run_packets(
@@ -142,7 +191,294 @@ def test_secure_server_passes_input_owner_to_owned_receive_loop(monkeypatch):
         loop_calls[0][1]["server_private_key"]
         is PREPARED_SERVER_PRIVATE_KEY
     )
+    assert isinstance(
+        loop_calls[0][1]["owned_sessions"],
+        weakref.WeakValueDictionary,
+    )
+    assert isinstance(
+        loop_calls[0][1]["owned_pending_sessions"],
+        weakref.WeakValueDictionary,
+    )
+    assert (
+        loop_calls[0][1]["owned_pending_sessions"]
+        is not loop_calls[0][1]["owned_sessions"]
+    )
     assert fake_socket.close_count == 1
+
+
+def test_secure_server_runtime_failure_sends_owned_close_before_socket_close(
+    monkeypatch,
+):
+    address = ("127.0.0.1", 50123)
+    server_key = b"\x12" * 32
+    runtime_failure = RuntimeError("secure receive loop failed")
+    state = secure.SecureState()
+    fake_socket = _OrderedSocket()
+
+    def create_socket(listen_ip, *, reuse_address):
+        assert listen_ip == "127.0.0.1"
+        assert reuse_address is False
+        return fake_socket
+
+    async def fail_after_session(*_args, **kwargs):
+        _install_owned_session(
+            kwargs["state"],
+            kwargs["owned_sessions"],
+            address,
+            server_key=server_key,
+        )
+        raise runtime_failure
+
+    monkeypatch.setattr(secure, "create_udp_listener_socket", create_socket)
+    monkeypatch.setattr(secure, "_secure_server_loop", fail_after_session)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(
+            secure.secure_server(
+                _Queue(),
+                "127.0.0.1",
+                9999,
+                state=state,
+                wall_clock=lambda: 1010.0,
+                monotonic_clock=lambda: 1010.0,
+                server_private_key=PREPARED_SERVER_PRIVATE_KEY,
+            )
+        )
+
+    assert excinfo.value is runtime_failure
+    assert fake_socket.events == [
+        ("send", address, 0),
+        ("close", 0),
+    ]
+    assert fake_socket.close_count == 1
+    assert len(fake_socket.sent) == 1
+    packet, destination = fake_socket.sent[0]
+    assert destination == address
+    assert _decrypt_server_message(packet, server_key) == (
+        secure.build_session_close_message("boat_001", 1010)
+    )
+    stats = state.stats()
+    assert stats.sessions_closed == 1
+    assert stats.current_sessions == 0
+
+
+def test_secure_server_cancellation_sends_owned_close_before_socket_close(
+    monkeypatch,
+):
+    address = ("127.0.0.1", 50124)
+    server_key = b"\x22" * 32
+    state = secure.SecureState()
+    fake_socket = _OrderedSocket()
+
+    monkeypatch.setattr(
+        secure,
+        "create_udp_listener_socket",
+        lambda _listen_ip, *, reuse_address: fake_socket,
+    )
+
+    async def scenario():
+        started = asyncio.Event()
+
+        async def wait_after_session(*_args, **kwargs):
+            _install_owned_session(
+                kwargs["state"],
+                kwargs["owned_sessions"],
+                address,
+                server_key=server_key,
+            )
+            started.set()
+            await asyncio.Future()
+
+        monkeypatch.setattr(
+            secure,
+            "_secure_server_loop",
+            wait_after_session,
+        )
+        task = asyncio.create_task(
+            secure.secure_server(
+                _Queue(),
+                "127.0.0.1",
+                9999,
+                state=state,
+                wall_clock=lambda: 1010.0,
+                monotonic_clock=lambda: 1010.0,
+                server_private_key=PREPARED_SERVER_PRIVATE_KEY,
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert fake_socket.events == [
+        ("send", address, 0),
+        ("close", 0),
+    ]
+    assert fake_socket.close_count == 1
+    assert len(fake_socket.sent) == 1
+    packet, destination = fake_socket.sent[0]
+    assert destination == address
+    assert _decrypt_server_message(packet, server_key) == (
+        secure.build_session_close_message("boat_001", 1010)
+    )
+    assert state.stats().sessions_closed == 1
+    assert state.stats().current_sessions == 0
+
+
+def test_close_owned_sessions_ignores_stale_replaced_handle():
+    address = ("127.0.0.1", 50125)
+    unrelated_address = ("127.0.0.1", 50199)
+    state = secure.SecureState(session_ttl=5.0)
+    state.install_session(
+        unrelated_address,
+        "unrelated",
+        AESGCM(b"\x31" * 32),
+        AESGCM(b"\x32" * 32),
+        now=0.0,
+    )
+    owned_sessions = weakref.WeakValueDictionary()
+    old_session = _install_owned_session(
+        state,
+        owned_sessions,
+        address,
+        server_key=b"\x32" * 32,
+        now=1.0,
+    )
+    replacement = state.install_session(
+        address,
+        "boat_001",
+        AESGCM(b"\x41" * 32),
+        AESGCM(b"\x42" * 32),
+        now=4.0,
+    )
+    fake_socket = _OrderedSocket()
+
+    secure.close_owned_sessions(
+        fake_socket,
+        state,
+        owned_sessions,
+        wall_clock=lambda: 1010.0,
+        monotonic_clock=lambda: 5.0,
+    )
+
+    assert old_session is not replacement
+    assert state._sessions[address] is replacement
+    assert unrelated_address in state._sessions
+    assert fake_socket.sent == []
+    assert fake_socket.events == []
+    stats = state.stats()
+    assert stats.sessions_replaced == 1
+    assert stats.sessions_expired == 0
+    assert stats.sessions_closed == 0
+    assert stats.current_sessions == 2
+
+
+def test_shared_state_listener_close_sends_only_exact_owned_session():
+    first_address = ("127.0.0.1", 50126)
+    second_address = ("127.0.0.1", 50127)
+    first_server_key = b"\x52" * 32
+    second_server_key = b"\x62" * 32
+    state = secure.SecureState()
+    first_owned = weakref.WeakValueDictionary()
+    second_owned = weakref.WeakValueDictionary()
+    first_session = _install_owned_session(
+        state,
+        first_owned,
+        first_address,
+        station_id="boat_first",
+        client_key=b"\x51" * 32,
+        server_key=first_server_key,
+    )
+    second_session = _install_owned_session(
+        state,
+        second_owned,
+        second_address,
+        station_id="boat_second",
+        client_key=b"\x61" * 32,
+        server_key=second_server_key,
+    )
+    first_socket = _OrderedSocket()
+    second_socket = _OrderedSocket()
+
+    secure.close_owned_sessions(
+        first_socket,
+        state,
+        first_owned,
+        wall_clock=lambda: 1010.0,
+        monotonic_clock=lambda: 1010.0,
+    )
+
+    assert len(first_socket.sent) == 1
+    first_packet, first_destination = first_socket.sent[0]
+    assert first_destination == first_address
+    assert _decrypt_server_message(first_packet, first_server_key) == (
+        secure.build_session_close_message("boat_first", 1010)
+    )
+    assert second_socket.sent == []
+    assert state.get_active_session(first_address, 1010.0) is None
+    assert state.get_active_session(second_address, 1010.0) is second_session
+    assert first_session is not second_session
+    assert state.stats().sessions_closed == 1
+    assert state.stats().current_sessions == 1
+
+
+def test_secure_server_close_send_failure_is_best_effort_and_closes_socket(
+    monkeypatch,
+):
+    addresses = (
+        ("127.0.0.1", 50128),
+        ("127.0.0.1", 50129),
+    )
+    state = secure.SecureState()
+    send_error = OSError("simulated close send failure")
+    fake_socket = _OrderedSocket(send_error=send_error)
+
+    monkeypatch.setattr(
+        secure,
+        "create_udp_listener_socket",
+        lambda _listen_ip, *, reuse_address: fake_socket,
+    )
+
+    async def return_after_sessions(*_args, **kwargs):
+        for index, address in enumerate(addresses, start=1):
+            _install_owned_session(
+                kwargs["state"],
+                kwargs["owned_sessions"],
+                address,
+                station_id=f"boat_{index}",
+                client_key=bytes((index,)) * 32,
+                server_key=bytes((index + 10,)) * 32,
+            )
+
+    monkeypatch.setattr(
+        secure,
+        "_secure_server_loop",
+        return_after_sessions,
+    )
+
+    asyncio.run(
+        secure.secure_server(
+            _Queue(),
+            "127.0.0.1",
+            9999,
+            state=state,
+            wall_clock=lambda: 1010.0,
+            monotonic_clock=lambda: 1010.0,
+            server_private_key=PREPARED_SERVER_PRIVATE_KEY,
+        )
+    )
+
+    assert fake_socket.sent == []
+    assert fake_socket.events == [
+        ("send", addresses[0], 0),
+        ("send", addresses[1], 0),
+        ("close", 0),
+    ]
+    assert fake_socket.close_count == 1
+    assert state.stats().sessions_closed == 2
+    assert state.stats().current_sessions == 0
 
 
 def test_udpsec_handshake_ping_replay_and_rejected_data_are_transport_only(

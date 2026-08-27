@@ -1,6 +1,7 @@
 import asyncio
 import yaml
 import os
+import signal
 import time
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
@@ -972,8 +973,23 @@ async def main(
             await control_server.close()
         forwarder.close()
 
-if __name__ == '__main__':
+def _raise_keyboard_interrupt_for_sigterm(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+def run_service():
+    previous_sigterm = signal.signal(
+        signal.SIGTERM,
+        _raise_keyboard_interrupt_for_sigterm,
+    )
     try:
         asyncio.run(main())
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+if __name__ == '__main__':
+    try:
+        run_service()
     except KeyboardInterrupt:
         print("Exiting.")

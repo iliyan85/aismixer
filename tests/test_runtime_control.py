@@ -42,6 +42,40 @@ unix_socket_test = pytest.mark.skipif(
 )
 
 
+def test_aismixer_run_service_installs_and_restores_sigterm_handler(
+    monkeypatch,
+):
+    previous_handler = object()
+    signal_calls = []
+
+    def fake_signal(signum, handler):
+        signal_calls.append((signum, handler))
+        return previous_handler
+
+    def interrupt(_coroutine):
+        _coroutine.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(aismixer.signal, "signal", fake_signal)
+    monkeypatch.setattr(aismixer.asyncio, "run", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        aismixer.run_service()
+
+    assert signal_calls == [
+        (
+            aismixer.signal.SIGTERM,
+            aismixer._raise_keyboard_interrupt_for_sigterm,
+        ),
+        (aismixer.signal.SIGTERM, previous_handler),
+    ]
+    with pytest.raises(KeyboardInterrupt):
+        aismixer._raise_keyboard_interrupt_for_sigterm(
+            aismixer.signal.SIGTERM,
+            None,
+        )
+
+
 def empty_queue_metrics(name, capacity):
     return QueueMetricsSnapshot(
         name=name,
