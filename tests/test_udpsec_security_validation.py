@@ -121,6 +121,25 @@ class _ThreadSafeIngressSink:
         return self._items.empty()
 
 
+class _ThreadSafeTrafficCounter:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._received = 0
+        self._accepted = 0
+
+    def transport_received(self, _data):
+        with self._lock:
+            self._received += 1
+
+    def frame_accepted(self, _payload):
+        with self._lock:
+            self._accepted += 1
+
+    def snapshot(self):
+        with self._lock:
+            return self._received, self._accepted
+
+
 class _IdleInput:
     def selectable_sockets(self):
         return []
@@ -145,6 +164,7 @@ class _LoopbackSecureServer:
         port=0,
         *,
         graceful_close=False,
+        state=None,
     ):
         self.secure = secure
         self.server_private_key = server_private_key
@@ -152,10 +172,11 @@ class _LoopbackSecureServer:
         self.port = port
         self.graceful_close = graceful_close
         self.socket = socket.socket(family, socket.SOCK_DGRAM)
-        self.state = secure.SecureState()
+        self.state = secure.SecureState() if state is None else state
         self.owned_sessions = {}
         self.owned_pending_sessions = {}
         self.ingress = _ThreadSafeIngressSink()
+        self.traffic = _ThreadSafeTrafficCounter()
         self.remote_addr = None
 
         self._loop = None
@@ -187,6 +208,7 @@ class _LoopbackSecureServer:
                 self.host,
                 self.port,
                 sec_input_id="loopback-validation",
+                input_traffic=self.traffic,
                 state=self.state,
                 server_private_key=self.server_private_key,
                 owned_sessions=self.owned_sessions,
@@ -300,6 +322,7 @@ def _running_secure_server(
     port=0,
     *,
     graceful_close=False,
+    state=None,
 ):
     server = _LoopbackSecureServer(
         secure,
@@ -308,6 +331,7 @@ def _running_secure_server(
         host,
         port,
         graceful_close=graceful_close,
+        state=state,
     )
     try:
         yield server.start()
@@ -580,6 +604,28 @@ def _assert_single_confirmed_session(server):
     assert stats.current_pending_sessions == 0
     assert len(server.state._sessions) == 1
     return next(iter(server.state._sessions.values()))
+
+
+def _wait_for_server_stats(server, predicate, failure_message):
+    deadline = time.monotonic() + NETWORK_TIMEOUT
+    while True:
+        stats = server.call_in_loop(server.state.stats)
+        if predicate(stats):
+            return stats
+        if time.monotonic() >= deadline:
+            raise AssertionError(failure_message)
+        time.sleep(0.01)
+
+
+def _wait_for_server_traffic(server, minimum_received, failure_message):
+    deadline = time.monotonic() + NETWORK_TIMEOUT
+    while True:
+        snapshot = server.traffic.snapshot()
+        if snapshot[0] >= minimum_received:
+            return snapshot
+        if time.monotonic() >= deadline:
+            raise AssertionError(failure_message)
+        time.sleep(0.01)
 
 
 def _receive_authenticated_pong(
@@ -883,6 +929,251 @@ def test_real_client_proactively_recovers_after_server_restart(
                 recovered_material,
                 sequence,
             )
+
+
+def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
+    real_udpsec_endpoints,
+):
+    endpoints = real_udpsec_endpoints
+    state = endpoints.secure.SecureState(
+        data_nonce_max_per_session=2,
+    )
+
+    with _running_secure_server(
+        endpoints.secure,
+        endpoints.server_private_key,
+        socket.AF_INET,
+        "127.0.0.1",
+        state=state,
+    ) as server:
+        with _client_socket(socket.AF_INET, "127.0.0.1") as client:
+            initial_material = _perform_real_handshake(
+                endpoints,
+                client,
+                server.remote_addr,
+            )
+            initial_session = _assert_single_confirmed_session(server)
+            after_confirmation = server.call_in_loop(server.state.stats)
+
+            # The authenticated sequence-zero confirmation owns the first
+            # replay slot in this traffic-key epoch.
+            assert len(initial_session.seen_data_nonces) == 1
+            assert after_confirmation.current_data_nonces == 1
+            assert after_confirmation.data_nonces_accepted == 1
+
+            nonce_a = _nonce(950)
+            assert not initial_session.seen_data_nonces.contains(nonce_a)
+            payload_a = "!AIVDM,1,1,,A,nonce-capacity-a,0*00"
+            packet_a = _encrypted_json_packet(
+                endpoints.proxy,
+                initial_material.client_to_server_key,
+                nonce_a,
+                {
+                    "type": "nmea",
+                    "payload": payload_a,
+                    "timestamp": 1000,
+                    "source_id": STATION_ID,
+                },
+            )
+            client.sendto(packet_a, server.remote_addr)
+
+            frame_a = server.ingress.get()
+            assert (
+                decode_frame_slice(frame_a, 0, len(frame_a.payload))
+                == payload_a
+            )
+            assert server.ingress.empty()
+            after_a = server.call_in_loop(server.state.stats)
+            assert (
+                server.state._sessions[client.getsockname()]
+                is initial_session
+            )
+            assert len(initial_session.seen_data_nonces) == 2
+            assert initial_session.seen_data_nonces.contains(nonce_a)
+            assert (
+                after_a.data_nonces_accepted
+                == after_confirmation.data_nonces_accepted + 1
+            )
+            assert after_a.current_data_nonces == 2
+
+            # Membership is authoritative before the capacity check: exact A
+            # remains a replay at size == max and cannot exhaust the epoch.
+            client.sendto(packet_a, server.remote_addr)
+            after_replay = _wait_for_server_stats(
+                server,
+                lambda stats: (
+                    stats.data_nonce_replays
+                    == after_a.data_nonce_replays + 1
+                ),
+                "server did not classify exact full-capacity replay",
+            )
+            assert (
+                server.state._sessions[client.getsockname()]
+                is initial_session
+            )
+            assert len(initial_session.seen_data_nonces) == 2
+            assert after_replay.current_sessions == 1
+            assert after_replay.current_data_nonces == 2
+            assert (
+                after_replay.data_nonce_exhaustions
+                == after_a.data_nonce_exhaustions
+            )
+            assert after_replay.sessions_touched == after_a.sessions_touched
+            assert server.ingress.empty()
+
+            nonce_b = _nonce(951)
+            payload_b = "!AIVDM,1,1,,A,must-drop-on-exhaustion,0*00"
+            packet_b = _encrypted_json_packet(
+                endpoints.proxy,
+                initial_material.client_to_server_key,
+                nonce_b,
+                {
+                    "type": "nmea",
+                    "payload": payload_b,
+                    "timestamp": 1001,
+                    "source_id": STATION_ID,
+                },
+            )
+            last_seen_before_exhaustion = initial_session.last_seen
+            client.sendto(packet_b, server.remote_addr)
+            exhausted = _wait_for_server_stats(
+                server,
+                lambda stats: (
+                    stats.data_nonce_exhaustions
+                    == after_replay.data_nonce_exhaustions + 1
+                    and stats.current_sessions == 0
+                ),
+                "server did not fail closed on DATA nonce exhaustion",
+            )
+
+            assert server.state._sessions == {}
+            assert server.owned_sessions == {}
+            assert len(initial_session.seen_data_nonces) == 0
+            assert initial_session.last_seen == last_seen_before_exhaustion
+            assert exhausted.current_pending_sessions == 0
+            assert exhausted.current_data_nonces == 0
+            assert (
+                exhausted.data_nonces_accepted
+                == after_replay.data_nonces_accepted
+            )
+            assert (
+                exhausted.data_nonce_replays
+                == after_replay.data_nonce_replays
+            )
+            assert exhausted.sessions_touched == after_replay.sessions_touched
+            assert (
+                exhausted.data_nonces_session_discarded
+                == after_replay.data_nonces_session_discarded + 2
+            )
+            assert server.ingress.empty()
+
+            # Exact old ciphertext is inert once its key epoch is gone. The
+            # existing unanswered-ping lifecycle then requests a fresh epoch.
+            client.sendto(packet_a, server.remote_addr)
+            config = {
+                "station_id": STATION_ID,
+                "keepalive_interval": 0.03,
+                "peer_timeout": 0.12,
+                "session_refresh_interval": 0,
+                "reconnect_delay": 0.01,
+            }
+            recovery_started = time.monotonic()
+            reason = endpoints.proxy.forward_loop(
+                _IdleInput(),
+                client,
+                config,
+                initial_material,
+                server.remote_addr,
+            )
+            recovery_elapsed = time.monotonic() - recovery_started
+
+            assert reason == endpoints.proxy.SESSION_END_PROACTIVE_REKEY
+            assert (
+                endpoints.proxy.retry_delay_for_reason(reason, config)
+                is None
+            )
+            assert recovery_elapsed < config["peer_timeout"]
+            after_silent_loss = server.call_in_loop(server.state.stats)
+            assert after_silent_loss.current_sessions == 0
+            assert after_silent_loss.current_data_nonces == 0
+            assert (
+                after_silent_loss.data_nonces_accepted
+                == exhausted.data_nonces_accepted
+            )
+            assert (
+                after_silent_loss.sessions_touched
+                == exhausted.sessions_touched
+            )
+            assert server.ingress.empty()
+
+            recovered_material = _perform_real_handshake(
+                endpoints,
+                client,
+                server.remote_addr,
+            )
+            recovered_session = _assert_single_confirmed_session(server)
+            recovered = server.call_in_loop(server.state.stats)
+            assert recovered_session is not initial_session
+            assert recovered_material != initial_material
+            assert len(recovered_session.seen_data_nonces) == 1
+            assert not recovered_session.seen_data_nonces.contains(nonce_a)
+            assert recovered.current_data_nonces == 1
+
+            fresh_nonce = _nonce(952)
+            fresh_payload = "!AIVDM,1,1,,A,fresh-after-exhaustion,0*00"
+            fresh_packet = _encrypted_json_packet(
+                endpoints.proxy,
+                recovered_material.client_to_server_key,
+                fresh_nonce,
+                {
+                    "type": "nmea",
+                    "payload": fresh_payload,
+                    "timestamp": 1002,
+                    "source_id": STATION_ID,
+                },
+            )
+
+            # The old packet uses an unseen nonce in the fresh ledger, so its
+            # rejection demonstrates key-epoch isolation rather than a nonce
+            # duplicate fast path. Only the fresh packet may reach ingress.
+            received_before, accepted_before = server.traffic.snapshot()
+            client.sendto(packet_a, server.remote_addr)
+            client.sendto(fresh_packet, server.remote_addr)
+            fresh_frame = server.ingress.get()
+            assert (
+                decode_frame_slice(
+                    fresh_frame,
+                    0,
+                    len(fresh_frame.payload),
+                )
+                == fresh_payload
+            )
+            received_after, accepted_after = _wait_for_server_traffic(
+                server,
+                received_before + 2,
+                "server did not receive both old- and fresh-epoch packets",
+            )
+            assert received_after == received_before + 2
+            assert accepted_after == accepted_before + 1
+            assert server.ingress.empty()
+
+            final = server.call_in_loop(server.state.stats)
+            assert (
+                server.state._sessions[client.getsockname()]
+                is recovered_session
+            )
+            assert final.current_sessions == 1
+            assert final.current_data_nonces == 2
+            assert (
+                final.data_nonce_exhaustions
+                == exhausted.data_nonce_exhaustions
+            )
+            assert final.data_nonce_replays == recovered.data_nonce_replays
+            assert (
+                final.data_nonces_accepted
+                == recovered.data_nonces_accepted + 1
+            )
+            assert final.sessions_touched == recovered.sessions_touched + 1
 
 
 def test_real_confirmed_same_address_rekey_replaces_traffic_keys(

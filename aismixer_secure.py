@@ -8,6 +8,7 @@ import weakref
 import yaml
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+from enum import Enum
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -51,7 +52,6 @@ PENDING_SESSION_TTL_SECONDS = 30
 PENDING_SESSION_MAX = SESSION_MAX
 HANDSHAKE_REPLAY_TTL_SECONDS = 60
 HANDSHAKE_REPLAY_MAX = 100000
-DATA_NONCE_TTL_SECONDS = SESSION_TTL_SECONDS
 DATA_NONCE_MAX_PER_SESSION = 100000
 
 _HANDSHAKE_REPLAY_LABEL = b"HANDSHAKE-REPLAY"
@@ -238,6 +238,40 @@ class _BoundedExpiringSet:
         return discarded
 
 
+class _DataNonceAdmission(Enum):
+    ACCEPTED = "accepted"
+    REPLAY = "replay"
+    EXHAUSTED = "exhausted"
+    STALE = "stale"
+
+
+class _BoundedNonceSet:
+    """Retain DATA nonces until their owning traffic-key epoch ends."""
+
+    def __init__(self, max_entries):
+        self._max_entries = max_entries
+        self._live_by_key = set()
+
+    def __len__(self):
+        return len(self._live_by_key)
+
+    def contains(self, key):
+        return key in self._live_by_key
+
+    def admit(self, key):
+        if key in self._live_by_key:
+            return _DataNonceAdmission.REPLAY
+        if len(self._live_by_key) >= self._max_entries:
+            return _DataNonceAdmission.EXHAUSTED
+        self._live_by_key.add(key)
+        return _DataNonceAdmission.ACCEPTED
+
+    def discard_all(self):
+        discarded = len(self._live_by_key)
+        self._live_by_key.clear()
+        return discarded
+
+
 @dataclass
 class _SecureSession:
     _address: object
@@ -246,7 +280,7 @@ class _SecureSession:
     server_to_client_aesgcm: AESGCM
     created_at: float
     last_seen: float
-    seen_data_nonces: _BoundedExpiringSet
+    seen_data_nonces: _BoundedNonceSet
 
 
 @dataclass
@@ -256,7 +290,7 @@ class _PendingSecureSession:
     client_to_server_aesgcm: AESGCM
     server_to_client_aesgcm: AESGCM
     created_at: float
-    seen_data_nonces: _BoundedExpiringSet
+    seen_data_nonces: _BoundedNonceSet
 
 
 @dataclass(frozen=True)
@@ -283,6 +317,7 @@ class SecureStateStats:
     data_nonce_replays: int
     data_nonces_expired: int
     data_nonces_capacity_evicted: int
+    data_nonce_exhaustions: int
     data_nonces_session_discarded: int
 
     current_handshake_replays: int
@@ -302,7 +337,6 @@ class SecureState:
         max_sessions=SESSION_MAX,
         handshake_replay_ttl=HANDSHAKE_REPLAY_TTL_SECONDS,
         handshake_replay_max=HANDSHAKE_REPLAY_MAX,
-        data_nonce_ttl=DATA_NONCE_TTL_SECONDS,
         data_nonce_max_per_session=DATA_NONCE_MAX_PER_SESSION,
         pending_session_ttl=PENDING_SESSION_TTL_SECONDS,
         max_pending_sessions=PENDING_SESSION_MAX,
@@ -319,8 +353,6 @@ class SecureState:
             "handshake_replay_ttl", handshake_replay_ttl)
         self._handshake_replay_max = _validate_positive_int(
             "handshake_replay_max", handshake_replay_max)
-        self._data_nonce_ttl = _validate_positive_ttl(
-            "data_nonce_ttl", data_nonce_ttl)
         self._data_nonce_max_per_session = _validate_positive_int(
             "data_nonce_max_per_session", data_nonce_max_per_session)
 
@@ -351,8 +383,11 @@ class SecureState:
 
         self._data_nonces_accepted = 0
         self._data_nonce_replays = 0
+        # Retained for compatibility; DATA nonce records no longer expire or
+        # undergo live-record capacity eviction within a traffic-key epoch.
         self._data_nonces_expired = 0
         self._data_nonces_capacity_evicted = 0
+        self._data_nonce_exhaustions = 0
         self._data_nonces_session_discarded = 0
 
         self._current_data_nonces = 0
@@ -388,6 +423,7 @@ class SecureState:
             data_nonces_capacity_evicted=(
                 self._data_nonces_capacity_evicted
             ),
+            data_nonce_exhaustions=self._data_nonce_exhaustions,
             data_nonces_session_discarded=(
                 self._data_nonces_session_discarded
             ),
@@ -435,6 +471,8 @@ class SecureState:
             self._sessions_capacity_evicted += 1
         elif reason == "replaced":
             self._sessions_replaced += 1
+        elif reason == "nonce_exhausted":
+            self._data_nonce_exhaustions += 1
         else:
             raise ValueError(f"Unknown session removal reason: {reason}")
         return session
@@ -449,6 +487,8 @@ class SecureState:
             self._pending_sessions_capacity_evicted += 1
         elif reason == "replaced":
             self._pending_sessions_replaced += 1
+        elif reason == "nonce_exhausted":
+            self._data_nonce_exhaustions += 1
         else:
             raise ValueError(
                 f"Unknown pending-session removal reason: {reason}"
@@ -498,8 +538,7 @@ class SecureState:
             server_to_client_aesgcm=server_to_client_aesgcm,
             created_at=now,
             last_seen=now,
-            seen_data_nonces=_BoundedExpiringSet(
-                self._data_nonce_ttl,
+            seen_data_nonces=_BoundedNonceSet(
                 self._data_nonce_max_per_session,
             ),
         )
@@ -533,8 +572,7 @@ class SecureState:
             client_to_server_aesgcm=client_to_server_aesgcm,
             server_to_client_aesgcm=server_to_client_aesgcm,
             created_at=now,
-            seen_data_nonces=_BoundedExpiringSet(
-                self._data_nonce_ttl,
+            seen_data_nonces=_BoundedNonceSet(
                 self._data_nonce_max_per_session,
             ),
         )
@@ -631,17 +669,12 @@ class SecureState:
         )
         return session
 
-    def _account_expired_data_nonces(self, expired):
-        self._data_nonces_expired += expired
-        self._current_data_nonces -= expired
-
     def data_nonce_seen(self, session, nonce, now):
         if self._get_live_session_handle(
             session._address, session, now
         ) is None:
             return False
-        seen, expired = session.seen_data_nonces.contains(nonce, now)
-        self._account_expired_data_nonces(expired)
+        seen = session.seen_data_nonces.contains(nonce)
         if seen:
             self._data_nonce_replays += 1
         return seen
@@ -651,53 +684,73 @@ class SecureState:
             pending._address, pending, now
         ) is None:
             return False
-        seen, expired = pending.seen_data_nonces.contains(nonce, now)
-        self._account_expired_data_nonces(expired)
-        return seen
+        return pending.seen_data_nonces.contains(nonce)
 
-    def accept_data_nonce(self, session, nonce, now):
+    def _account_accepted_data_nonce(self):
+        self._data_nonces_accepted += 1
+        self._current_data_nonces += 1
+        self._peak_data_nonces = max(
+            self._peak_data_nonces,
+            self._current_data_nonces,
+        )
+
+    def _remove_exact_session(self, session, reason):
+        addr = session._address
+        if self._sessions.get(addr) is not session:
+            return False
+        self._remove_session(addr, reason)
+        return True
+
+    def _remove_exact_pending_session(self, pending, reason):
+        addr = pending._address
+        if self._pending_sessions.get(addr) is not pending:
+            return False
+        self._remove_pending_session(addr, reason)
+        return True
+
+    def admit_data_nonce(self, session, nonce, now):
         if self._get_live_session_handle(
             session._address, session, now
         ) is None:
-            return False
-        admission = session.seen_data_nonces.accept(nonce, now)
-        self._account_expired_data_nonces(admission.expired)
-        self._data_nonces_capacity_evicted += admission.capacity_evicted
-        self._current_data_nonces -= admission.capacity_evicted
-
-        if not admission.accepted:
+            return _DataNonceAdmission.STALE
+        admission = session.seen_data_nonces.admit(nonce)
+        if admission is _DataNonceAdmission.REPLAY:
             self._data_nonce_replays += 1
-            return False
+        elif admission is _DataNonceAdmission.EXHAUSTED:
+            if not self._remove_exact_session(session, "nonce_exhausted"):
+                return _DataNonceAdmission.STALE
+        else:
+            self._account_accepted_data_nonce()
+        return admission
 
-        self._data_nonces_accepted += 1
-        self._current_data_nonces += 1
-        self._peak_data_nonces = max(
-            self._peak_data_nonces,
-            self._current_data_nonces,
+    def accept_data_nonce(self, session, nonce, now):
+        return (
+            self.admit_data_nonce(session, nonce, now)
+            is _DataNonceAdmission.ACCEPTED
         )
-        return True
 
-    def accept_pending_data_nonce(self, pending, nonce, now):
+    def admit_pending_data_nonce(self, pending, nonce, now):
         if self._get_live_pending_session_handle(
             pending._address, pending, now
         ) is None:
-            return False
-        admission = pending.seen_data_nonces.accept(nonce, now)
-        self._account_expired_data_nonces(admission.expired)
-        self._data_nonces_capacity_evicted += admission.capacity_evicted
-        self._current_data_nonces -= admission.capacity_evicted
-
-        if not admission.accepted:
+            return _DataNonceAdmission.STALE
+        admission = pending.seen_data_nonces.admit(nonce)
+        if admission is _DataNonceAdmission.REPLAY:
             self._data_nonce_replays += 1
-            return False
+        elif admission is _DataNonceAdmission.EXHAUSTED:
+            if not self._remove_exact_pending_session(
+                pending, "nonce_exhausted"
+            ):
+                return _DataNonceAdmission.STALE
+        else:
+            self._account_accepted_data_nonce()
+        return admission
 
-        self._data_nonces_accepted += 1
-        self._current_data_nonces += 1
-        self._peak_data_nonces = max(
-            self._peak_data_nonces,
-            self._current_data_nonces,
+    def accept_pending_data_nonce(self, pending, nonce, now):
+        return (
+            self.admit_pending_data_nonce(pending, nonce, now)
+            is _DataNonceAdmission.ACCEPTED
         )
-        return True
 
 
 secure_state = SecureState()
@@ -1027,13 +1080,27 @@ async def _secure_server_loop(
                                 f"from {addr}"
                             )
                             continue
-                        if not state_owner.accept_pending_data_nonce(
+                        admission = state_owner.admit_pending_data_nonce(
                             pending, nonce, local_now
-                        ):
+                        )
+                        if admission is _DataNonceAdmission.REPLAY:
                             print(
                                 f"[!] Duplicate secure data nonce "
                                 f"from {addr}"
                             )
+                            continue
+                        if admission is _DataNonceAdmission.EXHAUSTED:
+                            if (
+                                owned_pending_sessions is not None
+                                and owned_pending_sessions.get(addr) is pending
+                            ):
+                                owned_pending_sessions.pop(addr, None)
+                            print(
+                                f"[!] Pending secure session nonce capacity "
+                                f"exhausted for {addr}"
+                            )
+                            continue
+                        if admission is not _DataNonceAdmission.ACCEPTED:
                             continue
 
                         session = state_owner.promote_pending_session(
@@ -1101,7 +1168,7 @@ async def _secure_server_loop(
                         print(f"[!] Invalid ping from {addr}")
                         continue
                 elif message_type == "nmea":
-                    if "payload" not in msg:
+                    if not isinstance(msg.get("payload"), str):
                         print(f"[!] Invalid NMEA data from {addr}")
                         continue
                 elif message_type == SESSION_CLOSE_TYPE:
@@ -1117,10 +1184,24 @@ async def _secure_server_loop(
                     print(f"[!] Unknown secure message type from {addr}")
                     continue
 
-                if not state_owner.accept_data_nonce(
+                admission = state_owner.admit_data_nonce(
                     session, nonce, local_now
-                ):
+                )
+                if admission is _DataNonceAdmission.REPLAY:
                     print(f"[!] Duplicate secure data nonce from {addr}")
+                    continue
+                if admission is _DataNonceAdmission.EXHAUSTED:
+                    if (
+                        owned_sessions is not None
+                        and owned_sessions.get(addr) is session
+                    ):
+                        owned_sessions.pop(addr, None)
+                    print(
+                        f"[!] Secure session nonce capacity exhausted "
+                        f"for {addr}"
+                    )
+                    continue
+                if admission is not _DataNonceAdmission.ACCEPTED:
                     continue
 
                 if message_type == SESSION_CLOSE_TYPE:

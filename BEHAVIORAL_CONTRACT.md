@@ -312,16 +312,17 @@ timestamped debug output.
 Handshake freshness remains inclusive at the boundary:
 `abs(wall_now - transmitted_timestamp) <= 30`. Monotonic time owns handshake
 replay TTL, pending-session creation and TTL, active-session creation and
-last-seen times, active-session TTL, data-nonce TTL, and local capacity
-ordering. Each allowed received packet uses one monotonic observation for all
-of that packet's local-state decisions. Network policy is applied first; a
-denied packet performs no cryptographic work, state mutation, cleanup, or
-secure-state clock read.
+last-seen times, active-session TTL, and local capacity ordering. Each allowed
+received packet uses one monotonic observation for all of that packet's
+local-state decisions. Network policy is applied first; a denied packet
+performs no cryptographic work, state mutation, cleanup, or secure-state clock
+read.
 
 Every process-local TTL uses the same exact boundary: state is live while
-`age < ttl` and expires when `age >= ttl`. A duplicate handshake replay key or
-data nonce does not refresh its expiry. Wall-clock changes do not expire,
-revive, or extend replay, pending-session, active-session, or nonce state.
+`age < ttl` and expires when `age >= ttl`. A duplicate handshake replay key
+does not refresh its expiry. Wall-clock changes do not expire, revive, or
+extend handshake-replay, pending-session, or active-session state and do not
+alter data-nonce state. Accepted data nonces have no independent TTL.
 
 Handshake replay identity is exactly the value produced by
 `build_handshake_replay_key(client_auth_digest, client_signature)`. The digest
@@ -351,9 +352,10 @@ Installing or replacing a pending session does not remove, replace, or touch
 an active session at the same address. While the candidate remains pending,
 confirmation failure or client timeout leaves any existing active session
 intact; it does not promote the pending entry and does not itself delete
-server-side pending state. Pending expiry, same-address replacement, or capacity
-eviction discards only that pending entry and its nonce state and does not itself
-alter an active session at that address.
+server-side pending state. Pending expiry, same-address replacement, capacity
+eviction, or nonce exhaustion removes only that exact pending entry. Each such
+removal makes the candidate traffic-key epoch unusable before its nonce state
+is discarded and does not itself alter an active session at that address.
 
 When multiple listeners share one `SecureState`, each listener retains the
 exact pending object created through its socket. Only that listener may confirm
@@ -376,8 +378,9 @@ stores are removed before packet-type-specific handling. Expired state may
 therefore remain physically present until later allowed traffic, but an
 expired directly addressed session is never treated as live. State operations
 receiving an active or pending handle first require exact retained-object
-identity at its address. A replaced, capacity-evicted, promoted, expired, or
-otherwise stale handle cannot mutate state or trigger unrelated cleanup.
+identity at its address. A replaced, capacity-evicted, promoted, expired,
+nonce-exhausted, or otherwise stale handle cannot mutate state or trigger
+unrelated cleanup.
 
 UDPSEC has no plaintext session-reset or other unauthenticated session-control
 packet. A DATA packet received for an address with no live pending or active
@@ -462,29 +465,51 @@ promotion. Promotion removes the pending entry and, as one state-model
 transition, replaces any live active session at the same address.
 The station identity, both directional AES-GCM owners, and the pending nonce
 set become the new active state; active creation and last-seen time begin at
-promotion. The server then returns an encrypted sequence-zero pong using the
-promoted server-to-client owner; the proxy requires the same sequence and
-timestamp rules before accepting that confirmation pong.
+promotion. The transferred confirmation nonce remains retained and counts
+against `DATA_NONCE_MAX_PER_SESSION` for the promoted traffic-key epoch. The
+server then returns an encrypted sequence-zero pong using the promoted
+server-to-client owner; the proxy requires the same sequence and timestamp
+rules before accepting that confirmation pong.
 
 For promotion at a new address, expired active sessions are removed before
 active capacity is considered; if capacity remains full, the
 least-recently-seen live active session is evicted. Equal active timestamps are
 resolved by deterministic activity order. At most `SESSION_MAX` active
-sessions are retained. Replacing, expiring, or capacity-evicting an active
-session discards its nonce state.
+sessions are retained. Every active-session removal, including replacement,
+expiry, session-capacity eviction, graceful close, or nonce exhaustion, makes
+that exact traffic-key epoch unusable before discarding its nonce state.
 
-Secure-data nonce identity is the exact 12-byte nonce within its owning pending
-or active session. Identical bytes in different session states are independent.
-A live nonce replay for an owner is rejected before decryption under that owner
-and does not refresh nonce expiry. A new pending nonce is retained only after
-decryption and complete confirmation validation; a new active nonce is retained
-only after decryption, JSON decoding, source matching, and message-type and
-required-field validation. Admission occurs before promotion, session touch,
-pong generation, or NMEA action. Each nonce set retains at most
-`DATA_NONCE_MAX_PER_SESSION` records, expires only its ordered front prefix,
-and evicts the oldest live nonce deterministically when capacity remains full.
-Promotion transfers the pending nonce set without discarding it; other removal
-of its owning session discards it.
+Secure-data replay identity is the exact 12-byte nonce within its receiver-side
+directional traffic-key epoch. Identical bytes under distinct epochs are
+independent. Once admitted, a nonce remains retained without an independent
+TTL or live-entry eviction until its exact owning epoch is unusable. A
+pre-decrypt membership check may reject a retained replay early, but
+authoritative post-validation admission distinguishes `ACCEPTED`, `REPLAY`,
+and `EXHAUSTED`. Membership is checked before capacity, so a retained duplicate
+at exact capacity is `REPLAY`, leaves the epoch intact, and does not mutate its
+ledger.
+
+A new pending nonce reaches authoritative admission only after decryption and
+complete confirmation validation. A new active nonce reaches admission only
+after decryption, JSON decoding, source matching, and complete message-type and
+required-field validation. Authentication failures, malformed data, wrong
+source identities, invalid message shapes, and unknown types cannot retain a
+nonce or exhaust a live owner. `ACCEPTED` retains a new nonce below
+`DATA_NONCE_MAX_PER_SESSION` before promotion, session touch, pong generation,
+graceful-close handling, or NMEA action.
+
+For a distinct valid nonce at full capacity, `EXHAUSTED` retains no new nonce
+and evicts no existing nonce. Active exhaustion removes the exact active object
+with reason `nonce_exhausted`, making that traffic-key epoch unusable before its
+ledger is discarded; the triggering packet is dropped without session touch,
+pong generation, graceful-close handling, or NMEA action. Pending exhaustion
+removes only the exact pending candidate, sends no confirmation pong, performs
+no promotion, and leaves any existing active session intact.
+
+Active exhaustion has no wire response. Later old-epoch DATA, including pings,
+is silently dropped. The unresolved-ping lifecycle above recovers through a
+fresh signed ECDHE handshake and fresh directional keys; no NMEA payload is
+buffered or replayed during recovery.
 
 Graceful close is a canonical JSON control message with type `"close"`, reason
 `"shutdown"`, an unsigned integer timestamp, and the authenticated station
@@ -495,12 +520,13 @@ unacknowledged, and neither endpoint waits for a reply.
 A client close is encrypted under the current client-to-server AES-GCM owner.
 The server accepts it only at the exact active peer address and through the
 listener that retained that exact live session object. Source identity and the
-complete canonical message shape must match. Decryption and the normal active
-data-nonce replay checks occur before state changes; only after nonce admission
-does the server remove that exact active session and discard its nonce state.
-Pending state at the same address and sessions owned by other listeners remain
-unchanged. Forged, plaintext, wrong-key, replayed, stale-handle, or cross-listener
-close attempts cannot remove a session.
+complete canonical message shape must match. Decryption, canonical validation,
+and authoritative active data-nonce admission occur before close-specific state
+changes. Only `ACCEPTED` processes the packet as a graceful close; `EXHAUSTED`
+follows the fail-closed epoch-invalidating path above and is not counted as a
+normal close. Pending state at the same address and sessions owned by other
+listeners remain unchanged. Forged, plaintext, wrong-key, replayed,
+stale-handle, or cross-listener close attempts cannot remove a session.
 
 A server close is encrypted under the current server-to-client AES-GCM owner
 and sent only through the listener socket that owns the exact retained live
@@ -518,18 +544,24 @@ the fallbacks. Each fresh confirmed ECDHE session has fresh traffic keys, so a
 close captured under an older session cannot authenticate against or terminate
 the replacement session.
 
-An NMEA message that contains the required `payload` key but whose value is not
-a string retains that accepted nonce and touches its active session before
-frame construction is attempted. It produces no frame or queue item and is not
-promoted to a protocol exception; later packets continue to be processed.
+An NMEA message is semantically valid for nonce admission only when its required
+`payload` value is a string. A missing or non-string payload neither retains a
+nonce nor touches or exhausts its active session. It produces no frame or queue
+item; later packets continue to be processed.
 
 `stats()` returns an immutable point-in-time `SecureStateStats` snapshot. It
 reports replay, pending-session, active-session, and data-nonce lifecycle
 counts, including `sessions_closed` for normal active-session removal, plus
-current and peak sizes. Active-session removal distinguishes normal close from
-expiry, replacement, and capacity eviction; every removed record has exactly
-one removal reason. Reading statistics invokes neither clock, performs no
-cleanup, exposes no mutable state, and does not change an earlier snapshot.
+current and peak sizes. `data_nonce_exhaustions` counts fail-closed removal of
+an exact active or pending traffic-key epoch and is not counted as normal close,
+expiry, replacement, or active- or pending-session capacity eviction. The
+legacy `data_nonces_expired` and `data_nonces_capacity_evicted` fields remain in
+the snapshot for compatibility but stay zero; accepted data nonces no longer
+expire or undergo live-entry eviction. Retained records discarded when their
+owner epoch ends contribute to `data_nonces_session_discarded`. Every removed
+record has exactly one removal reason. Reading statistics invokes neither
+clock, performs no cleanup, exposes no mutable state, and does not change an
+earlier snapshot.
 
 This section governs only process-local secure state and the encrypted graceful
 close described above. It does not otherwise redefine secure packet formats,

@@ -6,6 +6,18 @@ still change public APIs and configuration behavior as the service matures.
 
 ## [Unreleased]
 
+### UDPSEC security
+
+- Retains every admitted receiver-side DATA nonce for its full traffic-key
+  epoch instead of expiring or evicting live nonce records. At the hard
+  per-epoch bound, the next distinct authenticated and semantically valid nonce
+  fails closed by invalidating only that exact active or pending epoch and
+  dropping the packet. Active loss recovers through the existing authenticated
+  ECDHE re-handshake with no wire-protocol change.
+- Adds `data_nonce_exhaustions` secure-state accounting. The legacy
+  `data_nonces_expired` and `data_nonces_capacity_evicted` snapshot fields
+  remain for compatibility and stay zero.
+
 ## [0.2.0] - 2026-08-09
 
 ### Highlights
@@ -100,10 +112,11 @@ still change public APIs and configuration behavior as the service matures.
   HKDF-SHA256 derives separate client-to-server and server-to-client
   AES-256-GCM traffic keys from the ephemeral shared secret and authenticated
   transcript.
-- Adds encrypted key-possession confirmation, strict handshake/control
-  validation, and explicitly owned, bounded, TTL-managed replay, pending-
-  session, active-session, and per-session nonce state with lifecycle
-  statistics internal to the secure-state owner.
+- Adds encrypted key-possession confirmation and strict handshake/control
+  validation. Handshake-replay, pending-session, and active-session state is
+  explicitly owned, bounded, and TTL-managed; per-session DATA nonce state is
+  separately bounded, with lifecycle statistics internal to the secure-state
+  owner.
 - This provides forward-secrecy properties against later identity-key
   compromise only when past ephemeral secrets have been discarded and neither
   endpoint was compromised while those secrets were live. The protocol has not
