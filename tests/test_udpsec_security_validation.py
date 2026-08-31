@@ -173,6 +173,7 @@ class _LoopbackSecureServer:
         self.graceful_close = graceful_close
         self.socket = socket.socket(family, socket.SOCK_DGRAM)
         self.state = secure.SecureState() if state is None else state
+        self.endpoint_token = secure._new_endpoint_token()
         self.owned_sessions = {}
         self.owned_pending_sessions = {}
         self.ingress = _ThreadSafeIngressSink()
@@ -207,6 +208,7 @@ class _LoopbackSecureServer:
                 self.ingress,
                 self.host,
                 self.port,
+                endpoint_token=self.endpoint_token,
                 sec_input_id="loopback-validation",
                 input_traffic=self.traffic,
                 state=self.state,
@@ -285,6 +287,12 @@ class _LoopbackSecureServer:
         if not succeeded:
             raise result
         return result
+
+    def relation_key(self, peer_address):
+        return self.secure._EndpointPeerKey(
+            self.endpoint_token,
+            peer_address,
+        )
 
     def close(self):
         loop = self._loop
@@ -603,7 +611,9 @@ def _assert_single_confirmed_session(server):
     assert stats.current_sessions == 1
     assert stats.current_pending_sessions == 0
     assert len(server.state._sessions) == 1
-    return next(iter(server.state._sessions.values()))
+    session = next(iter(server.state._sessions.values()))
+    assert session._relation_key.endpoint_token is server.endpoint_token
+    return session
 
 
 def _wait_for_server_stats(server, predicate, failure_message):
@@ -985,7 +995,9 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
             assert server.ingress.empty()
             after_a = server.call_in_loop(server.state.stats)
             assert (
-                server.state._sessions[client.getsockname()]
+                server.state._sessions[
+                    server.relation_key(client.getsockname())
+                ]
                 is initial_session
             )
             assert len(initial_session.seen_data_nonces) == 2
@@ -1008,7 +1020,9 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
                 "server did not classify exact full-capacity replay",
             )
             assert (
-                server.state._sessions[client.getsockname()]
+                server.state._sessions[
+                    server.relation_key(client.getsockname())
+                ]
                 is initial_session
             )
             assert len(initial_session.seen_data_nonces) == 2
@@ -1159,7 +1173,9 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
 
             final = server.call_in_loop(server.state.stats)
             assert (
-                server.state._sessions[client.getsockname()]
+                server.state._sessions[
+                    server.relation_key(client.getsockname())
+                ]
                 is recovered_session
             )
             assert final.current_sessions == 1
@@ -1334,7 +1350,9 @@ def test_real_packet_loss_requires_fresh_handshake_retry(
                         exact_expiry
                     )
                 )
-                assert expired == [client.getsockname()]
+                assert expired == [
+                    server.relation_key(client.getsockname())
+                ]
                 assert (
                     server.call_in_loop(server.state.stats)
                     .pending_sessions_expired
@@ -1402,8 +1420,8 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
             )
             assert client_a.getsockname() != client_b.getsockname()
             assert set(server.state._sessions) == {
-                client_a.getsockname(),
-                client_b.getsockname(),
+                server.relation_key(client_a.getsockname()),
+                server.relation_key(client_b.getsockname()),
             }
             assert material_a != material_b
 
@@ -1445,8 +1463,12 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
             assert received_payloads == {payload_a, payload_b}
             assert server.ingress.empty()
 
-            session_a = server.state._sessions[client_a.getsockname()]
-            session_b = server.state._sessions[client_b.getsockname()]
+            session_a = server.state._sessions[
+                server.relation_key(client_a.getsockname())
+            ]
+            session_b = server.state._sessions[
+                server.relation_key(client_b.getsockname())
+            ]
             assert shared_nonce in session_a.seen_data_nonces._live_by_key
             assert shared_nonce in session_b.seen_data_nonces._live_by_key
 
@@ -1545,6 +1567,233 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
             )
             assert replay_after.current_sessions == 3
             assert replay_after.current_pending_sessions == 0
+
+
+def test_real_same_peer_is_isolated_across_physical_listeners(
+    real_udpsec_endpoints,
+):
+    endpoints = real_udpsec_endpoints
+    shared_state = endpoints.secure.SecureState()
+
+    with (
+        _running_secure_server(
+            endpoints.secure,
+            endpoints.server_private_key,
+            socket.AF_INET,
+            "127.0.0.1",
+            state=shared_state,
+        ) as server_a,
+        _running_secure_server(
+            endpoints.secure,
+            endpoints.server_private_key,
+            socket.AF_INET,
+            "127.0.0.1",
+            state=shared_state,
+        ) as server_b,
+        _client_socket(socket.AF_INET, "127.0.0.1") as client,
+    ):
+        client_address = client.getsockname()
+        material_a = _perform_real_handshake(
+            endpoints,
+            client,
+            server_a.remote_addr,
+        )
+        relation_a = server_a.relation_key(client_address)
+        session_a = shared_state._sessions[relation_a]
+
+        material_b = _perform_real_handshake(
+            endpoints,
+            client,
+            server_b.remote_addr,
+        )
+        relation_b = server_b.relation_key(client_address)
+        session_b = shared_state._sessions[relation_b]
+
+        assert server_a.remote_addr != server_b.remote_addr
+        assert server_a.endpoint_token is not server_b.endpoint_token
+        assert relation_a.peer_address == relation_b.peer_address
+        assert relation_a != relation_b
+        assert session_a is not session_b
+        assert session_a._address == client_address
+        assert session_b._address == client_address
+        assert material_a != material_b
+        assert set(shared_state._sessions) == {relation_a, relation_b}
+        assert server_a.owned_sessions == {relation_a: session_a}
+        assert server_b.owned_sessions == {relation_b: session_b}
+
+        confirmed = server_a.call_in_loop(shared_state.stats)
+        assert confirmed.current_sessions == 2
+        assert confirmed.current_pending_sessions == 0
+        assert confirmed.sessions_replaced == 0
+        assert confirmed.pending_sessions_replaced == 0
+        assert confirmed.handshake_replay_accepted == 2
+        assert confirmed.handshake_replay_rejected == 0
+
+        shared_nonce = _nonce(750)
+        payload_a = "!AIVDM,1,1,,A,listener-a,0*00"
+        payload_b = "!AIVDM,1,1,,A,listener-b,0*00"
+        packet_a = _encrypted_json_packet(
+            endpoints.proxy,
+            material_a.client_to_server_key,
+            shared_nonce,
+            {
+                "type": "nmea",
+                "payload": payload_a,
+                "timestamp": 1000,
+                "source_id": STATION_ID,
+            },
+        )
+        packet_b = _encrypted_json_packet(
+            endpoints.proxy,
+            material_b.client_to_server_key,
+            shared_nonce,
+            {
+                "type": "nmea",
+                "payload": payload_b,
+                "timestamp": 1000,
+                "source_id": STATION_ID,
+            },
+        )
+
+        client.sendto(packet_a, server_a.remote_addr)
+        frame_a = server_a.ingress.get()
+        assert decode_frame_slice(frame_a, 0, len(frame_a.payload)) == payload_a
+        assert server_b.ingress.empty()
+
+        client.sendto(packet_b, server_b.remote_addr)
+        frame_b = server_b.ingress.get()
+        assert decode_frame_slice(frame_b, 0, len(frame_b.payload)) == payload_b
+        assert server_a.ingress.empty()
+        assert session_a.seen_data_nonces.contains(shared_nonce)
+        assert session_b.seen_data_nonces.contains(shared_nonce)
+
+        endpoints.proxy.send_ping(
+            client,
+            server_a.remote_addr,
+            material_a.client_to_server_key,
+            STATION_ID,
+            41,
+        )
+        _receive_authenticated_pong(
+            endpoints.proxy,
+            client,
+            server_a.remote_addr,
+            material_a,
+            41,
+        )
+        endpoints.proxy.send_ping(
+            client,
+            server_b.remote_addr,
+            material_b.client_to_server_key,
+            STATION_ID,
+            42,
+        )
+        _receive_authenticated_pong(
+            endpoints.proxy,
+            client,
+            server_b.remote_addr,
+            material_b,
+            42,
+        )
+
+        before_cross = server_a.call_in_loop(shared_state.stats)
+        a_last_seen = session_a.last_seen
+        a_nonces = set(session_a.seen_data_nonces._live_by_key)
+        b_nonce_count = len(session_b.seen_data_nonces)
+        cross_nmea_nonce = _nonce(751)
+        cross_ping_nonce = _nonce(752)
+        cross_nmea = _encrypted_json_packet(
+            endpoints.proxy,
+            material_a.client_to_server_key,
+            cross_nmea_nonce,
+            {
+                "type": "nmea",
+                "payload": "must-not-cross-endpoints",
+                "timestamp": 1000,
+                "source_id": STATION_ID,
+            },
+        )
+        cross_ping = _encrypted_json_packet(
+            endpoints.proxy,
+            material_a.client_to_server_key,
+            cross_ping_nonce,
+            {
+                "type": "ping",
+                "seq": 43,
+                "timestamp": 1000,
+                "source_id": STATION_ID,
+            },
+        )
+
+        client.sendto(cross_nmea, server_b.remote_addr)
+        client.sendto(cross_ping, server_b.remote_addr)
+        endpoints.proxy.send_session_close(
+            client,
+            server_b.remote_addr,
+            material_a.client_to_server_key,
+            STATION_ID,
+        )
+        endpoints.proxy.send_ping(
+            client,
+            server_b.remote_addr,
+            material_b.client_to_server_key,
+            STATION_ID,
+            44,
+        )
+        _receive_authenticated_pong(
+            endpoints.proxy,
+            client,
+            server_b.remote_addr,
+            material_b,
+            44,
+        )
+
+        after_cross = server_a.call_in_loop(shared_state.stats)
+        assert shared_state._sessions[relation_a] is session_a
+        assert shared_state._sessions[relation_b] is session_b
+        assert session_a.last_seen == a_last_seen
+        assert set(session_a.seen_data_nonces._live_by_key) == a_nonces
+        assert len(session_b.seen_data_nonces) == b_nonce_count + 1
+        assert not session_b.seen_data_nonces.contains(cross_nmea_nonce)
+        assert not session_b.seen_data_nonces.contains(cross_ping_nonce)
+        assert after_cross.data_nonces_accepted == (
+            before_cross.data_nonces_accepted + 1
+        )
+        assert after_cross.sessions_touched == before_cross.sessions_touched + 1
+        assert after_cross.sessions_closed == before_cross.sessions_closed
+        assert server_a.ingress.empty()
+        assert server_b.ingress.empty()
+
+        endpoints.proxy.send_session_close(
+            client,
+            server_a.remote_addr,
+            material_a.client_to_server_key,
+            STATION_ID,
+        )
+        closed = _wait_for_server_stats(
+            server_a,
+            lambda stats: stats.current_sessions == 1,
+            "listener A did not close its endpoint-scoped session",
+        )
+        assert relation_a not in shared_state._sessions
+        assert shared_state._sessions[relation_b] is session_b
+        assert closed.sessions_closed == before_cross.sessions_closed + 1
+
+        endpoints.proxy.send_ping(
+            client,
+            server_b.remote_addr,
+            material_b.client_to_server_key,
+            STATION_ID,
+            45,
+        )
+        _receive_authenticated_pong(
+            endpoints.proxy,
+            client,
+            server_b.remote_addr,
+            material_b,
+            45,
+        )
+        assert shared_state._sessions[relation_b] is session_b
 
 
 def test_ipv6_remote_comparison_uses_ip_and_port_from_four_tuple(
@@ -2089,7 +2338,9 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                 client.recvfrom(8192)
 
             after = server.call_in_loop(server.state.stats)
-            assert server.state._sessions[client.getsockname()] is session
+            assert server.state._sessions[
+                server.relation_key(client.getsockname())
+            ] is session
             assert after.current_sessions == 1
             assert after.current_pending_sessions == 0
             assert after.sessions_touched == before.sessions_touched + 2
@@ -2343,24 +2594,28 @@ def test_expired_pending_handle_cannot_replace_live_active_session(
     secure = real_udpsec_endpoints.secure
     state = secure.SecureState(pending_session_ttl=5)
     address = ("127.0.0.1", 51001)
-    active = state.install_session(
+    relation_key = secure._EndpointPeerKey(
+        secure._new_endpoint_token(),
         address,
+    )
+    active = state.install_session(
+        relation_key,
         STATION_ID,
         AESGCM(b"\x61" * 32),
         AESGCM(b"\x62" * 32),
         0,
     )
     pending = state.install_pending_session(
-        address,
+        relation_key,
         STATION_ID,
         AESGCM(b"\x63" * 32),
         AESGCM(b"\x64" * 32),
         1,
     )
 
-    assert state.promote_pending_session(address, pending, 6) is None
-    assert state.get_active_session(address, 6) is active
-    assert state.get_pending_session(address, 6) is None
+    assert state.promote_pending_session(relation_key, pending, 6) is None
+    assert state.get_active_session(relation_key, 6) is active
+    assert state.get_pending_session(relation_key, 6) is None
     stats = state.stats()
     assert stats.pending_sessions_expired == 1
     assert stats.pending_sessions_promoted == 0
@@ -2375,22 +2630,31 @@ def test_session_state_retains_only_directional_cipher_contexts(
     secure = real_udpsec_endpoints.secure
     state = secure.SecureState()
     address = ("127.0.0.1", 51002)
-    active = state.install_session(
+    relation_key = secure._EndpointPeerKey(
+        secure._new_endpoint_token(),
         address,
+    )
+    active = state.install_session(
+        relation_key,
         STATION_ID,
         AESGCM(b"\x65" * 32),
         AESGCM(b"\x66" * 32),
         10,
     )
     pending = state.install_pending_session(
-        address,
+        relation_key,
         STATION_ID,
         AESGCM(b"\x67" * 32),
         AESGCM(b"\x68" * 32),
         11,
     )
 
+    assert active._relation_key is relation_key
+    assert pending._relation_key is relation_key
+    assert active._address == address
+    assert pending._address == address
     assert set(vars(active)) == {
+        "_relation_key",
         "_address",
         "station_id",
         "client_to_server_aesgcm",
@@ -2400,6 +2664,7 @@ def test_session_state_retains_only_directional_cipher_contexts(
         "seen_data_nonces",
     }
     assert set(vars(pending)) == {
+        "_relation_key",
         "_address",
         "station_id",
         "client_to_server_aesgcm",

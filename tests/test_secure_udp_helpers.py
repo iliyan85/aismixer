@@ -43,6 +43,7 @@ STATION_PRIVATE_KEY_FILENAME = "station_private.key"
 STATION_PUBLIC_KEY_FILENAME = "station_public.pem"
 REMOTE_CANONICAL_PUBLIC_KEY_PATH = "/etc/nmea_sproxy/keys/aismixer_public.pem"
 _PREPARED_SERVER_PRIVATE_KEY = ec.derive_private_key(23, ec.SECP256R1())
+_TEST_ENDPOINT_TOKENS = {}
 
 
 def load_proxy_module():
@@ -98,6 +99,30 @@ def load_secure_module_with_fake_keys(
         return module
 
 
+def _test_endpoint_token(secure):
+    token = _TEST_ENDPOINT_TOKENS.get(secure)
+    if token is None:
+        token = secure._EndpointToken()
+        _TEST_ENDPOINT_TOKENS[secure] = token
+    return token
+
+
+def _relation_key(secure, address, endpoint_token=None):
+    token = (
+        _test_endpoint_token(secure)
+        if endpoint_token is None
+        else endpoint_token
+    )
+    return secure._EndpointPeerKey(token, address)
+
+
+def _relation_keys(secure, addresses, endpoint_token=None):
+    return tuple(
+        _relation_key(secure, address, endpoint_token)
+        for address in addresses
+    )
+
+
 def test_authorized_station_identity_keys_are_validated_once(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
 
@@ -129,6 +154,7 @@ def test_secure_loop_rejects_missing_identity_before_binding(monkeypatch):
                 _FakeQueue(),
                 "127.0.0.1",
                 19999,
+                endpoint_token=_test_endpoint_token(secure),
             )
         )
 
@@ -519,12 +545,18 @@ def _run_secure_server_with_packets(
     graceful_shutdown=False,
     owned_sessions=None,
     owned_pending_sessions=None,
+    endpoint_token=None,
 ):
     fake_socket = _FakeSecureSocket()
     fake_loop = _FakeSecureLoop(packets)
     fake_queue = _FakeQueue()
 
     state = secure.SecureState() if state is None else state
+    endpoint_token = (
+        _test_endpoint_token(secure)
+        if endpoint_token is None
+        else endpoint_token
+    )
     wall_clock = _FakeClock(1010.0) if wall_clock is None else wall_clock
     monotonic_clock = (
         _FakeClock(1010.0)
@@ -535,45 +567,38 @@ def _run_secure_server_with_packets(
         owned_sessions = dict(state._sessions)
     if owned_pending_sessions is None:
         owned_pending_sessions = dict(state._pending_sessions)
-    socket_factory = _FakeSecureSocketFactory(fake_socket)
-    monkeypatch.setattr(
-        secure,
-        "create_udp_listener_socket",
-        socket_factory,
-    )
     monkeypatch.setattr(secure, "asyncio", _FakeAsyncioModule(fake_loop))
-    if not graceful_shutdown:
-        monkeypatch.setattr(
-            secure,
-            "close_owned_sessions",
-            lambda *_args, **_kwargs: None,
-        )
-    owned_registries = iter((owned_sessions, owned_pending_sessions))
-
-    class _OwnedSessionsFactory:
-        @staticmethod
-        def WeakValueDictionary():
-            return next(owned_registries)
-
-    monkeypatch.setattr(secure, "weakref", _OwnedSessionsFactory)
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(
-            secure.secure_server(
-                fake_queue,
-                "127.0.0.1",
-                9999,
-                sec_input_id=sec_input_id,
-                ingress_policy=ingress_policy,
-                state=state,
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                secure._secure_server_loop(
+                    fake_socket,
+                    fake_queue,
+                    "127.0.0.1",
+                    9999,
+                    sec_input_id=sec_input_id,
+                    ingress_policy=ingress_policy,
+                    endpoint_token=endpoint_token,
+                    state=state,
+                    wall_clock=wall_clock,
+                    monotonic_clock=monotonic_clock,
+                    server_private_key=server_private_key,
+                    owned_sessions=owned_sessions,
+                    owned_pending_sessions=owned_pending_sessions,
+                )
+            )
+    finally:
+        if graceful_shutdown:
+            secure.close_owned_sessions(
+                fake_socket,
+                state,
+                owned_sessions,
                 wall_clock=wall_clock,
                 monotonic_clock=monotonic_clock,
-                server_private_key=server_private_key,
             )
-        )
+        fake_socket.close()
 
     assert fake_socket.close_count == 1
-    assert socket_factory.calls == [("127.0.0.1", False)]
     return fake_queue, fake_socket
 
 
@@ -647,11 +672,12 @@ def _install_test_session(
     server_to_client_key,
     now=1000.0,
     station_id="boat_001",
+    endpoint_token=None,
 ):
     client_to_server_aesgcm = secure.AESGCM(client_to_server_key)
     server_to_client_aesgcm = secure.AESGCM(server_to_client_key)
     session = state.install_session(
-        addr,
+        _relation_key(secure, addr, endpoint_token),
         station_id,
         client_to_server_aesgcm,
         server_to_client_aesgcm,
@@ -737,7 +763,7 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
         shared_secret,
         transcript_hash,
     )
-    pending = state._pending_sessions[addr]
+    pending = state._pending_sessions[_relation_key(secure, addr)]
 
     nonce = b"\x01" * 12
     plaintext = b"direction check"
@@ -798,10 +824,68 @@ def test_secure_server_rejects_exact_replay_from_different_address(
     assert len(fake_socket.sent) == 1
     assert fake_socket.sent[0][1] == first_addr
     assert tuple(state._sessions) == ()
-    assert tuple(state._pending_sessions) == (first_addr,)
+    assert tuple(state._pending_sessions) == _relation_keys(
+        secure, (first_addr,)
+    )
     assert state.stats().handshake_replay_accepted == 1
     assert state.stats().handshake_replay_rejected == 1
     assert state.stats().pending_sessions_created == 1
+
+
+def test_secure_server_handshake_replay_cache_spans_endpoint_namespaces(
+    monkeypatch,
+):
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    packet = _signed_handshake_packet(
+        secure,
+        client_identity_private_key,
+        "boat_001",
+        1000,
+    )
+    peer = ("127.0.0.1", 50123)
+    endpoint_a = secure._new_endpoint_token()
+    endpoint_b = secure._new_endpoint_token()
+    relation_a = _relation_key(secure, peer, endpoint_a)
+    relation_b = _relation_key(secure, peer, endpoint_b)
+    state = secure.SecureState()
+
+    _, first_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, peer)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+        endpoint_token=endpoint_a,
+        owned_sessions={},
+        owned_pending_sessions={},
+    )
+    pending_a = state._pending_sessions[relation_a]
+
+    _, second_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, peer)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+        endpoint_token=endpoint_b,
+        owned_sessions={},
+        owned_pending_sessions={},
+    )
+
+    assert len(first_socket.sent) == 1
+    assert first_socket.sent[0][1] == peer
+    assert second_socket.sent == []
+    assert state._pending_sessions == {relation_a: pending_a}
+    assert relation_b not in state._pending_sessions
+    stats = state.stats()
+    assert stats.handshake_replay_accepted == 1
+    assert stats.handshake_replay_rejected == 1
+    assert stats.pending_sessions_created == 1
 
 
 def test_invalid_hellos_do_not_consume_replay_or_generate_server_ephemeral(
@@ -1103,7 +1187,7 @@ def test_fresh_same_timestamp_hellos_get_fresh_server_state(monkeypatch):
     assert state.stats().handshake_replay_accepted == 2
     assert state.stats().handshake_replay_rejected == 0
     assert tuple(state._sessions) == ()
-    assert tuple(state._pending_sessions) == (addr,)
+    assert tuple(state._pending_sessions) == _relation_keys(secure, (addr,))
     assert state.stats().pending_sessions_created == 2
     assert state.stats().pending_sessions_replaced == 1
     assert state.stats().current_pending_sessions == 1
@@ -1149,14 +1233,14 @@ def test_plaintext_keepalive_is_silently_ignored_without_touch_or_promotion(
     state = secure.SecureState()
     addr = ("127.0.0.1", 50123)
     active = state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         object(),
         object(),
         now=1000.0,
     )
     pending = state.install_pending_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         object(),
         object(),
@@ -1176,8 +1260,8 @@ def test_plaintext_keepalive_is_silently_ignored_without_touch_or_promotion(
 
     assert fake_queue.items == []
     assert fake_socket.sent == []
-    assert state._sessions[addr] is active
-    assert state._pending_sessions[addr] is pending
+    assert state._sessions[_relation_key(secure, addr)] is active
+    assert state._pending_sessions[_relation_key(secure, addr)] is pending
     assert active.last_seen == 1000.0
     assert state.stats().sessions_touched == 0
     assert state.stats().pending_sessions_promoted == 0
@@ -1269,7 +1353,7 @@ def test_secure_server_valid_client_close_removes_exact_owned_active_session(
         server_to_client_key,
     )
     pending = state.install_pending_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         secure.AESGCM(b"\x03" * 32),
         secure.AESGCM(b"\x04" * 32),
@@ -1288,14 +1372,14 @@ def test_secure_server_valid_client_close_removes_exact_owned_active_session(
         [(packet, addr)],
         state=state,
         monotonic_clock=_FakeClock(1010.0),
-        owned_sessions={addr: session},
+        owned_sessions={_relation_key(secure, addr): session},
     )
 
     stats = state.stats()
     assert fake_queue.items == []
     assert fake_socket.sent == []
-    assert addr not in state._sessions
-    assert state._pending_sessions[addr] is pending
+    assert _relation_key(secure, addr) not in state._sessions
+    assert state._pending_sessions[_relation_key(secure, addr)] is pending
     assert len(session.seen_data_nonces) == 0
     assert stats.sessions_closed == 1
     assert stats.sessions_touched == 0
@@ -1352,13 +1436,13 @@ def test_secure_server_forged_client_close_cannot_remove_active_session(
         [(packet, addr)],
         state=state,
         monotonic_clock=_FakeClock(1010.0),
-        owned_sessions={addr: session},
+        owned_sessions={_relation_key(secure, addr): session},
     )
 
     stats = state.stats()
     assert fake_queue.items == []
     assert fake_socket.sent == []
-    assert state._sessions[addr] is session
+    assert state._sessions[_relation_key(secure, addr)] is session
     assert len(session.seen_data_nonces) == 0
     assert session.last_seen == 1000.0
     assert stats.sessions_closed == 0
@@ -1404,13 +1488,13 @@ def test_secure_server_valid_client_close_requires_exact_listener_owner(
         [(packet, addr)],
         state=state,
         monotonic_clock=_FakeClock(1010.0),
-        owned_sessions={addr: stale},
+        owned_sessions={_relation_key(secure, addr): stale},
     )
 
     stats = state.stats()
     assert fake_queue.items == []
     assert fake_socket.sent == []
-    assert state._sessions[addr] is current
+    assert state._sessions[_relation_key(secure, addr)] is current
     assert len(current.seen_data_nonces) == 0
     assert current.last_seen == 1000.0
     assert stats.sessions_replaced == 1
@@ -1509,7 +1593,7 @@ def test_secure_server_denied_data_peer_gets_no_response(monkeypatch):
     state = secure.SecureState(session_ttl=1.0)
     retained_addr = ("198.51.100.20", 50000)
     state.install_session(
-        retained_addr,
+        _relation_key(secure, retained_addr),
         "retained",
         object(),
         object(),
@@ -1536,7 +1620,9 @@ def test_secure_server_denied_data_peer_gets_no_response(monkeypatch):
 
     assert fake_queue.items == []
     assert fake_socket.sent == []
-    assert tuple(state._sessions) == (retained_addr,)
+    assert tuple(state._sessions) == _relation_keys(
+        secure, (retained_addr,)
+    )
     assert state.stats().current_sessions == 1
     assert state.stats().sessions_expired == 0
     assert wall_clock.calls == 0
@@ -2105,14 +2191,14 @@ def test_authenticated_hello_preserves_active_and_installs_pending_candidate(
     addr = ("127.0.0.1", 50123)
     other_addr = ("127.0.0.1", 50124)
     old = state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         object(),
         object(),
         now=0.0,
     )
     other = state.install_session(
-        other_addr,
+        _relation_key(secure, other_addr),
         "other",
         object(),
         object(),
@@ -2133,11 +2219,11 @@ def test_authenticated_hello_preserves_active_and_installs_pending_candidate(
         monotonic_clock=_FakeClock(2.0),
     )
 
-    pending = state._pending_sessions[addr]
+    pending = state._pending_sessions[_relation_key(secure, addr)]
     response, response_addr = fake_socket.sent[0]
     assert response_addr == addr
     assert response.startswith(b"OK|")
-    assert state._sessions[addr] is old
+    assert state._sessions[_relation_key(secure, addr)] is old
     assert pending is not old
     assert (
         pending.client_to_server_aesgcm
@@ -2147,9 +2233,11 @@ def test_authenticated_hello_preserves_active_and_installs_pending_candidate(
         pending.server_to_client_aesgcm
         is not old.server_to_client_aesgcm
     )
-    assert state._sessions[other_addr] is other
-    assert tuple(state._sessions) == (addr, other_addr)
-    assert tuple(state._pending_sessions) == (addr,)
+    assert state._sessions[_relation_key(secure, other_addr)] is other
+    assert tuple(state._sessions) == _relation_keys(
+        secure, (addr, other_addr)
+    )
+    assert tuple(state._pending_sessions) == _relation_keys(secure, (addr,))
     assert state.data_nonce_seen(old, nonce, now=2.0)
     assert not state.pending_data_nonce_seen(pending, nonce, now=2.0)
 
@@ -2263,7 +2351,7 @@ def test_secure_server_retains_nonce_for_live_traffic_key_epoch(monkeypatch):
     assert len(first_queue.items) == 1
     assert len(later_queue.items) == 1
     assert replay_queue.items == []
-    assert state._sessions[addr] is session
+    assert state._sessions[_relation_key(secure, addr)] is session
     assert session.last_seen == 299.0
     assert session.seen_data_nonces.contains(first_nonce)
     stats = state.stats()
@@ -2324,7 +2412,7 @@ def test_secure_server_valid_new_nonce_at_capacity_invalidates_epoch_without_act
             triggering_nonce,
             secure.build_session_close_message("boat_001", 1000),
         )
-    owned_sessions = {addr: session}
+    owned_sessions = {_relation_key(secure, addr): session}
 
     queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
@@ -2338,7 +2426,7 @@ def test_secure_server_valid_new_nonce_at_capacity_invalidates_epoch_without_act
     stats = state.stats()
     assert queue.items == []
     assert fake_socket.sent == []
-    assert addr not in state._sessions
+    assert _relation_key(secure, addr) not in state._sessions
     assert owned_sessions == {}
     assert session.last_seen == 1000.0
     assert len(session.seen_data_nonces) == 0
@@ -2403,7 +2491,7 @@ def test_secure_server_invalid_packet_at_nonce_capacity_preserves_epoch(
     stats = state.stats()
     assert queue.items == []
     assert fake_socket.sent == []
-    assert state._sessions[addr] is session
+    assert state._sessions[_relation_key(secure, addr)] is session
     assert session.last_seen == 1000.0
     assert session.seen_data_nonces.contains(retained_nonce)
     assert not session.seen_data_nonces.contains(rejected_nonce)
@@ -2434,7 +2522,7 @@ def test_secure_server_rejects_repeated_nonce_before_second_decrypt(monkeypatch)
     server_to_client_aesgcm = object()
     state = secure.SecureState()
     state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         client_to_server_aesgcm,
         server_to_client_aesgcm,
@@ -2538,7 +2626,7 @@ def test_allowed_peer_activity_proactively_cleans_silent_expired_session(monkeyp
     silent_addr = ("127.0.0.1", 50122)
     active_addr = ("127.0.0.1", 50123)
     state.install_session(
-        silent_addr,
+        _relation_key(secure, silent_addr),
         "silent",
         object(),
         object(),
@@ -2567,7 +2655,7 @@ def test_allowed_handshake_proactively_cleans_silent_expired_session(monkeypatch
     silent_addr = ("127.0.0.1", 50122)
     handshake_addr = ("127.0.0.1", 50123)
     state.install_session(
-        silent_addr,
+        _relation_key(secure, silent_addr),
         "silent",
         object(),
         object(),
@@ -2587,7 +2675,9 @@ def test_allowed_handshake_proactively_cleans_silent_expired_session(monkeypatch
     )
 
     assert tuple(state._sessions) == ()
-    assert tuple(state._pending_sessions) == (handshake_addr,)
+    assert tuple(state._pending_sessions) == _relation_keys(
+        secure, (handshake_addr,)
+    )
     assert state.stats().sessions_expired == 1
     assert state.stats().pending_sessions_created == 1
     assert len(fake_socket.sent) == 1
@@ -2599,7 +2689,7 @@ def test_unknown_allowed_packet_proactively_cleans_without_wall_clock(monkeypatc
     state = secure.SecureState(session_ttl=10.0)
     silent_addr = ("127.0.0.1", 50122)
     state.install_session(
-        silent_addr,
+        _relation_key(secure, silent_addr),
         "silent",
         object(),
         object(),
@@ -2630,7 +2720,7 @@ def test_exactly_expired_address_data_is_silently_dropped(monkeypatch):
     state = secure.SecureState(session_ttl=10.0)
     addr = ("127.0.0.1", 50123)
     state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         object(),
         object(),
@@ -4219,7 +4309,7 @@ def test_runtime_end_to_end_ecdhe_and_directional_encryption(monkeypatch):
         client_key_material.client_to_server_key
         != client_key_material.server_to_client_key
     )
-    server_session = state._sessions[client_addr]
+    server_session = state._sessions[_relation_key(secure, client_addr)]
     assert (
         server_session.client_to_server_aesgcm
         is not server_session.server_to_client_aesgcm
@@ -5669,7 +5759,7 @@ def test_secure_session_stores_identity_crypto_and_monotonic_timestamps(monkeypa
     server_to_client_aesgcm = object()
 
     session = state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         client_to_server_aesgcm,
         server_to_client_aesgcm,
@@ -5682,7 +5772,7 @@ def test_secure_session_stores_identity_crypto_and_monotonic_timestamps(monkeypa
     assert session.created_at == 100.0
     assert session.last_seen == 100.0
     assert len(session.seen_data_nonces) == 0
-    assert tuple(state._sessions) == (addr,)
+    assert tuple(state._sessions) == _relation_keys(secure, (addr,))
     assert state.stats().sessions_created == 1
 
 
@@ -5690,7 +5780,7 @@ def test_data_nonce_accepts_first_validated_nonce(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState()
     session = state.install_session(
-        ("192.0.2.10", 50000),
+        _relation_key(secure, ("192.0.2.10", 50000)),
         "boat_001",
         object(),
         object(),
@@ -5711,7 +5801,7 @@ def test_data_nonce_replay_is_retained_for_session_lifetime(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(session_ttl=20_000.0)
     session = state.install_session(
-        ("192.0.2.10", 50000),
+        _relation_key(secure, ("192.0.2.10", 50000)),
         "boat_001",
         object(),
         object(),
@@ -5736,7 +5826,7 @@ def test_data_nonce_lookup_does_not_expire_retained_records(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(session_ttl=1000.0)
     session = state.install_session(
-        ("192.0.2.10", 50000),
+        _relation_key(secure, ("192.0.2.10", 50000)),
         "boat_001",
         object(),
         object(),
@@ -5764,7 +5854,7 @@ def test_data_nonce_admission_checks_replay_before_capacity(monkeypatch):
         data_nonce_max_per_session=2,
     )
     session = state.install_session(
-        ("192.0.2.10", 50000),
+        _relation_key(secure, ("192.0.2.10", 50000)),
         "boat_001",
         object(),
         object(),
@@ -5784,12 +5874,12 @@ def test_data_nonce_admission_checks_replay_before_capacity(monkeypatch):
         session, one, now=102.0
     ) is secure._DataNonceAdmission.REPLAY
 
-    assert state._sessions[session._address] is session
+    assert state._sessions[_relation_key(secure, session._address)] is session
     assert set(session.seen_data_nonces._live_by_key) == {one, two}
     assert state.admit_data_nonce(
         session, three, now=103.0
     ) is secure._DataNonceAdmission.EXHAUSTED
-    assert session._address not in state._sessions
+    assert _relation_key(secure, session._address) not in state._sessions
     assert len(session.seen_data_nonces) == 0
     stats = state.stats()
     assert stats.data_nonce_replays == 1
@@ -5808,14 +5898,14 @@ def test_data_nonce_exhaustion_removes_only_exact_owning_session(monkeypatch):
         max_sessions=2,
     )
     exhausted = state.install_session(
-        ("192.0.2.10", 50000),
+        _relation_key(secure, ("192.0.2.10", 50000)),
         "boat_001",
         object(),
         object(),
         now=0.0,
     )
     other = state.install_session(
-        ("192.0.2.11", 50001),
+        _relation_key(secure, ("192.0.2.11", 50001)),
         "boat_002",
         object(),
         object(),
@@ -5829,8 +5919,8 @@ def test_data_nonce_exhaustion_removes_only_exact_owning_session(monkeypatch):
         exhausted, triggering, now=1.0
     ) is secure._DataNonceAdmission.EXHAUSTED
 
-    assert exhausted._address not in state._sessions
-    assert state._sessions[other._address] is other
+    assert _relation_key(secure, exhausted._address) not in state._sessions
+    assert state._sessions[_relation_key(secure, other._address)] is other
     stats = state.stats()
     assert stats.data_nonce_exhaustions == 1
     assert stats.data_nonces_capacity_evicted == 0
@@ -5840,14 +5930,14 @@ def test_data_nonce_caches_are_independent_per_session(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState()
     first = state.install_session(
-        ("192.0.2.10", 50000),
+        _relation_key(secure, ("192.0.2.10", 50000)),
         "boat_001",
         object(),
         object(),
         now=100.0,
     )
     second = state.install_session(
-        ("192.0.2.11", 50001),
+        _relation_key(secure, ("192.0.2.11", 50001)),
         "boat_002",
         object(),
         object(),
@@ -5867,15 +5957,15 @@ def test_get_active_session_uses_exact_ttl_boundary(monkeypatch):
     state = secure.SecureState(session_ttl=30.0)
     addr = ("192.0.2.10", 50000)
     session = state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         object(),
         object(),
         now=100.0,
     )
 
-    assert state.get_active_session(addr, now=129.999) is session
-    assert state.get_active_session(addr, now=130.0) is None
+    assert state.get_active_session(_relation_key(secure, addr), now=129.999) is session
+    assert state.get_active_session(_relation_key(secure, addr), now=130.0) is None
     stats = state.stats()
     assert stats.sessions_expired == 1
     assert stats.current_sessions == 0
@@ -5885,7 +5975,7 @@ def test_get_active_session_returns_none_for_missing_session(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState()
 
-    assert state.get_active_session(("192.0.2.10", 50000), now=120.0) is None
+    assert state.get_active_session(_relation_key(secure, ("192.0.2.10", 50000)), now=120.0) is None
     assert state.stats().sessions_expired == 0
 
 
@@ -5895,26 +5985,30 @@ def test_touch_session_updates_lru_order_without_changing_creation(monkeypatch):
     first_addr = ("192.0.2.10", 50000)
     second_addr = ("192.0.2.11", 50001)
     first = state.install_session(
-        first_addr,
+        _relation_key(secure, first_addr),
         "first",
         object(),
         object(),
         now=100.0,
     )
     state.install_session(
-        second_addr,
+        _relation_key(secure, second_addr),
         "second",
         object(),
         object(),
         now=110.0,
     )
 
-    assert tuple(state._sessions) == (first_addr, second_addr)
-    assert state.touch_session(first_addr, first, now=125.0)
+    assert tuple(state._sessions) == _relation_keys(
+        secure, (first_addr, second_addr)
+    )
+    assert state.touch_session(_relation_key(secure, first_addr), first, now=125.0)
 
     assert first.created_at == 100.0
     assert first.last_seen == 125.0
-    assert tuple(state._sessions) == (second_addr, first_addr)
+    assert tuple(state._sessions) == _relation_keys(
+        secure, (second_addr, first_addr)
+    )
     assert state.stats().sessions_touched == 1
 
 
@@ -5924,14 +6018,14 @@ def test_session_cleanup_removes_expired_lru_prefix_and_stops_at_live(monkeypatc
     expired_addr = ("192.0.2.10", 50000)
     active_addr = ("192.0.2.11", 50001)
     state.install_session(
-        expired_addr,
+        _relation_key(secure, expired_addr),
         "expired",
         object(),
         object(),
         now=90.0,
     )
     state.install_session(
-        active_addr,
+        _relation_key(secure, active_addr),
         "active",
         object(),
         object(),
@@ -5940,8 +6034,8 @@ def test_session_cleanup_removes_expired_lru_prefix_and_stops_at_live(monkeypatc
 
     removed = state.cleanup_expired_sessions(now=120.0)
 
-    assert removed == [expired_addr]
-    assert tuple(state._sessions) == (active_addr,)
+    assert removed == list(_relation_keys(secure, (expired_addr,)))
+    assert tuple(state._sessions) == _relation_keys(secure, (active_addr,))
     assert state.stats().sessions_expired == 1
 
 
@@ -5952,30 +6046,32 @@ def test_session_capacity_evicts_least_recently_seen(monkeypatch):
     second_addr = ("192.0.2.11", 50001)
     third_addr = ("192.0.2.12", 50002)
     first = state.install_session(
-        first_addr,
+        _relation_key(secure, first_addr),
         "first",
         object(),
         object(),
         now=100.0,
     )
     state.install_session(
-        second_addr,
+        _relation_key(secure, second_addr),
         "second",
         object(),
         object(),
         now=110.0,
     )
-    assert state.touch_session(first_addr, first, now=120.0)
+    assert state.touch_session(_relation_key(secure, first_addr), first, now=120.0)
 
     state.install_session(
-        third_addr,
+        _relation_key(secure, third_addr),
         "third",
         object(),
         object(),
         now=130.0,
     )
 
-    assert tuple(state._sessions) == (first_addr, third_addr)
+    assert tuple(state._sessions) == _relation_keys(
+        secure, (first_addr, third_addr)
+    )
     stats = state.stats()
     assert stats.sessions_capacity_evicted == 1
     assert stats.sessions_expired == 0
@@ -5990,14 +6086,14 @@ def test_equal_session_timestamps_use_deterministic_activity_order(monkeypatch):
     second_addr = ("192.0.2.11", 50001)
     third_addr = ("192.0.2.12", 50002)
     state.install_session(
-        first_addr,
+        _relation_key(secure, first_addr),
         "first",
         object(),
         object(),
         now=100.0,
     )
     state.install_session(
-        second_addr,
+        _relation_key(secure, second_addr),
         "second",
         object(),
         object(),
@@ -6005,14 +6101,16 @@ def test_equal_session_timestamps_use_deterministic_activity_order(monkeypatch):
     )
 
     state.install_session(
-        third_addr,
+        _relation_key(secure, third_addr),
         "third",
         object(),
         object(),
         now=100.0,
     )
 
-    assert tuple(state._sessions) == (second_addr, third_addr)
+    assert tuple(state._sessions) == _relation_keys(
+        secure, (second_addr, third_addr)
+    )
     assert state.stats().sessions_capacity_evicted == 1
 
 
@@ -6023,14 +6121,14 @@ def test_expired_sessions_are_removed_before_capacity_eviction(monkeypatch):
     active_addr = ("192.0.2.11", 50001)
     new_addr = ("192.0.2.12", 50002)
     state.install_session(
-        expired_addr,
+        _relation_key(secure, expired_addr),
         "expired",
         object(),
         object(),
         now=90.0,
     )
     state.install_session(
-        active_addr,
+        _relation_key(secure, active_addr),
         "active",
         object(),
         object(),
@@ -6038,14 +6136,16 @@ def test_expired_sessions_are_removed_before_capacity_eviction(monkeypatch):
     )
 
     state.install_session(
-        new_addr,
+        _relation_key(secure, new_addr),
         "new",
         object(),
         object(),
         now=120.0,
     )
 
-    assert tuple(state._sessions) == (active_addr, new_addr)
+    assert tuple(state._sessions) == _relation_keys(
+        secure, (active_addr, new_addr)
+    )
     stats = state.stats()
     assert stats.sessions_expired == 1
     assert stats.sessions_capacity_evicted == 0
@@ -6063,14 +6163,14 @@ def test_live_session_replacement_discards_nonce_state_without_other_eviction(
     new_client_to_server_aesgcm = object()
     new_server_to_client_aesgcm = object()
     old = state.install_session(
-        replaced_addr,
+        _relation_key(secure, replaced_addr),
         "old",
         old_client_to_server_aesgcm,
         old_server_to_client_aesgcm,
         now=100.0,
     )
     state.install_session(
-        other_addr,
+        _relation_key(secure, other_addr),
         "other",
         object(),
         object(),
@@ -6080,14 +6180,14 @@ def test_live_session_replacement_discards_nonce_state_without_other_eviction(
     assert state.accept_data_nonce(old, nonce, now=115.0)
 
     new = state.install_session(
-        replaced_addr,
+        _relation_key(secure, replaced_addr),
         "new",
         new_client_to_server_aesgcm,
         new_server_to_client_aesgcm,
         now=120.0,
     )
 
-    assert new is state._sessions[replaced_addr]
+    assert new is state._sessions[_relation_key(secure, replaced_addr)]
     assert new is not old
     assert (
         new.client_to_server_aesgcm
@@ -6097,7 +6197,9 @@ def test_live_session_replacement_discards_nonce_state_without_other_eviction(
         new.server_to_client_aesgcm
         is new_server_to_client_aesgcm
     )
-    assert tuple(state._sessions) == (other_addr, replaced_addr)
+    assert tuple(state._sessions) == _relation_keys(
+        secure, (other_addr, replaced_addr)
+    )
     assert not state.data_nonce_seen(new, nonce, now=120.0)
     assert state.accept_data_nonce(new, nonce, now=120.0)
     stats = state.stats()
@@ -6112,7 +6214,7 @@ def test_expired_same_address_installation_is_not_live_replacement(monkeypatch):
     state = secure.SecureState(session_ttl=30.0)
     addr = ("192.0.2.10", 50000)
     old = state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "old",
         object(),
         object(),
@@ -6121,14 +6223,14 @@ def test_expired_same_address_installation_is_not_live_replacement(monkeypatch):
     assert state.accept_data_nonce(old, b"\x01" * 12, now=100.0)
 
     new = state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "new",
         object(),
         object(),
         now=130.0,
     )
 
-    assert new is state._sessions[addr]
+    assert new is state._sessions[_relation_key(secure, addr)]
     stats = state.stats()
     assert stats.sessions_created == 2
     assert stats.sessions_replaced == 0
@@ -6140,7 +6242,7 @@ def test_session_capacity_discard_counts_retained_nonces_once(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(max_sessions=1)
     first = state.install_session(
-        ("192.0.2.10", 50000),
+        _relation_key(secure, ("192.0.2.10", 50000)),
         "first",
         object(),
         object(),
@@ -6150,7 +6252,7 @@ def test_session_capacity_discard_counts_retained_nonces_once(monkeypatch):
     assert state.accept_data_nonce(first, b"\x02" * 12, now=101.0)
 
     state.install_session(
-        ("192.0.2.11", 50001),
+        _relation_key(secure, ("192.0.2.11", 50001)),
         "second",
         object(),
         object(),
@@ -6173,7 +6275,7 @@ def test_removed_session_handle_cannot_mutate_nonce_state_or_statistics(
     state = secure.SecureState(max_sessions=1)
     old_addr = ("192.0.2.10", 50000)
     old = state.install_session(
-        old_addr,
+        _relation_key(secure, old_addr),
         "old",
         object(),
         object(),
@@ -6182,7 +6284,7 @@ def test_removed_session_handle_cannot_mutate_nonce_state_or_statistics(
     assert state.accept_data_nonce(old, b"\x01" * 12, now=100.0)
 
     state.install_session(
-        ("192.0.2.11", 50001),
+        _relation_key(secure, ("192.0.2.11", 50001)),
         "new",
         object(),
         object(),
@@ -6203,14 +6305,14 @@ def test_same_address_stale_session_handle_cannot_admit_or_exhaust_nonce(
     state = secure.SecureState(data_nonce_max_per_session=1)
     addr = ("192.0.2.10", 50000)
     stale = state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "old",
         object(),
         object(),
         now=100.0,
     )
     replacement = state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "new",
         object(),
         object(),
@@ -6225,7 +6327,7 @@ def test_same_address_stale_session_handle_cannot_admit_or_exhaust_nonce(
     )
 
     assert admission is secure._DataNonceAdmission.STALE
-    assert state._sessions[addr] is replacement
+    assert state._sessions[_relation_key(secure, addr)] is replacement
     assert len(stale.seen_data_nonces) == 0
     assert len(replacement.seen_data_nonces) == 0
     assert state.stats() == before
@@ -6238,14 +6340,14 @@ def test_same_address_stale_pending_handle_cannot_admit_or_exhaust_nonce(
     state = secure.SecureState(data_nonce_max_per_session=1)
     addr = ("192.0.2.10", 50000)
     stale = state.install_pending_session(
-        addr,
+        _relation_key(secure, addr),
         "old",
         object(),
         object(),
         now=100.0,
     )
     replacement = state.install_pending_session(
-        addr,
+        _relation_key(secure, addr),
         "new",
         object(),
         object(),
@@ -6260,7 +6362,7 @@ def test_same_address_stale_pending_handle_cannot_admit_or_exhaust_nonce(
     )
 
     assert admission is secure._DataNonceAdmission.STALE
-    assert state._pending_sessions[addr] is replacement
+    assert state._pending_sessions[_relation_key(secure, addr)] is replacement
     assert len(stale.seen_data_nonces) == 0
     assert len(replacement.seen_data_nonces) == 0
     assert state.stats() == before
@@ -6274,14 +6376,14 @@ def test_stale_nonce_check_does_not_cleanup_unrelated_expired_session(
     stale_addr = ("192.0.2.10", 50000)
     expiring_addr = ("192.0.2.11", 50001)
     stale = state.install_session(
-        stale_addr,
+        _relation_key(secure, stale_addr),
         "stale",
         object(),
         object(),
         now=0.0,
     )
     expiring = state.install_session(
-        expiring_addr,
+        _relation_key(secure, expiring_addr),
         "expiring",
         object(),
         object(),
@@ -6292,7 +6394,7 @@ def test_stale_nonce_check_does_not_cleanup_unrelated_expired_session(
         expiring, expiring_nonce, now=2.0
     )
     replacement = state.install_session(
-        stale_addr,
+        _relation_key(secure, stale_addr),
         "replacement",
         object(),
         object(),
@@ -6313,7 +6415,7 @@ def test_stale_nonce_check_does_not_cleanup_unrelated_expired_session(
 
     assert state.stats() == before_stats
     assert tuple(state._sessions.items()) == before_sessions
-    assert state._sessions[expiring_addr] is expiring
+    assert state._sessions[_relation_key(secure, expiring_addr)] is expiring
     assert (
         set(expiring.seen_data_nonces._live_by_key)
         == before_expiring_nonces
@@ -6333,7 +6435,7 @@ def test_stale_nonce_accept_does_not_cleanup_unrelated_expired_session(
     expiring_addr = ("192.0.2.11", 50001)
     replacement_addr = ("192.0.2.12", 50002)
     stale = state.install_session(
-        stale_addr,
+        _relation_key(secure, stale_addr),
         "stale",
         object(),
         object(),
@@ -6343,7 +6445,7 @@ def test_stale_nonce_accept_does_not_cleanup_unrelated_expired_session(
         stale, b"\x01" * 12, now=0.0
     )
     expiring = state.install_session(
-        expiring_addr,
+        _relation_key(secure, expiring_addr),
         "expiring",
         object(),
         object(),
@@ -6354,13 +6456,13 @@ def test_stale_nonce_accept_does_not_cleanup_unrelated_expired_session(
         expiring, expiring_nonce, now=2.0
     )
     state.install_session(
-        replacement_addr,
+        _relation_key(secure, replacement_addr),
         "replacement",
         object(),
         object(),
         now=3.0,
     )
-    assert stale_addr not in state._sessions
+    assert _relation_key(secure, stale_addr) not in state._sessions
 
     before_stats = state.stats()
     before_sessions = tuple(state._sessions.items())
@@ -6375,7 +6477,7 @@ def test_stale_nonce_accept_does_not_cleanup_unrelated_expired_session(
 
     assert state.stats() == before_stats
     assert tuple(state._sessions.items()) == before_sessions
-    assert state._sessions[expiring_addr] is expiring
+    assert state._sessions[_relation_key(secure, expiring_addr)] is expiring
     assert (
         set(expiring.seen_data_nonces._live_by_key)
         == before_expiring_nonces
@@ -6394,21 +6496,21 @@ def test_stale_touch_does_not_cleanup_unrelated_expired_session(
     stale_addr = ("192.0.2.10", 50000)
     expiring_addr = ("192.0.2.11", 50001)
     stale = state.install_session(
-        stale_addr,
+        _relation_key(secure, stale_addr),
         "stale",
         object(),
         object(),
         now=0.0,
     )
     expiring = state.install_session(
-        expiring_addr,
+        _relation_key(secure, expiring_addr),
         "expiring",
         object(),
         object(),
         now=2.0,
     )
     state.install_session(
-        stale_addr,
+        _relation_key(secure, stale_addr),
         "replacement",
         object(),
         object(),
@@ -6419,12 +6521,12 @@ def test_stale_touch_does_not_cleanup_unrelated_expired_session(
     before_sessions = tuple(state._sessions.items())
 
     assert not state.touch_session(
-        stale_addr, stale, now=12.0
+        _relation_key(secure, stale_addr), stale, now=12.0
     )
 
     assert state.stats() == before_stats
     assert tuple(state._sessions.items()) == before_sessions
-    assert state._sessions[expiring_addr] is expiring
+    assert state._sessions[_relation_key(secure, expiring_addr)] is expiring
     assert state.stats().sessions_touched == before_stats.sessions_touched
 
 
@@ -6436,14 +6538,14 @@ def test_touch_address_mismatch_is_side_effect_free_before_cleanup(
     expiring_addr = ("192.0.2.10", 50000)
     current_addr = ("192.0.2.11", 50001)
     expiring = state.install_session(
-        expiring_addr,
+        _relation_key(secure, expiring_addr),
         "expiring",
         object(),
         object(),
         now=2.0,
     )
     current = state.install_session(
-        current_addr,
+        _relation_key(secure, current_addr),
         "current",
         object(),
         object(),
@@ -6454,12 +6556,12 @@ def test_touch_address_mismatch_is_side_effect_free_before_cleanup(
     before_sessions = tuple(state._sessions.items())
 
     assert not state.touch_session(
-        expiring_addr, current, now=12.0
+        _relation_key(secure, expiring_addr), current, now=12.0
     )
 
     assert state.stats() == before_stats
     assert tuple(state._sessions.items()) == before_sessions
-    assert state._sessions[expiring_addr] is expiring
+    assert state._sessions[_relation_key(secure, expiring_addr)] is expiring
     assert current.last_seen == 3.0
 
 
@@ -6468,7 +6570,7 @@ def test_expired_session_handle_cannot_accept_or_check_nonces(monkeypatch):
     state = secure.SecureState(session_ttl=10.0)
     addr = ("192.0.2.10", 50000)
     session = state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "old",
         object(),
         object(),
@@ -6479,7 +6581,7 @@ def test_expired_session_handle_cannot_accept_or_check_nonces(monkeypatch):
     assert not state.data_nonce_seen(session, b"\x01" * 12, now=10.0)
 
     after_expiry = state.stats()
-    assert addr not in state._sessions
+    assert _relation_key(secure, addr) not in state._sessions
     assert after_expiry.sessions_expired == 1
     assert after_expiry.data_nonces_session_discarded == 1
     assert after_expiry.data_nonces_accepted == 1
@@ -6489,9 +6591,9 @@ def test_expired_session_handle_cannot_accept_or_check_nonces(monkeypatch):
     assert not state.accept_data_nonce(
         session, b"\x02" * 12, now=10.0
     )
-    assert not state.touch_session(addr, session, now=10.0)
+    assert not state.touch_session(_relation_key(secure, addr), session, now=10.0)
     assert state.stats() == after_expiry
-    assert addr not in state._sessions
+    assert _relation_key(secure, addr) not in state._sessions
 
 
 def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
@@ -6536,7 +6638,7 @@ def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
         initial.current_sessions = 1
 
     state.install_session(
-        ("192.0.2.10", 50000),
+        _relation_key(secure, ("192.0.2.10", 50000)),
         "boat_001",
         object(),
         object(),
@@ -6554,7 +6656,7 @@ def test_secure_state_stats_do_not_read_clocks_or_cleanup(monkeypatch):
     state = secure.SecureState(session_ttl=1.0)
     addr = ("192.0.2.10", 50000)
     state.install_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         object(),
         object(),
@@ -6570,7 +6672,7 @@ def test_secure_state_stats_do_not_read_clocks_or_cleanup(monkeypatch):
     stats = state.stats()
 
     assert stats.current_sessions == 1
-    assert tuple(state._sessions) == (addr,)
+    assert tuple(state._sessions) == _relation_keys(secure, (addr,))
     assert stats.sessions_expired == 0
 
 
@@ -7012,10 +7114,11 @@ def _d66_install_pending(
     marker=40,
     now=0.0,
     station_id="boat_001",
+    endpoint_token=None,
 ):
     client_to_server_key, server_to_client_key = _d66_keys(marker)
     pending = state.install_pending_session(
-        addr,
+        _relation_key(secure, addr, endpoint_token),
         station_id,
         secure.AESGCM(client_to_server_key),
         secure.AESGCM(server_to_client_key),
@@ -7153,6 +7256,7 @@ def test_d66_pending_representation_and_creation_stats(monkeypatch):
     assert isinstance(pending, secure._PendingSecureSession)
     assert set(vars(pending)) == {
         "_address",
+        "_relation_key",
         "station_id",
         "client_to_server_aesgcm",
         "server_to_client_aesgcm",
@@ -7176,8 +7280,8 @@ def test_d66_pending_representation_and_creation_stats(monkeypatch):
         assert not hasattr(pending, forbidden_name)
 
     stats = state.stats()
-    assert state.get_active_session(addr, 12.5) is None
-    assert state.get_pending_session(addr, 12.5) is pending
+    assert state.get_active_session(_relation_key(secure, addr), 12.5) is None
+    assert state.get_pending_session(_relation_key(secure, addr), 12.5) is pending
     assert stats.pending_sessions_created == 1
     assert stats.current_pending_sessions == 1
     assert stats.peak_pending_sessions == 1
@@ -7217,12 +7321,14 @@ def test_d66_pending_exact_ttl_prefix_cleanup_without_min(
         )
         expired = state.cleanup_expired_pending_sessions(11.0)
 
-    assert expired == addresses[:2]
-    assert tuple(state._pending_sessions) == (addresses[2],)
+    assert expired == list(_relation_keys(secure, addresses[:2]))
+    assert tuple(state._pending_sessions) == _relation_keys(
+        secure, (addresses[2],)
+    )
     assert state.cleanup_expired_pending_sessions(11.999) == []
-    assert state.cleanup_expired_pending_sessions(12.0) == [
-        addresses[2]
-    ]
+    assert state.cleanup_expired_pending_sessions(12.0) == list(
+        _relation_keys(secure, (addresses[2],))
+    )
     stats = state.stats()
     assert stats.pending_sessions_expired == 3
     assert stats.pending_sessions_capacity_evicted == 0
@@ -7266,9 +7372,9 @@ def test_d66_pending_capacity_is_independent_and_cleans_expired_first(
     _d66_install_pending(
         secure, state, pending_addresses[2], marker=14, now=10.0
     )
-    assert tuple(state._pending_sessions) == (
-        pending_addresses[1],
-        pending_addresses[2],
+    assert tuple(state._pending_sessions) == _relation_keys(
+        secure,
+        (pending_addresses[1], pending_addresses[2]),
     )
     assert state.stats().pending_sessions_expired == 1
     assert state.stats().pending_sessions_capacity_evicted == 0
@@ -7289,11 +7395,11 @@ def test_d66_pending_capacity_is_independent_and_cleans_expired_first(
             now=10.5,
         )
 
-    assert tuple(state._pending_sessions) == (
-        pending_addresses[2],
-        pending_addresses[3],
+    assert tuple(state._pending_sessions) == _relation_keys(
+        secure,
+        (pending_addresses[2], pending_addresses[3]),
     )
-    assert state._sessions == {active_addr: active}
+    assert state._sessions == {_relation_key(secure, active_addr): active}
     stats = state.stats()
     assert stats.pending_sessions_created == 4
     assert stats.pending_sessions_expired == 1
@@ -7342,8 +7448,8 @@ def test_d66_pending_replacement_preserves_active_and_accounts_cache(
         now=2.0,
     )
 
-    assert state._sessions[addr] is active
-    assert state._pending_sessions[addr] is second_pending
+    assert state._sessions[_relation_key(secure, addr)] is active
+    assert state._pending_sessions[_relation_key(secure, addr)] is second_pending
     assert len(first_pending.seen_data_nonces) == 0
     assert active.seen_data_nonces.contains(active_nonce)
     stats = state.stats()
@@ -7357,8 +7463,10 @@ def test_d66_pending_replacement_preserves_active_and_accounts_cache(
     assert stats.data_nonces_session_discarded == 1
 
     assert state.cleanup_expired_pending_sessions(31.999) == []
-    assert state.cleanup_expired_pending_sessions(32.0) == [addr]
-    assert state._sessions[addr] is active
+    assert state.cleanup_expired_pending_sessions(32.0) == [
+        _relation_key(secure, addr)
+    ]
+    assert state._sessions[_relation_key(secure, addr)] is active
     stats = state.stats()
     assert stats.pending_sessions_expired == 1
     assert stats.current_pending_sessions == 0
@@ -7389,9 +7497,9 @@ def test_d66_stale_pending_handle_cannot_promote_or_replace_active(
         secure, state, addr, marker=30, now=2.0
     )
 
-    assert state.promote_pending_session(addr, stale, 3.0) is None
-    assert state._sessions[addr] is active
-    assert state._pending_sessions[addr] is current
+    assert state.promote_pending_session(_relation_key(secure, addr), stale, 3.0) is None
+    assert state._sessions[_relation_key(secure, addr)] is active
+    assert state._pending_sessions[_relation_key(secure, addr)] is current
     stats = state.stats()
     assert stats.pending_sessions_promoted == 0
     assert stats.sessions_replaced == 0
@@ -7426,10 +7534,10 @@ def test_d66_promotion_transfers_nonce_cache_and_discards_old_once(
     )
     transferred_cache = pending.seen_data_nonces
 
-    promoted = state.promote_pending_session(addr, pending, 2.0)
+    promoted = state.promote_pending_session(_relation_key(secure, addr), pending, 2.0)
 
-    assert promoted is state._sessions[addr]
-    assert addr not in state._pending_sessions
+    assert promoted is state._sessions[_relation_key(secure, addr)]
+    assert _relation_key(secure, addr) not in state._pending_sessions
     assert promoted.seen_data_nonces is transferred_cache
     assert promoted.seen_data_nonces.contains(
         confirmation_nonce,
@@ -7467,8 +7575,8 @@ def test_d66_authenticated_hello_is_pending_until_exact_expiry(
         ephemeral_scalar=11,
     )
 
-    pending = state._pending_sessions[addr]
-    assert state.get_active_session(addr, 100.0) is None
+    pending = state._pending_sessions[_relation_key(secure, addr)]
+    assert state.get_active_session(_relation_key(secure, addr), 100.0) is None
     assert (
         pending.client_to_server_aesgcm
         is not pending.server_to_client_aesgcm
@@ -7497,7 +7605,9 @@ def test_d66_authenticated_hello_is_pending_until_exact_expiry(
         assert not hasattr(pending, forbidden_name)
 
     assert state.cleanup_expired_pending_sessions(129.999) == []
-    assert state.cleanup_expired_pending_sessions(130.0) == [addr]
+    assert state.cleanup_expired_pending_sessions(130.0) == [
+        _relation_key(secure, addr)
+    ]
     stats = state.stats()
     assert stats.pending_sessions_created == 1
     assert stats.pending_sessions_expired == 1
@@ -7539,8 +7649,8 @@ def test_d66_valid_confirmation_promotes_and_sends_directional_pong(
     )
 
     assert queue.items == []
-    assert addr not in state._pending_sessions
-    active = state._sessions[addr]
+    assert _relation_key(secure, addr) not in state._pending_sessions
+    active = state._sessions[_relation_key(secure, addr)]
     assert active.seen_data_nonces is pending.seen_data_nonces
     assert active.seen_data_nonces.contains(nonce)
     assert active.last_seen == 1.0
@@ -7609,8 +7719,9 @@ def test_d66_pending_confirmation_requires_exact_listener_owner(
         client_to_server_key,
         nonce,
     )
-    other_active = {addr: old_active}
-    other_pending = {addr: stale_pending}
+    relation_key = _relation_key(secure, addr)
+    other_active = {relation_key: old_active}
+    other_pending = {relation_key: stale_pending}
 
     queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
@@ -7624,10 +7735,10 @@ def test_d66_pending_confirmation_requires_exact_listener_owner(
 
     assert queue.items == []
     assert fake_socket.sent == []
-    assert state._sessions[addr] is old_active
-    assert state._pending_sessions[addr] is pending
-    assert other_active == {addr: old_active}
-    assert other_pending == {addr: stale_pending}
+    assert state._sessions[_relation_key(secure, addr)] is old_active
+    assert state._pending_sessions[_relation_key(secure, addr)] is pending
+    assert other_active == {relation_key: old_active}
+    assert other_pending == {relation_key: stale_pending}
     assert stale_pending is not pending
     assert not pending.seen_data_nonces.contains(nonce)
     stats = state.stats()
@@ -7637,7 +7748,7 @@ def test_d66_pending_confirmation_requires_exact_listener_owner(
     assert stats.data_nonces_accepted == 0
 
     owner_active = {}
-    owner_pending = {addr: pending}
+    owner_pending = {relation_key: pending}
     queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
         secure,
@@ -7655,11 +7766,11 @@ def test_d66_pending_confirmation_requires_exact_listener_owner(
         fake_socket.sent[0][0],
         server_to_client_key,
     )["seq"] == secure.SESSION_CONFIRMATION_SEQUENCE
-    replacement = state._sessions[addr]
+    replacement = state._sessions[_relation_key(secure, addr)]
     assert replacement is not old_active
-    assert owner_active == {addr: replacement}
+    assert owner_active == {relation_key: replacement}
     assert owner_pending == {}
-    assert addr not in state._pending_sessions
+    assert _relation_key(secure, addr) not in state._pending_sessions
     assert replacement.seen_data_nonces.contains(nonce)
     assert state.stats().pending_sessions_promoted == 1
     assert state.stats().sessions_replaced == 1
@@ -7733,7 +7844,7 @@ def test_d66_confirmation_nonce_counts_toward_active_capacity(monkeypatch):
             monotonic_clock=_FakeClock(1.0),
         )
     )
-    active = state._sessions[addr]
+    active = state._sessions[_relation_key(secure, addr)]
     assert confirmation_queue.items == []
     assert len(confirmation_socket.sent) == 1
     assert active.seen_data_nonces.contains(confirmation_nonce)
@@ -7774,7 +7885,7 @@ def test_d66_confirmation_nonce_counts_toward_active_capacity(monkeypatch):
     stats = state.stats()
     assert exhausting_queue.items == []
     assert exhausting_socket.sent == []
-    assert addr not in state._sessions
+    assert _relation_key(secure, addr) not in state._sessions
     assert len(active.seen_data_nonces) == 0
     assert stats.pending_sessions_promoted == 1
     assert stats.data_nonces_accepted == 2
@@ -7821,8 +7932,9 @@ def test_d66_pending_nonce_exhaustion_preserves_previous_active(monkeypatch):
         pending_client_key,
         b"\x4a" * 12,
     )
-    owned_sessions = {addr: active}
-    owned_pending_sessions = {addr: pending}
+    relation_key = _relation_key(secure, addr)
+    owned_sessions = {relation_key: active}
+    owned_pending_sessions = {relation_key: pending}
 
     queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
@@ -7837,9 +7949,9 @@ def test_d66_pending_nonce_exhaustion_preserves_previous_active(monkeypatch):
     stats = state.stats()
     assert queue.items == []
     assert fake_socket.sent == []
-    assert state._sessions[addr] is active
-    assert addr not in state._pending_sessions
-    assert owned_sessions == {addr: active}
+    assert state._sessions[_relation_key(secure, addr)] is active
+    assert _relation_key(secure, addr) not in state._pending_sessions
+    assert owned_sessions == {relation_key: active}
     assert owned_pending_sessions == {}
     assert active.last_seen == 0.0
     assert active.seen_data_nonces.contains(active_nonce)
@@ -7891,7 +8003,7 @@ def test_d66_active_session_rejects_fresh_reserved_sequence_zero(
 
     assert queue.items == []
     assert fake_socket.sent == []
-    assert state._sessions[addr] is active
+    assert state._sessions[_relation_key(secure, addr)] is active
     assert active.last_seen == 0.0
     assert not active.seen_data_nonces.contains(nonce)
     assert state.stats().sessions_touched == 0
@@ -8009,8 +8121,8 @@ def test_d66_invalid_pending_packets_do_not_promote_or_consume_nonce(
 
     assert queue.items == []
     assert fake_socket.sent == []
-    assert state._pending_sessions[addr] is pending
-    assert state.get_active_session(addr, 1.0) is None
+    assert state._pending_sessions[_relation_key(secure, addr)] is pending
+    assert state.get_active_session(_relation_key(secure, addr), 1.0) is None
     assert not pending.seen_data_nonces.contains(nonce)
     stats = state.stats()
     assert stats.pending_sessions_promoted == 0
@@ -8109,8 +8221,8 @@ def test_d66_pending_auth_failure_and_seen_nonce_fall_back_to_active(
 
     assert parse_calls == [packet for packet, _ in packets]
     assert len(queue.items) == 2
-    assert state._sessions[addr] is active
-    assert state._pending_sessions[addr] is pending
+    assert state._sessions[_relation_key(secure, addr)] is active
+    assert state._pending_sessions[_relation_key(secure, addr)] is pending
     assert active.last_seen == 1.0
     assert pending.seen_data_nonces.contains(shared_nonce)
     assert active.seen_data_nonces.contains(shared_nonce)
@@ -8147,7 +8259,7 @@ def test_d66_authenticated_invalid_pending_plaintext_is_exclusive(
     )
     pending_server_key = bytes((30,)) * 32
     pending = state.install_pending_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         secure.AESGCM(shared_client_key),
         secure.AESGCM(pending_server_key),
@@ -8171,8 +8283,8 @@ def test_d66_authenticated_invalid_pending_plaintext_is_exclusive(
 
     assert queue.items == []
     assert fake_socket.sent == []
-    assert state._sessions[addr] is active
-    assert state._pending_sessions[addr] is pending
+    assert state._sessions[_relation_key(secure, addr)] is active
+    assert state._pending_sessions[_relation_key(secure, addr)] is pending
     assert active.last_seen == 0.0
     assert not active.seen_data_nonces.contains(nonce)
     assert not pending.seen_data_nonces.contains(nonce)
@@ -8199,7 +8311,7 @@ def test_d66_only_invalid_tag_selects_active_key_fallback(monkeypatch):
             raise RuntimeError("unexpected pending decrypt failure")
 
     pending = state.install_pending_session(
-        addr,
+        _relation_key(secure, addr),
         "boat_001",
         UnexpectedDecryptFailure(),
         secure.AESGCM(bytes((30,)) * 32),
@@ -8223,8 +8335,8 @@ def test_d66_only_invalid_tag_selects_active_key_fallback(monkeypatch):
 
     assert queue.items == []
     assert fake_socket.sent == []
-    assert state._sessions[addr] is active
-    assert state._pending_sessions[addr] is pending
+    assert state._sessions[_relation_key(secure, addr)] is active
+    assert state._pending_sessions[_relation_key(secure, addr)] is pending
     assert active.last_seen == 0.0
     assert not active.seen_data_nonces.contains(nonce)
     assert not pending.seen_data_nonces.contains(nonce)
@@ -8266,8 +8378,8 @@ def test_d66_plaintext_keepalive_is_absent_and_silent(monkeypatch):
     assert not hasattr(state, "handle_keepalive")
     assert queue.items == []
     assert fake_socket.sent == []
-    assert state._sessions[addr] is active
-    assert state._pending_sessions[addr] is pending
+    assert state._sessions[_relation_key(secure, addr)] is active
+    assert state._pending_sessions[_relation_key(secure, addr)] is pending
     assert active.last_seen == 0.0
     assert state.stats().sessions_touched == 0
     assert state.stats().pending_sessions_promoted == 0
@@ -8320,7 +8432,7 @@ def test_d66_same_address_confirmed_rekey_preserves_then_replaces_active(
         first_confirmation_socket.sent[0][0],
         first_keys.server_to_client_key,
     )["seq"] == secure.SESSION_CONFIRMATION_SEQUENCE
-    first_active = state._sessions[addr]
+    first_active = state._sessions[_relation_key(secure, addr)]
     first_cache = first_active.seen_data_nonces
 
     # Treat the first pong as lost: the server is active, and a later fresh
@@ -8342,8 +8454,8 @@ def test_d66_same_address_confirmed_rekey_preserves_then_replaces_active(
     assert second_keys.server_to_client_key != (
         first_keys.server_to_client_key
     )
-    assert state._sessions[addr] is first_active
-    second_pending = state._pending_sessions[addr]
+    assert state._sessions[_relation_key(secure, addr)] is first_active
+    second_pending = state._pending_sessions[_relation_key(secure, addr)]
 
     old_data_nonce = b"\x62" * 12
     old_ping_nonce = b"\x63" * 12
@@ -8387,8 +8499,8 @@ def test_d66_same_address_confirmed_rekey_preserves_then_replaces_active(
         old_socket.sent[0][0],
         first_keys.server_to_client_key,
     )["seq"] == 1
-    assert state._sessions[addr] is first_active
-    assert state._pending_sessions[addr] is second_pending
+    assert state._sessions[_relation_key(secure, addr)] is first_active
+    assert state._pending_sessions[_relation_key(secure, addr)] is second_pending
     assert len(first_cache) == 3
 
     second_confirmation_nonce = b"\x64" * 12
@@ -8414,9 +8526,9 @@ def test_d66_same_address_confirmed_rekey_preserves_then_replaces_active(
         second_confirmation_socket.sent[0][0],
         second_keys.server_to_client_key,
     )["seq"] == secure.SESSION_CONFIRMATION_SEQUENCE
-    second_active = state._sessions[addr]
+    second_active = state._sessions[_relation_key(secure, addr)]
     assert second_active is not first_active
-    assert addr not in state._pending_sessions
+    assert _relation_key(secure, addr) not in state._pending_sessions
     assert second_active.seen_data_nonces is (
         second_pending.seen_data_nonces
     )
@@ -8503,3 +8615,542 @@ def test_d66_same_address_confirmed_rekey_preserves_then_replaces_active(
     assert stats.current_sessions == 1
     assert stats.data_nonces_session_discarded == 3
     assert stats.current_data_nonces == 3
+
+
+# UDPSEC 1B physical-listener session namespace isolation.
+
+
+def test_endpoint_namespace_same_peer_active_and_pending_are_independent(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=4, max_pending_sessions=4)
+    endpoint_a = secure._new_endpoint_token()
+    endpoint_b = secure._new_endpoint_token()
+    peer = ("192.0.2.10", 50000)
+    relation_a = _relation_key(secure, peer, endpoint_a)
+    relation_b = _relation_key(secure, peer, endpoint_b)
+
+    active_a = state.install_session(
+        relation_a, "boat_001", object(), object(), 0.0
+    )
+    active_b = state.install_session(
+        relation_b, "boat_001", object(), object(), 0.0
+    )
+    pending_a = state.install_pending_session(
+        relation_a, "boat_001", object(), object(), 1.0
+    )
+    pending_b = state.install_pending_session(
+        relation_b, "boat_001", object(), object(), 1.0
+    )
+
+    assert active_a._relation_key == relation_a
+    assert active_b._relation_key == relation_b
+    assert pending_a._relation_key == relation_a
+    assert pending_b._relation_key == relation_b
+    assert {item._address for item in (active_a, active_b)} == {peer}
+    assert {item._address for item in (pending_a, pending_b)} == {peer}
+    assert state._sessions == {
+        relation_a: active_a,
+        relation_b: active_b,
+    }
+    assert state._pending_sessions == {
+        relation_a: pending_a,
+        relation_b: pending_b,
+    }
+    assert state.stats().sessions_replaced == 0
+    assert state.stats().pending_sessions_replaced == 0
+
+    assert state.touch_session(relation_a, active_a, 1.5)
+    assert tuple(state._sessions) == (relation_b, relation_a)
+    assert state._sessions[relation_b] is active_b
+    assert active_a.last_seen == 1.5
+    assert active_b.last_seen == 0.0
+    assert state.stats().sessions_touched == 1
+
+    replacement_a = state.install_session(
+        relation_a, "boat_001", object(), object(), 2.0
+    )
+    pending_replacement_a = state.install_pending_session(
+        relation_a, "boat_001", object(), object(), 2.0
+    )
+
+    assert state._sessions[relation_a] is replacement_a
+    assert state._sessions[relation_b] is active_b
+    assert state._pending_sessions[relation_a] is pending_replacement_a
+    assert state._pending_sessions[relation_b] is pending_b
+    assert state.stats().sessions_replaced == 1
+    assert state.stats().pending_sessions_replaced == 1
+
+
+def test_endpoint_namespace_fresh_incarnation_cannot_select_retained_state(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_a = secure._new_endpoint_token()
+    endpoint_b = secure._new_endpoint_token()
+    peer = ("127.0.0.1", 51089)
+    relation_a = _relation_key(secure, peer, endpoint_a)
+    relation_b = _relation_key(secure, peer, endpoint_b)
+    key_a = b"\x3f" * 32
+    active_a, _, _ = _install_test_session(
+        secure,
+        state,
+        peer,
+        key_a,
+        b"\x40" * 32,
+        now=0.0,
+        endpoint_token=endpoint_a,
+    )
+    nonce = b"\x41" * 12
+    packet = _encrypted_data_packet(
+        secure,
+        key_a,
+        nonce,
+        payload="!AIVDM,1,1,,A,old-incarnation,0*00",
+    )
+
+    assert state.get_active_session(relation_b, 0.5) is None
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, peer)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+        endpoint_token=endpoint_b,
+        owned_sessions={},
+        owned_pending_sessions={},
+    )
+
+    assert queue.items == []
+    assert fake_socket.sent == []
+    assert state._sessions == {relation_a: active_a}
+    assert relation_b not in state._sessions
+    assert active_a.last_seen == 0.0
+    assert not active_a.seen_data_nonces.contains(nonce)
+    stats = state.stats()
+    assert stats.sessions_touched == 0
+    assert stats.data_nonces_accepted == 0
+    assert stats.data_nonce_exhaustions == 0
+
+
+def test_endpoint_namespace_promotion_replaces_only_same_relation(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(data_nonce_max_per_session=4)
+    endpoint_a = secure._new_endpoint_token()
+    endpoint_b = secure._new_endpoint_token()
+    peer = ("192.0.2.11", 50001)
+    relation_a = _relation_key(secure, peer, endpoint_a)
+    relation_b = _relation_key(secure, peer, endpoint_b)
+    active_a = state.install_session(
+        relation_a, "boat_001", object(), object(), 0.0
+    )
+    active_b = state.install_session(
+        relation_b, "boat_001", object(), object(), 0.0
+    )
+    nonce_a = b"\x01" * 12
+    nonce_b = b"\x02" * 12
+    confirmation_nonce = b"\x03" * 12
+    assert state.accept_data_nonce(active_a, nonce_a, 0.1)
+    assert state.accept_data_nonce(active_b, nonce_b, 0.1)
+    pending_b = state.install_pending_session(
+        relation_b, "boat_001", object(), object(), 1.0
+    )
+    assert state.accept_pending_data_nonce(
+        pending_b, confirmation_nonce, 1.1
+    )
+    transferred_ledger = pending_b.seen_data_nonces
+
+    assert state.promote_pending_session(
+        relation_a, pending_b, 2.0
+    ) is None
+    assert state._sessions[relation_a] is active_a
+    assert state._sessions[relation_b] is active_b
+    assert state._pending_sessions[relation_b] is pending_b
+
+    promoted_b = state.promote_pending_session(
+        relation_b, pending_b, 2.0
+    )
+
+    assert state._sessions[relation_a] is active_a
+    assert active_a.seen_data_nonces.contains(nonce_a)
+    assert active_a.last_seen == 0.0
+    assert promoted_b is state._sessions[relation_b]
+    assert promoted_b.seen_data_nonces is transferred_ledger
+    assert promoted_b.seen_data_nonces.contains(confirmation_nonce)
+    assert len(active_b.seen_data_nonces) == 0
+    assert state.stats().pending_sessions_promoted == 1
+    assert state.stats().sessions_replaced == 1
+
+
+def test_endpoint_namespace_exact_replacement_preserves_global_capacity_policy(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=2, max_pending_sessions=2)
+    peer = ("192.0.2.12", 50002)
+    relation_a = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    relation_b = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    relation_c = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    state.install_session(relation_a, "boat_001", object(), object(), 0.0)
+    active_b = state.install_session(
+        relation_b, "boat_001", object(), object(), 0.0
+    )
+    state.install_pending_session(
+        relation_a, "boat_001", object(), object(), 0.0
+    )
+    pending_b = state.install_pending_session(
+        relation_b, "boat_001", object(), object(), 0.0
+    )
+
+    state.install_session(relation_a, "boat_001", object(), object(), 1.0)
+    state.install_pending_session(
+        relation_a, "boat_001", object(), object(), 1.0
+    )
+    assert state._sessions[relation_b] is active_b
+    assert state._pending_sessions[relation_b] is pending_b
+    assert state.stats().sessions_capacity_evicted == 0
+    assert state.stats().pending_sessions_capacity_evicted == 0
+
+    state.install_session(relation_c, "boat_001", object(), object(), 2.0)
+    state.install_pending_session(
+        relation_c, "boat_001", object(), object(), 2.0
+    )
+    assert relation_b not in state._sessions
+    assert relation_b not in state._pending_sessions
+    assert tuple(state._sessions) == (relation_a, relation_c)
+    assert tuple(state._pending_sessions) == (relation_a, relation_c)
+    assert state.stats().sessions_replaced == 1
+    assert state.stats().pending_sessions_replaced == 1
+    assert state.stats().sessions_capacity_evicted == 1
+    assert state.stats().pending_sessions_capacity_evicted == 1
+
+
+def test_endpoint_namespace_active_replay_and_exhaustion_are_isolated(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(data_nonce_max_per_session=1)
+    peer = ("192.0.2.13", 50003)
+    relation_a = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    relation_b = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    active_a = state.install_session(
+        relation_a, "boat_001", object(), object(), 0.0
+    )
+    active_b = state.install_session(
+        relation_b, "boat_001", object(), object(), 0.0
+    )
+    shared_nonce = b"\x11" * 12
+
+    assert state.admit_data_nonce(
+        active_a, shared_nonce, 0.1
+    ) is secure._DataNonceAdmission.ACCEPTED
+    assert state.admit_data_nonce(
+        active_a, shared_nonce, 0.2
+    ) is secure._DataNonceAdmission.REPLAY
+    assert state.admit_data_nonce(
+        active_b, shared_nonce, 0.2
+    ) is secure._DataNonceAdmission.ACCEPTED
+    assert state.admit_data_nonce(
+        active_a, b"\x12" * 12, 0.3
+    ) is secure._DataNonceAdmission.EXHAUSTED
+
+    assert relation_a not in state._sessions
+    assert state._sessions[relation_b] is active_b
+    assert active_b.seen_data_nonces.contains(shared_nonce)
+    assert active_b.last_seen == 0.0
+    stats = state.stats()
+    assert stats.data_nonces_accepted == 2
+    assert stats.data_nonce_replays == 1
+    assert stats.data_nonce_exhaustions == 1
+    assert stats.current_data_nonces == 1
+    assert stats.data_nonces_expired == 0
+    assert stats.data_nonces_capacity_evicted == 0
+
+
+def test_endpoint_namespace_pending_exhaustion_preserves_all_active_state(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(data_nonce_max_per_session=1)
+    peer = ("192.0.2.14", 50004)
+    relation_a = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    relation_b = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    active_a = state.install_session(
+        relation_a, "boat_001", object(), object(), 0.0
+    )
+    active_b = state.install_session(
+        relation_b, "boat_001", object(), object(), 0.0
+    )
+    pending_a = state.install_pending_session(
+        relation_a, "boat_001", object(), object(), 1.0
+    )
+    pending_b = state.install_pending_session(
+        relation_b, "boat_001", object(), object(), 1.0
+    )
+    shared_nonce = b"\x21" * 12
+    assert state.accept_pending_data_nonce(pending_a, shared_nonce, 1.1)
+    assert state.accept_pending_data_nonce(pending_b, shared_nonce, 1.1)
+
+    assert state.admit_pending_data_nonce(
+        pending_a, b"\x22" * 12, 1.2
+    ) is secure._DataNonceAdmission.EXHAUSTED
+
+    assert state._sessions[relation_a] is active_a
+    assert state._sessions[relation_b] is active_b
+    assert relation_a not in state._pending_sessions
+    assert state._pending_sessions[relation_b] is pending_b
+    assert pending_b.seen_data_nonces.contains(shared_nonce)
+    assert active_a.last_seen == 0.0
+    assert active_b.last_seen == 0.0
+
+
+@pytest.mark.parametrize(
+    "peer",
+    (
+        pytest.param(("192.0.2.15", 50005), id="ipv4"),
+        pytest.param(("2001:db8::15", 50005, 17, 4), id="ipv6"),
+    ),
+)
+def test_endpoint_namespace_expiry_uses_complete_relation_key(
+    monkeypatch,
+    peer,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(
+        session_ttl=10.0,
+        pending_session_ttl=10.0,
+    )
+    relation_a = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    relation_b = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    state.install_session(relation_a, "boat_001", object(), object(), 0.0)
+    active_b = state.install_session(
+        relation_b, "boat_001", object(), object(), 1.0
+    )
+    state.install_pending_session(
+        relation_a, "boat_001", object(), object(), 0.0
+    )
+    pending_b = state.install_pending_session(
+        relation_b, "boat_001", object(), object(), 1.0
+    )
+
+    assert state.cleanup_expired_sessions(10.0) == [relation_a]
+    assert state.cleanup_expired_pending_sessions(10.0) == [relation_a]
+    assert state._sessions[relation_b] is active_b
+    assert state._pending_sessions[relation_b] is pending_b
+    assert active_b._address == peer
+    assert pending_b._address == peer
+
+
+def test_endpoint_namespace_stale_handles_cannot_cross_relations(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(data_nonce_max_per_session=1)
+    peer = ("192.0.2.16", 50006)
+    relation_a = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    relation_b = _relation_key(
+        secure, peer, secure._new_endpoint_token()
+    )
+    stale_active = state.install_session(
+        relation_a, "boat_001", object(), object(), 0.0
+    )
+    replacement_a = state.install_session(
+        relation_a, "boat_001", object(), object(), 1.0
+    )
+    active_b = state.install_session(
+        relation_b, "boat_001", object(), object(), 1.0
+    )
+    stale_pending = state.install_pending_session(
+        relation_a, "boat_001", object(), object(), 1.0
+    )
+    replacement_pending_a = state.install_pending_session(
+        relation_a, "boat_001", object(), object(), 2.0
+    )
+    pending_b = state.install_pending_session(
+        relation_b, "boat_001", object(), object(), 2.0
+    )
+
+    assert state.admit_data_nonce(
+        stale_active, b"\x31" * 12, 3.0
+    ) is secure._DataNonceAdmission.STALE
+    assert state.admit_pending_data_nonce(
+        stale_pending, b"\x32" * 12, 3.0
+    ) is secure._DataNonceAdmission.STALE
+    assert not state.touch_session(relation_a, stale_active, 3.0)
+    assert state._sessions[relation_a] is replacement_a
+    assert state._sessions[relation_b] is active_b
+    assert state._pending_sessions[relation_a] is replacement_pending_a
+    assert state._pending_sessions[relation_b] is pending_b
+    assert len(active_b.seen_data_nonces) == 0
+    assert len(pending_b.seen_data_nonces) == 0
+
+
+@pytest.mark.parametrize("message_type", ("nmea", "ping", "close"))
+def test_endpoint_namespace_cross_listener_active_data_is_inert(
+    monkeypatch,
+    message_type,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_a = secure._new_endpoint_token()
+    endpoint_b = secure._new_endpoint_token()
+    peer = ("127.0.0.1", 51090)
+    relation_a = _relation_key(secure, peer, endpoint_a)
+    relation_b = _relation_key(secure, peer, endpoint_b)
+    key_a = b"\x41" * 32
+    key_b = b"\x42" * 32
+    active_a, _, _ = _install_test_session(
+        secure,
+        state,
+        peer,
+        key_a,
+        b"\x51" * 32,
+        now=0.0,
+        endpoint_token=endpoint_a,
+    )
+    active_b, _, _ = _install_test_session(
+        secure,
+        state,
+        peer,
+        key_b,
+        b"\x52" * 32,
+        now=0.0,
+        endpoint_token=endpoint_b,
+    )
+    nonce = bytes((0x60 + len(message_type),)) * 12
+    if message_type == "nmea":
+        packet = _encrypted_data_packet(
+            secure,
+            key_a,
+            nonce,
+            payload="!AIVDM,1,1,,A,cross-endpoint,0*00",
+        )
+    elif message_type == "ping":
+        packet = _encrypted_control_packet(
+            secure,
+            key_a,
+            nonce,
+            {
+                "type": "ping",
+                "seq": 9,
+                "timestamp": 1000,
+                "source_id": "boat_001",
+            },
+        )
+    else:
+        packet = _encrypted_control_packet(
+            secure,
+            key_a,
+            nonce,
+            secure.build_session_close_message("boat_001", 1000),
+        )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, peer)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+        endpoint_token=endpoint_b,
+        owned_sessions={relation_b: active_b},
+        owned_pending_sessions={},
+    )
+
+    assert queue.items == []
+    assert fake_socket.sent == []
+    assert state._sessions[relation_a] is active_a
+    assert state._sessions[relation_b] is active_b
+    assert active_a.last_seen == 0.0
+    assert active_b.last_seen == 0.0
+    assert len(active_a.seen_data_nonces) == 0
+    assert len(active_b.seen_data_nonces) == 0
+    stats = state.stats()
+    assert stats.sessions_touched == 0
+    assert stats.sessions_closed == 0
+    assert stats.data_nonces_accepted == 0
+    assert stats.data_nonce_exhaustions == 0
+
+
+def test_endpoint_namespace_wrong_listener_confirmation_is_inert(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_a = secure._new_endpoint_token()
+    endpoint_b = secure._new_endpoint_token()
+    peer = ("127.0.0.1", 51091)
+    relation_a = _relation_key(secure, peer, endpoint_a)
+    relation_b = _relation_key(secure, peer, endpoint_b)
+    active_a, _, _ = _install_test_session(
+        secure,
+        state,
+        peer,
+        b"\x71" * 32,
+        b"\x72" * 32,
+        now=0.0,
+        endpoint_token=endpoint_a,
+    )
+    active_b, _, _ = _install_test_session(
+        secure,
+        state,
+        peer,
+        b"\x73" * 32,
+        b"\x74" * 32,
+        now=0.0,
+        endpoint_token=endpoint_b,
+    )
+    pending_a, pending_key_a, _ = _d66_install_pending(
+        secure,
+        state,
+        peer,
+        marker=80,
+        now=0.5,
+        endpoint_token=endpoint_a,
+    )
+    nonce = b"\x75" * 12
+    confirmation = _d66_confirmation_packet(
+        secure, pending_key_a, nonce
+    )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(confirmation, peer)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+        endpoint_token=endpoint_b,
+        owned_sessions={relation_b: active_b},
+        owned_pending_sessions={},
+    )
+
+    assert queue.items == []
+    assert fake_socket.sent == []
+    assert state._sessions[relation_a] is active_a
+    assert state._sessions[relation_b] is active_b
+    assert state._pending_sessions[relation_a] is pending_a
+    assert not pending_a.seen_data_nonces.contains(nonce)
+    assert active_a.last_seen == 0.0
+    assert active_b.last_seen == 0.0
+    assert state.stats().pending_sessions_promoted == 0
+    assert state.stats().sessions_touched == 0
+    assert state.stats().data_nonces_accepted == 0

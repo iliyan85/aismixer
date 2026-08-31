@@ -305,6 +305,19 @@ default is module-wide, while an isolated state owner and clocks may be
 injected into a secure listener. This state is in-memory and process-local; it
 is neither durable nor shared across processes.
 
+Each physical secure-listener socket incarnation owns one opaque endpoint
+token. The token has process-local object-identity semantics, remains stable
+for that socket's lifetime, and is never transmitted or derived from listener
+configuration, network addresses, station identity, or cryptographic key
+material. Pending and active relation identity is the exact combination of
+that endpoint token and the raw peer socket address returned by `recvfrom()`.
+The raw address remains separately retained for replies, source metadata,
+assembler identity, logging, and diagnostics. Identical raw peer addresses on
+different physical listener incarnations are independent relations. A
+replacement socket receives a fresh endpoint token and cannot select retained
+state from the prior incarnation; abnormally retained old state remains
+unreachable until its existing lifecycle removes it.
+
 Wall time and monotonic time have separate ownership. Wall time is used only
 for externally meaningful protocol or diagnostic timestamps: the transmitted
 handshake timestamp check, ping, pong, and graceful-close timestamps, and
@@ -336,37 +349,45 @@ replay set retains at most `HANDSHAKE_REPLAY_MAX` records, expires only its
 ordered front prefix during admission, and evicts the oldest live record
 deterministically when capacity remains full.
 
-A pending session is identified by the exact peer socket address and retains
-the authenticated station ID, separate client-to-server and server-to-client
-AES-GCM owners, its monotonic creation time, and a private data-nonce set.
+A pending session is identified by its exact endpoint-token/peer-address
+relation and retains the raw peer address, authenticated station ID, separate
+client-to-server and server-to-client AES-GCM owners, its monotonic creation
+time, and a private data-nonce set.
 Pending sessions have their own TTL, capacity, and creation order, independent
 of active-session TTL, capacity, and activity order. Pending lifetime is not
 refreshed by traffic. Expiry removes only the expired ordered front prefix. A
-new pending address is installed at the newest end; when capacity remains
+new pending relation is installed at the newest end; when capacity remains
 full, the oldest live pending entry is evicted deterministically. A newer live
-pending session at the same address replaces only the older pending entry and
-occupies the newest position. Equal creation times follow deterministic
-installation order. At most `PENDING_SESSION_MAX` pending sessions are retained.
+pending session for the same endpoint/peer relation replaces only that older
+pending entry and occupies the newest position. A same-peer entry in another
+endpoint namespace is not a replacement. Equal creation times follow
+deterministic installation order. At most `PENDING_SESSION_MAX` pending
+sessions are retained across the process-wide `SecureState`.
 
 Installing or replacing a pending session does not remove, replace, or touch
-an active session at the same address. While the candidate remains pending,
+an active session in the same endpoint/peer relation. While the candidate
+remains pending,
 confirmation failure or client timeout leaves any existing active session
 intact; it does not promote the pending entry and does not itself delete
-server-side pending state. Pending expiry, same-address replacement, capacity
+server-side pending state. Pending expiry, same-relation replacement, capacity
 eviction, or nonce exhaustion removes only that exact pending entry. Each such
 removal makes the candidate traffic-key epoch unusable before its nonce state
-is discarded and does not itself alter an active session at that address.
+is discarded and does not itself alter an active session in that relation.
 
-When multiple listeners share one `SecureState`, each listener retains the
-exact pending object created through its socket. Only that listener may confirm
-and promote that still-current object. A missing, stale, or replaced
-listener-local handle cannot consume the candidate nonce or transfer promotion
-ownership across listener sockets.
+When multiple listeners share one `SecureState`, endpoint-scoped state lookup
+prevents a packet received through one socket from selecting any same-peer
+pending or active object owned by another socket. Each listener additionally
+retains weak exact-object ownership handles for confirmation, client close,
+and shutdown as defense in depth. Only that listener may confirm and promote
+its still-current pending object or close its exact active object. A missing,
+stale, replaced, or wrong-endpoint handle cannot consume nonce state, transfer
+promotion ownership, touch, exhaust, or close another listener's relation.
 
-An active session is identified by the exact peer socket address and retains
-its authenticated station ID, separate client-to-server and server-to-client
-AES-GCM owners, monotonic creation and last-seen times, and a private
-data-nonce set. Active sessions are ordered from least to most recently seen.
+An active session is identified by its exact endpoint-token/peer-address
+relation and retains the raw peer address, authenticated station ID, separate
+client-to-server and server-to-client AES-GCM owners, monotonic creation and
+last-seen times, and a private data-nonce set. Active sessions are ordered from
+least to most recently seen across the process-wide `SecureState`.
 Installation and valid activity place a session at the most-recent end. Only
 promotion or a fully validated active secure NMEA or ping packet counts as
 activity; invalid, malformed, mismatched, expired, or replayed traffic does not
@@ -378,13 +399,15 @@ stores are removed before packet-type-specific handling. Expired state may
 therefore remain physically present until later allowed traffic, but an
 expired directly addressed session is never treated as live. State operations
 receiving an active or pending handle first require exact retained-object
-identity at its address. A replaced, capacity-evicted, promoted, expired,
+identity at its endpoint/peer relation. A replaced, capacity-evicted,
+promoted, expired,
 nonce-exhausted, or otherwise stale handle cannot mutate state or trigger
 unrelated cleanup.
 
 UDPSEC has no plaintext session-reset or other unauthenticated session-control
-packet. A DATA packet received for an address with no live pending or active
-session is dropped without a wire response. Plaintext, malformed, unknown, or
+packet. A DATA packet received through an endpoint/peer relation with no live
+pending or active session is dropped without a wire response. Plaintext,
+malformed, unknown, or
 otherwise unauthenticated datagrams cannot touch, promote, replace, extend, or
 delete a live session. The monotonic cleanup of state that has already reached
 its locally owned TTL remains the only state effect an allowed unknown packet
@@ -462,7 +485,8 @@ requires type `"ping"`, reserved sequence `0` as a built-in integer and not a
 boolean, a built-in-integer timestamp, and a source identity equal to the
 pending station ID. The packet nonce is admitted to the pending session before
 promotion. Promotion removes the pending entry and, as one state-model
-transition, replaces any live active session at the same address.
+transition, replaces any live active session in the same endpoint/peer
+relation.
 The station identity, both directional AES-GCM owners, and the pending nonce
 set become the new active state; active creation and last-seen time begin at
 promotion. The transferred confirmation nonce remains retained and counts
@@ -471,13 +495,20 @@ server then returns an encrypted sequence-zero pong using the promoted
 server-to-client owner; the proxy requires the same sequence and timestamp
 rules before accepting that confirmation pong.
 
-For promotion at a new address, expired active sessions are removed before
-active capacity is considered; if capacity remains full, the
+For promotion at a new endpoint/peer relation, expired active sessions are
+removed before active capacity is considered; if capacity remains full, the
 least-recently-seen live active session is evicted. Equal active timestamps are
 resolved by deterministic activity order. At most `SESSION_MAX` active
 sessions are retained. Every active-session removal, including replacement,
 expiry, session-capacity eviction, graceful close, or nonce exhaustion, makes
 that exact traffic-key epoch unusable before discarding its nonce state.
+
+Active and pending capacity limits remain aggregate process-wide resource
+policy. Exact endpoint/peer equality controls replacement, so a same-peer
+relation on another endpoint is never mistaken for the relation being
+replaced. When an aggregate store is genuinely full, its existing
+deterministic global capacity policy may nevertheless evict the oldest live
+entry belonging to another endpoint.
 
 Secure-data replay identity is the exact 12-byte nonce within its receiver-side
 directional traffic-key epoch. Identical bytes under distinct epochs are
@@ -518,14 +549,15 @@ channel; there is no plaintext close prefix. It is best-effort and
 unacknowledged, and neither endpoint waits for a reply.
 
 A client close is encrypted under the current client-to-server AES-GCM owner.
-The server accepts it only at the exact active peer address and through the
-listener that retained that exact live session object. Source identity and the
+The server accepts it only in the receiving endpoint's exact active
+endpoint/peer relation and through the listener that retained that exact live
+session object. Source identity and the
 complete canonical message shape must match. Decryption, canonical validation,
 and authoritative active data-nonce admission occur before close-specific state
 changes. Only `ACCEPTED` processes the packet as a graceful close; `EXHAUSTED`
 follows the fail-closed epoch-invalidating path above and is not counted as a
-normal close. Pending state at the same address and sessions owned by other
-listeners remain unchanged. Forged, plaintext, wrong-key, replayed,
+normal close. Pending state in the same relation and same-peer sessions owned
+by other listeners remain unchanged. Forged, plaintext, wrong-key, replayed,
 stale-handle, or cross-listener close attempts cannot remove a session.
 
 A server close is encrypted under the current server-to-client AES-GCM owner

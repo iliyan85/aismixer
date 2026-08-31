@@ -272,8 +272,37 @@ class _BoundedNonceSet:
         return discarded
 
 
+class _EndpointToken:
+    """Opaque identity token for one physical listener incarnation."""
+
+    __slots__ = ()
+
+
+def _new_endpoint_token():
+    return _EndpointToken()
+
+
+@dataclass(frozen=True)
+class _EndpointPeerKey:
+    """Process-local identity for one listener/remote-peer relation."""
+
+    endpoint_token: _EndpointToken
+    peer_address: object
+
+    def __post_init__(self):
+        if not isinstance(self.endpoint_token, _EndpointToken):
+            raise TypeError("endpoint_token must be an _EndpointToken")
+
+
+def _require_endpoint_peer_key(relation_key):
+    if not isinstance(relation_key, _EndpointPeerKey):
+        raise TypeError("relation_key must be an _EndpointPeerKey")
+    return relation_key
+
+
 @dataclass
 class _SecureSession:
+    _relation_key: _EndpointPeerKey
     _address: object
     station_id: str
     client_to_server_aesgcm: AESGCM
@@ -285,6 +314,7 @@ class _SecureSession:
 
 @dataclass
 class _PendingSecureSession:
+    _relation_key: _EndpointPeerKey
     _address: object
     station_id: str
     client_to_server_aesgcm: AESGCM
@@ -459,8 +489,8 @@ class SecureState:
         self._current_data_nonces -= discarded_nonces
         self._data_nonces_session_discarded += discarded_nonces
 
-    def _remove_session(self, addr, reason):
-        session = self._sessions.pop(addr)
+    def _remove_session(self, relation_key, reason):
+        session = self._sessions.pop(relation_key)
         self._discard_session_nonces(session)
 
         if reason == "expired":
@@ -477,8 +507,8 @@ class SecureState:
             raise ValueError(f"Unknown session removal reason: {reason}")
         return session
 
-    def _remove_pending_session(self, addr, reason):
-        pending = self._pending_sessions.pop(addr)
+    def _remove_pending_session(self, relation_key, reason):
+        pending = self._pending_sessions.pop(relation_key)
         self._discard_session_nonces(pending)
 
         if reason == "expired":
@@ -498,41 +528,45 @@ class SecureState:
     def cleanup_expired_sessions(self, now):
         expired = []
         while self._sessions:
-            addr, session = next(iter(self._sessions.items()))
+            relation_key, session = next(iter(self._sessions.items()))
             if now - session.last_seen < self._session_ttl:
                 break
-            self._remove_session(addr, "expired")
-            expired.append(addr)
+            self._remove_session(relation_key, "expired")
+            expired.append(relation_key)
         return expired
 
     def cleanup_expired_pending_sessions(self, now):
         expired = []
         while self._pending_sessions:
-            addr, pending = next(iter(self._pending_sessions.items()))
+            relation_key, pending = next(
+                iter(self._pending_sessions.items())
+            )
             if now < pending.created_at + self._pending_session_ttl:
                 break
-            self._remove_pending_session(addr, "expired")
-            expired.append(addr)
+            self._remove_pending_session(relation_key, "expired")
+            expired.append(relation_key)
         return expired
 
     def install_session(
         self,
-        addr,
+        relation_key,
         station_id,
         client_to_server_aesgcm,
         server_to_client_aesgcm,
         now,
     ):
+        relation_key = _require_endpoint_peer_key(relation_key)
         self.cleanup_expired_sessions(now)
 
-        if addr in self._sessions:
-            self._remove_session(addr, "replaced")
+        if relation_key in self._sessions:
+            self._remove_session(relation_key, "replaced")
         elif len(self._sessions) >= self._max_sessions:
-            oldest_addr = next(iter(self._sessions))
-            self._remove_session(oldest_addr, "capacity")
+            oldest_relation_key = next(iter(self._sessions))
+            self._remove_session(oldest_relation_key, "capacity")
 
         session = _SecureSession(
-            _address=addr,
+            _relation_key=relation_key,
+            _address=relation_key.peer_address,
             station_id=station_id,
             client_to_server_aesgcm=client_to_server_aesgcm,
             server_to_client_aesgcm=server_to_client_aesgcm,
@@ -542,7 +576,7 @@ class SecureState:
                 self._data_nonce_max_per_session,
             ),
         )
-        self._sessions[addr] = session
+        self._sessions[relation_key] = session
         self._sessions_created += 1
         self._peak_sessions = max(
             self._peak_sessions,
@@ -552,22 +586,24 @@ class SecureState:
 
     def install_pending_session(
         self,
-        addr,
+        relation_key,
         station_id,
         client_to_server_aesgcm,
         server_to_client_aesgcm,
         now,
     ):
+        relation_key = _require_endpoint_peer_key(relation_key)
         self.cleanup_expired_pending_sessions(now)
 
-        if addr in self._pending_sessions:
-            self._remove_pending_session(addr, "replaced")
+        if relation_key in self._pending_sessions:
+            self._remove_pending_session(relation_key, "replaced")
         elif len(self._pending_sessions) >= self._max_pending_sessions:
-            oldest_addr = next(iter(self._pending_sessions))
-            self._remove_pending_session(oldest_addr, "capacity")
+            oldest_relation_key = next(iter(self._pending_sessions))
+            self._remove_pending_session(oldest_relation_key, "capacity")
 
         pending = _PendingSecureSession(
-            _address=addr,
+            _relation_key=relation_key,
+            _address=relation_key.peer_address,
             station_id=station_id,
             client_to_server_aesgcm=client_to_server_aesgcm,
             server_to_client_aesgcm=server_to_client_aesgcm,
@@ -576,7 +612,7 @@ class SecureState:
                 self._data_nonce_max_per_session,
             ),
         )
-        self._pending_sessions[addr] = pending
+        self._pending_sessions[relation_key] = pending
         self._pending_sessions_created += 1
         self._peak_pending_sessions = max(
             self._peak_pending_sessions,
@@ -584,72 +620,88 @@ class SecureState:
         )
         return pending
 
-    def get_active_session(self, addr, now):
+    def get_active_session(self, relation_key, now):
+        relation_key = _require_endpoint_peer_key(relation_key)
         self.cleanup_expired_sessions(now)
-        return self._sessions.get(addr)
+        return self._sessions.get(relation_key)
 
-    def get_pending_session(self, addr, now):
+    def get_pending_session(self, relation_key, now):
+        relation_key = _require_endpoint_peer_key(relation_key)
         self.cleanup_expired_pending_sessions(now)
-        return self._pending_sessions.get(addr)
+        return self._pending_sessions.get(relation_key)
 
-    def _get_live_session_handle(self, addr, session, now):
-        if self._sessions.get(addr) is not session:
+    def _get_live_session_handle(self, relation_key, session, now):
+        relation_key = _require_endpoint_peer_key(relation_key)
+        if self._sessions.get(relation_key) is not session:
             return None
 
         self.cleanup_expired_sessions(now)
-        if self._sessions.get(addr) is not session:
+        if self._sessions.get(relation_key) is not session:
             return None
 
         return session
 
-    def _get_live_pending_session_handle(self, addr, pending, now):
-        if self._pending_sessions.get(addr) is not pending:
+    def _get_live_pending_session_handle(
+        self,
+        relation_key,
+        pending,
+        now,
+    ):
+        relation_key = _require_endpoint_peer_key(relation_key)
+        if self._pending_sessions.get(relation_key) is not pending:
             return None
 
         self.cleanup_expired_pending_sessions(now)
-        if self._pending_sessions.get(addr) is not pending:
+        if self._pending_sessions.get(relation_key) is not pending:
             return None
 
         return pending
 
-    def _touch_active_session(self, addr, session, now):
+    def _touch_active_session(self, relation_key, session, now):
         session.last_seen = now
-        self._sessions.move_to_end(addr)
+        self._sessions.move_to_end(relation_key)
         self._sessions_touched += 1
 
-    def touch_session(self, addr, session, now):
-        if self._get_live_session_handle(addr, session, now) is None:
+    def touch_session(self, relation_key, session, now):
+        if self._get_live_session_handle(
+            relation_key, session, now
+        ) is None:
             return False
-        self._touch_active_session(addr, session, now)
+        self._touch_active_session(relation_key, session, now)
         return True
 
-    def is_live_session_handle(self, addr, session, now):
-        return self._get_live_session_handle(addr, session, now) is not None
+    def is_live_session_handle(self, relation_key, session, now):
+        return self._get_live_session_handle(
+            relation_key, session, now
+        ) is not None
 
-    def close_session(self, addr, session, now):
-        if self._get_live_session_handle(addr, session, now) is None:
+    def close_session(self, relation_key, session, now):
+        if self._get_live_session_handle(
+            relation_key, session, now
+        ) is None:
             return False
-        self._remove_session(addr, "closed")
+        self._remove_session(relation_key, "closed")
         return True
 
-    def promote_pending_session(self, addr, pending, now):
+    def promote_pending_session(self, relation_key, pending, now):
         if self._get_live_pending_session_handle(
-            addr, pending, now
+            relation_key, pending, now
         ) is None:
             return None
 
         self.cleanup_expired_sessions(now)
-        self._pending_sessions.pop(addr)
+        self._pending_sessions.pop(relation_key)
         self._pending_sessions_promoted += 1
 
-        if addr in self._sessions:
-            self._remove_session(addr, "replaced")
+        if relation_key in self._sessions:
+            self._remove_session(relation_key, "replaced")
         elif len(self._sessions) >= self._max_sessions:
-            oldest_addr = next(iter(self._sessions))
-            self._remove_session(oldest_addr, "capacity")
+            oldest_relation_key = next(iter(self._sessions))
+            self._remove_session(oldest_relation_key, "capacity")
 
         session = _SecureSession(
-            _address=addr,
+            _relation_key=relation_key,
+            _address=relation_key.peer_address,
             station_id=pending.station_id,
             client_to_server_aesgcm=(
                 pending.client_to_server_aesgcm
@@ -661,7 +713,7 @@ class SecureState:
             last_seen=now,
             seen_data_nonces=pending.seen_data_nonces,
         )
-        self._sessions[addr] = session
+        self._sessions[relation_key] = session
         self._sessions_created += 1
         self._peak_sessions = max(
             self._peak_sessions,
@@ -671,7 +723,7 @@ class SecureState:
 
     def data_nonce_seen(self, session, nonce, now):
         if self._get_live_session_handle(
-            session._address, session, now
+            session._relation_key, session, now
         ) is None:
             return False
         seen = session.seen_data_nonces.contains(nonce)
@@ -681,7 +733,7 @@ class SecureState:
 
     def pending_data_nonce_seen(self, pending, nonce, now):
         if self._get_live_pending_session_handle(
-            pending._address, pending, now
+            pending._relation_key, pending, now
         ) is None:
             return False
         return pending.seen_data_nonces.contains(nonce)
@@ -695,22 +747,22 @@ class SecureState:
         )
 
     def _remove_exact_session(self, session, reason):
-        addr = session._address
-        if self._sessions.get(addr) is not session:
+        relation_key = session._relation_key
+        if self._sessions.get(relation_key) is not session:
             return False
-        self._remove_session(addr, reason)
+        self._remove_session(relation_key, reason)
         return True
 
     def _remove_exact_pending_session(self, pending, reason):
-        addr = pending._address
-        if self._pending_sessions.get(addr) is not pending:
+        relation_key = pending._relation_key
+        if self._pending_sessions.get(relation_key) is not pending:
             return False
-        self._remove_pending_session(addr, reason)
+        self._remove_pending_session(relation_key, reason)
         return True
 
     def admit_data_nonce(self, session, nonce, now):
         if self._get_live_session_handle(
-            session._address, session, now
+            session._relation_key, session, now
         ) is None:
             return _DataNonceAdmission.STALE
         admission = session.seen_data_nonces.admit(nonce)
@@ -731,7 +783,7 @@ class SecureState:
 
     def admit_pending_data_nonce(self, pending, nonce, now):
         if self._get_live_pending_session_handle(
-            pending._address, pending, now
+            pending._relation_key, pending, now
         ) is None:
             return _DataNonceAdmission.STALE
         admission = pending.seen_data_nonces.admit(nonce)
@@ -827,14 +879,15 @@ def close_owned_sessions(
         if monotonic_clock is None
         else monotonic_clock
     )
-    for addr, session in list(owned_sessions.items()):
+    for relation_key, session in list(owned_sessions.items()):
         local_now = monotonic_now()
         if not state_owner.is_live_session_handle(
-            addr,
+            relation_key,
             session,
             local_now,
         ):
             continue
+        addr = session._address
         try:
             message = build_session_close_message(
                 session.station_id,
@@ -853,7 +906,11 @@ def close_owned_sessions(
                 f"{type(exc).__name__}: {exc}"
             )
         finally:
-            state_owner.close_session(addr, session, local_now)
+            state_owner.close_session(
+                relation_key,
+                session,
+                local_now,
+            )
 
 
 def _build_server_handshake(
@@ -928,6 +985,7 @@ async def _secure_server_loop(
     sec_input_id=None,
     ingress_policy=None,
     *,
+    endpoint_token,
     input_traffic=None,
     state=None,
     wall_clock=None,
@@ -939,6 +997,8 @@ async def _secure_server_loop(
     active_server_private_key = _require_prepared_server_private_key(
         server_private_key
     )
+    if not isinstance(endpoint_token, _EndpointToken):
+        raise TypeError("endpoint_token must be an _EndpointToken")
 
     sock.bind((ip, port))
     sock.setblocking(False)
@@ -957,6 +1017,7 @@ async def _secure_server_loop(
         source_ip = addr[0]
         if not policy.allows(source_ip):
             continue
+        relation_key = _EndpointPeerKey(endpoint_token, addr)
         local_now = monotonic_now()
         state_owner.cleanup_expired_sessions(local_now)
         state_owner.cleanup_expired_pending_sessions(local_now)
@@ -1016,14 +1077,14 @@ async def _secure_server_loop(
                     server_private_key=active_server_private_key,
                 )
                 pending = state_owner.install_pending_session(
-                    addr,
+                    relation_key,
                     station_id,
                     client_to_server_aesgcm,
                     server_to_client_aesgcm,
                     local_now,
                 )
                 if owned_pending_sessions is not None:
-                    owned_pending_sessions[addr] = pending
+                    owned_pending_sessions[relation_key] = pending
 
                 sock.sendto(response_packet, addr)
                 print(
@@ -1038,14 +1099,16 @@ async def _secure_server_loop(
         elif data.startswith(DATA_PREFIX):
             try:
                 pending = state_owner.get_pending_session(
-                    addr, local_now
+                    relation_key, local_now
                 )
                 if (
                     owned_pending_sessions is not None
-                    and owned_pending_sessions.get(addr) is not pending
+                    and owned_pending_sessions.get(relation_key) is not pending
                 ):
                     pending = None
-                session = state_owner.get_active_session(addr, local_now)
+                session = state_owner.get_active_session(
+                    relation_key, local_now
+                )
                 if pending is None and session is None:
                     continue
 
@@ -1092,9 +1155,13 @@ async def _secure_server_loop(
                         if admission is _DataNonceAdmission.EXHAUSTED:
                             if (
                                 owned_pending_sessions is not None
-                                and owned_pending_sessions.get(addr) is pending
+                                and owned_pending_sessions.get(
+                                    relation_key
+                                ) is pending
                             ):
-                                owned_pending_sessions.pop(addr, None)
+                                owned_pending_sessions.pop(
+                                    relation_key, None
+                                )
                             print(
                                 f"[!] Pending secure session nonce capacity "
                                 f"exhausted for {addr}"
@@ -1104,23 +1171,25 @@ async def _secure_server_loop(
                             continue
 
                         session = state_owner.promote_pending_session(
-                            addr,
+                            relation_key,
                             pending,
                             local_now,
                         )
                         if session is None:
                             continue
                         if not state_owner.touch_session(
-                            addr, session, local_now
+                            relation_key, session, local_now
                         ):
                             continue
                         if (
                             owned_pending_sessions is not None
-                            and owned_pending_sessions.get(addr) is pending
+                            and owned_pending_sessions.get(
+                                relation_key
+                            ) is pending
                         ):
-                            owned_pending_sessions.pop(addr, None)
+                            owned_pending_sessions.pop(relation_key, None)
                         if owned_sessions is not None:
-                            owned_sessions[addr] = session
+                            owned_sessions[relation_key] = session
 
                         response = build_pong_message(
                             session.station_id,
@@ -1177,7 +1246,7 @@ async def _secure_server_loop(
                         continue
                     if (
                         owned_sessions is not None
-                        and owned_sessions.get(addr) is not session
+                        and owned_sessions.get(relation_key) is not session
                     ):
                         continue
                 else:
@@ -1193,9 +1262,9 @@ async def _secure_server_loop(
                 if admission is _DataNonceAdmission.EXHAUSTED:
                     if (
                         owned_sessions is not None
-                        and owned_sessions.get(addr) is session
+                        and owned_sessions.get(relation_key) is session
                     ):
-                        owned_sessions.pop(addr, None)
+                        owned_sessions.pop(relation_key, None)
                     print(
                         f"[!] Secure session nonce capacity exhausted "
                         f"for {addr}"
@@ -1205,10 +1274,18 @@ async def _secure_server_loop(
                     continue
 
                 if message_type == SESSION_CLOSE_TYPE:
-                    state_owner.close_session(addr, session, local_now)
+                    state_owner.close_session(
+                        relation_key,
+                        session,
+                        local_now,
+                    )
                     continue
 
-                state_owner.touch_session(addr, session, local_now)
+                state_owner.touch_session(
+                    relation_key,
+                    session,
+                    local_now,
+                )
 
                 if message_type == "ping":
                     response = build_pong_message(
@@ -1270,10 +1347,12 @@ async def secure_server(
     """Run one secure ingress producer and close its owned socket exactly once."""
 
     sock = create_udp_listener_socket(ip, reuse_address=False)
+    endpoint_token = _new_endpoint_token()
     state_owner = secure_state if state is None else state
-    # SecureState may be shared by multiple listeners. Weak exact handles keep
-    # handshake and shutdown ownership local to this socket without retaining
-    # removed state.
+    # SecureState may be shared by multiple listeners. The opaque token scopes
+    # every peer relation to this exact socket incarnation. Weak exact handles
+    # retain complementary confirmation and shutdown ownership without keeping
+    # removed state alive.
     owned_sessions = weakref.WeakValueDictionary()
     owned_pending_sessions = weakref.WeakValueDictionary()
     try:
@@ -1284,6 +1363,7 @@ async def secure_server(
             port,
             sec_input_id=sec_input_id,
             ingress_policy=ingress_policy,
+            endpoint_token=endpoint_token,
             input_traffic=input_traffic,
             state=state_owner,
             wall_clock=wall_clock,

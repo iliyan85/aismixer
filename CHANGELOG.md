@@ -8,6 +8,9 @@ still change public APIs and configuration behavior as the service matures.
 
 ### UDPSEC security
 
+- Isolates pending and active sessions by physical listener socket incarnation
+  plus raw peer address, preventing same-peer state from being selected or
+  replaced across listeners sharing one `SecureState`, with no wire change.
 - Retains every admitted receiver-side DATA nonce for its full traffic-key
   epoch instead of expiring or evicting live nonce records. At the hard
   per-epoch bound, the next distinct authenticated and semantically valid nonce
