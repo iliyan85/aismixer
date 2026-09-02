@@ -571,6 +571,149 @@ def test_handle_socket_waits_for_private_queue_capacity_before_next_receive(
     asyncio.run(scenario())
 
 
+class _QueuedPacketLoop:
+    """Fake receive loop that can also raise injected receive-time errors.
+
+    Each queued item is either an ``(data, addr)`` packet tuple or a
+    ``BaseException`` instance to raise from ``sock_recvfrom`` on that turn,
+    matching the harness used for the UDPSEC secure listener's equivalent
+    receive-boundary regression tests.
+    """
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    async def sock_recvfrom(self, _sock, _size):
+        if self._items:
+            item = self._items.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        raise asyncio.CancelledError()
+
+
+@pytest.mark.parametrize(
+    "recv_error",
+    [
+        pytest.param(
+            ConnectionResetError("simulated ICMP port-unreachable reset"),
+            id="connection_reset",
+        ),
+        pytest.param(
+            ConnectionRefusedError("simulated ICMP port-unreachable refusal"),
+            id="connection_refused",
+        ),
+    ],
+)
+def test_handle_socket_contains_recoverable_recv_error(
+    monkeypatch,
+    recv_error,
+):
+    """A recoverable peer/network recv error must not crash the plain UDP
+    listener, must not be counted as a received transport packet, must not
+    emit an IngressFrame, and must not prevent subsequent valid traffic from
+    being processed -- mirroring the UDPSEC secure-listener policy."""
+
+    queue = _FakeQueue()
+    packet = (SENTENCE + "\r\n").encode()
+    traffic = InputTrafficMetrics("udp-ingress:0:recv-error", "udp")
+    fake_loop = _QueuedPacketLoop(
+        [recv_error, (packet, ("192.0.2.10", 17778))]
+    )
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                queue,
+                input_traffic=traffic,
+            )
+        )
+
+    # Subsequent valid traffic was still processed: exactly one frame from
+    # the packet that followed the contained recv error.
+    assert len(queue.items) == 1
+    frame = queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    assert frame.payload == SENTENCE.encode("utf-8")
+
+    # The failed receive produced no data, so it must not be counted as a
+    # received transport packet, and it must not have emitted a frame.
+    snapshot = traffic.input_traffic_snapshot()
+    assert snapshot.transport_packets == 1
+    assert snapshot.transport_bytes == len(packet)
+    assert snapshot.accepted_frames == 1
+    assert snapshot.payload_bytes == len(frame.payload)
+
+
+def test_handle_socket_propagates_unclassified_os_error(monkeypatch):
+    """A generic/unclassified OSError from the receive boundary (for
+    example, a broken local socket descriptor) is not a recognised
+    recoverable peer/network condition and must propagate out of the plain
+    UDP listener so the essential-task supervisor's fail-fast semantics
+    still apply."""
+
+    queue = _FakeQueue()
+    traffic = InputTrafficMetrics("udp-ingress:0:fatal-error", "udp")
+    fatal_error = OSError(9, "Bad file descriptor")
+    fake_loop = _QueuedPacketLoop([fatal_error])
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(OSError) as excinfo:
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                queue,
+                input_traffic=traffic,
+            )
+        )
+
+    assert excinfo.value is fatal_error
+    assert not isinstance(
+        excinfo.value,
+        (ConnectionResetError, ConnectionRefusedError),
+    )
+    assert queue.items == []
+    assert traffic.input_traffic_snapshot().transport_packets == 0
+
+
+def test_handle_socket_propagates_mid_stream_cancellation(monkeypatch):
+    """asyncio.CancelledError raised mid-stream from the receive boundary
+    must keep propagating unchanged, distinct from the recoverable
+    ConnectionResetError/ConnectionRefusedError handling, and distinct from
+    the CancelledError _QueuedPacketLoop raises on item exhaustion."""
+
+    queue = _FakeQueue()
+    packet = (SENTENCE + "\r\n").encode()
+    traffic = InputTrafficMetrics("udp-ingress:0:mid-cancel", "udp")
+    fake_loop = _QueuedPacketLoop(
+        [
+            (packet, ("192.0.2.10", 17778)),
+            asyncio.CancelledError("mid-stream cancel"),
+        ]
+    )
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                queue,
+                input_traffic=traffic,
+            )
+        )
+
+    assert len(queue.items) == 1
+    assert queue.items[0].payload == SENTENCE.encode("utf-8")
+
+
 def test_ingress_fan_in_loop_binds_frame_and_drops_unsupported(
     monkeypatch,
 ):
