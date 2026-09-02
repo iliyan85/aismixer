@@ -1,6 +1,6 @@
 title: AISMixer
-description: Open-source platform for receiving, normalizing, deduplicating, tagging, routing, and forwarding AIS NMEA 0183 streams.
+description: Platform for receiving, normalizing, deduplicating, tagging, routing, and forwarding AIS NMEA 0183 streams; source code is publicly available under CC BY-NC 4.0.
 url: https://aismixer.net
 baseurl: ""
 markdown: kramdown
-source_sync_commit: "7a2874d08fb136bab5136c32a827cec6206eb4ba"
+source_sync_commit: "32d21333cf376d11e6dbcd55dacc5fa985dd5a22"

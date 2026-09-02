@@ -47,10 +47,11 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu", "OpenWrt"],
-    "description": "Open-source platform for deterministic AIS processing, logical routing, bounded stages, process-local runtime observability, and authenticated ECDHE UDPSEC.",
+    "description": "Platform for deterministic AIS processing, logical routing, bounded stages, process-local runtime observability, and authenticated ECDHE UDPSEC; source code is publicly available under CC BY-NC 4.0.",
     "url": "https://aismixer.net/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
+    "license": "https://github.com/iliyan85/aismixer/blob/main/LICENSE",
     "author": {
       "@type": "Person",
       "name": "Iliyan Iliev",
@@ -109,7 +110,7 @@
   <header class="hero container" id="top">
     <div class="two-col">
       <div class="hero-copy">
-        <div class="chip">Open source • Python • AIS NMEA 0183</div>
+        <div class="chip">Python • AIS NMEA 0183</div>
         <h1>AISMixer</h1>
         <p class="hero-kicker">AIS stream processing and routing platform</p>
         <p class="tagline">Normalize · Deduplicate · Tag · Route · Forward</p>
@@ -118,9 +119,10 @@
           stream, and deliver it to the UDP egress targets that need it.
         </p>
         <div class="cta" role="group" aria-label="Project links">
-          <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">View the GitHub repository</a>
-          <a class="button" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Explore the GitHub Wiki</a>
+          <a class="button primary" href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">Get started</a>
+          <a class="button" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">View the GitHub repository</a>
         </div>
+        <p class="muted">The source code is publicly available under <a href="https://github.com/iliyan85/aismixer/blob/main/LICENSE" target="_blank" rel="noopener">CC BY-NC 4.0</a>; commercial use is not permitted by that license.</p>
       </div>
       <aside class="card hero-summary" aria-labelledby="logical-stream-title">
         <div class="icons" aria-hidden="true">📡 → 🧭 → 📤</div>
@@ -278,8 +280,8 @@
         <article class="card state-card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Secure replay and sessions</h3>
-          <p>Handshake replay records, pending sessions, active sessions, and the private nonce state owned by each pending or active session are hard-bounded. Monotonic local time governs TTL, and expired state is removed before deterministic live-state eviction.</p>
-          <p>Installing a same-address pending candidate preserves the current active session and replaces only an older pending candidate. The active session changes only after authenticated encrypted confirmation and pending-to-active promotion; a failed confirmation, or pending expiry, replacement, or capacity eviction, leaves it intact. All secure state is in-memory, process-local, and lost at restart.</p>
+          <p>Handshake replay records, pending sessions, active sessions, and each session's private DATA-nonce replay ledger are hard-bounded. Handshake and session lifetimes use monotonic TTLs. Every admitted DATA nonce is instead retained for the full usable directional traffic-key epoch, has no independent TTL, and is not evicted while that epoch remains usable. Exhaustion fails closed for that key epoch; recovery uses a fresh authenticated handshake with fresh directional keys.</p>
+          <p>A pending candidate replaces only an older candidate for the same physical-listener/peer relation and preserves any active session until authenticated encrypted confirmation succeeds. Sessions from the same peer on separate physical UDPSEC listeners are isolated from one another; aggregate capacity budgets remain process-wide. All secure state is in-memory, process-local, and lost at restart.</p>
         </article>
         <article class="card state-card">
           <div class="icons" aria-hidden="true">📊</div>
@@ -423,7 +425,7 @@
       <div class="section-heading">
         <p class="eyebrow">UDPSEC lifecycle</p>
         <h2>Authenticated transport with bounded local state</h2>
-        <p class="section-intro">The current UDPSEC path between <span class="kbd">nmea_sproxy</span> and <span class="kbd">aismixer</span> uses authenticated ephemeral ECDHE and independent directional keys, with encrypted sequence-zero confirmation before the client treats a new session as established.</p>
+        <p class="section-intro">The current source-tree UDPSEC path between <span class="kbd">nmea_sproxy</span> and <span class="kbd">aismixer</span> uses configured long-term P-256 ECDSA identities, signed ephemeral P-256 ECDHE, fresh directional AES-256-GCM keys, and encrypted sequence-zero proof of key possession before the client treats a new session as established.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="UDPSEC authenticated ECDHE session-establishment flow">
         <div class="pipeline-node">
@@ -467,13 +469,14 @@
         <article class="card">
           <div class="icons" aria-hidden="true">♻️</div>
           <h3>Coordinated update and local state</h3>
-          <p>Both endpoints must be updated together; there is no legacy fallback, mixed mode, negotiation switch, certificate system, or algorithm negotiation.</p>
-          <p>Allowed traffic drives expiry cleanup rather than a background timer. Replay, pending-session, active-session, and nonce state is in-memory, process-local, non-durable, and lost when the service restarts.</p>
+          <p>Both endpoints must be updated together. After confirmation, NMEA DATA, ping/pong liveness, and best-effort close are authenticated and encrypted. An unresolved liveness check or enabled planned session refresh proactively starts a fresh signed ECDHE handshake with fresh directional keys; UDPSEC does not buffer or replay NMEA payloads during recovery.</p>
+          <p>Recovery uses a fresh authenticated handshake. UDPSEC has no plaintext reset, <span class="kbd">NOSESSION</span> recovery, downgrade control, or automatic fallback to plain UDP. DATA for an unknown old session is ignored without a plaintext recovery response. Secure session and replay state is in-memory, process-local, non-durable, and lost at restart.</p>
+          <p>UDPSEC works through NAT or CGNAT while the server-observed source address and port remain stable. Rebinding or network change requires a fresh authenticated handshake; an established session is not automatically migrated.</p>
         </article>
       </div>
       <div class="callout">
         <p><strong>Forward-secrecy boundary:</strong> Later compromise of a long-term identity key does not by itself reconstruct keys for completed sessions when old ephemeral private keys and raw shared secrets are gone and neither endpoint was compromised while they were in memory. An identity key compromised in the present enables future impersonation. This implemented property is supported by engineering validation, not formal cryptographic verification.</p>
-        <p><strong>Transport boundary:</strong> UDPSEC authenticates and encrypts data and control packets within its scope, but does not prove AIS truthfulness or detect spoofing, guarantee UDP delivery or ordering, protect compromised endpoints, or provide complete denial-of-service resistance. It does not hide peer IP addresses, packet timing or lengths, or the cleartext ClientHello station identifier; NOSESSION hints are unauthenticated.</p>
+        <p><strong>Transport boundary:</strong> UDPSEC authenticates and encrypts data and control packets within its scope, but does not prove vessel identity, position, physical origin, or the absence of AIS spoofing; guarantee UDP delivery or ordering; protect compromised endpoints; or provide complete denial-of-service resistance. It does not hide peer IP addresses, packet timing or lengths, or the cleartext ClientHello station identifier.</p>
         <p>Read the <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">security policy</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">behavioural contract</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>, and <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a> for the detailed boundaries.</p>
       </div>
     </section>
@@ -482,9 +485,9 @@
       <div class="section-heading">
         <p class="eyebrow">nmea_sproxy and physical AIS receivers</p>
         <h2>Connect networked or physical AIS receivers through nmea_sproxy</h2>
-        <p class="section-intro"><span class="kbd">nmea_sproxy</span> is the station-side proxy that connects one local AIS source to one configured <span class="kbd">aismixer</span> destination.</p>
+        <p class="section-intro"><span class="kbd">nmea_sproxy</span> is the station-side proxy that connects one local UDP or physical serial/USB AIS input to one network output: UDPSEC or explicitly configured plain UDP.</p>
       </div>
-      <div class="architecture-path" role="group" aria-label="Physical AIS receiver connection through nmea_sproxy to aismixer">
+      <div class="architecture-path" role="group" aria-label="Physical AIS receiver connection through nmea_sproxy to a network output">
         <div class="path-node">
           <span class="icons" aria-hidden="true">📻</span>
           <strong>Physical AIS receiver</strong>
@@ -503,7 +506,8 @@
         </div>
         <div class="path-node">
           <span class="icons" aria-hidden="true">🛰️</span>
-          <strong><span class="kbd">aismixer</span></strong>
+          <strong>Network output</strong>
+          <small><span class="kbd">aismixer</span> over UDPSEC or a plain-UDP consumer on a trusted network</small>
         </div>
       </div>
       <div class="grid proxy-grid">
@@ -523,7 +527,7 @@
         </article>
         <article class="card">
           <h3>Clear relation boundary</h3>
-          <p>One local input maps to one configured output. <span class="kbd">nmea_sproxy</span> does not mix, fan out, route, deduplicate, assemble multipart AIS, or rewrite TAG metadata.</p>
+          <p>One local input maps to one configured output. The proxy forwards the bare supported AIS sentence match, stripping ingress TAG blocks, prefixes, surrounding bytes, and input terminators. <span class="kbd">nmea_sproxy</span> does not mix, fan out, route, deduplicate, or assemble multipart AIS.</p>
         </article>
       </div>
       <div class="callout">
@@ -535,7 +539,7 @@
       <div class="section-heading">
         <p class="eyebrow">OpenWrt edge deployment</p>
         <h2>Run <span class="kbd">aismixer</span> or <span class="kbd">nmea_sproxy</span> on OpenWrt</h2>
-        <p class="section-intro">The signed AISMixer APK repository for OpenWrt 25.12 currently publishes the Python/procd deployment for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</p>
+        <p class="section-intro">The signed AISMixer APK repository for OpenWrt 25.12 currently publishes the <span class="kbd">0.2.1-r1</span> Python/procd package snapshot for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
         <article class="card">
@@ -559,12 +563,13 @@
         <article class="card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Explicit UDPSEC trust</h3>
-          <p>The <span class="kbd">aismixer</span> and <span class="kbd">nmea_sproxy</span> services each generate their local identity key pair automatically on first installation or startup, as appropriate. UDPSEC peer trust material is never exchanged automatically: provision the <span class="kbd">aismixer</span> public key locally at the station and authorize the station public key on the <span class="kbd">aismixer</span> side.</p>
+          <p>The packages ship no private keys. The OpenWrt <span class="kbd">aismixer</span> init flow prepares its local identity and, when a valid private key exists, can repair the matching public key. <span class="kbd">nmea_sproxy</span> may create the canonical station key pair only when both key files are absent; a partial, invalid, or mismatched proxy pair fails closed without automatic replacement. UDPSEC peer trust is always provisioned manually: install the <span class="kbd">aismixer</span> public key at the station and authorize the station public key on the <span class="kbd">aismixer</span> side.</p>
         </article>
       </div>
-      <p class="boundary-note"><strong>Package architecture.</strong> Select the package architecture that matches the official OpenWrt package feeds configured on the device; do not derive this value from <span class="kbd">apk --print-arch</span>.</p>
+      <p class="boundary-note"><strong>Package architecture.</strong> <span class="kbd">PKGARCH:=all</span> describes the architecture-independent Python and shell payload; it does not make the package available in every target feed. The currently built, published, and validated feeds are <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>, without intentionally excluding other suitable targets. Select the feed architecture configured for the device; do not derive it from <span class="kbd">apk --print-arch</span>.</p>
       <p class="boundary-note"><strong>Writable space.</strong> The Python runtime and dependencies require materially more writable space than a minimal OpenWrt installation. Verify available overlay space before installation; extroot is an OpenWrt deployment option where internal writable storage is limited.</p>
-      <pre class="command-example" aria-label="Install the aismixer package from the signed AISMixer OpenWrt APK repository"><code># Supported package architectures: x86_64 or mips_24kc
+      <p class="boundary-note"><strong>First-start safety.</strong> Apply firewall or network isolation and verify writable space before installation. The package hooks enable and start <span class="kbd">aismixer</span> during installation, and the seeded configuration includes broadly listening plain-UDP listeners. Stop the service immediately afterward, configure listeners and UDPSEC authorization, and only then start and inspect it.</p>
+      <pre class="command-example" aria-label="Install the aismixer package from the signed AISMixer OpenWrt APK repository"><code># Currently published feeds: x86_64 or mips_24kc
 AISMIXER_ARCH='x86_64'
 
 wget -O /etc/apk/keys/aismixer-openwrt.pem \
@@ -579,16 +584,23 @@ grep -qxF "$REPO_URL" "$REPO_FILE" 2&gt;/dev/null || {
 }
 
 apk update
-apk add aismixer</code></pre>
+apk add aismixer
+/etc/init.d/aismixer stop
+vi /etc/aismixer/config.yaml
+vi /etc/aismixer/authorized_keys.yaml
+/etc/init.d/aismixer start
+/etc/init.d/aismixer status
+logread -e aismixer</code></pre>
+      <p class="boundary-note"><strong>Package snapshot.</strong> Published <span class="kbd">0.2.1-r1</span> packages use a pinned source revision and may trail later <span class="kbd">main</span> changes. Check the package revision, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>, and <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">Releases</a> before assuming newer hardening is included.</p>
       <p class="boundary-note"><strong>End-to-end validation.</strong> The <span class="kbd">mips_24kc</span> deployment path has been validated end to end with physical serial AIS ingress, <span class="kbd">nmea_sproxy</span>, authenticated UDPSEC, processing by the <span class="kbd">aismixer</span> service, <span class="kbd">procd</span> service operation, and local runtime control and observability.</p>
-      <p class="boundary-note"><strong>Receiver-side endpoint only.</strong> Use <span class="kbd">apk add nmea_sproxy</span> instead of <span class="kbd">apk add aismixer</span> to install the station proxy independently. See the <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> and <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a> for complete deployment and trust-provisioning steps.</p>
+      <p class="boundary-note"><strong>Receiver-side endpoint only.</strong> Use <span class="kbd">apk add nmea_sproxy</span> instead of <span class="kbd">apk add aismixer</span> to install the station proxy independently. See the <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>, and <a href="https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment" target="_blank" rel="noopener">OpenWrt Deployment Wiki</a> for complete deployment and trust-provisioning steps.</p>
     </section>
 
     <section id="operations" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Conventional Linux deployment and operations</p>
-        <h2>A Linux and systemd lifecycle built for real installations</h2>
-        <p class="section-intro">For conventional Linux hosts, the repository-managed systemd deployment keeps runtime files, operator state, local routing control, and read-only runtime statistics aligned. OpenWrt uses the APK/procd path described above.</p>
+        <p class="eyebrow">Debian-family deployment and operations</p>
+        <h2>A Debian-family and systemd lifecycle built for real installations</h2>
+        <p class="section-intro">For Debian-family systemd hosts, including Debian and Raspberry Pi OS, the repository-managed deployment keeps runtime files, operator state, local routing control, and read-only runtime statistics aligned. OpenWrt uses the APK/procd path described above.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -599,7 +611,7 @@ apk add aismixer</code></pre>
         <article class="card">
           <div class="icons" aria-hidden="true">🔄</div>
           <h3>Install, update, and uninstall</h3>
-          <p>Privilege-aware lifecycle scripts handle root or sudo operation and maintain the deployed runtime and service units.</p>
+          <p>Privilege-aware lifecycle scripts handle root or sudo operation and maintain the deployed runtime and service units. The AISMixer updater restarts its service and can start an inactive service; the <span class="kbd">nmea_sproxy</span> updater reloads systemd but does not start or restart proxy instances. See the <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> and <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🗝️</div>
@@ -629,9 +641,9 @@ apk add aismixer</code></pre>
             <li>Compiled numeric target-only routing, exact immutable bytes encoded once per emitted sentence, ordered <span class="kbd">OutputBatch</span> results, and an ordered local egress completion barrier.</li>
             <li>Logical zones and target-scoped deduplication, atomic process-local routing updates, interactive <span class="kbd">aismixerctl</span>, and read-only aggregate, per-input, and per-output statistics.</li>
             <li>Deterministic multipart assembly, TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> handling, and global or target-scoped deduplication.</li>
-            <li>Authenticated ephemeral P-256 ECDHE UDPSEC, long-term P-256 ECDSA identities, independent directional AES-GCM keys, and hard-bounded local secure state.</li>
+            <li>Authenticated ephemeral P-256 ECDHE UDPSEC, configured long-term P-256 ECDSA identities, fresh directional AES-256-GCM keys, encrypted key-possession confirmation, authenticated and encrypted data, liveness, and best-effort close, full-epoch DATA replay protection, fail-closed bounded state, and physical-listener session isolation.</li>
             <li>One UDP or serial input to one UDPSEC or explicit trusted plain-UDP output per <span class="kbd">nmea_sproxy</span> process or systemd instance, plus IPv4/IPv6 endpoint controls.</li>
-            <li>Conventional Linux deployment with systemd <span class="kbd">RuntimeDirectory</span>, privilege-aware lifecycle scripts, preserved operator state, and the global operator CLI, alongside the signed OpenWrt 25.12 APK/procd deployment published for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</li>
+            <li>Debian-family deployment with systemd <span class="kbd">RuntimeDirectory</span>, privilege-aware lifecycle scripts, preserved operator state, and the global operator CLI, alongside the signed OpenWrt 25.12 APK/procd deployment published for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</li>
           </ul>
         </article>
         <article class="card status-card status-next">
@@ -652,6 +664,7 @@ apk add aismixer</code></pre>
         <a href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">nmea_sproxy guide</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Security policy</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
       </div>
     </section>
 
@@ -697,7 +710,7 @@ apk add aismixer</code></pre>
           <h3>Iliyan Iliev, PhD</h3>
           <p class="maintainer-role">Founder, originator, and maintainer of AISMixer</p>
           <p>Backend and network systems developer and researcher with interests in AIS/NMEA processing, maritime and regional security, transport, and tourism.</p>
-          <p><strong>AI-assisted development:</strong> ChatGPT has supported architectural reasoning, planning, documentation, and review. OpenAI Codex has supported repository analysis, implementation, testing, and validation. Both tools are used under the founder’s direction; project decisions and final responsibility remain human.</p>
+          <p><strong>AI-assisted development:</strong> ChatGPT has supported architectural reasoning, planning, documentation, and review. OpenAI Codex has supported repository analysis, implementation, testing, and validation. Anthropic Claude Code has supported repository review, implementation handoff, cross-checking, testing, and validation. These tools are used under the founder’s direction; project decisions and final responsibility remain human.</p>
         </div>
         <div class="links maintainer-links" role="group" aria-label="Maintainer links">
           <a href="https://github.com/iliyan85" target="_blank" rel="noopener">GitHub profile</a>
@@ -717,6 +730,7 @@ apk add aismixer</code></pre>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a>
         <a href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Discussions</a>
         <a href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Issues</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
         <a href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">Contact</a>
       </nav>
     </div>

@@ -47,10 +47,11 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu", "OpenWrt"],
-    "description": "Platformă open-source pentru procesare deterministă AIS NMEA 0183, rutare logică, etape cu capacitate finită, observabilitate runtime locală procesului și UDPSEC cu ECDHE autentificat.",
+    "description": "Platformă pentru procesarea deterministă AIS NMEA 0183, rutare logică, etape cu capacitate finită, observabilitate runtime locală procesului și UDPSEC cu ECDHE autentificat; codul-sursă este disponibil public sub licența CC BY-NC 4.0.",
     "url": "https://aismixer.net/ro/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
+    "license": "https://github.com/iliyan85/aismixer/blob/main/LICENSE",
     "author": {
       "@type": "Person",
       "name": "Iliyan Iliev",
@@ -109,7 +110,7 @@
   <header class="hero container" id="top">
     <div class="two-col">
       <div class="hero-copy">
-        <div class="chip">Cod cu sursă deschisă • Python • AIS NMEA 0183</div>
+        <div class="chip">Python • AIS NMEA 0183</div>
         <h1>AISMixer</h1>
         <p class="hero-kicker">Platformă de procesare și rutare a fluxurilor AIS</p>
         <p class="tagline">Normalizează · Deduplică · Etichetează · Rutează · Redirecționează</p>
@@ -119,9 +120,10 @@
           care au nevoie de el.
         </p>
         <div class="cta" role="group" aria-label="Legături către proiect">
-          <a class="button primary" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Vedeți depozitul GitHub</a>
-          <a class="button" href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Explorați Wiki-ul GitHub</a>
+          <a class="button primary" href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">Începeți</a>
+          <a class="button" href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Vedeți depozitul GitHub</a>
         </div>
+        <p class="muted">Codul-sursă al proiectului AISMixer este disponibil public sub licența <a href="https://github.com/iliyan85/aismixer/blob/main/LICENSE" target="_blank" rel="noopener">CC BY-NC 4.0</a>; licența nu permite utilizarea comercială.</p>
       </div>
       <aside class="card hero-summary" aria-labelledby="logical-stream-title">
         <div class="icons" aria-hidden="true">📡 → 🧭 → 📤</div>
@@ -279,8 +281,8 @@
         <article class="card state-card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Protecție anti-replay și sesiuni securizate</h3>
-          <p>Înregistrările anti-replay pentru handshake, sesiunile în așteptare, sesiunile active și starea privată a nonce-urilor, deținută separat de fiecare sesiune în așteptare sau activă, au limite stricte de capacitate. Timpul monoton local guvernează TTL-ul; starea expirată este eliminată înaintea evacuării deterministe impuse de capacitate.</p>
-          <p>Instalarea unui candidat în așteptare la aceeași adresă păstrează sesiunea activă existentă și înlocuiește numai candidatul în așteptare mai vechi de la acea adresă. Sesiunea activă este înlocuită numai după confirmarea criptată autentificată și promovarea candidatului; dacă confirmarea eșuează ori candidatul expiră, este înlocuit sau evacuat din cauza capacității, sesiunea activă rămâne intactă. Toată starea securizată rămâne numai în memorie, este locală procesului și se pierde la repornire.</p>
+          <p>Înregistrările anti-replay pentru handshake, precum și sesiunile în așteptare și active, au TTL-uri monotone și limite stricte de capacitate. Fiecare nonce DATA admis rămâne însă memorat pentru întreaga epocă utilizabilă a cheii de trafic direcționale, fără TTL independent și fără eliminare cât timp acea epocă rămâne utilizabilă. Epuizarea invalidează în mod sigur (fail-closed) numai epoca de cheie afectată; recuperarea folosește un handshake autentificat nou, cu chei direcționale proaspete.</p>
+          <p>Un candidat în așteptare înlocuiește numai un candidat mai vechi pentru aceeași relație dintre listenerul fizic și peer și păstrează orice sesiune activă până când confirmarea criptată autentificată reușește. Sesiunile aceluiași peer pe listenere UDPSEC fizice separate sunt izolate unele de altele; limitele agregate de capacitate rămân la nivelul procesului. Toată starea securizată rămâne numai în memorie, este locală procesului și se pierde la repornire.</p>
         </article>
         <article class="card state-card">
           <div class="icons" aria-hidden="true">📊</div>
@@ -424,7 +426,7 @@
       <div class="section-heading">
         <p class="eyebrow">Ciclul de viață UDPSEC</p>
         <h2>Transport autentificat cu stare locală limitată</h2>
-        <p class="section-intro">Traseul UDPSEC actual dintre <span class="kbd">nmea_sproxy</span> și serviciul <span class="kbd">aismixer</span> folosește un schimb ECDHE efemer autentificat și chei direcționale independente, cu o confirmare criptată cu secvența zero înainte ca clientul să considere stabilită o sesiune nouă.</p>
+        <p class="section-intro">Traseul UDPSEC actual din codul-sursă dintre <span class="kbd">nmea_sproxy</span> și serviciul <span class="kbd">aismixer</span> folosește identități ECDSA P-256 pe termen lung configurate, ECDHE efemer P-256 semnat, chei AES-256-GCM direcționale proaspete și dovada criptată a posesiei cheilor prin confirmarea cu secvența zero înainte ca clientul să considere stabilită o sesiune nouă.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="Fluxul de stabilire a unei sesiuni UDPSEC autentificate">
         <div class="pipeline-node">
@@ -468,13 +470,14 @@
         <article class="card">
           <div class="icons" aria-hidden="true">♻️</div>
           <h3>Actualizare coordonată și stare locală</h3>
-          <p>Ambele endpoint-uri trebuie actualizate împreună. Nu există fallback legacy, mod mixt, comutator pentru negociere, sistem de certificate sau negociere a algoritmilor.</p>
-          <p>Traficul permis declanșează curățarea stării expirate, nu un timer de fundal. Starea anti-replay, a sesiunilor în așteptare și active și a nonce-urilor rămâne numai în memorie, este locală procesului, nepersistentă și se pierde când serviciul repornește.</p>
+          <p>Ambele endpoint-uri trebuie actualizate împreună. După confirmare, mesajele NMEA DATA, schimburile ping/pong pentru verificarea activității și închiderea best-effort sunt autentificate și criptate. O verificare a activității rămasă fără răspuns sau reîmprospătarea planificată opțională a sesiunii pornește proactiv un handshake ECDHE semnat nou, cu chei direcționale proaspete; UDPSEC nu memorează și nu retransmite payload-uri NMEA în timpul recuperării.</p>
+          <p>Recuperarea folosește un handshake autentificat nou. UDPSEC nu are resetare în clar, recuperare <span class="kbd">NOSESSION</span>, control de downgrade sau revenire automată la UDP simplu. Pachetele DATA pentru sesiuni vechi necunoscute sunt ignorate fără răspuns de recuperare în clar. Starea securizată a sesiunilor și protecției anti-replay rămâne numai în memorie, este locală procesului, nepersistentă și se pierde la repornire.</p>
+          <p>UDPSEC funcționează prin NAT sau CGNAT cât timp adresa și portul sursă observate de server rămân stabile. Reasocierea adresei sau portului ori schimbarea rețelei necesită un handshake autentificat nou; sesiunea existentă nu este migrată automat.</p>
         </article>
       </div>
       <div class="callout">
         <p><strong>Forward secrecy, în limitele implementate:</strong> compromiterea ulterioară a unei chei de identitate pe termen lung nu permite, prin ea însăși, reconstruirea cheilor sesiunilor deja încheiate, dacă vechile chei private efemere și secretele ECDHE brute nu mai există și niciun endpoint nu a fost compromis cât timp acestea se aflau în memorie. Compromiterea actuală a unei chei de identitate permite uzurparea identității în sesiuni viitoare. Această proprietate implementată este susținută de validare inginerească, nu de verificare criptografică formală.</p>
-        <p><strong>Limita transportului:</strong> UDPSEC autentifică și criptează pachetele de date și de control în domeniul său, dar nu dovedește veridicitatea AIS și nu detectează spoofing-ul, nu garantează livrarea sau ordinea UDP, nu protejează endpoint-uri compromise și nu oferă rezistență completă la atacuri de refuz al serviciului. Nu ascunde adresele IP ale participanților, temporizarea sau lungimile pachetelor și nici identificatorul stației din ClientHello, transmis în clar; mesajele NOSESSION nu sunt autentificate.</p>
+        <p><strong>Limita transportului:</strong> UDPSEC autentifică și criptează pachetele de date și de control în domeniul său, dar nu dovedește identitatea sau poziția navei, originea fizică ori absența spoofing-ului AIS, nu garantează livrarea sau ordinea UDP, nu protejează endpoint-uri compromise și nu oferă rezistență completă la atacuri de refuz al serviciului. Nu ascunde adresele IP ale participanților, temporizarea sau lungimile pachetelor și nici identificatorul stației din ClientHello, transmis în clar.</p>
         <p>Citiți <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">politica de securitate</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">contractul comportamental</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> și <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki-ul</a> pentru limitele detaliate.</p>
       </div>
     </section>
@@ -483,9 +486,9 @@
       <div class="section-heading">
         <p class="eyebrow">nmea_sproxy și receptoare AIS fizice</p>
         <h2>Conectați receptoare AIS de rețea sau fizice prin nmea_sproxy</h2>
-        <p class="section-intro"><span class="kbd">nmea_sproxy</span> este proxy-ul de la stație care conectează o singură sursă AIS locală la o singură destinație configurată a serviciului <span class="kbd">aismixer</span>.</p>
+        <p class="section-intro"><span class="kbd">nmea_sproxy</span> este proxy-ul de la stație care conectează o singură intrare AIS locală, UDP, serială fizică ori serială virtuală prin USB, la o singură ieșire de rețea: UDPSEC sau UDP simplu configurat explicit.</p>
       </div>
-      <div class="architecture-path" role="group" aria-label="Conectarea unui receptor AIS fizic prin nmea_sproxy la serviciul aismixer">
+      <div class="architecture-path" role="group" aria-label="Conectarea unui receptor AIS fizic prin nmea_sproxy la o ieșire de rețea">
         <div class="path-node">
           <span class="icons" aria-hidden="true">📻</span>
           <strong>Receptor AIS fizic</strong>
@@ -504,7 +507,8 @@
         </div>
         <div class="path-node">
           <span class="icons" aria-hidden="true">🛰️</span>
-          <strong><span class="kbd">aismixer</span></strong>
+          <strong>Ieșire de rețea</strong>
+          <small><span class="kbd">aismixer</span> prin UDPSEC sau un consumator prin UDP simplu, într-o rețea de încredere</small>
         </div>
       </div>
       <div class="grid proxy-grid">
@@ -524,7 +528,7 @@
         </article>
         <article class="card">
           <h3>Model clar al relației</h3>
-          <p>O intrare locală este asociată unei singure ieșiri configurate. <span class="kbd">nmea_sproxy</span> nu mixează, nu distribuie către mai multe ieșiri, nu rutează, nu deduplică, nu asamblează AIS multipart și nu rescrie metadatele TAG.</p>
+          <p>O intrare locală este asociată unei singure ieșiri configurate. Fiecare potrivire AIS NMEA acceptată este redirecționată fără blocuri TAG de intrare, prefixe, octeți din jur și terminatori. <span class="kbd">nmea_sproxy</span> nu mixează, nu distribuie către mai multe ieșiri, nu rutează, nu deduplică și nu asamblează AIS multipart.</p>
         </article>
       </div>
       <div class="callout">
@@ -536,7 +540,7 @@
       <div class="section-heading">
         <p class="eyebrow">Implementare OpenWrt la marginea rețelei</p>
         <h2>Rulați serviciul <span class="kbd">aismixer</span> sau serviciul <span class="kbd">nmea_sproxy</span> pe OpenWrt</h2>
-        <p class="section-intro">Depozitul AISMixer APK semnat pentru OpenWrt 25.12 publică implementarea Python/procd pentru arhitecturile <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</p>
+        <p class="section-intro">Depozitul AISMixer APK semnat pentru OpenWrt 25.12 publică versiunea <span class="kbd">0.2.1-r1</span> a pachetelor Python/procd pentru arhitecturile <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
         <article class="card">
@@ -560,12 +564,13 @@
         <article class="card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Încredere UDPSEC explicită</h3>
-          <p>Serviciile <span class="kbd">aismixer</span> și <span class="kbd">nmea_sproxy</span> își generează automat perechile locale de chei de identitate la prima instalare sau pornire, după caz. Materialul de încredere UDPSEC nu este transferat niciodată automat între participanți: instalați local cheia publică a serviciului <span class="kbd">aismixer</span> la stație și autorizați cheia publică a stației în serviciul <span class="kbd">aismixer</span>.</p>
+          <p>Pachetele nu includ chei private. Fluxul init OpenWrt al serviciului <span class="kbd">aismixer</span> pregătește identitatea locală și, când există o cheie privată validă, poate reface cheia publică pereche. <span class="kbd">nmea_sproxy</span> poate crea perechea canonică a stației numai când ambele fișiere lipsesc; o pereche de chei a proxy-ului parțială, invalidă sau neconcordantă produce un refuz fail-closed fără înlocuire automată. Încrederea UDPSEC este întotdeauna configurată manual: instalați cheia publică <span class="kbd">aismixer</span> la stație și autorizați cheia publică a stației în <span class="kbd">aismixer</span>.</p>
         </article>
       </div>
-      <p class="boundary-note"><strong>Arhitectura pachetului.</strong> Selectați arhitectura pachetului care corespunde surselor oficiale de pachete OpenWrt configurate pe dispozitiv; nu determinați această valoare folosind <span class="kbd">apk --print-arch</span>.</p>
+      <p class="boundary-note"><strong>Arhitectura pachetului.</strong> <span class="kbd">PKGARCH:=all</span> descrie payload-ul Python și shell independent de arhitectură; nu face pachetul disponibil în feed-ul fiecărei arhitecturi. Feed-urile construite, publicate și validate în prezent sunt <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>, fără a exclude intenționat alte ținte potrivite. Selectați arhitectura feed-ului configurat pe dispozitiv; nu o determinați folosind <span class="kbd">apk --print-arch</span>.</p>
       <p class="boundary-note"><strong>Spațiu disponibil pentru scriere.</strong> Runtime-ul Python și dependențele necesită considerabil mai mult spațiu disponibil pentru scriere decât o instalare OpenWrt minimală. Verificați spațiul liber din overlay înainte de instalare; extroot este o opțiune de implementare OpenWrt atunci când spațiul intern disponibil pentru scriere este limitat.</p>
-      <pre class="command-example" aria-label="Instalarea pachetului aismixer din depozitul AISMixer APK semnat"><code># Selectați 'x86_64' sau 'mips_24kc':
+      <p class="boundary-note"><strong>Siguranță la prima pornire.</strong> Hook-urile pachetului activează și pornesc <span class="kbd">aismixer</span> în timpul instalării, iar configurația inclusă inițial conține listenere UDP simple cu acces larg. Aplicați în prealabil reguli de firewall sau izolare de rețea și verificați spațiul disponibil pentru scriere. Opriți serviciul imediat după instalare, configurați listenerele și autorizarea UDPSEC, apoi porniți-l și verificați-l.</p>
+      <pre class="command-example" aria-label="Instalarea pachetului aismixer din depozitul AISMixer APK semnat"><code># Feed-uri publicate în prezent: x86_64 sau mips_24kc
 AISMIXER_ARCH='x86_64'
 
 wget -O /etc/apk/keys/aismixer-openwrt.pem \
@@ -580,16 +585,23 @@ grep -qxF "$REPO_URL" "$REPO_FILE" 2&gt;/dev/null || {
 }
 
 apk update
-apk add aismixer</code></pre>
+apk add aismixer
+/etc/init.d/aismixer stop
+vi /etc/aismixer/config.yaml
+vi /etc/aismixer/authorized_keys.yaml
+/etc/init.d/aismixer start
+/etc/init.d/aismixer status
+logread -e aismixer</code></pre>
+      <p class="boundary-note"><strong>Versiunea pachetelor.</strong> Pachetele <span class="kbd">0.2.1-r1</span> publicate folosesc o revizie fixată a sursei și pot rămâne în urma modificărilor ulterioare din <span class="kbd">main</span>. Verificați revizia pachetului, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">lista de modificări</a> și <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">versiunile publicate</a> înainte de a presupune că sunt incluse consolidări mai noi.</p>
       <p class="boundary-note"><strong>Validare cap la cap.</strong> Calea de implementare pentru <span class="kbd">mips_24kc</span> a fost validată cap la cap cu intrare AIS serială fizică, <span class="kbd">nmea_sproxy</span>, UDPSEC autentificat, procesare prin serviciul <span class="kbd">aismixer</span>, funcționarea serviciilor prin <span class="kbd">procd</span>, control local și observabilitate runtime.</p>
-      <p class="boundary-note"><strong>Doar punctul terminal de lângă receptor.</strong> Folosiți <span class="kbd">apk add nmea_sproxy</span> în loc de <span class="kbd">apk add aismixer</span> pentru a instala independent proxy-ul de la stație. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> și <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> pentru pașii compleți de implementare și configurare a încrederii.</p>
+      <p class="boundary-note"><strong>Doar punctul terminal de lângă receptor.</strong> Folosiți <span class="kbd">apk add nmea_sproxy</span> în loc de <span class="kbd">apk add aismixer</span> pentru a instala independent proxy-ul de la stație. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> și <a href="https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment" target="_blank" rel="noopener">ghidul de implementare OpenWrt</a> pentru pașii compleți de implementare și configurare a încrederii.</p>
     </section>
 
     <section id="operations" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Implementare și operare convenționale pe Linux</p>
-        <h2>Un ciclu de viață Linux și systemd conceput pentru instalări reale</h2>
-        <p class="section-intro">Pentru gazdele Linux convenționale, implementarea systemd gestionată din depozit menține aliniate fișierele de runtime, starea operatorului, controlul local al rutării și statisticile runtime read-only. OpenWrt folosește calea APK/procd descrisă mai sus.</p>
+        <p class="eyebrow">Implementare și operare pentru familia Debian</p>
+        <h2>Un ciclu de viață pentru familia Debian și systemd, conceput pentru instalări reale</h2>
+        <p class="section-intro">Pentru gazde Debian și Raspberry Pi OS cu systemd, implementarea gestionată din depozit menține aliniate fișierele de runtime, starea operatorului, controlul local al rutării și statisticile runtime read-only. OpenWrt folosește calea APK/procd descrisă mai sus.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -600,7 +612,7 @@ apk add aismixer</code></pre>
         <article class="card">
           <div class="icons" aria-hidden="true">🔄</div>
           <h3>Instalare, actualizare și dezinstalare</h3>
-          <p>Scripturile pentru ciclul de viață gestionează rularea ca root sau prin sudo și întrețin fișierele runtime și unitățile de serviciu instalate.</p>
+          <p>Scripturile pentru ciclul de viață gestionează rularea ca root sau prin sudo și întrețin fișierele runtime și unitățile de serviciu instalate. Updaterul AISMixer repornește serviciul și poate porni un serviciu inactiv; updaterul <span class="kbd">nmea_sproxy</span> reîncarcă systemd, dar nu pornește și nu repornește instanțele proxy. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> și <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a>.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🗝️</div>
@@ -630,9 +642,9 @@ apk add aismixer</code></pre>
             <li>Rutare compilată bazată numai pe destinații numerice, octeți exacți și imuabili codificați o singură dată pentru fiecare propoziție emisă, rezultate <span class="kbd">OutputBatch</span> ordonate și o barieră locală și ordonată de finalizare egress.</li>
             <li>Zone logice și deduplicare per destinație, actualizări atomice ale rutării locale procesului, <span class="kbd">aismixerctl</span> interactiv și statistici read-only agregate, per intrare și per ieșire.</li>
             <li>Asamblare multipart deterministă, gestionarea TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> și deduplicare globală sau per destinație.</li>
-            <li>UDPSEC cu ECDHE efemer P-256 autentificat, identități ECDSA P-256 pe termen lung, chei AES-GCM direcționale independente și stare securizată locală cu limite stricte.</li>
+            <li>UDPSEC cu ECDHE efemer P-256 autentificat, identități ECDSA P-256 pe termen lung configurate, chei AES-256-GCM direcționale proaspete, confirmarea criptată a posesiei cheilor, date și verificări ale activității autentificate și criptate, închidere best-effort autentificată și criptată, protecție anti-replay DATA pe întreaga epocă a cheii, stare limitată fail-closed și izolarea sesiunilor pe listener fizic.</li>
             <li>Pentru fiecare proces sau instanță systemd <span class="kbd">nmea_sproxy</span>, o intrare UDP sau serială spre o ieșire UDPSEC ori o ieșire plain-UDP configurată explicit pentru o rețea de încredere, plus controale endpoint IPv4/IPv6.</li>
-            <li>Implementare Linux convențională cu <span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață care gestionează privilegiile, păstrarea stării operatorului și CLI global pentru operatori, alături de implementarea APK/procd semnată pentru OpenWrt 25.12, publicată pentru <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</li>
+            <li>Implementare pentru familia Debian cu <span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață care gestionează privilegiile, păstrarea stării operatorului și CLI global pentru operatori, alături de implementarea APK/procd semnată pentru OpenWrt 25.12, publicată pentru <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</li>
           </ul>
         </article>
         <article class="card status-card status-next">
@@ -653,6 +665,7 @@ apk add aismixer</code></pre>
         <a href="https://github.com/iliyan85/aismixer/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">Ghidul nmea_sproxy</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">Politica de securitate</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/LICENSE" target="_blank" rel="noopener">Licență</a>
       </div>
     </section>
 
@@ -698,7 +711,7 @@ apk add aismixer</code></pre>
           <h3>Iliyan Iliev, PhD</h3>
           <p class="maintainer-role">Fondator, inițiator și responsabil de întreținerea AISMixer</p>
           <p>Dezvoltator și cercetător în sisteme backend și de rețea, interesat de procesarea AIS/NMEA, securitatea maritimă și regională, transport și turism.</p>
-          <p><strong>Dezvoltare asistată de IA:</strong> ChatGPT sprijină analiza arhitecturală, planificarea, documentația și revizuirea. OpenAI Codex sprijină analiza depozitului, implementarea, testarea și validarea. Ambele instrumente sunt utilizate sub conducerea fondatorului; deciziile și responsabilitatea finală pentru proiect rămân umane.</p>
+          <p><strong>Dezvoltare asistată de IA:</strong> ChatGPT sprijină analiza arhitecturală, planificarea, documentația și revizuirea. OpenAI Codex sprijină analiza depozitului, implementarea, testarea și validarea. Anthropic Claude Code sprijină revizuirea depozitului, preluarea implementării, verificarea încrucișată, testarea și validarea. Aceste instrumente sunt utilizate sub conducerea fondatorului; deciziile și responsabilitatea finală pentru proiect rămân umane.</p>
         </div>
         <div class="links maintainer-links" role="group" aria-label="Legături ale responsabilului de întreținere">
           <a href="https://github.com/iliyan85" target="_blank" rel="noopener">Profil GitHub</a>
@@ -718,6 +731,7 @@ apk add aismixer</code></pre>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a>
         <a href="https://github.com/iliyan85/aismixer/discussions" target="_blank" rel="noopener">Discussions</a>
         <a href="https://github.com/iliyan85/aismixer/issues" target="_blank" rel="noopener">Issues</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/LICENSE" target="_blank" rel="noopener">Licență</a>
         <a href="mailto:iliyan85@gmail.com?subject=AISMixer%20contact">Contact</a>
       </nav>
     </div>
