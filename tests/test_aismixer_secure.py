@@ -16,12 +16,23 @@ PREPARED_SERVER_PRIVATE_KEY = ec.derive_private_key(29, ec.SECP256R1())
 
 
 class _PacketLoop:
+    """Fake receive loop.
+
+    Each queued item is either an ``(data, addr)`` packet tuple or a
+    ``BaseException`` instance to raise from ``sock_recvfrom`` on that turn,
+    so tests can simulate a receive-time OS error interleaved with real
+    datagrams without touching the real socket layer.
+    """
+
     def __init__(self, packets):
         self._packets = list(packets)
 
     async def sock_recvfrom(self, _sock, _size):
         if self._packets:
-            return self._packets.pop(0)
+            item = self._packets.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
         raise asyncio.CancelledError()
 
 
@@ -794,3 +805,187 @@ def test_udpsec_queue_exit_does_not_account_frame_as_accepted(
     assert snapshot.transport_bytes == len(packet)
     assert snapshot.accepted_frames == 0
     assert snapshot.payload_bytes == 0
+
+
+@pytest.mark.parametrize(
+    "recv_error",
+    [
+        pytest.param(
+            ConnectionResetError("simulated ICMP port-unreachable reset"),
+            id="connection_reset",
+        ),
+        pytest.param(
+            ConnectionRefusedError("simulated ICMP port-unreachable refusal"),
+            id="connection_refused",
+        ),
+    ],
+)
+def test_secure_server_loop_contains_recoverable_recv_error(
+    monkeypatch,
+    recv_error,
+):
+    """A recoverable peer/network recv error must not crash the listener,
+    must not mutate secure state, must not be counted as a received
+    transport packet, and must not prevent subsequent valid traffic from
+    being processed."""
+
+    address = ("127.0.0.1", 50130)
+    client_key = b"\x01" * 32
+    server_key = b"\x02" * 32
+    state = secure.SecureState()
+    endpoint_token = secure._new_endpoint_token()
+    _install_session(state, endpoint_token, address, client_key, server_key)
+    stats_before = state.stats()
+
+    packet = _secure_data_packet(
+        client_key,
+        b"\x50" * 12,
+        {
+            "type": "nmea",
+            "payload": "after contained recv error",
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+    )
+    traffic = InputTrafficMetrics("udpsec-ingress:0:secure", "udpsec")
+    queue = _Queue()
+
+    packets = [recv_error, (packet, address)]
+
+    _run_packets(
+        monkeypatch,
+        packets,
+        queue=queue,
+        traffic=traffic,
+        state=state,
+        endpoint_token=endpoint_token,
+    )
+
+    # Subsequent valid traffic was still processed: exactly the one frame
+    # from the packet that followed the contained recv error.
+    assert len(queue.items) == 1
+    assert queue.items[0].payload == b"after contained recv error"
+
+    # The failed receive produced no data, so it must not be counted as a
+    # received transport packet.
+    snapshot = traffic.input_traffic_snapshot()
+    assert snapshot.transport_packets == 1
+    assert snapshot.transport_bytes == len(packet)
+    assert snapshot.accepted_frames == 1
+
+    # No secure state changed as a side effect of the failed receive itself;
+    # the only state change is the single accepted DATA nonce from the
+    # valid packet that followed it.
+    stats_after = state.stats()
+    assert stats_after.sessions_created == stats_before.sessions_created
+    assert stats_after.sessions_replaced == stats_before.sessions_replaced
+    assert stats_after.sessions_closed == stats_before.sessions_closed
+    assert (
+        stats_after.pending_sessions_created
+        == stats_before.pending_sessions_created
+    )
+    assert (
+        stats_after.handshake_replay_accepted
+        == stats_before.handshake_replay_accepted
+    )
+    assert stats_after.current_sessions == stats_before.current_sessions
+    assert (
+        stats_after.data_nonces_accepted
+        == stats_before.data_nonces_accepted + 1
+    )
+    assert stats_after.data_nonce_replays == stats_before.data_nonce_replays
+
+
+def test_secure_server_loop_propagates_unclassified_os_error(monkeypatch):
+    """A generic/unclassified OSError from the receive boundary is not a
+    recognised recoverable peer/network condition (for example, a broken
+    local socket descriptor) and must propagate out of the secure listener
+    so the essential-task supervisor's fail-fast semantics still apply."""
+
+    fatal_error = OSError(9, "Bad file descriptor")
+    fake_socket = _Socket()
+    fake_loop = _PacketLoop([fatal_error])
+    monkeypatch.setattr(secure, "asyncio", _AsyncioWithLoop(fake_loop))
+    monkeypatch.setattr(secure, "DEBUG", False)
+    state = secure.SecureState()
+    traffic = InputTrafficMetrics("udpsec-ingress:0:secure", "udpsec")
+    queue = _Queue()
+    endpoint_token = secure._new_endpoint_token()
+
+    with pytest.raises(OSError) as excinfo:
+        asyncio.run(
+            secure._secure_server_loop(
+                fake_socket,
+                queue,
+                "127.0.0.1",
+                9999,
+                endpoint_token=endpoint_token,
+                input_traffic=traffic,
+                state=state,
+                wall_clock=lambda: 1010.0,
+                monotonic_clock=lambda: 1010.0,
+                server_private_key=PREPARED_SERVER_PRIVATE_KEY,
+            )
+        )
+
+    assert excinfo.value is fatal_error
+    assert not isinstance(
+        excinfo.value,
+        (ConnectionResetError, ConnectionRefusedError),
+    )
+    assert queue.items == []
+    assert traffic.input_traffic_snapshot().transport_packets == 0
+    assert state.stats().current_sessions == 0
+
+
+def test_secure_server_loop_propagates_mid_stream_cancellation(monkeypatch):
+    """asyncio.CancelledError raised mid-stream from the receive boundary
+    must keep propagating unchanged, distinct from the recoverable
+    ConnectionResetError/ConnectionRefusedError handling, and distinct from
+    the CancelledError _PacketLoop raises on packet exhaustion."""
+
+    address = ("127.0.0.1", 50131)
+    client_key = b"\x01" * 32
+    server_key = b"\x02" * 32
+    state = secure.SecureState()
+    endpoint_token = secure._new_endpoint_token()
+    _install_session(state, endpoint_token, address, client_key, server_key)
+
+    packet = _secure_data_packet(
+        client_key,
+        b"\x51" * 12,
+        {
+            "type": "nmea",
+            "payload": "before cancellation",
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+    )
+    traffic = InputTrafficMetrics("udpsec-ingress:0:secure", "udpsec")
+    queue = _Queue()
+
+    fake_socket = _Socket()
+    fake_loop = _PacketLoop(
+        [(packet, address), asyncio.CancelledError("mid-stream cancel")]
+    )
+    monkeypatch.setattr(secure, "asyncio", _AsyncioWithLoop(fake_loop))
+    monkeypatch.setattr(secure, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            secure._secure_server_loop(
+                fake_socket,
+                queue,
+                "127.0.0.1",
+                9999,
+                endpoint_token=endpoint_token,
+                input_traffic=traffic,
+                state=state,
+                wall_clock=lambda: 1010.0,
+                monotonic_clock=lambda: 1010.0,
+                server_private_key=PREPARED_SERVER_PRIVATE_KEY,
+            )
+        )
+
+    assert len(queue.items) == 1
+    assert queue.items[0].payload == b"before cancellation"

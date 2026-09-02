@@ -1011,7 +1011,20 @@ async def _secure_server_loop(
     print(f"[+] Secure listener started on {ip}:{port}")
 
     while True:
-        data, addr = await loop.sock_recvfrom(sock, 8192)
+        try:
+            data, addr = await loop.sock_recvfrom(sock, 8192)
+        except (ConnectionResetError, ConnectionRefusedError) as e:
+            # Recoverable peer/network receive condition (for example, an
+            # ICMP port-unreachable response to an earlier reply surfacing as
+            # WSAECONNRESET on the next Windows recv). This is not a broken
+            # local socket or a runtime invariant failure, so the listener
+            # stays up and simply awaits the next datagram. Any other OSError
+            # is left to propagate to the essential-task supervisor.
+            print(
+                f"[!] Secure listener recv contained {type(e).__name__} "
+                f"(peer/network condition): {e}"
+            )
+            continue
         if input_traffic is not None:
             input_traffic.transport_received(data)
         source_ip = addr[0]
