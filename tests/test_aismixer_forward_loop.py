@@ -2323,6 +2323,89 @@ def test_earlier_s_is_reused_when_completion_has_no_s(
     assert first_tag.startswith(f"c:123,s:early,g:1-2-{group_id}*")
 
 
+def test_duplicate_fragment_s_updates_cached_value_used_at_completion(
+    monkeypatch,
+):
+    """Regression for Point 5: an exact-duplicate arrival (same assembler
+    ordinal, same NMEA fragment text, different TAG s) may update the
+    cached multipart s, and that cached value supplies the effective s when
+    the completion arrival itself carries no s of its own."""
+    group_id = "424242"
+    first = make_nmea_sentence("AIVDM,2,1,7,A,11SDUP,0")
+    second = make_nmea_sentence("AIVDM,2,2,7,A,22SDUP,0")
+    earlier_arrival = f"\\s:early,g:1-2-{group_id}*00\\{first}"
+    # Reuses the exact same NMEA fragment text as earlier_arrival, so the
+    # assembler classifies this as DUPLICATE, not CONFLICT; only the TAG s
+    # differs.
+    duplicate_arrival = f"\\s:duplicate,g:1-2-{group_id}*00\\{first}"
+    # Completion carries no s of its own, so it cannot mask the cached value.
+    completion_arrival = f"\\g:2-2-{group_id}*00\\{second}"
+
+    async def run():
+        queue, task, fake_forwarder = await start_forward_loop_capture(
+            monkeypatch,
+            station_id="",
+        )
+        try:
+            await queue.put(make_event(earlier_arrival))
+            await queue.put(make_event(duplicate_arrival))
+            await asyncio.sleep(0.05)
+            if task.done():
+                task.result()
+            # Neither the earlier nor the duplicate arrival is a completing
+            # arrival, so neither emits a message by itself.
+            assert fake_forwarder.messages == []
+
+            await queue.put(make_event(completion_arrival))
+            # If the second arrival had instead been misclassified as a
+            # CONFLICT, ordinal 1 would have been discarded and this
+            # ordinal-2-only completion could never reach 2 sends; this
+            # wait times out rather than passing silently in that case.
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=2,
+            )
+
+            # A later group reusing the same AssemblyKey (same sequential ID
+            # and channel) proves the completed group's s context was
+            # consumed, not merely overwritten.
+            fresh_first = make_nmea_sentence("AIVDM,2,1,7,A,11SFRE,0")
+            fresh_second = make_nmea_sentence("AIVDM,2,2,7,A,22SFRE,0")
+            await queue.put(make_event(fresh_first))
+            await queue.put(make_event(fresh_second))
+            await wait_for_forwarder_activity(
+                fake_forwarder,
+                task,
+                broadcast_count=4,
+            )
+            return fake_forwarder
+        finally:
+            await cancel_task(task)
+
+    fake_forwarder = asyncio.run(run())
+    messages = fake_forwarder.messages
+    assert len(messages) == 4
+    assert first in messages[0]
+    assert second in messages[1]
+    assert "11SFRE" in messages[2]
+    assert "22SFRE" in messages[3]
+
+    completed_tag = leading_tag(messages[0])
+    # Contract: an exact duplicate may update the cached s, and completion
+    # (which carries no s of its own) falls back to that cached value.
+    assert re.fullmatch(
+        rf"c:\d+,s:duplicate,g:1-2-{group_id}\*[0-9A-F]{{2}}",
+        completed_tag,
+    )
+    assert all("s:early" not in message for message in messages)
+    assert all("s:duplicate" not in message for message in messages[2:])
+
+    # The completed group's cached s does not leak into a later, unrelated
+    # completion that reuses the same AssemblyKey.
+    assert ",s:192_0_2_10," in leading_tag(messages[2])
+
+
 def test_structural_non_numeric_g_enables_multipart_s_cache(
     monkeypatch,
 ):
