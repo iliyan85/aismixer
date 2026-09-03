@@ -152,6 +152,21 @@ initial_routing_table = load_optional_routing_table(
 routing_state = RoutingState(initial_routing_table)
 
 
+def _validate_g_id_digits(value):
+    """Return one supported width for generated numeric group IDs.
+
+    The upper bound is an implementation/operational guardrail, not a protocol
+    limit: it rejects pathological configuration while still leaving very large
+    practical uniqueness headroom for the generated GID.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("g_id_digits must be an integer between 1 and 32")
+    if not 1 <= value <= 32:
+        raise ValueError("g_id_digits must be an integer between 1 and 32")
+    return value
+
+
 def create_data_plane_processor() -> PythonDataPlaneProcessor:
     """Create the processor owned by one production runtime invocation."""
 
@@ -160,7 +175,7 @@ def create_data_plane_processor() -> PythonDataPlaneProcessor:
         preserve_ingress_c=C_PRESERVE_INGRESS_C,
         preserve_ingress_gid=G_PRESERVE_INGRESS_GID,
         always_tag_single=G_ALWAYS_TAG_SINGLE,
-        gid_digits=G_ID_DIGITS,
+        gid_digits=_validate_g_id_digits(G_ID_DIGITS),
     )
 
 
@@ -892,6 +907,13 @@ async def main(
     sec_input_policies = compile_input_policies(SEC_INPUTS, "sec_inputs")
     udp_input_policies = compile_input_policies(UDP_INPUTS, "udp_inputs")
     load_optional_routing_control_unix_settings(config)
+
+    # Reject static configuration (including g_id_digits) before any step with a
+    # persistent side effect: prepare_udpsec_ingress_activation below can
+    # generate and write server key material.
+    processor_queue = _BoundedProcessingQueue(processing_queue_maxsize)
+    processor = create_data_plane_processor()
+
     udpsec_identity = prepare_udpsec_ingress_activation(SEC_INPUTS)
     if udpsec_identity is not None and udpsec_identity.generated:
         print(
@@ -899,8 +921,6 @@ async def main(
             f"{udpsec_identity.public_path}"
         )
 
-    processor_queue = _BoundedProcessingQueue(processing_queue_maxsize)
-    processor = create_data_plane_processor()
     input_queues = []
     input_traffic = []
     egress_queue = _ObservedQueue(name="egress", maxsize=1)

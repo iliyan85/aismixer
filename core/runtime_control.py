@@ -42,7 +42,7 @@ _ServiceFactory: TypeAlias = Callable[
 ]
 _ProtocolFactory: TypeAlias = Callable[[object, RuntimeStatisticsSource], object]
 _ServerFactory: TypeAlias = Callable[..., object]
-_OCTAL_MODE_RE = re.compile(r"^[0-7]{3,4}$")
+_CANONICAL_OCTAL_MODE_RE = re.compile(r"^0[0-7]{3}$")
 
 
 def load_optional_routing_control_unix_settings(
@@ -174,22 +174,17 @@ def _load_socket_mode(unix: Mapping[str, object]) -> int:
         return DEFAULT_CONTROL_SOCKET_MODE
 
     socket_mode = unix["socket_mode"]
-    if isinstance(socket_mode, bool):
+    # A raw YAML scalar (int or bool) has already lost the operator's intended
+    # radix, so only an explicit canonical octal string is accepted: exactly
+    # four characters "0000".."0777" with a leading zero. The resolved integer
+    # is what the lower-level server API receives.
+    if (
+        not isinstance(socket_mode, str)
+        or _CANONICAL_OCTAL_MODE_RE.fullmatch(socket_mode) is None
+    ):
         raise RuntimeControlConfigError(
-            "'control.unix.socket_mode' must be an octal permission mode."
+            "'control.unix.socket_mode' must be a canonical octal permission "
+            'string from "0000" to "0777" '
+            "(exactly four characters with a leading zero)."
         )
-
-    if isinstance(socket_mode, int):
-        mode = socket_mode
-    elif isinstance(socket_mode, str) and _OCTAL_MODE_RE.fullmatch(socket_mode):
-        mode = int(socket_mode, 8)
-    else:
-        raise RuntimeControlConfigError(
-            "'control.unix.socket_mode' must be an octal permission mode."
-        )
-
-    if mode < 0 or mode > 0o777:
-        raise RuntimeControlConfigError(
-            "'control.unix.socket_mode' must be an octal permission mode."
-        )
-    return mode
+    return int(socket_mode, 8)

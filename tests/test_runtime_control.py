@@ -203,7 +203,10 @@ def test_default_max_request_bytes_and_socket_mode():
     settings = load_optional_routing_control_unix_settings(enabled_config())
 
     assert settings.max_request_bytes == DEFAULT_CONTROL_MAX_REQUEST_BYTES
+    # Absent 'socket_mode' resolves to the internal default without being
+    # routed through the user-input canonical-string parser.
     assert settings.socket_mode == DEFAULT_CONTROL_SOCKET_MODE
+    assert DEFAULT_CONTROL_SOCKET_MODE == 0o660
 
 
 def test_custom_max_request_bytes_is_accepted():
@@ -225,22 +228,46 @@ def test_invalid_max_request_bytes_is_rejected(max_request_bytes):
 @pytest.mark.parametrize(
     ("socket_mode", "expected"),
     [
-        (0o600, 0o600),
-        ("660", 0o660),
+        ("0000", 0o000),
+        ("0600", 0o600),
+        ("0640", 0o640),
         ("0660", 0o660),
+        ("0700", 0o700),
+        ("0777", 0o777),
     ],
 )
-def test_socket_mode_valid_forms_are_accepted(socket_mode, expected):
+def test_socket_mode_canonical_octal_strings_are_accepted(socket_mode, expected):
     settings = load_optional_routing_control_unix_settings(
         enabled_config(socket_mode=socket_mode)
     )
 
     assert settings.socket_mode == expected
+    assert type(settings.socket_mode) is int
 
 
 @pytest.mark.parametrize(
     "socket_mode",
-    [True, -1, 0o1000, "668", "0888", "6600", "u=rw,g=rw", "abc"],
+    [
+        # Raw scalars: YAML parsing has already lost the intended radix.
+        # (YAML 'socket_mode: 0660' parses to int 432, same as literal 432.)
+        True,
+        384,
+        432,
+        444,
+        0,
+        -1,
+        0o1000,
+        # Non-canonical strings: wrong length, missing leading zero, non-octal.
+        "600",
+        "660",
+        "668",
+        "0888",
+        "6600",
+        "00600",
+        "0o660",
+        "u=rw,g=rw",
+        "abc",
+    ],
 )
 def test_invalid_socket_mode_is_rejected(socket_mode):
     with pytest.raises(RuntimeControlConfigError, match="socket_mode"):
@@ -813,7 +840,9 @@ def test_plain_main_with_no_identity_starts_without_creating_keys(
     asyncio.run(scenario())
 
 
-def test_main_prepares_udpsec_identity_before_runtime_activation(monkeypatch):
+def test_main_validates_processor_config_before_udpsec_identity_and_activation(
+    monkeypatch,
+):
     async def scenario():
         events = []
         udp_socket = _MainTestSocket()
@@ -876,8 +905,64 @@ def test_main_prepares_udpsec_identity_before_runtime_activation(monkeypatch):
 
         await aismixer.main()
 
-        assert events[0][0] == "identity"
-        assert events[1:] == ["processor", "listener", "supervisor"]
+        # Processor construction (where g_id_digits is validated) runs before
+        # UDPSEC identity preparation, which can write persistent key material.
+        # Identity still precedes listener/control activation and supervision.
+        assert events[0] == "processor"
+        assert events[1][0] == "identity"
+        assert events[2:] == ["listener", "supervisor"]
+
+    asyncio.run(scenario())
+
+
+def test_invalid_g_id_digits_blocks_udpsec_identity_and_supervision(monkeypatch):
+    async def scenario():
+        real_factory = aismixer.create_data_plane_processor
+        prepare_calls = []
+        supervision_calls = []
+
+        def fail_prepare(sec_inputs):
+            prepare_calls.append(tuple(sec_inputs))
+            raise AssertionError(
+                "UDPSEC identity preparation must not run when static "
+                "configuration is invalid"
+            )
+
+        async def fail_supervisor(task_specs):
+            supervision_calls.append(tuple(task_specs))
+            raise AssertionError(
+                "no runtime task may be supervised when static configuration "
+                "is invalid"
+            )
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10111,
+                },
+            ),
+            supervisor=fail_supervisor,
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "create_data_plane_processor",
+            real_factory,
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "prepare_udpsec_ingress_activation",
+            fail_prepare,
+        )
+        monkeypatch.setattr(aismixer, "G_ID_DIGITS", 0)
+
+        with pytest.raises(ValueError, match="g_id_digits"):
+            await aismixer.main()
+
+        assert prepare_calls == []
+        assert supervision_calls == []
 
     asyncio.run(scenario())
 

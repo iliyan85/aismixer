@@ -290,6 +290,113 @@ def test_processor_factory_uses_current_runtime_configuration(monkeypatch):
     ]
 
 
+def _forbidden_processor_constructor(**_kwargs):
+    raise AssertionError(
+        "processor must not be constructed with invalid g_id_digits"
+    )
+
+
+@pytest.mark.parametrize("digits", [1, 18, 32])
+def test_g_id_digits_boundary_values_are_accepted(monkeypatch, digits):
+    constructor_calls = []
+
+    def fake_processor_constructor(**kwargs):
+        constructor_calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        aismixer,
+        "PythonDataPlaneProcessor",
+        fake_processor_constructor,
+    )
+    monkeypatch.setattr(aismixer, "G_ID_DIGITS", digits)
+
+    aismixer.create_data_plane_processor()
+
+    assert constructor_calls[0]["gid_digits"] == digits
+
+
+def test_g_id_digits_shipped_default_is_eighteen():
+    assert aismixer._validate_g_id_digits(aismixer.G_ID_DIGITS) == 18
+    assert aismixer.G_ID_DIGITS == 18
+
+
+@pytest.mark.parametrize("digits", [False, True, None, "18", 18.0])
+def test_g_id_digits_rejects_non_integer_configuration(monkeypatch, digits):
+    monkeypatch.setattr(
+        aismixer,
+        "PythonDataPlaneProcessor",
+        _forbidden_processor_constructor,
+    )
+    monkeypatch.setattr(aismixer, "G_ID_DIGITS", digits)
+
+    with pytest.raises(TypeError, match="g_id_digits"):
+        aismixer.create_data_plane_processor()
+
+
+@pytest.mark.parametrize("digits", [0, -1, 33])
+def test_g_id_digits_rejects_out_of_range_configuration(monkeypatch, digits):
+    monkeypatch.setattr(
+        aismixer,
+        "PythonDataPlaneProcessor",
+        _forbidden_processor_constructor,
+    )
+    monkeypatch.setattr(aismixer, "G_ID_DIGITS", digits)
+
+    with pytest.raises(ValueError, match="g_id_digits"):
+        aismixer.create_data_plane_processor()
+
+
+def test_invalid_g_id_digits_is_rejected_before_any_frame_processing_starts(
+    monkeypatch,
+):
+    async def scenario():
+        supervised_specs = []
+
+        async def spy_supervise_named_tasks(task_specs):
+            supervised_specs.append(tuple(task_specs))
+
+        class MainForwarder:
+            target_ids = ()
+            target_id_by_name = {}
+            all_target_ids = ()
+
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        output_forwarder = MainForwarder()
+
+        monkeypatch.setattr(aismixer, "SEC_INPUTS", [])
+        monkeypatch.setattr(aismixer, "UDP_INPUTS", [])
+        monkeypatch.setattr(aismixer, "config", {"control": None})
+        monkeypatch.setattr(aismixer, "routing_state", RoutingState())
+        monkeypatch.setattr(aismixer, "forwarder", output_forwarder)
+        monkeypatch.setattr(aismixer, "DEBUG", False)
+        monkeypatch.setattr(aismixer, "G_ID_DIGITS", 0)
+        monkeypatch.setattr(
+            aismixer,
+            "_supervise_named_tasks",
+            spy_supervise_named_tasks,
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "build_optional_routing_control_server",
+            lambda *_args: None,
+        )
+
+        with pytest.raises(ValueError, match="g_id_digits"):
+            await aismixer.main()
+
+        # No ingress / processor / egress task was ever supervised, so no
+        # frame-processing path could reach GID generation.
+        assert supervised_specs == []
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("operation", "required_arguments"),
     [
