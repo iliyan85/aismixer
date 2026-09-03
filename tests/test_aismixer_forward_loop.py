@@ -714,6 +714,149 @@ def test_handle_socket_propagates_mid_stream_cancellation(monkeypatch):
     assert queue.items[0].payload == SENTENCE.encode("utf-8")
 
 
+def test_handle_socket_creates_one_frame_from_multi_sentence_datagram(
+    monkeypatch,
+):
+    """Regression for Point 6: one UDP datagram containing two supported
+    AIS sentences produces exactly one enqueued frame carrying both
+    sentences, in order, not two independently-counted frames."""
+    queue = _FakeQueue()
+    packet = (SENTENCE + "\r\n" + SECOND_SENTENCE).encode("utf-8")
+    traffic = InputTrafficMetrics("udp-ingress:0:multi", "udp")
+    fake_loop = _OnePacketLoop((packet, ("192.0.2.10", 17778)))
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            aismixer.handle_socket(
+                object(),
+                queue,
+                input_traffic=traffic,
+            )
+        )
+
+    assert len(queue.items) == 1
+    frame = queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    # No outer whitespace exists to trim here, so full-datagram
+    # normalization is an identity transform on this ASCII payload; both
+    # sentences and the internal CRLF between them remain intact in order.
+    assert frame.payload == packet
+    assert frame.text_mode is PayloadTextMode.UTF8_IGNORE
+    assert frame.source_id == "udp:192.0.2.10"
+    assert frame.alias_for_s is None
+    assert frame.remote_ip == "192.0.2.10"
+    assert frame.assembler_key == "192.0.2.10:17778"
+
+    snapshot = traffic.input_traffic_snapshot()
+    assert snapshot.transport_packets == 1
+    assert snapshot.transport_bytes == len(packet)
+    assert snapshot.accepted_frames == 1
+    assert snapshot.payload_bytes == len(frame.payload)
+
+
+def test_handle_socket_frame_reaches_processor_with_one_snapshot(
+    monkeypatch,
+):
+    """Regression for Point 6: a frame produced by the real handle_socket()
+    boundary from a two-sentence datagram binds one routing snapshot and
+    emits both sentences, in order, under that one binding."""
+    ingress_queue = _FakeQueue()
+    packet = (SENTENCE + "\r\n" + SECOND_SENTENCE).encode("utf-8")
+    fake_loop = _OnePacketLoop((packet, ("192.0.2.10", 17778)))
+
+    with monkeypatch.context() as socket_patch:
+        socket_patch.setattr(
+            aismixer, "asyncio", _FakeAsyncioModule(fake_loop)
+        )
+        socket_patch.setattr(aismixer, "DEBUG", False)
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                aismixer.handle_socket(object(), ingress_queue)
+            )
+
+    assert len(ingress_queue.items) == 1
+    real_frame = ingress_queue.items[0]
+    assert isinstance(real_frame, IngressFrame)
+
+    routing_table = RecordingRoutingTable((0,))
+    routing_state = RecordingRoutingState(routing_table)
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [real_frame],
+            expected_targeted_sends=2,
+            routing_state=routing_state,
+        )
+    )
+
+    assert routing_state.snapshot_calls == 1
+    assert routing_table.source_ids == [real_frame.source_id]
+    assert len(fake_forwarder.targeted_messages) == 2
+    assert SENTENCE in fake_forwarder.targeted_messages[0][1]
+    assert SECOND_SENTENCE in fake_forwarder.targeted_messages[1][1]
+    assert (
+        fake_forwarder.targeted_messages[0][0]
+        == fake_forwarder.targeted_messages[1][0]
+    )
+
+
+def test_handle_socket_normalizes_invalid_utf8_around_valid_sentence(
+    monkeypatch,
+):
+    """Regression for Point 6: the documented decode(errors="ignore")
+    .strip() normalization discards invalid UTF-8 bytes surrounding a
+    valid AIS sentence while leaving the sentence itself intact and
+    forwardable. This freezes existing behavior; it does not claim
+    byte-for-byte preservation, which the current contract does not
+    provide."""
+    queue = _FakeQueue()
+    packet = b"\xff\xfe" + SENTENCE.encode("ascii") + b"\x80"
+    traffic = InputTrafficMetrics("udp-ingress:0:invalid-utf8", "udp")
+    fake_loop = _OnePacketLoop((packet, ("192.0.2.10", 17778)))
+
+    with monkeypatch.context() as socket_patch:
+        socket_patch.setattr(
+            aismixer, "asyncio", _FakeAsyncioModule(fake_loop)
+        )
+        socket_patch.setattr(aismixer, "DEBUG", False)
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                aismixer.handle_socket(
+                    object(),
+                    queue,
+                    input_traffic=traffic,
+                )
+            )
+
+    assert len(queue.items) == 1
+    frame = queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    # The invalid bytes are discarded, not preserved byte-for-byte; the
+    # valid ASCII sentence remains intact.
+    assert frame.payload == SENTENCE.encode("utf-8")
+    assert frame.text_mode is PayloadTextMode.UTF8_IGNORE
+
+    snapshot = traffic.input_traffic_snapshot()
+    assert snapshot.transport_packets == 1
+    assert snapshot.transport_bytes == len(packet)
+    assert snapshot.accepted_frames == 1
+    assert snapshot.payload_bytes == len(frame.payload)
+
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [frame],
+            expected_broadcast_sends=1,
+        )
+    )
+    assert len(fake_forwarder.messages) == 1
+    assert SENTENCE in fake_forwarder.messages[0]
+
+
 def test_ingress_fan_in_loop_binds_frame_and_drops_unsupported(
     monkeypatch,
 ):
