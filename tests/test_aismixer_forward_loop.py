@@ -304,6 +304,41 @@ def test_handle_socket_creates_ingress_frame_with_udp_source_id(monkeypatch):
     )
 
 
+def test_handle_socket_debug_true_prints_input_trace(monkeypatch, capsys):
+    """Regression for Point 7: explicit debug: true must still enable the
+    existing per-frame INPUT traffic trace."""
+    queue = _FakeQueue()
+    packet = SENTENCE.encode("utf-8")
+    fake_loop = _OnePacketLoop((packet, ("192.0.2.10", 17778)))
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", True)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(aismixer.handle_socket(object(), queue))
+
+    captured = capsys.readouterr()
+    assert "INPUT" in captured.out
+    assert SENTENCE in captured.out
+
+
+def test_handle_socket_debug_false_prints_no_input_trace(monkeypatch, capsys):
+    """Regression for Point 7: explicit (and default) debug: false must
+    disable the per-frame INPUT traffic trace."""
+    queue = _FakeQueue()
+    packet = SENTENCE.encode("utf-8")
+    fake_loop = _OnePacketLoop((packet, ("192.0.2.10", 17778)))
+
+    monkeypatch.setattr(aismixer, "asyncio", _FakeAsyncioModule(fake_loop))
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(aismixer.handle_socket(object(), queue))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
 def test_handle_socket_allows_packet_matching_ingress_policy(monkeypatch):
     queue = _FakeQueue()
     fake_loop = _OnePacketLoop(

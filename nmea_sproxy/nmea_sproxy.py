@@ -814,6 +814,87 @@ def _coerce_input_adapter(local_input, ingress_policy=None):
     return UdpInputAdapter(local_input, ingress_policy)
 
 
+HEARTBEAT_INTERVAL_SECONDS = 60.0
+
+
+class ForwardingStats:
+    """Own relation-lifetime forwarding counters and heartbeat scheduling.
+
+    Both the cumulative counters and the heartbeat deadline belong to the
+    running relation/process, not to one secure session or one plain-output
+    socket incarnation, so they must persist unchanged across successive
+    forward_loop()/plain_udp_forward_loop() invocations (UDPSEC
+    reconnect/rekey, plain-UDP output-socket recreation).
+    """
+
+    __slots__ = ("_messages", "_bytes", "_next_heartbeat_at")
+
+    def __init__(self):
+        self._messages = 0
+        self._bytes = 0
+        self._next_heartbeat_at = None
+
+    def record_forwarded(self, sentence):
+        self._messages += 1
+        self._bytes += len(sentence.encode("utf-8"))
+
+    @property
+    def messages(self):
+        return self._messages
+
+    @property
+    def bytes(self):
+        return self._bytes
+
+    def is_heartbeat_due(self, now):
+        """Return whether the relation-level heartbeat deadline has passed.
+
+        The first call for a fresh instance only establishes the initial
+        deadline and never fires immediately.
+        """
+        if self._next_heartbeat_at is None:
+            self._next_heartbeat_at = now + HEARTBEAT_INTERVAL_SECONDS
+            return False
+        return now >= self._next_heartbeat_at
+
+    def reschedule_heartbeat(self, now):
+        self._next_heartbeat_at = now + HEARTBEAT_INTERVAL_SECONDS
+
+    def heartbeat_remaining(self, now):
+        """Return the non-negative seconds until the next heartbeat."""
+        if self._next_heartbeat_at is None:
+            return HEARTBEAT_INTERVAL_SECONDS
+        return max(0.0, self._next_heartbeat_at - now)
+
+
+def _format_bytes_compact(byte_count):
+    """Render a byte count compactly for the sparse runtime heartbeat."""
+
+    value = float(byte_count)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024.0:
+            return f"{byte_count}B" if unit == "B" else f"{value:.2f}{unit}"
+        value /= 1024.0
+    return f"{value:.2f}TiB"
+
+
+def print_forwarding_heartbeat(input_adapter, output_label, stats, *, session_up=None):
+    """Print a sparse, traffic-rate-independent forwarding summary.
+
+    Sourced entirely from existing adapter/stats state; performs no
+    separate accounting of its own.
+    """
+    input_label = "serial" if isinstance(input_adapter, SerialInputAdapter) else "udp"
+    line = (
+        f"Runtime: input={input_label} output={output_label} "
+        f"forwarded={stats.messages} messages / "
+        f"{_format_bytes_compact(stats.bytes)}"
+    )
+    if session_up is not None:
+        line += f" session={'up' if session_up else 'down'}"
+    print(line)
+
+
 def iter_forwardable_nmea_sentences(data):
     return extract_nmea_sentences(data.decode(errors="replace").strip())
 
@@ -837,17 +918,18 @@ def send_udpsec_nmea_sentence(
     )
 
 
-def forward_input_payload(data, send_sentence):
+def forward_input_payload(data, send_sentence, stats=None):
     for clean_line in iter_forwardable_nmea_sentences(data):
         if not clean_line:
             continue
-        print(clean_line)
         send_sentence(clean_line)
+        if stats is not None:
+            stats.record_forwarded(clean_line)
 
 
-def forward_pending_input(input_adapter, send_sentence):
+def forward_pending_input(input_adapter, send_sentence, stats=None):
     for data in input_adapter.read_pending():
-        forward_input_payload(data, send_sentence)
+        forward_input_payload(data, send_sentence, stats)
 
 
 def send_ping(sock, remote_addr, client_to_server_key, station_id, seq):
@@ -1066,7 +1148,14 @@ def forward_loop(
     session_key_material,
     remote_addr,
     ingress_policy=None,
+    stats=None,
 ):
+    """Run one authenticated forwarding session.
+
+    ``stats`` should be the caller-owned ForwardingStats for the running
+    relation so cumulative counters survive reconnect/rekey across
+    successive calls; a fresh instance is created only when none is given.
+    """
     input_adapter = _coerce_input_adapter(local_input, ingress_policy)
     client_to_server_key = session_key_material.client_to_server_key
     server_to_client_key = session_key_material.server_to_client_key
@@ -1075,6 +1164,7 @@ def forward_loop(
     last_ping_at = session_started_at
     expected_ping_seq = None
     next_ping_seq = 1
+    stats = ForwardingStats() if stats is None else stats
     send_sentence = lambda clean_line: send_udpsec_nmea_sentence(
         clean_line,
         out_sock,
@@ -1129,10 +1219,22 @@ def forward_loop(
         if deadline_reason is not None:
             return deadline_reason
 
+        if stats.is_heartbeat_due(now):
+            print_forwarding_heartbeat(
+                input_adapter,
+                UDPSEC_OUTPUT_TYPE,
+                stats,
+                session_up=(
+                    now < last_authenticated_peer + float(config["peer_timeout"])
+                ),
+            )
+            stats.reschedule_heartbeat(now)
+
         try:
             forward_pending_input(
                 input_adapter,
                 send_sentence,
+                stats,
             )
         except Exception as e:
             print(f"❌ Forwarding error: {e}")
@@ -1155,6 +1257,9 @@ def forward_loop(
         )
         if input_poll_interval is not None:
             poll_timeout = min(poll_timeout, input_poll_interval)
+        # Bound the wait so the heartbeat cadence is explicit rather than
+        # merely incidental to keepalive/session wakeups.
+        poll_timeout = min(poll_timeout, stats.heartbeat_remaining(now))
 
         try:
             readable, _, _ = select.select(
@@ -1203,32 +1308,58 @@ def forward_loop(
                     forward_input_payload(
                         data,
                         send_sentence,
+                        stats,
                     )
             except Exception as e:
                 print(f"❌ Forwarding error: {e}")
                 return SESSION_END_SOCKET_ERROR
 
-def plain_udp_forward_loop(local_input, output_adapter, ingress_policy=None):
+def plain_udp_forward_loop(local_input, output_adapter, ingress_policy=None, stats=None):
+    """Run one plain UDP forwarding pass over the current output socket.
+
+    ``stats`` should be the caller-owned ForwardingStats for the running
+    relation so cumulative counters survive output-socket recreation across
+    successive calls; a fresh instance is created only when none is given.
+    """
     input_adapter = _coerce_input_adapter(local_input, ingress_policy)
+    stats = ForwardingStats() if stats is None else stats
 
     while True:
+        now = time.monotonic()
+        if stats.is_heartbeat_due(now):
+            print_forwarding_heartbeat(input_adapter, UDP_OUTPUT_TYPE, stats)
+            stats.reschedule_heartbeat(now)
+
         send_sentence = output_adapter.send_sentence
         try:
-            forward_pending_input(input_adapter, send_sentence)
+            forward_pending_input(input_adapter, send_sentence, stats)
         except Exception as e:
             print(f"❌ Plain UDP forwarding error: {e}")
             return SESSION_END_SOCKET_ERROR
 
+        # Recompute monotonic time here rather than reusing the value
+        # captured before forward_pending_input(), which may itself take a
+        # non-trivial amount of time.
+        now = time.monotonic()
         input_sockets = input_adapter.selectable_sockets()
         poll_timeout = input_adapter.poll_interval()
+        # Bound an unset (None) or overlong adapter poll interval so a
+        # quiet relation still wakes up in time for its own heartbeat,
+        # rather than blocking indefinitely on select()/sleep().
+        heartbeat_remaining = stats.heartbeat_remaining(now)
+        bounded_timeout = (
+            heartbeat_remaining
+            if poll_timeout is None
+            else min(poll_timeout, heartbeat_remaining)
+        )
 
         if not input_sockets:
-            time.sleep(poll_timeout if poll_timeout is not None else 0.2)
+            time.sleep(bounded_timeout)
             continue
 
         try:
             readable, _, _ = select.select(
-                input_sockets, [], [], poll_timeout
+                input_sockets, [], [], bounded_timeout
             )
         except Exception as e:
             print(f"❌ Plain UDP forwarding error: {e}")
@@ -1239,7 +1370,7 @@ def plain_udp_forward_loop(local_input, output_adapter, ingress_policy=None):
                 continue
             try:
                 for data in input_adapter.read_ready(ready_socket):
-                    forward_input_payload(data, send_sentence)
+                    forward_input_payload(data, send_sentence, stats)
             except Exception as e:
                 print(f"❌ Plain UDP forwarding error: {e}")
                 return SESSION_END_SOCKET_ERROR
@@ -1258,19 +1389,29 @@ def run_plain_udp_relation(
     config,
     ingress_policy=None,
     output_adapter=None,
+    stats=None,
 ):
+    """Run the plain UDP relation for the process lifetime, recreating the
+    output socket as needed.
+
+    One ForwardingStats instance is owned here for the whole relation, so
+    its cumulative counters survive output-socket recreation across
+    successive plain_udp_forward_loop() calls.
+    """
     if output_adapter is None:
         try:
             output_adapter = create_plain_udp_output_adapter(output_config)
         except ProxyConfigError as exc:
             print(f"Configuration error: {exc}", file=sys.stderr)
             return 1
+    stats = ForwardingStats() if stats is None else stats
     try:
         while True:
             reason = plain_udp_forward_loop(
                 local_input,
                 output_adapter,
                 ingress_policy,
+                stats,
             )
             output_adapter.close()
 
@@ -1396,6 +1537,11 @@ def main(argv=None):
         )
 
     active_session_key_material = None
+    # One ForwardingStats instance is owned for the whole process/relation
+    # lifetime here, so cumulative counters survive UDPSEC reconnect/rekey
+    # and plain-UDP output-socket recreation across successive forwarding
+    # loop invocations.
+    stats = ForwardingStats()
     local_input.start()
     try:
         if output_config["type"] == UDP_OUTPUT_TYPE:
@@ -1405,6 +1551,7 @@ def main(argv=None):
                 config,
                 ingress_policy,
                 output_adapter=plain_output,
+                stats=stats,
             )
 
         while True:
@@ -1424,6 +1571,7 @@ def main(argv=None):
                     session_key_material,
                     remote_addr,
                     ingress_policy,
+                    stats,
                 )
                 if reason == SESSION_END_PEER_GRACEFUL_CLOSE:
                     active_session_key_material = None

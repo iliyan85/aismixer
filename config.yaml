@@ -46,4 +46,4 @@ g_always_tag_single: false
 # ако е false или няма \c:..., ползваме текущото време на сървъра.
 c_preserve_ingress_c: true
 
-debug: true
+debug: false

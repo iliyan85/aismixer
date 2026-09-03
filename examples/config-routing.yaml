@@ -7,7 +7,7 @@
 # separate from emitted NMEA TAG s values.
 
 station_id: mixstation_1
-debug: true
+debug: false
 
 sec_inputs:
   # sec_inputs[].id may still be used as the emitted TAG s alias when

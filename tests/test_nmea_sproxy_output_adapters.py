@@ -1,4 +1,5 @@
 import importlib.util
+import itertools
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -436,6 +437,88 @@ def test_plain_udp_payload_does_not_rewrite_tag_metadata():
     ]
 
 
+def test_forwarding_stats_accumulates_messages_and_bytes():
+    """Regression for Point 7: cumulative forwarding counters back the
+    sparse heartbeat instead of per-sentence stdout logging."""
+    proxy = load_proxy_module()
+    stats = proxy.ForwardingStats()
+
+    stats.record_forwarded("!AIVDM,1,1,,A,payload,0*00")
+    stats.record_forwarded("!AIVDO,1,1,,A,ownship,0*00")
+
+    assert stats.messages == 2
+    assert stats.bytes == len("!AIVDM,1,1,,A,payload,0*00") + len(
+        "!AIVDO,1,1,,A,ownship,0*00"
+    )
+
+
+def test_forward_input_payload_no_longer_prints_per_sentence(capsys):
+    """Regression for Point 7: unconditional per-sentence stdout tracing is
+    removed; forwarding and optional stats recording are unaffected."""
+    proxy = load_proxy_module()
+    sent = []
+    stats = proxy.ForwardingStats()
+    sentence = "!AIVDM,1,1,,A,payload,0*00"
+
+    proxy.forward_input_payload(sentence.encode(), sent.append, stats)
+
+    assert sent == [sentence]
+    assert stats.messages == 1
+    assert stats.bytes == len(sentence)
+    assert capsys.readouterr().out == ""
+
+
+def test_plain_udp_forward_loop_prints_sparse_heartbeat_not_per_sentence_trace(
+    monkeypatch,
+    capsys,
+):
+    """Regression for Point 7: the plain UDP loop reports a sparse,
+    debug-independent heartbeat at the ~60s cadence instead of tracing
+    every forwarded sentence."""
+    proxy = load_proxy_module()
+
+    class FakeUdpAdapter:
+        def __init__(self):
+            self._served = False
+
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return 0.0
+
+        def read_ready(self, _ready_socket):
+            return []
+
+        def read_pending(self):
+            if self._served:
+                raise OSError("end test")
+            self._served = True
+            return [b"!AIVDM,1,1,,A,payload,0*00"]
+
+    class Output:
+        def __init__(self):
+            self.sent = []
+
+        def send_sentence(self, line):
+            self.sent.append(line)
+
+    clock = itertools.chain([0.0, 0.0, 61.0], itertools.repeat(61.0))
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(proxy.time, "sleep", lambda _seconds: None)
+
+    output = Output()
+    reason = proxy.plain_udp_forward_loop(FakeUdpAdapter(), output)
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    assert output.sent == ["!AIVDM,1,1,,A,payload,0*00"]
+    captured = capsys.readouterr()
+    assert captured.out.count("Runtime:") == 1
+    assert "input=udp output=udp" in captured.out
+    assert "forwarded=1 messages" in captured.out
+    assert "!AIVDM" not in captured.out
+
+
 def test_udp_input_to_plain_udp_uses_allow_from(monkeypatch):
     proxy = load_proxy_module()
     policy = proxy.NetworkPolicy.from_entries(
@@ -655,7 +738,7 @@ def test_plain_udp_reconnect_reuses_pinned_resolved_destination(monkeypatch):
         sockets.append(sock)
         return sock
 
-    def fake_forward_loop(_local_input, output_adapter, _ingress_policy):
+    def fake_forward_loop(_local_input, output_adapter, _ingress_policy, _stats):
         calls.append(output_adapter.sock)
         output_adapter.send_sentence(payload)
         if len(calls) > 1:
@@ -693,6 +776,269 @@ def test_plain_udp_reconnect_reuses_pinned_resolved_destination(monkeypatch):
     assert sockets[1].bound == ("192.0.2.15", 0)
     assert sockets[0].sent == [(payload.encode(), first_addr)]
     assert sockets[1].sent == [(payload.encode(), first_addr)]
+
+
+def test_plain_udp_relation_stats_persist_across_socket_recreation(
+    monkeypatch,
+):
+    """Regression for Point 7: ForwardingStats must survive plain-UDP
+    output-socket recreation. The relation owns one instance and reuses it
+    across successive plain_udp_forward_loop() invocations rather than
+    resetting on each reconnect."""
+    proxy = load_proxy_module()
+    adapters = sys.modules[proxy.PlainUdpOutputAdapter.__module__]
+    output_config = {
+        "type": "udp",
+        "host": "mixer.example.net",
+        "port": 17777,
+        "legacy": False,
+    }
+    seen_stats_instances = []
+    calls = []
+
+    def fake_getaddrinfo(host, port, family, sock_type):
+        return [(family, sock_type, 17, "", ("192.0.2.10", 17777))]
+
+    def fake_socket(family, sock_type):
+        return FakeSocket(family, sock_type)
+
+    def fake_forward_loop(_local_input, _output_adapter, _ingress_policy, stats):
+        seen_stats_instances.append(stats)
+        stats.record_forwarded("!AIVDM,1,1,,A,payload,0*00")
+        calls.append(1)
+        if len(calls) > 1:
+            raise KeyboardInterrupt
+        return proxy.SESSION_END_SOCKET_ERROR
+
+    monkeypatch.setattr(adapters.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(adapters.socket, "socket", fake_socket)
+    monkeypatch.setattr(proxy, "plain_udp_forward_loop", fake_forward_loop)
+    monkeypatch.setattr(proxy.time, "sleep", lambda _delay: None)
+    output_adapter = proxy.create_plain_udp_output_adapter(output_config)
+
+    with pytest.raises(KeyboardInterrupt):
+        proxy.run_plain_udp_relation(
+            object(),
+            output_config,
+            {"reconnect_delay": 5},
+            output_adapter=output_adapter,
+        )
+
+    assert len(seen_stats_instances) == 2
+    assert seen_stats_instances[0] is seen_stats_instances[1]
+    assert seen_stats_instances[0].messages == 2
+
+
+def test_plain_udp_forward_loop_heartbeat_schedule_persists_across_socket_recreation(
+    monkeypatch,
+    capsys,
+):
+    """Regression: plain-UDP output-socket recreation must not reset the
+    relation-level heartbeat deadline any more than it resets the
+    forwarding counters."""
+    proxy = load_proxy_module()
+    shared_stats = proxy.ForwardingStats()
+
+    class FakeUdpAdapter:
+        def __init__(self):
+            self._served = False
+
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return 0.0
+
+        def read_ready(self, _ready_socket):
+            return []
+
+        def read_pending(self):
+            if self._served:
+                raise OSError("end test")
+            self._served = True
+            return [b"!AIVDM,1,1,,A,payload,0*00"]
+
+    class Output:
+        def send_sentence(self, _line):
+            pass
+
+    monkeypatch.setattr(proxy.time, "sleep", lambda _seconds: None)
+
+    # First socket incarnation: its first is_heartbeat_due() check
+    # establishes the relation deadline at 0 + 60 = 60; the incarnation
+    # ends immediately after forwarding one sentence, before that deadline.
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: 0.0)
+    reason1 = proxy.plain_udp_forward_loop(
+        FakeUdpAdapter(), Output(), None, shared_stats
+    )
+    assert reason1 == proxy.SESSION_END_SOCKET_ERROR
+    assert "Runtime:" not in capsys.readouterr().out
+    assert shared_stats.messages == 1
+
+    # Socket recreated; this incarnation's own clock is at 65, past the
+    # 60s relation deadline established by the first incarnation (a fresh
+    # per-incarnation deadline of 65 + 60 = 125 would not have fired). The
+    # heartbeat prints with the count as of that moment (still 1, since it
+    # fires before this incarnation's own forward), and the counter keeps
+    # climbing afterward.
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: 65.0)
+    reason2 = proxy.plain_udp_forward_loop(
+        FakeUdpAdapter(), Output(), None, shared_stats
+    )
+    assert reason2 == proxy.SESSION_END_SOCKET_ERROR
+    output2 = capsys.readouterr().out
+    assert "Runtime:" in output2
+    assert "forwarded=1 messages" in output2
+    assert shared_stats.messages == 2
+
+
+def test_plain_udp_forward_loop_bounds_wait_when_poll_interval_is_none(
+    monkeypatch,
+):
+    """Regression for Point 7: a relation whose adapter reports no
+    poll_interval() (matching UdpInputAdapter) must not block select()
+    indefinitely; the wait is bounded by the remaining time until the next
+    heartbeat."""
+    proxy = load_proxy_module()
+
+    class QuietUdpAdapter:
+        def selectable_sockets(self):
+            return ["fake-socket"]
+
+        def poll_interval(self):
+            return None
+
+        def read_ready(self, _ready_socket):
+            return []
+
+        def read_pending(self):
+            return []
+
+    class Output:
+        def send_sentence(self, _line):
+            raise AssertionError("no traffic should be sent")
+
+    clock = itertools.chain([0.0, 30.0], itertools.repeat(30.0))
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: next(clock))
+
+    select_calls = []
+
+    def fake_select(_readable, _writable, _exceptional, timeout):
+        select_calls.append(timeout)
+        raise OSError("end test")
+
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    reason = proxy.plain_udp_forward_loop(QuietUdpAdapter(), Output())
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    assert select_calls == [30.0]
+
+
+def test_plain_udp_forward_loop_quiet_relation_wakes_at_relation_level_deadline(
+    monkeypatch,
+):
+    """Regression: a quiet UDP-input relation must wake at the remaining
+    time until the RELATION-level heartbeat deadline (carried on the
+    shared, caller-owned stats), not a deadline freshly computed from the
+    current call's own start."""
+    proxy = load_proxy_module()
+    shared_stats = proxy.ForwardingStats()
+
+    class QuietUdpAdapter:
+        def selectable_sockets(self):
+            return ["fake-socket"]
+
+        def poll_interval(self):
+            return None
+
+        def read_ready(self, _ready_socket):
+            return []
+
+        def read_pending(self):
+            return []
+
+    class Output:
+        def send_sentence(self, _line):
+            raise AssertionError("no traffic should be sent")
+
+    # First incarnation establishes the relation deadline at 0 + 60 = 60.
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: 0.0)
+
+    def raising_select(_readable, _writable, _exceptional, _timeout):
+        raise OSError("end test")
+
+    monkeypatch.setattr(proxy.select, "select", raising_select)
+    reason1 = proxy.plain_udp_forward_loop(
+        QuietUdpAdapter(), Output(), None, shared_stats
+    )
+    assert reason1 == proxy.SESSION_END_SOCKET_ERROR
+
+    # A later incarnation, reusing the same relation-owned stats, must
+    # wait only the remaining time to the ORIGINAL deadline (60 - 40 = 20),
+    # not a fresh 60s computed from this call's own start (40 + 60 = 100).
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: 40.0)
+    select_calls = []
+
+    def recording_select(_readable, _writable, _exceptional, timeout):
+        select_calls.append(timeout)
+        raise OSError("end test")
+
+    monkeypatch.setattr(proxy.select, "select", recording_select)
+    reason2 = proxy.plain_udp_forward_loop(
+        QuietUdpAdapter(), Output(), None, shared_stats
+    )
+    assert reason2 == proxy.SESSION_END_SOCKET_ERROR
+    assert select_calls == [20.0]
+
+
+def test_plain_udp_forward_loop_quiet_relation_still_emits_heartbeat(
+    monkeypatch,
+    capsys,
+):
+    """Regression for Point 7: a quiet UDP-input/plain-UDP relation with no
+    incoming traffic must still emit its ~60s heartbeat with unchanged
+    (zero) counters, rather than waiting indefinitely for input."""
+    proxy = load_proxy_module()
+
+    class QuietUdpAdapter:
+        def selectable_sockets(self):
+            return ["fake-socket"]
+
+        def poll_interval(self):
+            return None
+
+        def read_ready(self, _ready_socket):
+            return []
+
+        def read_pending(self):
+            return []
+
+    class Output:
+        def send_sentence(self, _line):
+            raise AssertionError("no traffic should be sent")
+
+    clock = itertools.chain([0.0, 30.0, 61.0], itertools.repeat(61.0))
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: next(clock))
+
+    select_calls = []
+
+    def fake_select(_readable, _writable, _exceptional, timeout):
+        select_calls.append(timeout)
+        if len(select_calls) >= 2:
+            raise OSError("end test")
+        return ([], [], [])
+
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    reason = proxy.plain_udp_forward_loop(QuietUdpAdapter(), Output())
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    assert select_calls[0] == 30.0
+    captured = capsys.readouterr()
+    assert captured.out.count("Runtime:") == 1
+    assert "input=udp output=udp" in captured.out
+    assert "forwarded=0 messages" in captured.out
 
 
 def test_plain_udp_main_does_not_open_keys_or_handshake(monkeypatch, tmp_path):

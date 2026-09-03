@@ -1,5 +1,6 @@
 import builtins
 import importlib.util
+import itertools
 import sys
 import time
 from pathlib import Path
@@ -744,3 +745,259 @@ def test_serial_payload_with_non_ai_talker_is_encrypted_through_udpsec_format(
         "timestamp": 1000,
         "source_id": "boat_001",
     }
+
+
+def test_print_forwarding_heartbeat_labels_serial_input(capsys):
+    """Regression for Point 7: the sparse heartbeat labels a real serial
+    input adapter as input=serial, not the udp fallback."""
+    proxy = load_proxy_module()
+    adapter = proxy.SerialInputAdapter(
+        {"type": "serial", "port": "COM4"},
+        serial_factory=lambda **_kwargs: None,
+    )
+    stats = proxy.ForwardingStats()
+    stats.record_forwarded("!AIVDM,1,1,,A,payload,0*00")
+
+    proxy.print_forwarding_heartbeat(adapter, proxy.UDP_OUTPUT_TYPE, stats)
+
+    captured = capsys.readouterr()
+    assert "input=serial output=udp" in captured.out
+    assert "forwarded=1 messages" in captured.out
+
+
+def test_forward_loop_prints_sparse_heartbeat_with_session_state(
+    monkeypatch,
+    capsys,
+):
+    """Regression for Point 7: the UDPSEC loop reports a sparse,
+    debug-independent heartbeat including session liveness, instead of
+    tracing every forwarded sentence."""
+    proxy = load_proxy_module()
+    client_to_server_key = b"\x01" * 32
+    session_key_material = proxy.SessionKeyMaterial(
+        client_to_server_key=client_to_server_key,
+        server_to_client_key=b"\x02" * 32,
+    )
+    remote_addr = ("192.0.2.10", 19999)
+
+    class FakeAdapter:
+        def __init__(self):
+            self._served = False
+
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return 0.0
+
+        def read_ready(self, _ready_socket):
+            return []
+
+        def read_pending(self):
+            if self._served:
+                return []
+            self._served = True
+            return [b"!AIVDM,1,1,,A,payload,0*00"]
+
+    class OutSocket:
+        def __init__(self):
+            self.sent = []
+
+        def sendto(self, data, destination):
+            self.sent.append((data, destination))
+
+    out_sock = OutSocket()
+    clock = itertools.chain(
+        [0.0, 0.0, 0.0, 0.0, 61.0],
+        itertools.repeat(61.0),
+    )
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(proxy.time, "time", lambda: 1000)
+
+    select_calls = []
+
+    def fake_select(_readable, _writable, _exceptional, _timeout):
+        select_calls.append(1)
+        if len(select_calls) >= 2:
+            raise OSError("end test")
+        return ([], [], [])
+
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    reason = proxy.forward_loop(
+        FakeAdapter(),
+        out_sock,
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 30,
+            "peer_timeout": 90,
+            "session_refresh_interval": 0,
+        },
+        session_key_material,
+        remote_addr,
+    )
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    # A keepalive ping may also fire at this clock tick; forwarding
+    # correctness itself is covered elsewhere. Here only the heartbeat
+    # matters.
+    assert len(out_sock.sent) >= 1
+    captured = capsys.readouterr()
+    assert captured.out.count("Runtime:") == 1
+    assert "input=udp output=udpsec" in captured.out
+    assert "forwarded=1 messages" in captured.out
+    assert "session=up" in captured.out
+
+
+def test_forward_loop_stats_persist_across_successive_sessions(monkeypatch):
+    """Regression for Point 7: ForwardingStats must survive UDPSEC
+    reconnect/rekey. The same instance passed across two successive
+    forward_loop() calls, exactly as main()'s reconnect loop does, must
+    keep accumulating rather than resetting per session."""
+    proxy = load_proxy_module()
+    client_to_server_key = b"\x01" * 32
+    session_key_material = proxy.SessionKeyMaterial(
+        client_to_server_key=client_to_server_key,
+        server_to_client_key=b"\x02" * 32,
+    )
+    remote_addr = ("192.0.2.10", 19999)
+    shared_stats = proxy.ForwardingStats()
+
+    class FakeAdapter:
+        def __init__(self):
+            self._served = False
+
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return 0.0
+
+        def read_ready(self, _ready_socket):
+            return []
+
+        def read_pending(self):
+            if self._served:
+                return []
+            self._served = True
+            return [b"!AIVDM,1,1,,A,payload,0*00"]
+
+    class OutSocket:
+        def sendto(self, _data, _destination):
+            pass
+
+    out_sock = OutSocket()
+    config = {
+        "station_id": "boat_001",
+        "keepalive_interval": 30,
+        "peer_timeout": 90,
+        "session_refresh_interval": 0,
+    }
+
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(proxy.time, "time", lambda: 1000)
+
+    def fake_select(_readable, _writable, _exceptional, _timeout):
+        raise OSError("end test")
+
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    for _ in range(2):
+        reason = proxy.forward_loop(
+            FakeAdapter(),
+            out_sock,
+            config,
+            session_key_material,
+            remote_addr,
+            None,
+            shared_stats,
+        )
+        assert reason == proxy.SESSION_END_SOCKET_ERROR
+
+    assert shared_stats.messages == 2
+
+
+def test_forward_loop_heartbeat_schedule_persists_across_successive_sessions(
+    monkeypatch,
+    capsys,
+):
+    """Regression: the heartbeat deadline belongs to the relation (carried
+    on the shared ForwardingStats), not to one session. Two successive
+    sessions, each individually far shorter than HEARTBEAT_INTERVAL_SECONDS,
+    must share one relation-level deadline rather than each restarting
+    their own 60s countdown -- otherwise a session_refresh_interval shorter
+    than the heartbeat interval could suppress the heartbeat indefinitely."""
+    proxy = load_proxy_module()
+    client_to_server_key = b"\x01" * 32
+    session_key_material = proxy.SessionKeyMaterial(
+        client_to_server_key=client_to_server_key,
+        server_to_client_key=b"\x02" * 32,
+    )
+    remote_addr = ("192.0.2.10", 19999)
+    shared_stats = proxy.ForwardingStats()
+    config = {
+        "station_id": "boat_001",
+        "keepalive_interval": 300,
+        "peer_timeout": 900,
+        "session_refresh_interval": 0,
+    }
+
+    class FakeAdapter:
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return 0.0
+
+        def read_ready(self, _ready_socket):
+            return []
+
+        def read_pending(self):
+            return []
+
+    class OutSocket:
+        def sendto(self, _data, _destination):
+            pass
+
+    out_sock = OutSocket()
+    monkeypatch.setattr(proxy.time, "time", lambda: 1000)
+
+    def fake_select(_readable, _writable, _exceptional, _timeout):
+        raise OSError("end test")
+
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    # Session 1's relation clock never advances past 0; its first
+    # is_heartbeat_due() check establishes the relation deadline at
+    # 0 + 60 = 60 and the session ends immediately after, well short of
+    # its own 60s lifetime.
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: 0.0)
+    reason1 = proxy.forward_loop(
+        FakeAdapter(),
+        out_sock,
+        config,
+        session_key_material,
+        remote_addr,
+        None,
+        shared_stats,
+    )
+    assert reason1 == proxy.SESSION_END_SOCKET_ERROR
+    assert "Runtime:" not in capsys.readouterr().out
+
+    # Session 2 starts at t=65: past the ORIGINAL relation deadline (60)
+    # established in session 1, but a fresh per-session deadline computed
+    # from this session's own start (65 + 60 = 125) would not have fired.
+    # The heartbeat firing here proves the deadline persisted from session
+    # 1 rather than resetting.
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: 65.0)
+    reason2 = proxy.forward_loop(
+        FakeAdapter(),
+        out_sock,
+        config,
+        session_key_material,
+        remote_addr,
+        None,
+        shared_stats,
+    )
+    assert reason2 == proxy.SESSION_END_SOCKET_ERROR
+    assert "Runtime:" in capsys.readouterr().out

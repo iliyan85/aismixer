@@ -309,3 +309,17 @@ def test_example_routing_config_is_internally_valid():
     assert table.match("udpsec:vitara_mobile").target_ids == ("udp:local_debug",)
     assert table.match_target_ids("udp:balchik_roof") == (1, 0)
     assert table.match_target_ids("udpsec:vitara_mobile") == (1,)
+    # Regression for Point 7: shipped example configs must not silently
+    # revert to high-frequency, traffic-proportional debug logging.
+    assert config["debug"] is False
+
+
+def test_example_routing_control_config_has_safe_debug_default():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "config-routing-control.yaml"
+    )
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    assert config["debug"] is False

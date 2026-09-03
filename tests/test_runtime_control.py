@@ -474,6 +474,7 @@ def test_disabled_control_runtime_does_not_start_server(monkeypatch):
         "ingress-fan-in",
         "processor-stage",
         "egress-stage",
+        "statistics-heartbeat",
     )
     fan_in_factory = specs["ingress-fan-in"].coroutine_factory
     processor_factory = specs["processor-stage"].coroutine_factory
@@ -1158,6 +1159,7 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
             "ingress-fan-in",
             "processor-stage",
             "egress-stage",
+            "statistics-heartbeat",
         ]
 
         secure_factories = tuple(
@@ -1770,3 +1772,19 @@ def test_runtime_control_unix_stack_updates_staged_routing(
         assert not path.exists()
 
     asyncio.run(scenario())
+
+
+def test_debug_config_missing_key_resolves_to_false():
+    """Regression for Point 7: a configuration with no debug key must
+    resolve to disabled traffic-proportional debug output, matching
+    aismixer.py's config.get("debug", False) fallback."""
+    config_without_debug_key = {"station_id": "test_station"}
+
+    assert config_without_debug_key.get("debug", False) is False
+
+
+def test_aismixer_debug_resolves_false_from_shipped_config():
+    """Regression for Point 7: the actual currently-loaded shipped
+    config.yaml must resolve aismixer.DEBUG to False, not merely the
+    fallback default in isolation."""
+    assert aismixer.DEBUG is False

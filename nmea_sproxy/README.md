@@ -509,9 +509,11 @@ Common symptoms:
 | No network output | Confirm matching NMEA input, output type, pinned destination, routing, firewall, and plain-UDP consumer or UDPSEC session state. |
 | Restart loop | Stop the unit, run the process manually with its exact config if safe, correct the persistent error, then start it again. |
 
-The current runtime prints every forwarded matching sentence to standard output.
-`log_level` does not currently filter this output, so journal or logread volume
-can follow the forwarded traffic rate.
+The runtime no longer traces every forwarded sentence to standard output.
+Instead it prints a sparse `Runtime: ...` summary roughly every 60 seconds,
+reporting input mode, output mode, cumulative forwarded message/byte counts,
+and UDPSEC session liveness where applicable. This heartbeat is independent
+of `log_level` and does not scale with traffic volume.
 
 ## ⚠️ Limitations and security boundary
 
@@ -527,8 +529,7 @@ Current operator-visible limits:
 - bounded serial queue that discards the oldest entry when full;
 - process-local, non-durable UDPSEC session and replay state;
 - fresh handshake required after a source-address or source-port tuple change;
-- no automatic UDPSEC session migration;
-- unconditional per-sentence standard-output logging.
+- no automatic UDPSEC session migration.
 
 UDPSEC provides confidentiality, cryptographic integrity, and peer
 authentication for transport between configured and authenticated endpoints.

@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+from functools import partial
 
 import pytest
 
@@ -15,6 +16,7 @@ from core.ingress_frame import IngressFrame
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.routing import RoutingTable
 from core.routing_state import RoutingSnapshot, RoutingState
+from core.runtime_statistics import InputTrafficMetrics, RuntimeStatisticsProvider
 
 
 def make_frame(label):
@@ -1440,6 +1442,7 @@ def test_main_constructs_one_processor_and_wires_runtime_stages(
             "ingress-fan-in",
             "processor-stage",
             "egress-stage",
+            "statistics-heartbeat",
         )
 
         fan_in_factory = specs["ingress-fan-in"].coroutine_factory
@@ -1587,6 +1590,54 @@ def test_debug_output_is_emitted_before_send_with_crlf_removed(capsys):
     asyncio.run(scenario())
 
 
+def test_debug_false_emits_no_output_trace(capsys):
+    """Regression for Point 7: debug=False must disable the per-output
+    OUTPUT traffic trace without affecting the actual send."""
+
+    async def scenario():
+        completion = asyncio.get_running_loop().create_future()
+        queue = asyncio.Queue()
+        await queue.put(
+            aismixer._EgressBatch(
+                output_batch(output("message", 0)),
+                completion,
+            )
+        )
+
+        class RecordingForwarder:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, _message):
+                raise AssertionError("production egress called send()")
+
+            async def send_to_ids(self, target_ids, message):
+                self.sent.append((tuple(target_ids), message))
+
+            async def send_to(self, _target_ids, _message):
+                raise AssertionError("production egress called send_to()")
+
+        forwarder = RecordingForwarder()
+        task = asyncio.create_task(
+            aismixer.egress_stage_loop(
+                queue,
+                forwarder,
+                debug=False,
+                timestamp=lambda: "STAMP",
+            )
+        )
+        try:
+            await completion
+        finally:
+            await cancel_task(task)
+
+        assert forwarder.sent == [((0,), b"message\r\n")]
+
+    asyncio.run(scenario())
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
 def test_debug_decode_is_non_throwing_and_does_not_modify_payload(capsys):
     async def scenario():
         payload = b"invalid-\xff\r\n"
@@ -1653,5 +1704,162 @@ def test_empty_target_ids_use_unified_numeric_dispatch_without_failure():
             await cancel_task(task)
 
         assert forwarder.events == [("numeric", (), payload)]
+
+    asyncio.run(scenario())
+
+
+def _make_statistics_provider():
+    processing_queue = aismixer._ObservedQueue(name="processing", maxsize=10)
+    egress_queue = aismixer._ObservedQueue(name="egress", maxsize=10)
+    processor = PythonDataPlaneProcessor()
+    egress_metrics = aismixer._EgressMetrics()
+    traffic = InputTrafficMetrics("udp-ingress:0:test", "udp")
+    traffic.transport_received(b"12345")
+    traffic.frame_accepted(b"1234")
+    provider = RuntimeStatisticsProvider(
+        ingress_queues=(),
+        processing_queue=processing_queue,
+        processor=processor,
+        egress_queue=egress_queue,
+        egress_operations=egress_metrics,
+        input_traffic=(traffic,),
+    )
+    return provider, traffic
+
+
+def test_statistics_heartbeat_prints_summary_and_repeated_reads_are_stable(
+    monkeypatch,
+    capsys,
+):
+    """Regression for Point 7: the sparse heartbeat surfaces existing
+    runtime-statistics fields, remains active independent of debug, and
+    reading statistics twice with no new traffic in between must not
+    mutate or reset any counter."""
+
+    monkeypatch.setattr(aismixer, "DEBUG", False)
+    provider, _traffic = _make_statistics_provider()
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) > 2:
+            raise asyncio.CancelledError()
+
+    async def scenario():
+        with pytest.raises(asyncio.CancelledError):
+            await aismixer.statistics_heartbeat_loop(
+                provider,
+                timestamp=lambda: "STAMP",
+                sleep=fake_sleep,
+            )
+
+    asyncio.run(scenario())
+
+    captured = capsys.readouterr()
+    lines = [line for line in captured.out.splitlines() if line]
+    assert len(lines) == 2
+    assert sleep_calls == [60.0, 60.0, 60.0]
+    for line in lines:
+        assert line.startswith("STAMP Runtime: ")
+        assert "rx[udp]=1 pkts/5B accepted=1 frames" in line
+        assert "rx[udpsec]" not in line
+        assert "processed=0 calls" in line
+        assert "output=0 msgs" in line
+        assert "queues processing=0/10 egress=0/10" in line
+        assert "egress_ok=0 egress_failed=0" in line
+    # No new traffic occurred between reads, so both reads must agree.
+    assert lines[0] == lines[1]
+
+
+def test_statistics_heartbeat_separates_udp_and_udpsec_input_totals(capsys):
+    """Regression: the heartbeat must aggregate transport packets/bytes and
+    accepted frames separately per input kind, not as one flat total."""
+
+    processing_queue = aismixer._ObservedQueue(name="processing", maxsize=10)
+    egress_queue = aismixer._ObservedQueue(name="egress", maxsize=10)
+    processor = PythonDataPlaneProcessor()
+    egress_metrics = aismixer._EgressMetrics()
+
+    udp_a = InputTrafficMetrics("udp-ingress:0:a", "udp")
+    udp_a.transport_received(b"12")
+    udp_a.frame_accepted(b"1")
+    udp_b = InputTrafficMetrics("udp-ingress:1:b", "udp")
+    udp_b.transport_received(b"345")
+    udp_b.frame_accepted(b"23")
+    udpsec_a = InputTrafficMetrics("udpsec-ingress:0:c", "udpsec")
+    udpsec_a.transport_received(b"1234567")
+    udpsec_a.frame_accepted(b"123456")
+
+    provider = RuntimeStatisticsProvider(
+        ingress_queues=(),
+        processing_queue=processing_queue,
+        processor=processor,
+        egress_queue=egress_queue,
+        egress_operations=egress_metrics,
+        input_traffic=(udp_a, udp_b, udpsec_a),
+    )
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) > 1:
+            raise asyncio.CancelledError()
+
+    async def scenario():
+        with pytest.raises(asyncio.CancelledError):
+            await aismixer.statistics_heartbeat_loop(
+                provider,
+                timestamp=lambda: "STAMP",
+                sleep=fake_sleep,
+            )
+
+    asyncio.run(scenario())
+
+    captured = capsys.readouterr()
+    line = captured.out.strip()
+    # udp totals combine both udp inputs: 1+1 packets, 2+3 bytes, 1+1 frames.
+    assert "rx[udp]=2 pkts/5B accepted=2 frames" in line
+    # udpsec totals remain separate, not folded into the udp figures.
+    assert "rx[udpsec]=1 pkts/7B accepted=1 frames" in line
+    assert line.index("rx[udp]") < line.index("rx[udpsec]")
+
+
+def test_statistics_heartbeat_is_lifecycle_cancelled_with_supervised_tasks():
+    """Regression for Point 7: the heartbeat task is owned by the same
+    supervision lifecycle as every other runtime stage and is cancelled
+    when a sibling essential task fails, rather than being leaked."""
+
+    provider, _traffic = _make_statistics_provider()
+    hang_forever = None
+
+    async def hanging_sleep(_seconds):
+        nonlocal hang_forever
+        hang_forever = asyncio.get_running_loop().create_future()
+        await hang_forever
+
+    async def failing_task():
+        raise RuntimeError("boom")
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="boom"):
+            await aismixer._supervise_named_tasks(
+                (
+                    aismixer._RuntimeTaskSpec(
+                        name="failing",
+                        coroutine_factory=failing_task,
+                    ),
+                    aismixer._RuntimeTaskSpec(
+                        name="statistics-heartbeat",
+                        coroutine_factory=partial(
+                            aismixer.statistics_heartbeat_loop,
+                            provider,
+                            sleep=hanging_sleep,
+                        ),
+                    ),
+                )
+            )
+        assert hang_forever is not None
+        assert hang_forever.cancelled()
 
     asyncio.run(scenario())

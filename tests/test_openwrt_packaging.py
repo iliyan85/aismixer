@@ -485,6 +485,9 @@ def test_openwrt_aismixer_config_only_enables_packaged_unix_control():
     }
 
     assert packaged == {**generic, "control": control}
+    # Regression for Point 7: shipped deployment seeds must not silently
+    # revert to high-frequency, traffic-proportional debug logging.
+    assert generic["debug"] is False
     assert "$(INSTALL_CONF) ./files/config.yaml" in install
     assert "$(PKG_BUILD_DIR)/config.yaml" not in install
     assert "/etc/aismixer/config.yaml" in conffiles.splitlines()

@@ -546,6 +546,7 @@ def _run_secure_server_with_packets(
     owned_sessions=None,
     owned_pending_sessions=None,
     endpoint_token=None,
+    debug=False,
 ):
     fake_socket = _FakeSecureSocket()
     fake_loop = _FakeSecureLoop(packets)
@@ -579,6 +580,7 @@ def _run_secure_server_with_packets(
                     sec_input_id=sec_input_id,
                     ingress_policy=ingress_policy,
                     endpoint_token=endpoint_token,
+                    debug=debug,
                     state=state,
                     wall_clock=wall_clock,
                     monotonic_clock=monotonic_clock,
@@ -1748,6 +1750,7 @@ def test_secure_server_preserves_unstripped_surrogate_payload(monkeypatch):
         secure,
         [(packet, addr)],
         state=state,
+        debug=True,
     )
 
     assert len(fake_queue.items) == 1

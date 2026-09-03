@@ -52,4 +52,4 @@ control:
     socket_path: /run/aismixer/control.sock
     socket_mode: "0660"
 
-debug: true
+debug: false

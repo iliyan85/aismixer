@@ -139,7 +139,7 @@ UDP_INPUTS = config.get("udp_inputs", [])
 FORWARDERS = config.get("forwarders", [])
 STATION_ID = config.get("station_id", "mixstation_1")
 UDP_ALIAS_MAP = load_udp_alias_map(config)
-DEBUG = config.get("debug", True)
+DEBUG = config.get("debug", False)
 G_PRESERVE_INGRESS_GID = config.get("g_preserve_ingress_gid", True)
 G_ID_DIGITS = config.get("g_id_digits", 18)
 G_ALWAYS_TAG_SINGLE = config.get("g_always_tag_single", False)
@@ -696,6 +696,76 @@ async def egress_stage_loop(
                 batch.completion.set_result(None)
 
 
+def _format_bytes_compact(byte_count: int) -> str:
+    """Render a byte count compactly for the sparse runtime heartbeat."""
+
+    value = float(byte_count)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024.0:
+            return f"{byte_count}B" if unit == "B" else f"{value:.2f}{unit}"
+        value /= 1024.0
+    return f"{value:.2f}TiB"
+
+
+async def statistics_heartbeat_loop(
+    statistics_provider,
+    *,
+    interval_seconds: float = 60.0,
+    timestamp=None,
+    sleep=None,
+):
+    """Print a sparse, debug-independent operational summary periodically.
+
+    Sourced entirely from existing runtime statistics owners; this task
+    performs no separate accounting of its own and never mutates or resets
+    any counter it reads.
+    """
+
+    active_timestamp = ts if timestamp is None else timestamp
+    active_sleep = asyncio.sleep if sleep is None else sleep
+    while True:
+        await active_sleep(interval_seconds)
+        snapshot = statistics_provider.snapshot()
+        inputs = statistics_provider.input_traffic_snapshot()
+
+        totals_by_kind: dict[str, dict[str, int]] = {}
+        for item in inputs:
+            bucket = totals_by_kind.setdefault(
+                item.kind, {"packets": 0, "bytes": 0, "frames": 0}
+            )
+            bucket["packets"] += item.transport_packets
+            bucket["bytes"] += item.transport_bytes
+            bucket["frames"] += item.accepted_frames
+
+        rx_segments = []
+        for kind in ("udp", "udpsec"):
+            totals = totals_by_kind.get(kind)
+            if totals is None:
+                continue
+            rx_segments.append(
+                f"rx[{kind}]={totals['packets']} pkts/"
+                f"{_format_bytes_compact(totals['bytes'])} "
+                f"accepted={totals['frames']} frames"
+            )
+
+        processing_queue = snapshot.processing_queue
+        egress_queue_metrics = snapshot.egress_queue
+        segments = list(rx_segments)
+        segments.append(f"processed={snapshot.processor.process_calls} calls")
+        segments.append(f"output={snapshot.processor.output_messages} msgs")
+        segments.append(
+            f"queues processing={processing_queue.depth}/"
+            f"{processing_queue.capacity} "
+            f"egress={egress_queue_metrics.depth}/"
+            f"{egress_queue_metrics.capacity}"
+        )
+        segments.append(
+            f"egress_ok={snapshot.egress_operations.outputs_completed} "
+            f"egress_failed={snapshot.egress_operations.outputs_failed}"
+        )
+        print(f"{active_timestamp()} Runtime: " + ", ".join(segments))
+
+
 async def _run_runtime_stages(
     ingress_queue,
     egress_queue,
@@ -875,6 +945,7 @@ async def main(
                         ingress_policy=ingress_policy,
                         input_traffic=traffic,
                         server_private_key=udpsec_identity.private_key,
+                        debug=DEBUG,
                     ),
                 )
             )
@@ -972,6 +1043,14 @@ async def main(
                         debug=DEBUG,
                         timestamp=ts,
                         metrics=egress_metrics,
+                    ),
+                ),
+                _RuntimeTaskSpec(
+                    name="statistics-heartbeat",
+                    coroutine_factory=partial(
+                        statistics_heartbeat_loop,
+                        statistics_provider,
+                        timestamp=ts,
                     ),
                 ),
             )

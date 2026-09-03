@@ -157,6 +157,7 @@ def _run_packets(
     state=None,
     ingress_policy=None,
     endpoint_token=None,
+    debug=False,
 ):
     fake_socket = _Socket()
     fake_loop = _PacketLoop(packets)
@@ -178,6 +179,7 @@ def _run_packets(
                 ingress_policy=ingress_policy,
                 endpoint_token=endpoint_token,
                 input_traffic=traffic,
+                debug=debug,
                 state=secure.SecureState() if state is None else state,
                 wall_clock=lambda: 1010.0,
                 monotonic_clock=lambda: 1010.0,
@@ -217,6 +219,9 @@ def test_secure_server_passes_input_owner_to_owned_receive_loop(monkeypatch):
     assert len(loop_calls) == 1
     assert loop_calls[0][0][0] is fake_socket
     assert loop_calls[0][1]["input_traffic"] is traffic
+    # Regression for Point 7: omitting debug= must resolve to the safe
+    # default, not silently enable traffic-proportional trace.
+    assert loop_calls[0][1]["debug"] is False
     assert (
         loop_calls[0][1]["server_private_key"]
         is PREPARED_SERVER_PRIVATE_KEY
@@ -235,6 +240,35 @@ def test_secure_server_passes_input_owner_to_owned_receive_loop(monkeypatch):
         is not loop_calls[0][1]["owned_sessions"]
     )
     assert fake_socket.close_count == 1
+
+
+def test_secure_server_propagates_explicit_debug_to_receive_loop(monkeypatch):
+    """Regression for Point 7: an explicit debug value passed to
+    secure_server() must reach the receive loop that owns the trace print,
+    not just a module-level default."""
+    fake_socket = _Socket()
+    loop_calls = []
+
+    def create_socket(listen_ip, *, reuse_address):
+        return fake_socket
+
+    async def capture_loop(*args, **kwargs):
+        loop_calls.append((args, kwargs))
+
+    monkeypatch.setattr(secure, "create_udp_listener_socket", create_socket)
+    monkeypatch.setattr(secure, "_secure_server_loop", capture_loop)
+
+    asyncio.run(
+        secure.secure_server(
+            _Queue(),
+            "127.0.0.1",
+            9999,
+            server_private_key=PREPARED_SERVER_PRIVATE_KEY,
+            debug=True,
+        )
+    )
+
+    assert loop_calls[0][1]["debug"] is True
 
 
 def test_secure_server_uses_fresh_endpoint_token_per_socket_incarnation(
@@ -727,6 +761,85 @@ def test_udpsec_valid_nmea_accounts_admitted_frame_payload_bytes(monkeypatch):
     assert snapshot.transport_bytes == len(packet)
     assert snapshot.accepted_frames == 1
     assert snapshot.payload_bytes == len(frame.payload)
+
+
+def test_udpsec_debug_true_prints_data_trace(monkeypatch, capsys):
+    """Regression for Point 7: debug=True must still enable the existing
+    per-DATA-message [SECURE] traffic trace."""
+    address = ("127.0.0.1", 50123)
+    client_key = b"\x01" * 32
+    server_key = b"\x02" * 32
+    payload = "!AIVDM,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*5C"
+    state = secure.SecureState()
+    endpoint_token = secure._new_endpoint_token()
+    _install_session(state, endpoint_token, address, client_key, server_key)
+    packet = _secure_data_packet(
+        client_key,
+        b"\x21" * 12,
+        {
+            "type": "nmea",
+            "payload": payload,
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+    )
+    traffic = InputTrafficMetrics("udpsec-ingress:0:secure", "udpsec")
+    queue = _Queue()
+
+    _run_packets(
+        monkeypatch,
+        [(packet, address)],
+        queue=queue,
+        traffic=traffic,
+        state=state,
+        endpoint_token=endpoint_token,
+        debug=True,
+    )
+
+    captured = capsys.readouterr()
+    assert "[SECURE]" in captured.out
+    assert payload in captured.out
+
+
+def test_udpsec_debug_false_prints_no_data_trace(monkeypatch, capsys):
+    """Regression for Point 7: debug=False (the default) must disable the
+    per-DATA-message [SECURE] traffic trace without affecting frame
+    admission."""
+    address = ("127.0.0.1", 50123)
+    client_key = b"\x01" * 32
+    server_key = b"\x02" * 32
+    payload = "!AIVDM,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*5C"
+    state = secure.SecureState()
+    endpoint_token = secure._new_endpoint_token()
+    _install_session(state, endpoint_token, address, client_key, server_key)
+    packet = _secure_data_packet(
+        client_key,
+        b"\x22" * 12,
+        {
+            "type": "nmea",
+            "payload": payload,
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+    )
+    traffic = InputTrafficMetrics("udpsec-ingress:0:secure", "udpsec")
+    queue = _Queue()
+
+    _run_packets(
+        monkeypatch,
+        [(packet, address)],
+        queue=queue,
+        traffic=traffic,
+        state=state,
+        endpoint_token=endpoint_token,
+    )
+
+    assert len(queue.items) == 1
+    captured = capsys.readouterr()
+    # The unconditional listener-started diagnostic remains visible; only
+    # the per-DATA-message trace is gated by debug.
+    assert "[SECURE]" not in captured.out
+    assert payload not in captured.out
 
 
 def test_udpsec_policy_rejection_still_accounts_raw_transport(monkeypatch):

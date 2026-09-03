@@ -11,7 +11,7 @@
 # are not persisted after restart.
 
 station_id: mixstation_1
-debug: true
+debug: false
 
 sec_inputs:
   # The UDPSEC routing source ID is based on the authenticated station identity:

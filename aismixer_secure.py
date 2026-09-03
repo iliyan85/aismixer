@@ -56,7 +56,7 @@ DATA_NONCE_MAX_PER_SESSION = 100000
 
 _HANDSHAKE_REPLAY_LABEL = b"HANDSHAKE-REPLAY"
 
-DEBUG = True  # Set to False in production
+DEBUG = False  # Safe fallback only; secure_server() callers pass debug= explicitly.
 
 
 def resolve_existing_path(candidates):
@@ -987,6 +987,7 @@ async def _secure_server_loop(
     *,
     endpoint_token,
     input_traffic=None,
+    debug: bool = False,
     state=None,
     wall_clock=None,
     monotonic_clock=None,
@@ -1334,7 +1335,7 @@ async def _secure_server_loop(
                     if input_traffic is not None:
                         input_traffic.frame_accepted(frame.payload)
 
-                if DEBUG:
+                if debug:
                     print(
                         f"{wall_now()} [SECURE] "
                         f"From {station_id}: {msg['payload']}")
@@ -1352,6 +1353,7 @@ async def secure_server(
     ingress_policy=None,
     *,
     input_traffic=None,
+    debug: bool = False,
     state=None,
     wall_clock=None,
     monotonic_clock=None,
@@ -1378,6 +1380,7 @@ async def secure_server(
             ingress_policy=ingress_policy,
             endpoint_token=endpoint_token,
             input_traffic=input_traffic,
+            debug=debug,
             state=state_owner,
             wall_clock=wall_clock,
             monotonic_clock=monotonic_clock,
