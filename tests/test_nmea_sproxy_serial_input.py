@@ -665,3 +665,82 @@ def test_serial_payload_is_encrypted_through_existing_udpsec_format(monkeypatch)
         "timestamp": 1000,
         "source_id": "boat_001",
     }
+
+
+def test_serial_payload_with_non_ai_talker_is_encrypted_through_udpsec_format(
+    monkeypatch,
+):
+    """Regression for Point 4: a base-station (non-AI) talker sentence must
+    reach the encrypted UDPSEC NMEA payload unchanged through the real
+    serial-input forwarding loop, not just at the extraction unit boundary."""
+    proxy = load_proxy_module()
+    client_to_server_key = b"\x01" * 32
+    session_key_material = proxy.SessionKeyMaterial(
+        client_to_server_key=client_to_server_key,
+        server_to_client_key=b"\x02" * 32,
+    )
+    remote_addr = ("192.0.2.10", 19999)
+    sentence = "!BSVDM,1,1,,A,payload,0*00"
+
+    class FakeSerialAdapter:
+        def __init__(self):
+            self.sent_payload = False
+
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return 0.05
+
+        def read_ready(self, _ready_socket):
+            return []
+
+        def read_pending(self):
+            if self.sent_payload:
+                return []
+            self.sent_payload = True
+            return [f"noise {sentence} trailer".encode()]
+
+    class OutSocket:
+        def __init__(self):
+            self.sent = []
+
+        def sendto(self, data, destination):
+            self.sent.append((data, destination))
+
+    out_sock = OutSocket()
+
+    def fake_select(readable, _writable, _exceptional, timeout):
+        assert readable == [out_sock]
+        raise OSError("end test")
+
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(proxy.time, "time", lambda: 1000)
+
+    reason = proxy.forward_loop(
+        FakeSerialAdapter(),
+        out_sock,
+        {
+            "station_id": "boat_001",
+            "keepalive_interval": 30,
+            "peer_timeout": 90,
+            "session_refresh_interval": 0,
+        },
+        session_key_material,
+        remote_addr,
+    )
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    assert len(out_sock.sent) == 1
+    packet, destination = out_sock.sent[0]
+    assert destination == remote_addr
+    assert proxy.decrypt_secure_json_message(
+        packet,
+        client_to_server_key,
+    ) == {
+        "type": "nmea",
+        "payload": sentence,
+        "timestamp": 1000,
+        "source_id": "boat_001",
+    }

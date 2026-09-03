@@ -180,11 +180,12 @@ and two relations must not compete for one device. Prefer stable device names.
 
 ### NMEA extraction
 
-Each datagram or completed serial line is scanned for uppercase `!AIVDM` or
-`!AIVDO` substrings ending in an uppercase `*HH` checksum-shaped suffix, where
-`HH` represents two uppercase hexadecimal characters. The proxy checks that
-syntax only: it does not calculate the checksum value or accept the mixer's
-broader talker set.
+Each datagram or completed serial line is scanned for `!<talker>VDM` or
+`!<talker>VDO` substrings ending in an uppercase `*HH` checksum-shaped suffix,
+where `HH` represents two uppercase hexadecimal characters. The accepted
+talker IDs are the same AIS whitelist AISMixer core supports: `AI`, `AB`,
+`AD`, `AN`, `AR`, `AS`, `AT`, `AX`, and `BS`. The proxy checks sentence syntax
+only: it does not calculate the checksum value.
 
 Every match is forwarded independently. Multipart fragments are not assembled;
 nonmatching material is silently discarded. The bare match is forwarded, so
@@ -518,7 +519,6 @@ Current operator-visible limits:
 
 - one input-to-output relation per process;
 - no mixing, AISMixer routing, fan-out, deduplication, or multipart assembly;
-- proxy scanner support narrower than the mixer scanner;
 - checksum-shaped syntax checking without checksum arithmetic verification;
 - ingress TAG blocks, prefixes, and surrounding material stripped;
 - lossy UDP delivery without payload buffering or retransmission;

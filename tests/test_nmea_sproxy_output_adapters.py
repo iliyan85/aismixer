@@ -472,6 +472,42 @@ def test_udp_input_to_plain_udp_uses_allow_from(monkeypatch):
     assert output.sent == ["!AIVDM,1,1,,A,payload,0*00"]
 
 
+def test_udp_input_to_plain_udp_forwards_non_ai_talker(monkeypatch):
+    """Regression for Point 4: a base-station (non-AI) talker sentence must
+    reach plain UDP output unchanged through the real UDP-input forwarding
+    loop, not just at the extraction unit boundary."""
+    proxy = load_proxy_module()
+    sentence = "!BSVDM,1,1,,A,payload,0*00"
+
+    class LocalSocket:
+        def recvfrom(self, _size):
+            return sentence.encode(), ("192.0.2.15", 50000)
+
+    class Output:
+        def __init__(self):
+            self.sent = []
+
+        def send_sentence(self, line):
+            self.sent.append(line)
+
+    local_sock = LocalSocket()
+    output = Output()
+    select_calls = []
+
+    def fake_select(_readable, _writable, _exceptional, _timeout):
+        if not select_calls:
+            select_calls.append("local")
+            return [local_sock], [], []
+        raise OSError("end test")
+
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    reason = proxy.plain_udp_forward_loop(local_sock, output)
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    assert output.sent == [sentence]
+
+
 def test_udp_input_denied_before_plain_udp_send(monkeypatch):
     proxy = load_proxy_module()
     policy = proxy.NetworkPolicy.from_entries(
@@ -548,6 +584,48 @@ def test_serial_input_to_plain_udp_uses_queue_without_selecting_serial():
 
     assert reason == proxy.SESSION_END_SOCKET_ERROR
     assert output.sent == ["!AIVDM,1,1,,A,payload,0*00"]
+
+
+def test_serial_input_to_plain_udp_forwards_non_ai_talker():
+    """Regression for Point 4: a base-station (non-AI) VDO sentence must
+    reach plain UDP output unchanged through the real serial-input
+    forwarding loop, not just at the extraction unit boundary."""
+    proxy = load_proxy_module()
+    sentence = "!BSVDO,1,1,,A,payload,0*00"
+
+    class SerialAdapter:
+        def __init__(self):
+            self.sent = False
+
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return 0.05
+
+        def read_ready(self, _ready_socket):
+            return []
+
+        def read_pending(self):
+            if self.sent:
+                return []
+            self.sent = True
+            return [sentence.encode()]
+
+    class Output:
+        def __init__(self):
+            self.sent = []
+
+        def send_sentence(self, line):
+            self.sent.append(line)
+            raise OSError("end test")
+
+    output = Output()
+
+    reason = proxy.plain_udp_forward_loop(SerialAdapter(), output)
+
+    assert reason == proxy.SESSION_END_SOCKET_ERROR
+    assert output.sent == [sentence]
 
 
 def test_plain_udp_reconnect_reuses_pinned_resolved_destination(monkeypatch):
