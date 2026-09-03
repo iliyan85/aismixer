@@ -1,12 +1,12 @@
 import time
-from collections import deque
+from collections import OrderedDict
 from typing import Callable, Optional, Any
 
 _MONO = time.monotonic_ns
 
 
 class TTLMap:
-    __slots__ = ("_ttl_ns", "_max_entries", "_on_evict", "_d", "_q",
+    __slots__ = ("_ttl_ns", "_max_entries", "_on_evict", "_d",
                  "_last_sweep_ns", "_sweep_every_ns", "_ops", "_ops_per_sweep")
 
     def __init__(self, ttl_seconds: float, max_entries: int = 200_000,
@@ -15,8 +15,7 @@ class TTLMap:
         self._ttl_ns = int(ttl_seconds * 1e9)
         self._max_entries = max_entries
         self._on_evict = on_evict
-        self._d = {}
-        self._q = deque()
+        self._d: "OrderedDict[Any, int]" = OrderedDict()
         self._last_sweep_ns = _MONO()
         self._sweep_every_ns = int(sweep_every_seconds * 1e9)
         self._ops = 0
@@ -26,10 +25,10 @@ class TTLMap:
         n = _MONO() if now_ns is None else now_ns
         exp = n + self._ttl_ns
         self._d[key] = exp
-        self._q.append((exp, key))
+        self._d.move_to_end(key)
         self._maybe_sweep(n)
         if len(self._d) > self._max_entries:
-            self._evict_oldest(n, hard=True)
+            self._evict_oldest()
 
     def contains(self, key: Any, now_ns: Optional[int] = None) -> bool:
         n = _MONO() if now_ns is None else now_ns
@@ -46,17 +45,16 @@ class TTLMap:
     def __len__(self) -> int: return len(self._d)
 
     def clear(self) -> int:
-        """Discard all live entries and expiry records, preserving config.
+        """Discard all live entries, preserving config.
 
-        The eviction callback is invoked exactly once for each key that is
-        live when the clear begins. Stale expiry-queue records do not produce
-        callbacks.
+        The eviction callback is invoked exactly once for each key that was
+        live when the clear began. Callback order is not part of the
+        contract.
         """
         live_keys = tuple(self._d)
         removed = len(live_keys)
 
         self._d.clear()
-        self._q.clear()
         self._ops = 0
         self._last_sweep_ns = _MONO()
 
@@ -75,14 +73,14 @@ class TTLMap:
             self._last_sweep_ns = now_ns
 
     def _sweep(self, now_ns: int) -> None:
-        q, d, on_evict = self._q, self._d, self._on_evict
-        while q and q[0][0] <= now_ns:
-            exp, key = q.popleft()
-            cur = d.get(key)
-            if cur is not None and cur <= now_ns and cur == exp:
-                del d[key]
-                if on_evict:
-                    on_evict(key)
+        d, on_evict = self._d, self._on_evict
+        while d:
+            key, exp = next(iter(d.items()))
+            if exp > now_ns:
+                break
+            del d[key]
+            if on_evict:
+                on_evict(key)
 
     def _evict_key_if_expired(self, key: Any, now_ns: int) -> None:
         exp = self._d.get(key)
@@ -91,14 +89,10 @@ class TTLMap:
             if self._on_evict:
                 self._on_evict(key)
 
-    def _evict_oldest(self, now_ns: int, hard: bool = False) -> None:
-        q, d, on_evict, target = self._q, self._d, self._on_evict, self._max_entries
-        while len(d) > target and q:
-            exp, key = q.popleft()
-            cur = d.get(key)
-            if cur is None:
-                continue
-            if hard or cur <= now_ns:
-                del d[key]
-                if on_evict:
-                    on_evict(key)
+    def _evict_oldest(self) -> None:
+        d, on_evict, target = self._d, self._on_evict, self._max_entries
+        while len(d) > target:
+            key, _ = next(iter(d.items()))
+            del d[key]
+            if on_evict:
+                on_evict(key)

@@ -77,7 +77,6 @@ def test_source_state_reset_discards_live_and_orphaned_state():
 
     assert source_state.reset() == 2
     assert len(source_state._s_cache) == 0
-    assert not source_state._s_cache._q
     assert source_state._per_s_state == {}
 
     assert source_state.reset() == 0
@@ -98,14 +97,14 @@ def test_source_state_reset_clears_stale_expiry_records_and_preserves_ttl(
     now_ns = 400_000_000
     source_state.touch_s("reused-station")
 
-    assert len(source_state._s_cache._q) == 2
+    assert len(source_state._s_cache) == 1
     assert source_state.reset() == 1
-    assert not source_state._s_cache._q
+    assert len(source_state._s_cache) == 0
     assert source_state._s_cache._ops == 0
 
     now_ns = 500_000_000
     source_state.touch_s("reused-station")
-    assert len(source_state._s_cache._q) == 1
+    assert len(source_state._s_cache) == 1
 
     # Both pre-reset expiry times pass without affecting the fresh entry.
     now_ns = 1_400_000_000
@@ -115,6 +114,25 @@ def test_source_state_reset_clears_stale_expiry_records_and_preserves_ttl(
     now_ns = 1_500_000_000
     assert not source_state._s_cache.contains("reused-station")
     assert "reused-station" not in source_state._per_s_state
+
+
+def test_source_state_capacity_eviction_does_not_discard_refreshed_source():
+    """Regression for Point 3: capacity pressure must not discard the
+    associated state of a source that was refreshed after another source
+    was touched."""
+    source_state = SourceState(max_entries=2)
+    source_state.touch_s("station-a")
+    source_state.touch_s("station-b")
+    source_state.touch_s("station-a")
+    source_state._per_s_state["station-a"]["marker"] = True
+
+    source_state.touch_s("station-c")
+
+    assert not source_state._s_cache.contains("station-b")
+    assert "station-b" not in source_state._per_s_state
+    assert source_state._s_cache.contains("station-a")
+    assert source_state._per_s_state["station-a"] == {"marker": True}
+    assert source_state._s_cache.contains("station-c")
 
 
 def test_source_state_reset_preserves_capacity_and_instance_isolation():
