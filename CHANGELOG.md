@@ -6,20 +6,137 @@ still change public APIs and configuration behavior as the service matures.
 
 ## [Unreleased]
 
-### UDPSEC security
+## [0.2.1] - 2026-09-04
 
-- Isolates pending and active sessions by physical listener socket incarnation
-  plus raw peer address, preventing same-peer state from being selected or
-  replaced across listeners sharing one `SecureState`, with no wire change.
+### Highlights
+
+- Closes a security and correctness hardening pass across UDPSEC session
+  lifecycle, ingress error containment, processing/state bookkeeping, runtime
+  observability, configuration validation, the local control-socket
+  lifecycle, and key-material handling. This remains a pre-1.0 release
+  without a stable public API or configuration compatibility guarantee.
+
+### UDPSEC hardening
+
+- Builds on the 0.2.0 authenticated ephemeral P-256 ECDHE handshake — signed
+  transcript-bound digests, HKDF-SHA256-derived directional AES-256-GCM
+  traffic keys, and an encrypted key-possession confirmation — with a
+  hardened session lifecycle.
+- Isolates pending and active sessions by physical listener socket
+  incarnation plus raw peer address, so same-peer state can no longer be
+  selected or replaced across listeners sharing one secure-state owner.
 - Retains every admitted receiver-side DATA nonce for its full traffic-key
   epoch instead of expiring or evicting live nonce records. At the hard
-  per-epoch bound, the next distinct authenticated and semantically valid nonce
-  fails closed by invalidating only that exact active or pending epoch and
-  dropping the packet. Active loss recovers through the existing authenticated
-  ECDHE re-handshake with no wire-protocol change.
-- Adds `data_nonce_exhaustions` secure-state accounting. The legacy
-  `data_nonces_expired` and `data_nonces_capacity_evicted` snapshot fields
-  remain for compatibility and stay zero.
+  per-epoch bound, the next distinct valid nonce fails closed by
+  invalidating only that one epoch and dropping the packet; recovery is
+  through the existing authenticated ECDHE re-handshake, with no
+  wire-protocol change. Adds `data_nonce_exhaustions` secure-state
+  accounting; the legacy `data_nonces_expired` and
+  `data_nonces_capacity_evicted` snapshot fields remain for compatibility
+  and stay zero.
+- Adds authenticated, encrypted keepalive liveness: sequence `0` is reserved
+  for the encrypted confirmation ping/pong, and every later ping/pong
+  requires an exact matching sequence from the pinned remote tuple, under
+  the live session key; no pong is accepted with no ping outstanding. An
+  unanswered ping at the next keepalive deadline ends the local forwarding
+  loop with a proactive-rekey reason and immediately starts one fresh signed
+  ECDHE handshake.
+- Adds an authenticated, encrypted best-effort graceful close sent under the
+  session's own key, replacing the previous unauthenticated plaintext
+  `NOSESSION` notice. UDPSEC now has no plaintext session-reset, downgrade,
+  or fallback path of any kind: a plaintext, malformed, or otherwise
+  unauthenticated datagram can never touch, promote, or delete a live
+  session, and every recovery path is fail-closed through a fresh
+  authenticated handshake.
+
+### Ingress robustness
+
+- Contains recoverable per-peer `ConnectionResetError` /
+  `ConnectionRefusedError` receive conditions (for example a delayed ICMP
+  port-unreachable response surfacing on a later receive) on both the plain
+  UDP and UDPSEC listeners: the condition is logged, produces no
+  `IngressFrame`, and the listener keeps awaiting the next datagram instead
+  of terminating the runtime. Any other `OSError` still propagates to
+  runtime supervision, and cancellation still propagates unchanged.
+- Plain UDP ingress now reads one full datagram per receive at a buffer size
+  that does not truncate ordinary IPv4/IPv6 UDP payloads at the application
+  boundary, replacing the previous 8192-byte application receive bound.
+
+### Processing and state correctness
+
+- Redesigns `TTLMap` expiry bookkeeping onto one ordered structure that also
+  serves as the expiry queue, removing the separate expiry-record queue that
+  previously grew by one stale record on every refresh of an existing key.
+- Expands `nmea_sproxy`'s accepted AIS talker whitelist from `AI`-only to
+  the same closed set AISMixer core supports: `AI`, `AB`, `AD`, `AN`, `AR`,
+  `AS`, `AT`, `AX`, and `BS`.
+- Closes regression coverage confirming multipart TAG `s` handling: an
+  exact-duplicate fragment arrival may update the cached `s`, a completing
+  arrival that carries no `s` of its own falls back to that cached value,
+  and the cached value does not leak into a later, unrelated completion
+  that reuses the same assembly key.
+
+### Runtime and operator behavior
+
+- The shipped example and packaged configuration now default `debug: false`
+  instead of `true`, so a fresh deployment no longer defaults to
+  high-frequency, traffic-proportional debug logging.
+- Adds a sparse, debug-independent runtime statistics heartbeat to both
+  AISMixer and `nmea_sproxy`, supervised as an essential task alongside the
+  existing ingress/processing/egress stages.
+- Hardens configuration validation: `g_id_digits` must now be a plain
+  integer in `1..32`, checked before any step with a persistent side effect
+  (including UDPSEC server key generation); `control.unix.socket_mode` now
+  requires an unambiguous canonical four-character octal string
+  (`"0000"`-`"0777"`) instead of a looser, radix-ambiguous form; and a
+  boolean `listen_port` is rejected instead of being silently coerced.
+- Hardens the local Unix-domain control-socket lifecycle: the socket node
+  is created under a mode-derived umask so it is never briefly more
+  permissive than its configured mode; a pre-existing path at the socket
+  location is now actively probed and only removed once confirmed stale —
+  a live socket refuses replacement instead of being displaced — with an
+  identity re-check immediately before removal to close the
+  replace-on-startup race; and a partial request frame left at connection
+  EOF is discarded instead of being dispatched.
+
+### Forwarding and key tooling
+
+- `Forwarder` now detects a cached UDP transport that has started closing
+  and transparently recreates it, instead of silently dropping sends
+  through a closing transport.
+- Hardens `--force` PEM key-pair replacement used by the canonical
+  `tools/aismixer_keys.py` utility: both the private and public PEM are
+  staged as complete temporary files beside their destinations, then
+  replaced individually with `os.replace`; an existing key file is never
+  truncated in place. Replacement across the pair is sequential, not one
+  atomic operation: a failure between the two individual replacements can
+  leave a new private key beside an old public key, a mismatch that
+  identity validation rejects and that `--repair-public` resolves.
+- `nmea_sproxy/station_keys_gen.py` now prints an explicit deprecation
+  notice naming its replacement on every invocation. The canonical key tool
+  for both server and station identities remains `tools/aismixer_keys.py`.
+- AISMixer's UDPSEC server identity is now prepared through a shared
+  identity service and only when `sec_inputs` actually configures secure
+  ingress, instead of unconditionally. `nmea_sproxy` station identity
+  preparation is now demand-driven at runtime instead of eager at
+  systemd-installer time; the installer no longer generates or repairs
+  station keys itself.
+
+### Compatibility and operator impact
+
+- No configuration keys were removed or renamed. The only shipped default
+  that changed is `debug` (`true` → `false`) in the example and packaged
+  configuration; an operator's existing explicit `debug: true` is
+  unaffected.
+- The legacy top-level `nmea_sproxy` configuration form (predating the
+  `input:`/`output:` mapping already canonical since 0.2.0) remains
+  accepted, now emits an explicit runtime deprecation notice, and the
+  shipped/example templates switched to the explicit mapping as their
+  primary form.
+- The UDPSEC control plane no longer sends or expects the plaintext
+  `NOSESSION` notice; graceful close is now an authenticated encrypted
+  message under an established session key. This is additive to the 0.2.0
+  ECDHE handshake, not a handshake-format change.
 
 ## [0.2.0] - 2026-08-09
 
@@ -334,6 +451,7 @@ still change public APIs and configuration behavior as the service matures.
 - No long-term storage or analytics.
 - No operational maritime-picture generation.
 
-[Unreleased]: https://github.com/iliyan85/aismixer/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/iliyan85/aismixer/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/iliyan85/aismixer/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/iliyan85/aismixer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/iliyan85/aismixer/releases/tag/v0.1.0
