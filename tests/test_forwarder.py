@@ -21,6 +21,10 @@ class _FakeTransport:
         self.closed = False
 
     def sendto(self, data):
+        if self.closed:
+            # Real asyncio silently drops here; asserting makes any accidental
+            # reuse of a closed cached transport a loud test failure.
+            raise AssertionError("sendto called on a closed transport")
         failure = self.loop.send_errors.get(self.remote_addr)
         if failure is not None:
             raise failure
@@ -29,6 +33,9 @@ class _FakeTransport:
 
     def close(self):
         self.closed = True
+
+    def is_closing(self):
+        return self.closed
 
 
 class _FakeLoop:
@@ -785,3 +792,39 @@ def test_close_closes_cached_transports(monkeypatch):
 
     assert transport.closed
     assert forwarder.transports == {}
+
+
+def test_usable_cached_transport_is_reused_without_recreation(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder([{"host": "127.0.0.1", "port": 19000}])
+
+    real_asyncio.run(forwarder.send(b"one"))
+    real_asyncio.run(forwarder.send(b"two"))
+
+    assert len(loop.created) == 1
+    transport = loop.created[0][1]
+    assert transport.sent == [b"one", b"two"]
+    assert list(forwarder.transports.values()) == [transport]
+
+
+def test_closing_cached_transport_is_evicted_and_recreated_once(monkeypatch):
+    loop = _patch_forwarder_loop(monkeypatch)
+    forwarder = Forwarder([{"host": "127.0.0.1", "port": 19000}])
+
+    real_asyncio.run(forwarder.send(b"first"))
+    stale_transport = loop.created[0][1]
+    assert list(forwarder.transports.values()) == [stale_transport]
+
+    # The cached transport starts closing while the Forwarder stays active.
+    stale_transport.close()
+    assert stale_transport.is_closing() is True
+
+    real_asyncio.run(forwarder.send(b"second"))
+
+    assert len(loop.created) == 2
+    fresh_transport = loop.created[1][1]
+    assert fresh_transport is not stale_transport
+    assert stale_transport.sent == [b"first"]
+    assert fresh_transport.sent == [b"second"]
+    assert list(forwarder.transports.values()) == [fresh_transport]
+    assert forwarder.output_traffic_snapshot()[0].dispatch_completed == 2

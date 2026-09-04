@@ -10,6 +10,8 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+import core.key_material as key_material
+
 
 ROOT = Path(__file__).resolve().parents[1]
 KEY_TOOL_PATH = ROOT / "tools" / "aismixer_keys.py"
@@ -207,6 +209,24 @@ def test_existing_files_are_not_overwritten_without_force(tmp_path):
     assert public_path.read_bytes() == b"existing public"
 
 
+def _residual_temp_files(directory):
+    return sorted(p.name for p in Path(directory).iterdir() if p.name.endswith(".tmp"))
+
+
+def _seed_valid_pair(tmp_path, tool):
+    """Create a real, valid old key pair at the default server names."""
+
+    seed_dir = tmp_path / "seed"
+    tool.generate_key_pair(seed_dir, tool.SERVER_PRIVATE_NAME, tool.SERVER_PUBLIC_NAME)
+    private_path = tmp_path / tool.SERVER_PRIVATE_NAME
+    public_path = tmp_path / tool.SERVER_PUBLIC_NAME
+    old_private = (seed_dir / tool.SERVER_PRIVATE_NAME).read_bytes()
+    old_public = (seed_dir / tool.SERVER_PUBLIC_NAME).read_bytes()
+    private_path.write_bytes(old_private)
+    public_path.write_bytes(old_public)
+    return private_path, public_path, old_private, old_public
+
+
 def test_force_overwrites_existing_files(tmp_path):
     tool = load_key_tool()
     private_path = tmp_path / tool.SERVER_PRIVATE_NAME
@@ -225,6 +245,173 @@ def test_force_overwrites_existing_files(tmp_path):
     assert public_path.read_bytes() != b"existing public"
     load_private_key(private_path)
     load_public_key(public_path)
+
+
+def test_force_success_replaces_pair_and_leaves_no_temp_files(tmp_path):
+    tool = load_key_tool()
+    private_path, public_path, old_private, old_public = _seed_valid_pair(tmp_path, tool)
+
+    tool.generate_key_pair(
+        tmp_path,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+        force=True,
+    )
+
+    new_private = load_private_key(private_path)
+    new_public = load_public_key(public_path)
+    assert private_path.read_bytes() != old_private
+    assert public_path.read_bytes() != old_public
+    assert new_private.public_key().public_numbers() == new_public.public_numbers()
+    assert _residual_temp_files(tmp_path) == []
+    if os.name == "posix":
+        assert stat.S_IMODE(private_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(public_path.stat().st_mode) == 0o644
+
+
+def test_force_failure_before_replacement_preserves_old_pair(tmp_path, monkeypatch):
+    tool = load_key_tool()
+    private_path, public_path, old_private, old_public = _seed_valid_pair(tmp_path, tool)
+
+    real_stage = key_material._stage_key_file
+    calls = {"n": 0}
+
+    def failing_stage(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("no space left while staging the public key")
+        return real_stage(*args, **kwargs)
+
+    monkeypatch.setattr(key_material, "_stage_key_file", failing_stage)
+
+    with pytest.raises(OSError, match="no space left"):
+        tool.generate_key_pair(
+            tmp_path,
+            tool.SERVER_PRIVATE_NAME,
+            tool.SERVER_PUBLIC_NAME,
+            force=True,
+        )
+
+    assert private_path.read_bytes() == old_private
+    assert public_path.read_bytes() == old_public
+    assert _residual_temp_files(tmp_path) == []
+
+
+def test_force_failure_on_first_replace_preserves_old_pair(tmp_path, monkeypatch):
+    tool = load_key_tool()
+    private_path, public_path, old_private, old_public = _seed_valid_pair(tmp_path, tool)
+
+    real_replace = key_material.os.replace
+
+    def failing_replace(src, dst):
+        if os.path.basename(os.fspath(dst)) == tool.SERVER_PRIVATE_NAME:
+            raise OSError("cannot replace private path")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(key_material.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="cannot replace private path"):
+        tool.generate_key_pair(
+            tmp_path,
+            tool.SERVER_PRIVATE_NAME,
+            tool.SERVER_PUBLIC_NAME,
+            force=True,
+        )
+
+    assert private_path.read_bytes() == old_private
+    assert public_path.read_bytes() == old_public
+    assert _residual_temp_files(tmp_path) == []
+
+
+def test_force_failure_on_second_replace_leaves_recoverable_residual(tmp_path, monkeypatch):
+    tool = load_key_tool()
+    private_path, public_path, old_private, old_public = _seed_valid_pair(tmp_path, tool)
+
+    real_replace = key_material.os.replace
+
+    def failing_replace(src, dst):
+        if os.path.basename(os.fspath(dst)) == tool.SERVER_PUBLIC_NAME:
+            raise OSError("cannot replace public path")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(key_material.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="cannot replace public path"):
+        tool.generate_key_pair(
+            tmp_path,
+            tool.SERVER_PRIVATE_NAME,
+            tool.SERVER_PUBLIC_NAME,
+            force=True,
+        )
+
+    # Residual: the new private is in place, the old public is untouched, and
+    # the pair is intentionally NOT claimed to be atomic.
+    assert private_path.read_bytes() != old_private
+    assert public_path.read_bytes() == old_public
+    assert _residual_temp_files(tmp_path) == []
+    new_private = load_private_key(private_path)  # parseable
+
+    # The public is recoverable from the new private via existing repair.
+    result = tool.repair_public_key(
+        tmp_path,
+        tool.SERVER_PRIVATE_NAME,
+        tool.SERVER_PUBLIC_NAME,
+    )
+    assert result.repaired is True
+    assert (
+        new_private.public_key().public_numbers()
+        == load_public_key(public_path).public_numbers()
+    )
+
+
+def test_non_force_write_requests_kernel_exclusive_create(tmp_path, monkeypatch):
+    tool = load_key_tool()
+    key_names = {tool.SERVER_PRIVATE_NAME, tool.SERVER_PUBLIC_NAME}
+    seen = []
+    real_open = key_material.os.open
+
+    def spy_open(path, flags, *rest):
+        if os.path.basename(os.fspath(path)) in key_names:
+            seen.append(flags)
+        return real_open(path, flags, *rest)
+
+    monkeypatch.setattr(key_material.os, "open", spy_open)
+
+    def forbidden_replace(*_args, **_kwargs):
+        raise AssertionError("os.replace must not run on the non-force path")
+
+    monkeypatch.setattr(key_material.os, "replace", forbidden_replace)
+
+    tool.generate_key_pair(tmp_path, tool.SERVER_PRIVATE_NAME, tool.SERVER_PUBLIC_NAME)
+
+    assert len(seen) == 2, "expected exclusive-create opens for both key files"
+    assert all(flags & os.O_EXCL for flags in seen)
+    assert all(not (flags & os.O_TRUNC) for flags in seen)
+
+
+def test_non_force_exclusive_create_still_refuses_a_raced_in_file(tmp_path, monkeypatch):
+    tool = load_key_tool()
+    key_names = {tool.SERVER_PRIVATE_NAME, tool.SERVER_PUBLIC_NAME}
+    private_path = tmp_path / tool.SERVER_PRIVATE_NAME
+    real_exists = key_material.Path.exists
+
+    def selective_exists(self):
+        if self.name in key_names:
+            return False  # hide the raced-in file from the Python pre-check
+        return real_exists(self)
+
+    monkeypatch.setattr(key_material.Path, "exists", selective_exists, raising=True)
+    private_path.write_bytes(b"raced-in private")
+
+    with pytest.raises(tool.KeyFileExistsError):
+        tool.generate_key_pair(
+            tmp_path,
+            tool.SERVER_PRIVATE_NAME,
+            tool.SERVER_PUBLIC_NAME,
+        )
+
+    # Enforcement fell to O_CREAT | O_EXCL, not the pre-check; file untouched.
+    assert private_path.read_bytes() == b"raced-in private"
 
 
 def test_key_file_permissions_are_set_on_posix(tmp_path):
@@ -466,3 +653,38 @@ def test_station_keys_gen_force_overwrites_existing_keys(tmp_path):
     assert public_path.read_bytes() != original_public
     load_private_key(private_path)
     load_public_key(public_path)
+
+
+def load_station_wrapper():
+    spec = importlib.util.spec_from_file_location(
+        "station_keys_gen", STATION_WRAPPER_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_station_keys_gen_emits_deprecation_notice_and_still_works(tmp_path):
+    result = run_station_wrapper(ROOT, STATION_WRAPPER_PATH, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "DEPRECATION" in result.stderr
+    assert "tools/aismixer_keys.py station" in result.stderr
+    assert str(tmp_path) in result.stderr
+    # No secret material is echoed by the notice.
+    assert "PRIVATE KEY" not in result.stderr
+    # Delegation is unchanged: keys are still produced with the legacy names.
+    assert (tmp_path / LEGACY_STATION_PRIVATE_NAME).exists()
+    assert (tmp_path / LEGACY_STATION_PUBLIC_NAME).exists()
+    assert "authorized_clients:" in result.stdout
+
+
+def test_station_keys_gen_notice_reports_resolved_output_directory():
+    wrapper = load_station_wrapper()
+
+    assert wrapper._resolved_keys_dir([]) == str(wrapper.SCRIPT_DIR)
+    assert wrapper._resolved_keys_dir(["--keys-dir", "/tmp/custom"]) == "/tmp/custom"
+    assert wrapper._resolved_keys_dir(["--keys-dir=/tmp/eq"]) == "/tmp/eq"
+    assert wrapper.SCRIPT_DIR.name == "nmea_sproxy"
+    assert "deprecated" in (wrapper.__doc__ or "").lower()

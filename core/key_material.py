@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,6 +50,76 @@ def _write_file(path: Path, data: bytes, mode: int, *, force: bool) -> None:
     with os.fdopen(fd, "wb") as file:
         file.write(data)
     os.chmod(path, mode)
+
+
+def _discard_key_file(path: Path) -> None:
+    """Best-effort removal of a staged PEM temp file. Never raises."""
+
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _stage_key_file(keys_dir: Path, final_name: str, data: bytes, mode: int) -> Path:
+    """Write one complete PEM to a fresh temp file beside its destination.
+
+    Filesystem-and-PEM specific: the temp is created in ``keys_dir`` so a later
+    ``os.replace`` onto the final path stays on one filesystem, and it is never
+    created more permissively than ``mode``. Returns the temp path; on any
+    failure the temp is removed and the error propagates.
+    """
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=os.fspath(keys_dir),
+        prefix=f"{final_name}.",
+        suffix=".tmp",
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            tmp_file.write(data)
+        os.chmod(tmp_path, mode)
+    except BaseException:
+        _discard_key_file(tmp_path)
+        raise
+    return tmp_path
+
+
+def _replace_key_pair(
+    private_path: Path,
+    private_pem: bytes,
+    public_path: Path,
+    public_pem: bytes,
+) -> None:
+    """Stage both PEM files completely, then replace destinations in place.
+
+    Each ``os.replace`` is atomic per file. Any failure before the first
+    ``os.replace`` leaves both destination files byte-for-byte untouched. The
+    pair replacement is sequential, not transactional: a failure after the
+    private replace but before the public replace can leave a new private next
+    to the old public. Runtime identity validation rejects that mismatch, and
+    the public key remains derivable from the private key. Private is replaced
+    first so this residual case is the recoverable one.
+    """
+
+    keys_dir = private_path.parent
+    private_tmp = _stage_key_file(
+        keys_dir, private_path.name, private_pem, PRIVATE_MODE
+    )
+    public_tmp: Path | None = None
+    try:
+        public_tmp = _stage_key_file(
+            keys_dir, public_path.name, public_pem, PUBLIC_MODE
+        )
+        os.replace(private_tmp, private_path)
+        os.replace(public_tmp, public_path)
+    finally:
+        _discard_key_file(private_tmp)
+        if public_tmp is not None:
+            _discard_key_file(public_tmp)
 
 
 def _serialize_private_key(private_key) -> bytes:
@@ -103,19 +174,18 @@ def generate_key_pair(
 
     private_key = ec.generate_private_key(ec.SECP256R1())
     public_key = private_key.public_key()
+    private_pem = _serialize_private_key(private_key)
+    public_pem = _serialize_public_key(public_key)
 
-    _write_file(
-        private_path,
-        _serialize_private_key(private_key),
-        PRIVATE_MODE,
-        force=force,
-    )
-    _write_file(
-        public_path,
-        _serialize_public_key(public_key),
-        PUBLIC_MODE,
-        force=force,
-    )
+    if force:
+        # Destructive replacement: stage both PEM files fully, then swap them
+        # into place. Never truncate an existing key file in situ.
+        _replace_key_pair(private_path, private_pem, public_path, public_pem)
+    else:
+        # Fresh generation only: exclusive create keeps the kernel-level
+        # no-overwrite guarantee (O_CREAT | O_EXCL) even against a race.
+        _write_file(private_path, private_pem, PRIVATE_MODE, force=False)
+        _write_file(public_path, public_pem, PUBLIC_MODE, force=False)
 
     return GeneratedKeyPair(
         private_path=private_path,

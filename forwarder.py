@@ -135,7 +135,15 @@ class Forwarder:
 
     async def _ensure_transport(self, loop, destination):
         key = _transport_cache_key(destination)
-        if key not in self.transports:
+        cached = self.transports.get(key)
+        if cached is not None and cached.is_closing():
+            # Defensive freshness check: a cached datagram transport that has
+            # started closing would silently drop sends. Evict just this entry
+            # and recreate it through the normal path below. This is hardening
+            # of a latent condition, not a response to an observed failure.
+            del self.transports[key]
+            cached = None
+        if cached is None:
             kwargs = {"remote_addr": (destination.host, destination.port)}
             if destination.source_ip is not None:
                 kwargs["family"] = destination.family

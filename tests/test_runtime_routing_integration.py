@@ -42,6 +42,9 @@ class _FakeTransport:
     def close(self):
         self.closed = True
 
+    def is_closing(self):
+        return self.closed
+
 
 class _FakeLoop:
     def __init__(self):
