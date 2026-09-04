@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=aismixer
 PKG_VERSION:=0.2.1
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 # Pinned to the tagged, signed v0.2.1 release commit. Do not follow a moving
 # branch; repin explicitly, source revision and mirror hash together, at the
@@ -57,6 +57,17 @@ define Package/aismixer
   TITLE:=AIS/NMEA mixer, deduplicator and router
   SOURCE:=github.com/iliyan85/aismixer
   DEPENDS:=+aismixer-common +python3-yaml +python3-cryptography
+  # Exact runtime pin on top of the ordinary select/build DEPENDS above:
+  # aismixer imports directly from the aismixer-common core/ tree (e.g.
+  # core.udpsec_protocol), and a same-named-but-mismatched-revision
+  # aismixer-common (as during an in-progress apk upgrade that has not yet
+  # replaced its core/ tree) fails with ImportError rather than degrading
+  # gracefully. The OpenWrt package version string is
+  # $(PKG_VERSION)-r$(PKG_RELEASE) (the literal "r" matches the published
+  # 0.2.1-r1/0.2.1-r2 artifacts and router `apk policy` output), derived
+  # from PKG_VERSION/PKG_RELEASE rather than hard-coded release text, so it
+  # always matches the revision aismixer itself is built as.
+  EXTRA_DEPENDS:=aismixer-common (=$(PKG_VERSION)-r$(PKG_RELEASE))
 endef
 
 define Package/aismixer/description
@@ -74,6 +85,12 @@ define Package/nmea_sproxy
   TITLE:=AIS/NMEA serial and UDP secure proxy
   SOURCE:=github.com/iliyan85/aismixer
   DEPENDS:=+aismixer-common +python3-yaml +python3-cryptography +python3-pyserial
+  # Exact runtime pin: see the matching comment on Package/aismixer's
+  # EXTRA_DEPENDS. nmea_sproxy imports directly from the aismixer-common
+  # core/ tree (e.g. build_ping_message from core.udpsec_protocol) and
+  # needs the exact same-revision core/ runtime, not merely any installed
+  # aismixer-common.
+  EXTRA_DEPENDS:=aismixer-common (=$(PKG_VERSION)-r$(PKG_RELEASE))
 endef
 
 define Package/nmea_sproxy/description

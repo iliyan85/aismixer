@@ -35,7 +35,7 @@ CANONICAL_PROXY_UDP_OUTPUT = (
     "  port: 17777\n"
 )
 EXPECTED_OPENWRT_VERSION = "0.2.1"
-EXPECTED_OPENWRT_RELEASE = "2"
+EXPECTED_OPENWRT_RELEASE = "3"
 EXPECTED_OPENWRT_SOURCE_DATE = "2026-09-04"
 EXPECTED_OPENWRT_SOURCE_REVISION = "d8d8c500f5bcfcb451db92b899b2eba5a1626e48"
 EXPECTED_OPENWRT_MIRROR_HASH = (
@@ -530,6 +530,110 @@ def test_openwrt_common_package_declares_cryptography_dependency():
     common = makefile_block(recipe, "Package/aismixer-common")
 
     assert "DEPENDS:=+python3 +python3-cryptography" in common
+
+
+def test_openwrt_consumers_pin_exact_matching_aismixer_common_revision():
+    """Regression: on a real OpenWrt 25.12.5 x86_64 router, `apk upgrade
+    aismixer-common aismixer nmea_sproxy` from 0.2.1-r1 transiently ran the
+    new aismixer/nmea_sproxy Python source against the still-r1
+    aismixer-common core/ tree mid-transaction, producing
+    `ImportError: cannot import name 'SESSION_CLOSE_TYPE' from
+    'core.udpsec_protocol'` (aismixer) and `cannot import name
+    'build_ping_message' from 'core.udpsec_protocol'` (nmea_sproxy) --
+    both symbols genuinely absent from the r1-pinned source. A plain,
+    unversioned `+aismixer-common` DEPENDS lets apk consider any installed
+    aismixer-common revision satisfying, including a stale one mid-upgrade.
+
+    Fix: keep the ordinary, unversioned `+aismixer-common` in DEPENDS for
+    normal build/select package-presence handling, and add a
+    version-constrained EXTRA_DEPENDS carrying the exact runtime pin. The
+    OpenWrt/APK package version string is $(PKG_VERSION)-r$(PKG_RELEASE)
+    with a literal "r" -- matching the published 0.2.1-r1/0.2.1-r2
+    artifacts and real router `apk policy` output -- not the bare
+    $(PKG_VERSION)-$(PKG_RELEASE) form.
+    """
+    recipe = read_text(PACKAGE_DIR / "Makefile")
+    exact_extra_depends = re.compile(
+        r"^\s*EXTRA_DEPENDS:=aismixer-common "
+        r"\(=\$\(PKG_VERSION\)-r\$\(PKG_RELEASE\)\)\s*$",
+        re.MULTILINE,
+    )
+    missing_r_form = re.compile(r"\(=\$\(PKG_VERSION\)-\$\(PKG_RELEASE\)\)")
+
+    for package_name in ("aismixer", "nmea_sproxy"):
+        package = makefile_block(recipe, f"Package/{package_name}")
+
+        # 1. Ordinary, unversioned +aismixer-common remains in DEPENDS for
+        #    normal build/select package-presence handling -- no version
+        #    constraint embedded here; that lives in EXTRA_DEPENDS only.
+        (depends_line,) = re.findall(
+            r"^\s*DEPENDS:=(.*)$", package, re.MULTILINE
+        )
+        assert "+aismixer-common" in depends_line.split(), (
+            f"Package/{package_name} DEPENDS must still list the ordinary "
+            f"'+aismixer-common' selection dependency. Got: {depends_line!r}"
+        )
+        assert "(" not in depends_line, (
+            f"Package/{package_name} DEPENDS must stay unversioned; the "
+            f"exact pin belongs in EXTRA_DEPENDS. Got: {depends_line!r}"
+        )
+
+        # 2 & 3. Exactly one EXTRA_DEPENDS line, carrying the
+        #    variable-derived "-r$(PKG_RELEASE)" exact pin (literal "r").
+        extra_depends = re.findall(
+            r"^\s*EXTRA_DEPENDS:=(.*)$", package, re.MULTILINE
+        )
+        assert len(extra_depends) == 1, (
+            "expected exactly one EXTRA_DEPENDS line in "
+            f"Package/{package_name}"
+        )
+        assert exact_extra_depends.search(package), (
+            f"Package/{package_name} must declare exactly "
+            "'EXTRA_DEPENDS:=aismixer-common "
+            "(=$(PKG_VERSION)-r$(PKG_RELEASE))'. "
+            f"Got: {extra_depends[0]!r}"
+        )
+
+        # 4. The "r"-less form must not appear anywhere in this package's
+        #    block: it does not match the real OpenWrt/APK package version
+        #    string and would never resolve against the published 0.2.1-rN
+        #    artifacts.
+        assert not missing_r_form.search(package), (
+            f"Package/{package_name} must not use "
+            "$(PKG_VERSION)-$(PKG_RELEASE) (missing the 'r'); the actual "
+            "package version string is $(PKG_VERSION)-r$(PKG_RELEASE)."
+        )
+
+        # Package-variable-derived, not hard-coded release text: this must
+        # keep matching automatically on the next release bump.
+        assert "0.2.1-3" not in extra_depends[0]
+        assert "0.2.1-r3" not in extra_depends[0]
+
+    # 5. aismixer-common must not gain a circular/self dependency, in
+    #    either DEPENDS or EXTRA_DEPENDS.
+    common = makefile_block(recipe, "Package/aismixer-common")
+    assert "EXTRA_DEPENDS" not in common
+    (common_depends,) = re.findall(
+        r"^\s*DEPENDS:=(.*)$", common, re.MULTILINE
+    )
+    assert "aismixer-common" not in common_depends
+
+    # 6. Packaging revision bump.
+    assert re.findall(r"^PKG_RELEASE:=(\S+)$", recipe, re.MULTILINE) == [
+        EXPECTED_OPENWRT_RELEASE
+    ]
+
+    # 7. Upstream source pin/date/hash remain exactly the published 0.2.1
+    #    values; only the packaging revision changed for this fix.
+    assert re.findall(r"^PKG_SOURCE_DATE:=(\S+)$", recipe, re.MULTILINE) == [
+        EXPECTED_OPENWRT_SOURCE_DATE
+    ]
+    assert re.findall(
+        r"^PKG_SOURCE_VERSION:=(\S+)$", recipe, re.MULTILINE
+    ) == [EXPECTED_OPENWRT_SOURCE_REVISION]
+    assert re.findall(r"^PKG_MIRROR_HASH:=(\S+)$", recipe, re.MULTILINE) == [
+        EXPECTED_OPENWRT_MIRROR_HASH
+    ]
 
 
 def test_openwrt_aismixer_config_only_enables_packaged_unix_control():
