@@ -12,9 +12,11 @@ service startup path remains unchanged for now.
 from __future__ import annotations
 
 import asyncio
+import enum
 import inspect
 import logging
 import os
+import socket
 import stat
 from typing import Final
 
@@ -32,8 +34,17 @@ ERROR_INTERNAL_ERROR: Final = "internal_error"
 FRAME_TOO_LARGE_MESSAGE: Final = "Routing control request exceeds maximum frame size."
 INTERNAL_ERROR_MESSAGE: Final = "Internal routing control error."
 _READ_CHUNK_SIZE: Final = 65_536
+_STALE_SOCKET_PROBE_TIMEOUT_SECONDS: Final = 1.0
 
 _SocketIdentity = tuple[int, int]
+
+
+class _SocketLiveness(enum.Enum):
+    """Classification of an existing Unix socket path before it is replaced."""
+
+    LIVE = "live"
+    STALE = "stale"
+    UNCERTAIN = "uncertain"
 
 
 class ControlSocketPathError(OSError):
@@ -114,13 +125,14 @@ class RoutingControlUnixServer:
             )
 
         self._prepare_socket_path()
+
+        # Own the raw socket until asyncio takes it over. It is bound but not
+        # listening, its permissions are set to the exact configured mode, and
+        # only then is it handed to the listener.
+        raw_socket = _bind_control_socket(self._socket_path, self._socket_mode)
         server = None
         socket_identity = None
         try:
-            server = await start_unix_server(
-                self._handle_connection,
-                path=self._socket_path,
-            )
             socket_identity = _socket_identity(self._socket_path)
             if socket_identity is None:
                 raise ControlSocketPathError(
@@ -128,10 +140,16 @@ class RoutingControlUnixServer:
                     "Created control socket path is not a Unix socket",
                 )
             os.chmod(self._socket_path, self._socket_mode)
+            server = await start_unix_server(
+                self._handle_connection,
+                sock=raw_socket,
+            )
         except BaseException:
             if server is not None:
                 server.close()
                 await server.wait_closed()
+            else:
+                raw_socket.close()
             if socket_identity is not None:
                 _remove_matching_socket(
                     self._socket_path,
@@ -221,8 +239,14 @@ class RoutingControlUnixServer:
 
             chunk = await reader.read(read_size)
             if not chunk:
+                # Only complete newline-delimited frames are executable. Any
+                # trailing partial frame at EOF is discarded without dispatch
+                # and without a response.
                 if buffer:
-                    await self._process_frame(buffer, writer)
+                    logger.debug(
+                        "Discarding %d-byte partial routing control frame at EOF.",
+                        len(buffer),
+                    )
                 return
             buffer += chunk
 
@@ -275,20 +299,95 @@ class RoutingControlUnixServer:
                 "Control socket path cannot be inspected",
             ) from exc
 
-        if stat.S_ISSOCK(path_stat.st_mode):
-            try:
-                os.unlink(self._socket_path)
-            except OSError as exc:
-                raise ControlSocketPathError(
-                    self._socket_path,
-                    "Stale control socket could not be removed",
-                ) from exc
+        if not stat.S_ISSOCK(path_stat.st_mode):
+            raise ControlSocketPathError(
+                self._socket_path,
+                "Refusing to replace "
+                f"{_path_type(path_stat.st_mode)} at control socket path",
+            )
+
+        liveness = _probe_unix_socket(self._socket_path)
+        if liveness is _SocketLiveness.LIVE:
+            raise ControlSocketPathError(
+                self._socket_path,
+                "Refusing to replace a live control socket",
+            )
+        if liveness is not _SocketLiveness.STALE:
+            raise ControlSocketPathError(
+                self._socket_path,
+                "Existing control socket could not be confirmed stale",
+            )
+
+        self._remove_stale_control_socket(
+            (path_stat.st_dev, path_stat.st_ino),
+        )
+
+    def _remove_stale_control_socket(self, identity: _SocketIdentity) -> None:
+        """Unlink the path only if it is still the exact stale socket observed.
+
+        Guards the window between the liveness probe and ``unlink`` against a
+        concurrent process replacing the node: a vanished path is fine, but a
+        different inode, a non-socket, or a now-live endpoint all fail closed
+        rather than deleting a replacement. The identity is re-checked once more
+        immediately after the liveness re-probe, since that probe briefly
+        reconnects and the node may be swapped again before ``unlink``. This is
+        best-effort path-based hardening, not cross-process serialization: a
+        sub-``unlink`` window remains because the path, not an inode, is
+        unlinked.
+        """
+
+        if not self._still_observed_stale_socket(identity):
             return
 
-        raise ControlSocketPathError(
-            self._socket_path,
-            f"Refusing to replace {_path_type(path_stat.st_mode)} at control socket path",
-        )
+        if _probe_unix_socket(self._socket_path) is not _SocketLiveness.STALE:
+            raise ControlSocketPathError(
+                self._socket_path,
+                "Control socket path changed during startup",
+            )
+
+        # Final check immediately before unlink: the re-probe above reconnected,
+        # so re-confirm the node is still the same stale socket.
+        if not self._still_observed_stale_socket(identity):
+            return
+
+        try:
+            os.unlink(self._socket_path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ControlSocketPathError(
+                self._socket_path,
+                "Stale control socket could not be removed",
+            ) from exc
+
+    def _still_observed_stale_socket(self, identity: _SocketIdentity) -> bool:
+        """Return whether the path is still exactly the observed stale socket.
+
+        ``False`` means the path has since disappeared, which is safe: the
+        caller can proceed to a fresh bind. A changed inode, a non-socket
+        object, or an ambiguous ``lstat`` failure all fail closed instead.
+        """
+
+        try:
+            current = os.lstat(self._socket_path)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ControlSocketPathError(
+                self._socket_path,
+                "Control socket path cannot be inspected",
+            ) from exc
+
+        if (
+            not stat.S_ISSOCK(current.st_mode)
+            or (current.st_dev, current.st_ino) != identity
+        ):
+            raise ControlSocketPathError(
+                self._socket_path,
+                "Control socket path changed during startup",
+            )
+
+        return True
 
 
 async def _write_response(writer, response: bytes) -> bool:
@@ -326,6 +425,51 @@ def _socket_identity(path: str) -> _SocketIdentity | None:
     if not stat.S_ISSOCK(path_stat.st_mode):
         return None
     return (path_stat.st_dev, path_stat.st_ino)
+
+
+def _bind_control_socket(path: str, socket_mode: int) -> socket.socket:
+    """Return a bound, not-yet-listening ``AF_UNIX`` socket for ``path``.
+
+    The filesystem socket node is created under a mode-derived umask so it can
+    never appear on disk more permissively than ``socket_mode``, even briefly.
+    No ``await`` occurs while that temporary umask is installed, and the
+    original umask is restored even if ``bind`` fails. The caller owns the
+    returned socket until it is handed to ``asyncio.start_unix_server``.
+    """
+
+    raw_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        previous_umask = os.umask(0o777 & ~socket_mode)
+        try:
+            raw_socket.bind(path)
+        finally:
+            os.umask(previous_umask)
+    except BaseException:
+        raw_socket.close()
+        raise
+    return raw_socket
+
+
+def _probe_unix_socket(path: str) -> _SocketLiveness:
+    """Classify an existing Unix socket path without sending a protocol request.
+
+    A completed connection means a listener is alive; ``ECONNREFUSED`` (or the
+    path already being gone) means the node is a stale leftover; anything else
+    is treated as uncertain so the caller can fail closed.
+    """
+
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(_STALE_SOCKET_PROBE_TIMEOUT_SECONDS)
+        try:
+            probe.connect(path)
+        except (ConnectionRefusedError, FileNotFoundError):
+            return _SocketLiveness.STALE
+        except OSError:
+            return _SocketLiveness.UNCERTAIN
+        return _SocketLiveness.LIVE
+    finally:
+        probe.close()
 
 
 def _remove_matching_socket(

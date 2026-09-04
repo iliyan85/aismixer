@@ -233,10 +233,22 @@ def _validate_response_correlation(
     response: Mapping[str, object],
 ) -> None:
     expected_request_id = _trusted_request_id_or_none(request)
-    if response["request_id"] != expected_request_id:
-        raise RoutingControlResponseError(
-            "Routing control response request_id does not match request."
-        )
+    actual_request_id = response["request_id"]
+    if actual_request_id == expected_request_id:
+        return
+
+    # A transport/protocol-layer failure detected before the server could echo
+    # a request ID legitimately carries request_id: null. The envelope has
+    # already been validated as a well-formed ``ok: false`` error, so surface it
+    # as the server error rather than as a request-ID mismatch. Ordinary
+    # correlation (including any non-null mismatch and null-id successes) stays
+    # strict.
+    if actual_request_id is None and response["ok"] is False:
+        return
+
+    raise RoutingControlResponseError(
+        "Routing control response request_id does not match request."
+    )
 
 
 def _trusted_request_id_or_none(request: Mapping[str, object]) -> str | None:

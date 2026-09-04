@@ -18,6 +18,8 @@ from core.routing_control_unix import (
     ERROR_INTERNAL_ERROR,
     ControlSocketPathError,
     RoutingControlUnixServer,
+    _probe_unix_socket,
+    _SocketLiveness,
 )
 from core.routing_state import RoutingState
 
@@ -223,11 +225,61 @@ def test_malformed_json_does_not_close_connection_before_later_valid_request():
     assert second["request_id"] == "req-ok"
 
 
-def test_final_eof_terminated_frame_is_processed_once():
-    writer, _protocol = run(handle_bytes(status_request("req-eof"), protocol=make_protocol()))
+def test_partial_frame_at_eof_is_discarded_without_dispatch_or_response():
+    protocol = RecordingProtocol()
 
+    writer, protocol = run(
+        handle_bytes(status_request("req-eof"), protocol=protocol)
+    )
+
+    assert protocol.frames == []
+    assert writer.write_calls == []
+    assert writer.closed is True
+
+
+def test_complete_frame_before_partial_eof_frame_executes_only_the_complete_frame():
+    protocol = RecordingProtocol()
+
+    writer, protocol = run(
+        handle_bytes(
+            status_request("first") + b"\n" + status_request("second"),
+            protocol=protocol,
+        )
+    )
+
+    assert protocol.frames == [status_request("first")]
     assert len(writer.write_calls) == 1
-    assert parse_write(writer.write_calls[0])["request_id"] == "req-eof"
+    assert parse_write(writer.write_calls[0])["request_id"] == "req-1"
+
+
+def test_partial_replace_frame_at_eof_cannot_mutate_routing():
+    service = RoutingControlService(RoutingState(), {"udp:a": 0})
+    protocol = RoutingControlProtocol(service, UnusedStatisticsSource())
+    replace_frame = encode_json_response(
+        {
+            "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+            "request_id": "replace-eof",
+            "method": "routing.replace",
+            "params": {
+                "routing": {
+                    "zones": {"source": {"include": ["udp:source"]}},
+                    "routes": [
+                        {
+                            "name": "source_to_a",
+                            "from_zone": "source",
+                            "to": ["udp:a"],
+                        }
+                    ],
+                }
+            },
+        }
+    )
+
+    # Frame delivered without a trailing newline, then EOF.
+    writer, _protocol = run(handle_bytes(replace_frame, protocol=protocol))
+
+    assert writer.write_calls == []
+    assert service.status().generation == 0
 
 
 def test_oversized_frame_produces_frame_too_large_without_calling_protocol():
@@ -640,5 +692,373 @@ def test_listener_survives_internal_client_error(tmp_path):
         assert "secret" not in json.dumps(first)
         assert second["ok"] is True
         assert second["request_id"] == "after-error"
+
+    run(scenario())
+
+
+# --- Point 9 C: existing Unix socket path — stale vs live ---
+
+
+@unix_socket_test
+def test_probe_classifies_missing_path_as_stale(tmp_path):
+    assert (
+        _probe_unix_socket(str(tmp_path / "absent.sock"))
+        is _SocketLiveness.STALE
+    )
+
+
+@unix_socket_test
+def test_probe_classifies_dead_socket_file_as_stale(tmp_path):
+    path = tmp_path / "dead.sock"
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        dead.bind(str(path))
+    finally:
+        dead.close()
+
+    assert _probe_unix_socket(str(path)) is _SocketLiveness.STALE
+
+
+@unix_socket_test
+def test_probe_classifies_listening_socket_as_live(tmp_path):
+    async def scenario():
+        path = tmp_path / "control.sock"
+        server = RoutingControlUnixServer(make_protocol(), path)
+        await server.start()
+        try:
+            assert _probe_unix_socket(str(path)) is _SocketLiveness.LIVE
+        finally:
+            await server.close()
+
+    run(scenario())
+
+
+@unix_socket_test
+def test_live_control_socket_is_preserved_and_remains_reachable(tmp_path):
+    async def scenario():
+        path = tmp_path / "control.sock"
+        server_a = RoutingControlUnixServer(make_protocol(), path)
+        await server_a.start()
+        before = os.lstat(path)
+        try:
+            server_b = RoutingControlUnixServer(make_protocol(), path)
+            with pytest.raises(
+                ControlSocketPathError,
+                match="live control socket",
+            ):
+                await server_b.start()
+            assert server_b.is_running is False
+
+            after = os.lstat(path)
+            assert (after.st_dev, after.st_ino) == (
+                before.st_dev,
+                before.st_ino,
+            )
+
+            response = parse_response(
+                await unix_request(path, status_request("after-collision"))
+            )
+            assert response["ok"] is True
+            assert response["request_id"] == "after-collision"
+        finally:
+            await server_a.close()
+
+    run(scenario())
+
+
+@unix_socket_test
+def test_uncertain_probe_result_refuses_startup_without_unlink(
+    tmp_path,
+    monkeypatch,
+):
+    async def scenario():
+        path = tmp_path / "control.sock"
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            dead.bind(str(path))
+        finally:
+            dead.close()
+        before = os.lstat(path)
+
+        monkeypatch.setattr(
+            "core.routing_control_unix._probe_unix_socket",
+            lambda _path: _SocketLiveness.UNCERTAIN,
+        )
+
+        server = RoutingControlUnixServer(make_protocol(), path)
+        with pytest.raises(ControlSocketPathError, match="stale"):
+            await server.start()
+
+        after = os.lstat(path)
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+
+    run(scenario())
+
+
+@unix_socket_test
+def test_live_socket_swapped_in_after_probe_is_not_unlinked(
+    tmp_path,
+    monkeypatch,
+):
+    async def scenario():
+        path = tmp_path / "control.sock"
+        original = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            original.bind(str(path))
+        finally:
+            original.close()
+
+        import core.routing_control_unix as unix_module
+
+        real_probe = unix_module._probe_unix_socket
+        holder = {}
+
+        def probe_then_swap_live(probe_path):
+            if holder.get("swapped"):
+                return real_probe(probe_path)
+            holder["swapped"] = True
+            result = real_probe(probe_path)
+            # Simulate another process winning the race: the stale node is
+            # replaced by a live listener between our probe and our unlink.
+            os.unlink(probe_path)
+            live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            live.bind(probe_path)
+            live.listen(1)
+            holder["socket"] = live
+            return result
+
+        monkeypatch.setattr(
+            unix_module,
+            "_probe_unix_socket",
+            probe_then_swap_live,
+        )
+
+        server = RoutingControlUnixServer(make_protocol(), path)
+        try:
+            with pytest.raises(
+                ControlSocketPathError,
+                match="changed during startup",
+            ):
+                await server.start()
+            assert stat.S_ISSOCK(os.lstat(path).st_mode)
+            assert real_probe(str(path)) is _SocketLiveness.LIVE
+        finally:
+            holder["socket"].close()
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+
+
+@unix_socket_test
+def test_live_socket_swapped_in_during_final_reprobe_is_not_unlinked(
+    tmp_path,
+    monkeypatch,
+):
+    async def scenario():
+        path = tmp_path / "control.sock"
+        original = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            original.bind(str(path))
+        finally:
+            original.close()
+
+        import core.routing_control_unix as unix_module
+
+        real_probe = unix_module._probe_unix_socket
+        holder = {}
+
+        def probe_swap_on_reprobe(probe_path):
+            holder["calls"] = holder.get("calls", 0) + 1
+            if holder["calls"] == 1:
+                # First probe (from _prepare_socket_path): untouched stale node.
+                return real_probe(probe_path)
+
+            # Second probe (the authoritative re-probe): it inspects the
+            # original stale socket and finds it STALE, but another process
+            # replaces the path with a live listener before it returns. A
+            # throwaway holder consumes the just-freed inode so the live
+            # replacement is guaranteed a distinct identity.
+            result = real_probe(probe_path)
+            os.unlink(probe_path)
+            inode_holder = open(tmp_path / "inode_holder", "wb")
+            holder["inode_holder"] = inode_holder
+            live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            live.bind(probe_path)
+            live.listen(1)
+            holder["socket"] = live
+            return result
+
+        monkeypatch.setattr(
+            unix_module,
+            "_probe_unix_socket",
+            probe_swap_on_reprobe,
+        )
+
+        server = RoutingControlUnixServer(make_protocol(), path)
+        try:
+            with pytest.raises(
+                ControlSocketPathError,
+                match="changed during startup",
+            ):
+                await server.start()
+            assert holder["calls"] == 2
+            assert stat.S_ISSOCK(os.lstat(path).st_mode)
+            assert real_probe(str(path)) is _SocketLiveness.LIVE
+        finally:
+            holder["socket"].close()
+            holder["inode_holder"].close()
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+
+
+# --- Point 9 D: permissions established before the listener accepts ---
+
+
+def _read_process_umask() -> int:
+    current = os.umask(0o022)
+    os.umask(current)
+    return current
+
+
+@unix_socket_test
+def test_configured_mode_is_established_before_asyncio_serves(
+    tmp_path,
+    monkeypatch,
+):
+    async def scenario():
+        path = tmp_path / "control.sock"
+        observed = {}
+        real_start_unix_server = asyncio.start_unix_server
+
+        async def spy_start_unix_server(handler, *args, sock=None, **kwargs):
+            observed["sockname"] = sock.getsockname()
+            observed["mode"] = stat.S_IMODE(os.lstat(path).st_mode)
+            return await real_start_unix_server(
+                handler,
+                *args,
+                sock=sock,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(asyncio, "start_unix_server", spy_start_unix_server)
+
+        previous_umask = os.umask(0o000)
+        try:
+            server = RoutingControlUnixServer(
+                make_protocol(),
+                path,
+                socket_mode=0o660,
+            )
+            await server.start()
+        finally:
+            os.umask(previous_umask)
+
+        try:
+            assert observed["sockname"] == str(path)
+            assert observed["mode"] == 0o660
+            assert stat.S_IMODE(os.lstat(path).st_mode) == 0o660
+        finally:
+            await server.close()
+
+    run(scenario())
+
+
+@unix_socket_test
+def test_bind_umask_is_restored_after_successful_start(tmp_path):
+    async def scenario():
+        path = tmp_path / "control.sock"
+        before = _read_process_umask()
+        server = RoutingControlUnixServer(
+            make_protocol(),
+            path,
+            socket_mode=0o600,
+        )
+        await server.start()
+        try:
+            assert _read_process_umask() == before
+        finally:
+            await server.close()
+
+    run(scenario())
+
+
+@unix_socket_test
+def test_bind_umask_is_restored_after_bind_failure(tmp_path, monkeypatch):
+    async def scenario():
+        path = tmp_path / "control.sock"
+        before = _read_process_umask()
+
+        import core.routing_control_unix as unix_module
+
+        real_socket_factory = socket.socket
+        created = []
+
+        class BindFailsSocket:
+            def __init__(self, *args):
+                self._wrapped = real_socket_factory(*args)
+                self.closed = False
+
+            def bind(self, _address):
+                raise OSError("bind boom")
+
+            def close(self):
+                self.closed = True
+                self._wrapped.close()
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        def factory(*args):
+            made = BindFailsSocket(*args)
+            created.append(made)
+            return made
+
+        monkeypatch.setattr(unix_module.socket, "socket", factory)
+
+        server = RoutingControlUnixServer(
+            make_protocol(),
+            path,
+            socket_mode=0o640,
+        )
+        with pytest.raises(OSError, match="bind boom"):
+            await server.start()
+
+        assert _read_process_umask() == before
+        assert not path.exists()
+        assert created and created[0].closed is True
+
+    run(scenario())
+
+
+@unix_socket_test
+def test_chmod_failure_does_not_remove_a_replacement_socket(
+    tmp_path,
+    monkeypatch,
+):
+    async def scenario():
+        path = tmp_path / "control.sock"
+        server = RoutingControlUnixServer(make_protocol(), path)
+        replacement_holder = {}
+
+        def swap_then_fail(chmod_path, _mode):
+            os.unlink(chmod_path)
+            replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            replacement.bind(str(chmod_path))
+            replacement_holder["socket"] = replacement
+            raise PermissionError("chmod denied")
+
+        monkeypatch.setattr(os, "chmod", swap_then_fail)
+
+        try:
+            with pytest.raises(PermissionError, match="chmod denied"):
+                await server.start()
+            assert stat.S_ISSOCK(os.lstat(path).st_mode)
+        finally:
+            replacement_holder["socket"].close()
+            if os.path.exists(path):
+                os.unlink(path)
 
     run(scenario())

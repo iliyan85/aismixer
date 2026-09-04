@@ -286,6 +286,67 @@ def test_null_response_id_is_allowed_when_request_has_no_trusted_id(monkeypatch)
     assert response["request_id"] is None
 
 
+def transport_error_response(code):
+    return {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": None,
+        "ok": False,
+        "error": {"code": code, "message": "transport failure"},
+    }
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["frame_too_large", "internal_error", "malformed_json", "a_future_code"],
+)
+def test_null_id_transport_error_surfaces_as_server_error(monkeypatch, code):
+    response, _writer = run(
+        request_with_response(
+            monkeypatch,
+            encode_frame(transport_error_response(code)),
+            request=request_mapping("req-1"),
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["request_id"] is None
+    assert response["error"]["code"] == code
+
+
+def test_null_id_success_response_is_still_rejected(monkeypatch):
+    ok_null = {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": None,
+        "ok": True,
+        "result": {},
+    }
+    with pytest.raises(RoutingControlResponseError, match="request_id"):
+        run(
+            request_with_response(
+                monkeypatch,
+                encode_frame(ok_null),
+                request=request_mapping("req-1"),
+            )
+        )
+
+
+def test_wrong_non_null_response_id_is_still_rejected(monkeypatch):
+    wrong = {
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+        "request_id": "req-2",
+        "ok": False,
+        "error": {"code": "invalid_request", "message": "no"},
+    }
+    with pytest.raises(RoutingControlResponseError, match="request_id"):
+        run(
+            request_with_response(
+                monkeypatch,
+                encode_frame(wrong),
+                request=request_mapping("req-1"),
+            )
+        )
+
+
 def test_oversized_response_is_rejected_without_content_in_exception(monkeypatch):
     with pytest.raises(RoutingControlResponseTooLargeError) as exc_info:
         run(
