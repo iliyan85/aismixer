@@ -35,11 +35,11 @@ CANONICAL_PROXY_UDP_OUTPUT = (
     "  port: 17777\n"
 )
 EXPECTED_OPENWRT_VERSION = "0.2.1"
-EXPECTED_OPENWRT_RELEASE = "1"
-EXPECTED_OPENWRT_SOURCE_DATE = "2026-08-25"
-EXPECTED_OPENWRT_SOURCE_REVISION = "cd68b202e362712fe0503ea2b4b8d55ef88a609a"
+EXPECTED_OPENWRT_RELEASE = "2"
+EXPECTED_OPENWRT_SOURCE_DATE = "2026-09-04"
+EXPECTED_OPENWRT_SOURCE_REVISION = "d8d8c500f5bcfcb451db92b899b2eba5a1626e48"
 EXPECTED_OPENWRT_MIRROR_HASH = (
-    "5e7136994d302df0399841e2e6aba3ce48889f21510dac2c8197d8f27413c941"
+    "8f95da56763df989923f7d1ebe283aa2f5ed173a3b37ff4399022ec9bacee9cb"
 )
 
 
@@ -421,6 +421,34 @@ def test_openwrt_recipe_uses_canonical_three_package_split():
     assert "-".join(("nmea", "sproxy")) not in recipe
 
 
+def test_openwrt_pkgarch_all_is_declared_only_on_shared_package_default():
+    """Regression: a top-level PKGARCH:=all before
+    include $(INCLUDE_DIR)/package.mk is ineffective for generated package
+    metadata -- real mips_24kc APK inspection showed all three packages
+    still reporting arch: mips_24kc despite that top-level line. PKGARCH
+    must instead be set inside Package/aismixer/Default, the shared block
+    every package definition calls, so it actually reaches the generated
+    metadata for all three packages without being duplicated per package."""
+    recipe = read_text(PACKAGE_DIR / "Makefile")
+    include_index = recipe.index("include $(INCLUDE_DIR)/package.mk")
+    preamble = recipe[:include_index]
+    default_block = makefile_block(recipe, "Package/aismixer/Default")
+
+    # 1. The shared default carries the architecture declaration.
+    assert re.search(r"^\s*PKGARCH:=all\s*$", default_block, re.MULTILINE)
+
+    # 2. No top-level PKGARCH:=all before include $(INCLUDE_DIR)/package.mk,
+    #    where it has no effect on generated package metadata.
+    assert "PKGARCH" not in preamble
+
+    # 3. All three packages still call the shared default that now carries
+    #    PKGARCH, and none of them duplicates the declaration itself.
+    for package_name in ("aismixer-common", "aismixer", "nmea_sproxy"):
+        package = makefile_block(recipe, f"Package/{package_name}")
+        assert "$(call Package/aismixer/Default)" in package
+        assert "PKGARCH" not in package
+
+
 def test_openwrt_packages_pin_stable_source_metadata():
     recipe = read_text(PACKAGE_DIR / "Makefile")
 
@@ -446,9 +474,31 @@ def test_openwrt_packages_pin_expected_release_source_metadata():
     assert re.findall(
         r"^PKG_SOURCE_VERSION:=(\S+)$", recipe, re.MULTILINE
     ) == [EXPECTED_OPENWRT_SOURCE_REVISION]
-    assert re.findall(
+
+
+def test_openwrt_package_mirror_hash_matches_current_source_pin():
+    """PKG_MIRROR_HASH must verify the exact PKG_SOURCE_VERSION pinned above.
+
+    Kept as its own test, separate from
+    test_openwrt_packages_pin_expected_release_source_metadata, so a source
+    repin that updates PKG_SOURCE_VERSION without regenerating the matching
+    SDK-produced PKG_MIRROR_HASH fails here specifically, rather than being
+    masked by (or conflated with) the other pin fields. This is the release
+    pin's content-integrity check: the archive OpenWrt actually downloads
+    and builds from must be the exact byte content of the pinned release
+    commit, not merely a commit SHA that resolves at fetch time.
+    """
+    recipe = read_text(PACKAGE_DIR / "Makefile")
+    (mirror_hash,) = re.findall(
         r"^PKG_MIRROR_HASH:=(\S+)$", recipe, re.MULTILINE
-    ) == [EXPECTED_OPENWRT_MIRROR_HASH]
+    )
+
+    assert mirror_hash == EXPECTED_OPENWRT_MIRROR_HASH, (
+        "PKG_MIRROR_HASH does not match the SDK-generated hash for the "
+        f"pinned PKG_SOURCE_VERSION; the Makefile holds {mirror_hash!r}. "
+        "Regenerate it with the OpenWrt SDK whenever PKG_SOURCE_VERSION "
+        "changes, and update EXPECTED_OPENWRT_MIRROR_HASH to match."
+    )
 
 
 def test_openwrt_nmea_sproxy_uses_procd_names_without_unavailable_title_dependency():
@@ -468,6 +518,18 @@ def test_openwrt_common_package_copies_complete_core_tree():
     assert "$(PKG_BUILD_DIR)/core/." in install
     assert "$(1)/usr/lib/aismixer/core/" in install
     assert "$(PKG_BUILD_DIR)/core/*.py" not in install
+
+
+def test_openwrt_common_package_declares_cryptography_dependency():
+    """Regression for Point 12A.2: aismixer-common ships core/key_material.py,
+    core/udpsec_crypto.py, core/udpsec_identity.py, and the canonical
+    tools/aismixer_keys.py, all of which import `cryptography` directly.
+    That dependency must be declared on aismixer-common itself rather than
+    relying on every downstream consumer to bring it in transitively."""
+    recipe = read_text(PACKAGE_DIR / "Makefile")
+    common = makefile_block(recipe, "Package/aismixer-common")
+
+    assert "DEPENDS:=+python3 +python3-cryptography" in common
 
 
 def test_openwrt_aismixer_config_only_enables_packaged_unix_control():
@@ -491,6 +553,22 @@ def test_openwrt_aismixer_config_only_enables_packaged_unix_control():
     assert "$(INSTALL_CONF) ./files/config.yaml" in install
     assert "$(PKG_BUILD_DIR)/config.yaml" not in install
     assert "/etc/aismixer/config.yaml" in conffiles.splitlines()
+
+
+def test_openwrt_aismixer_udp_alias_map_uses_sanitized_packaged_default():
+    """Regression for Point 12A.2: the packaged alias map must come from the
+    sanitized ./files/ template, not the repository-root developer/lab copy,
+    and must ship structurally empty."""
+    recipe = read_text(PACKAGE_DIR / "Makefile")
+    install = makefile_block(recipe, "Package/aismixer/install")
+    conffiles = makefile_block(recipe, "Package/aismixer/conffiles")
+    alias_map = yaml.safe_load(read_text(PACKAGE_FILES / "udp_alias_map.yaml"))
+
+    assert "$(INSTALL_CONF) ./files/udp_alias_map.yaml" in install
+    assert "$(1)/etc/aismixer/udp_alias_map.yaml" in install
+    assert "$(PKG_BUILD_DIR)/udp_alias_map.yaml" not in install
+    assert "/etc/aismixer/udp_alias_map.yaml" in conffiles.splitlines()
+    assert alias_map == {"udp_alias_map": []}
 
 
 def test_openwrt_package_has_safe_authorization_default_and_no_identity_payload():

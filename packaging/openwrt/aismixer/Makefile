@@ -6,32 +6,36 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=aismixer
 PKG_VERSION:=0.2.1
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
-# Pin the task-start R2.1 runtime revision; do not follow a moving branch.
-# At final release closure, repin the source revision and mirror hash together.
+# Pinned to the tagged, signed v0.2.1 release commit. Do not follow a moving
+# branch; repin explicitly, source revision and mirror hash together, at the
+# next release.
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/iliyan85/aismixer.git
-PKG_SOURCE_DATE:=2026-08-25
-PKG_SOURCE_VERSION:=cd68b202e362712fe0503ea2b4b8d55ef88a609a
+PKG_SOURCE_DATE:=2026-09-04
+PKG_SOURCE_VERSION:=d8d8c500f5bcfcb451db92b899b2eba5a1626e48
 
-PKG_MIRROR_HASH:=5e7136994d302df0399841e2e6aba3ce48889f21510dac2c8197d8f27413c941
+PKG_MIRROR_HASH:=8f95da56763df989923f7d1ebe283aa2f5ed173a3b37ff4399022ec9bacee9cb
 
 PKG_MAINTAINER:=Iliyan Iliev
 PKG_LICENSE:=CC-BY-NC-4.0
 PKG_LICENSE_FILES:=LICENSE
 
-# The current AISMixer payload is Python/shell only.
-# Native C components introduced later should become target-specific packages.
-PKGARCH:=all
-
 include $(INCLUDE_DIR)/package.mk
 
 
+# The current AISMixer payload is Python/shell only, hence PKGARCH:=all on
+# the shared package definition below. A top-level PKGARCH:=all before
+# include $(INCLUDE_DIR)/package.mk has no effect on generated package
+# metadata; it must be set per Package/* definition (here, once, via
+# Package/aismixer/Default). Native C components introduced later should
+# become target-specific packages.
 define Package/aismixer/Default
   SECTION:=net
   CATEGORY:=Network
   URL:=https://aismixer.net/
+  PKGARCH:=all
 endef
 
 
@@ -39,7 +43,7 @@ define Package/aismixer-common
   $(call Package/aismixer/Default)
   TITLE:=Shared AISMixer runtime modules
   SOURCE:=github.com/iliyan85/aismixer
-  DEPENDS:=+python3
+  DEPENDS:=+python3 +python3-cryptography
 endef
 
 define Package/aismixer-common/description
@@ -62,9 +66,9 @@ define Package/aismixer/description
 endef
 
 
-# The matching OpenWrt 25.12 feeds do not provide Python setproctitle.
-# Named relation identity is therefore exposed through procd instance names,
-# not OS process titles.
+# OpenWrt 25.12 does not package Python setproctitle. Named relation
+# identity is therefore exposed through procd instance names, not OS
+# process titles.
 define Package/nmea_sproxy
   $(call Package/aismixer/Default)
   TITLE:=AIS/NMEA serial and UDP secure proxy
@@ -124,7 +128,7 @@ define Package/aismixer/install
 	$(INSTALL_DIR) $(1)/etc/aismixer
 	$(INSTALL_CONF) ./files/config.yaml \
 		$(1)/etc/aismixer/config.yaml
-	$(INSTALL_CONF) $(PKG_BUILD_DIR)/udp_alias_map.yaml \
+	$(INSTALL_CONF) ./files/udp_alias_map.yaml \
 		$(1)/etc/aismixer/udp_alias_map.yaml
 	$(INSTALL_CONF) ./files/authorized_keys.yaml \
 		$(1)/etc/aismixer/authorized_keys.yaml
