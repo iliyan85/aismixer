@@ -40,6 +40,12 @@ from core.udpsec_identity import (
 DEFAULT_INGRESS_QUEUE_MAXSIZE = 1024
 DEFAULT_PROCESSING_QUEUE_MAXSIZE = 1024
 
+# Plain UDP ingress reads one whole datagram per receive. The buffer is sized so
+# that ordinary IPv4/IPv6 UDP datagrams are received without application-level
+# truncation before the datagram becomes one IngressFrame. It is a receive-buffer
+# choice, not a claim about the IP-layer UDP payload maximum.
+_UDP_RECV_BUFFER_SIZE = 65_535
+
 try:
     from setproctitle import setproctitle
     setproctitle('aismixer')
@@ -850,7 +856,7 @@ async def handle_socket(
     policy = ingress_policy or NetworkPolicy.unrestricted()
     while True:
         try:
-            data, addr = await loop.sock_recvfrom(sock, 8192)
+            data, addr = await loop.sock_recvfrom(sock, _UDP_RECV_BUFFER_SIZE)
         except (ConnectionResetError, ConnectionRefusedError) as e:
             # Recoverable peer/network receive condition. This is not a broken
             # local socket or a runtime invariant failure, so the listener stays

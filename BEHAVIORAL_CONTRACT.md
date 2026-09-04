@@ -42,6 +42,12 @@ and later queued items must continue to be processed. In particular, a bare
 `bytes` or `str` queue item is not implicitly converted; bytes must already be
 owned by an `IngressFrame`.
 
+A plain UDP receive yields one complete datagram, which is normalized into one
+`IngressFrame`. The receive buffer is large enough that ordinary IPv4/IPv6 UDP
+datagrams are not truncated at the application receive boundary, and the ingress
+path does not intentionally line-split the datagram before frame construction.
+Sentence scanning happens only after that datagram boundary has been preserved.
+
 UDP datagrams retain their historical full-datagram normalization: decode as
 UTF-8 with `errors="ignore"`, apply Python `str.strip()`, then encode the
 normalized text as UTF-8 frame bytes. These frames use `UTF8_IGNORE`, including
@@ -53,6 +59,15 @@ An accepted frame may contain no accepted AIS sentence, including an empty
 payload. It still follows the normal frame-level routing snapshot and match
 when routing is configured, then produces no output after extraction; it does
 not terminate the consumer.
+
+A built-in plain UDP or UDPSEC ingress producer contains a recoverable per-peer
+receive condition. `ConnectionResetError` and `ConnectionRefusedError` (for
+example an ICMP port-unreachable response surfacing on a later receive) are
+logged, produce no `IngressFrame`, are not counted as a received transport
+packet or transport bytes, and the producer continues awaiting the next
+datagram. Any other `OSError` propagates to runtime supervision, and
+`asyncio.CancelledError` propagates unchanged. Plain and secure producers
+currently apply this same receive-error policy.
 
 ## 3. Accepted sentence extraction
 
@@ -812,13 +827,13 @@ implementation.
 ### Runtime lifecycle supervision
 
 Every essential long-lived runtime task—each UDP and UDPSEC ingress producer,
-ingress fan-in, the processor stage, and the egress stage—is owned by one
-process-local supervision lifecycle. The fan-in in turn owns its private reader
-tasks. Failure, cancellation, or unexpected normal return by any essential task
-terminates the runtime: every still-running sibling is cancelled, and all owned
-task outcomes are awaited and retrieved before the primary failure, or a clear
-unexpected-termination error, propagates. Exceptions are not left detached
-from the runtime lifecycle.
+ingress fan-in, the processor stage, the egress stage, and the sparse
+statistics heartbeat—is owned by one process-local supervision lifecycle. The
+fan-in in turn owns its private reader tasks. Failure, cancellation, or
+unexpected normal return by any essential task terminates the runtime: every
+still-running sibling is cancelled, and all owned task outcomes are awaited and
+retrieved before the primary failure, or a clear unexpected-termination error,
+propagates. Exceptions are not left detached from the runtime lifecycle.
 
 External cancellation cancels and awaits all owned tasks and is re-raised.
 Stage cleanup resolves or cancels pending batch-completion acknowledgement
@@ -967,14 +982,14 @@ barrier. Already completed processor effects and local sends are not rolled
 back, and later admitted work is not processed after fail-fast shutdown. Local
 send completion is neither remote receipt nor a delivery acknowledgement.
 
-Every UDP and UDPSEC producer, fan-in, processor-stage, and egress-stage task is
-an essential task in one process-local fail-fast supervision lifecycle; fan-in
-similarly owns its private readers. Failure, unexpected return, or unexpected
-cancellation terminates siblings and retrieves their outcomes. This is
-supervision of asyncio tasks in one service process. It supplies cleanup and
-termination, not a coordinator process, ingress or egress worker processes,
-IPC, cross-process routing-snapshot distribution, automatic worker restart,
-recovery, or replay.
+Every UDP and UDPSEC producer, fan-in, processor-stage, egress-stage, and sparse
+statistics-heartbeat task is an essential task in one process-local fail-fast
+supervision lifecycle; fan-in similarly owns its private readers. Failure,
+unexpected return, or unexpected cancellation terminates siblings and retrieves
+their outcomes. This is supervision of asyncio tasks in one service process. It
+supplies cleanup and termination, not a coordinator process, ingress or egress
+worker processes, IPC, cross-process routing-snapshot distribution, automatic
+worker restart, recovery, or replay.
 
 ### Pull-based runtime statistics
 

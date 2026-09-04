@@ -627,6 +627,28 @@ class _QueuedPacketLoop:
         raise asyncio.CancelledError()
 
 
+class _SizeAwarePacketLoop:
+    """Fake receive loop that models real UDP socket-buffer truncation.
+
+    Unlike the other fakes, ``sock_recvfrom(sock, size)`` here honours the
+    caller's requested buffer size and returns only ``datagram[:size]``,
+    exactly as a real UDP socket discards the tail of a datagram larger than
+    the supplied receive buffer. It records every requested size.
+    """
+
+    def __init__(self, packet):
+        self._packet = packet
+        self.recv_sizes = []
+
+    async def sock_recvfrom(self, _sock, size):
+        if self._packet is None:
+            raise asyncio.CancelledError()
+        data, addr = self._packet
+        self._packet = None
+        self.recv_sizes.append(size)
+        return data[:size], addr
+
+
 @pytest.mark.parametrize(
     "recv_error",
     [
@@ -881,6 +903,76 @@ def test_handle_socket_normalizes_invalid_utf8_around_valid_sentence(
     assert snapshot.accepted_frames == 1
     assert snapshot.payload_bytes == len(frame.payload)
 
+    fake_forwarder = asyncio.run(
+        run_forward_loop_capture(
+            monkeypatch,
+            [frame],
+            expected_broadcast_sends=1,
+        )
+    )
+    assert len(fake_forwarder.messages) == 1
+    assert SENTENCE in fake_forwarder.messages[0]
+
+
+def test_handle_socket_receives_full_datagram_past_the_legacy_8192_bound(
+    monkeypatch,
+):
+    """Regression for Point 11: a plain UDP datagram far larger than the
+    former hard-coded 8192-byte receive buffer is received whole. One
+    datagram still becomes exactly one IngressFrame, an AIS sentence
+    positioned well past the old truncation point stays visible to the
+    scanner and reaches the forwarder, and transport accounting reflects the
+    complete datagram length.
+
+    Under the old ``sock_recvfrom(sock, 8192)`` bound the size-honouring fake
+    loop would have returned only leading filler, so this sentence -- which
+    starts at byte 60000 -- would never have reached frame construction."""
+    leading_filler = b"x" * 60_000
+    assert len(leading_filler) > 8192
+    packet = leading_filler + SENTENCE.encode("ascii")
+
+    queue = _FakeQueue()
+    traffic = InputTrafficMetrics("udp-ingress:0:full-datagram", "udp")
+    fake_loop = _SizeAwarePacketLoop((packet, ("192.0.2.10", 17778)))
+
+    with monkeypatch.context() as socket_patch:
+        socket_patch.setattr(
+            aismixer, "asyncio", _FakeAsyncioModule(fake_loop)
+        )
+        socket_patch.setattr(aismixer, "DEBUG", False)
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                aismixer.handle_socket(
+                    object(),
+                    queue,
+                    input_traffic=traffic,
+                )
+            )
+
+    # Exactly one receive, with a buffer large enough for the whole datagram.
+    assert fake_loop.recv_sizes == [aismixer._UDP_RECV_BUFFER_SIZE]
+    assert aismixer._UDP_RECV_BUFFER_SIZE >= len(packet)
+
+    # One datagram -> exactly one IngressFrame carrying the complete datagram.
+    assert len(queue.items) == 1
+    frame = queue.items[0]
+    assert isinstance(frame, IngressFrame)
+    assert frame.payload == packet
+    assert frame.text_mode is PayloadTextMode.UTF8_IGNORE
+
+    # The AIS sentence positioned past the old 8192 boundary is still present
+    # in the frame the scanner will see.
+    assert frame.payload.index(SENTENCE.encode("ascii")) == 60_000
+
+    # Transport byte accounting uses the complete received datagram length,
+    # not a truncated 8192.
+    snapshot = traffic.input_traffic_snapshot()
+    assert snapshot.transport_packets == 1
+    assert snapshot.transport_bytes == len(packet)
+    assert snapshot.accepted_frames == 1
+    assert snapshot.payload_bytes == len(packet)
+
+    # The tail sentence is extracted and forwarded exactly once.
     fake_forwarder = asyncio.run(
         run_forward_loop_capture(
             monkeypatch,
