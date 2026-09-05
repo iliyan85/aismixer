@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=aismixer
 PKG_VERSION:=0.2.1
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 # Pinned to the tagged, signed v0.2.1 release commit. Do not follow a moving
 # branch; repin explicitly, source revision and mirror hash together, at the

@@ -6,6 +6,24 @@ still change public APIs and configuration behavior as the project matures.
 
 ## [Unreleased]
 
+### Changed
+
+- Normalizes deployment, operational, package, security, CLI/help, and
+  runtime-facing wording to consistently distinguish the concrete `aismixer`
+  daemon from the broader AISMixer project/ecosystem. Project-level branding
+  intentionally remains AISMixer; not every occurrence of "AISMixer" was
+  changed.
+- Starts the systemd-managed and OpenWrt-wrapped `aismixer` and `nmea_sproxy`
+  long-lived processes with unbuffered Python output (`python3 -u`), so the
+  existing sparse runtime heartbeat and status lines reach journald/logd
+  promptly instead of being delayed by pipe-buffered stdout. This is a
+  deployment-only change: heartbeat scheduling, logging design, and
+  protocol/runtime-statistics semantics are unchanged, and `nmea_sproxy`
+  gains no debug or log-level feature.
+- Advances OpenWrt packaging to `0.2.1-r4` for the packaging/deployment
+  terminology corrections and unbuffered-output wrapper changes, while
+  remaining pinned to the upstream v0.2.1 source revision.
+
 ## [0.2.1] - 2026-09-04
 
 ### Highlights
