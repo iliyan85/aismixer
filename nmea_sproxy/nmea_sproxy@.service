@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/nmea_sproxy
-ExecStart=/usr/bin/python3 /opt/nmea_sproxy/nmea_sproxy.py --config /etc/nmea_sproxy/instances/%i.yaml --process-title nmea_sproxy@%i
+ExecStart=/usr/bin/python3 -u /opt/nmea_sproxy/nmea_sproxy.py --config /etc/nmea_sproxy/instances/%i.yaml --process-title nmea_sproxy@%i
 Restart=always
 RestartSec=5
 SyslogIdentifier=nmea_sproxy@%i

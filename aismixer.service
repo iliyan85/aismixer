@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/aismixer
-ExecStart=/usr/bin/python3 /opt/aismixer/aismixer.py
+ExecStart=/usr/bin/python3 -u /opt/aismixer/aismixer.py
 Restart=always
 SyslogIdentifier=aismixer
 RuntimeDirectory=aismixer

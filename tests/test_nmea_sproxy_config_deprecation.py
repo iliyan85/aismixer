@@ -270,6 +270,32 @@ def test_plain_udp_rejects_invalid_used_reconnect_delay(tmp_path):
         proxy.load_config(config_path)
 
 
+@pytest.mark.parametrize(
+    "log_level",
+    ["DEBUG", "INFO", "WARNING", "SILENT", "not-a-real-level"],
+)
+def test_log_level_is_accepted_but_never_gates_runtime_config(tmp_path, log_level):
+    """`log_level` is not a functional runtime logging filter: it is stored
+    verbatim without validation and read nowhere else, so the sparse runtime
+    heartbeat (which does not consult it) cannot be gated or filtered by it."""
+    proxy = load_proxy_module()
+    config_path = write_config(
+        tmp_path / "plain.yaml",
+        {
+            "input": canonical_input(),
+            "output": canonical_output("udp"),
+            "log_level": log_level,
+        },
+    )
+
+    config = proxy.load_config(config_path)
+
+    assert config["log_level"] == log_level
+    assert config["input"]["type"] == "udp"
+    assert config["output"]["type"] == "udp"
+    assert config["reconnect_delay"] == proxy.DEFAULT_CONFIG["reconnect_delay"]
+
+
 @pytest.mark.parametrize("output_type", ["udpsec", "udp"])
 def test_canonical_config_emits_no_deprecation_notice(
     tmp_path,

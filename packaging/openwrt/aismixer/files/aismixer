@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /usr/bin/python3 /usr/lib/aismixer/aismixer.py "$@"
+exec /usr/bin/python3 -u /usr/lib/aismixer/aismixer.py "$@"

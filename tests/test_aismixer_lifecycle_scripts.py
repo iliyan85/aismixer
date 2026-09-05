@@ -192,7 +192,7 @@ def test_repository_systemd_unit_defines_runtime_directory_and_service_behavior(
     assert "Wants=network-online.target" in unit
     assert "Type=simple" in unit
     assert "WorkingDirectory=/opt/aismixer" in unit
-    assert "ExecStart=/usr/bin/python3 /opt/aismixer/aismixer.py" in unit
+    assert "ExecStart=/usr/bin/python3 -u /opt/aismixer/aismixer.py" in unit
     assert "Restart=always" in unit
     assert "SyslogIdentifier=aismixer" in unit
     assert "RuntimeDirectory=aismixer" in unit

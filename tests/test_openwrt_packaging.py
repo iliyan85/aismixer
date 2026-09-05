@@ -511,6 +511,23 @@ def test_openwrt_nmea_sproxy_uses_procd_names_without_unavailable_title_dependen
     assert "--process-title" not in init
 
 
+def test_openwrt_wrappers_run_python_unbuffered_with_existing_paths_intact():
+    aismixer_wrapper = read_text(PACKAGE_FILES / "aismixer")
+    nmea_sproxy_wrapper = read_text(PACKAGE_FILES / "nmea_sproxy")
+
+    assert aismixer_wrapper.startswith("#!/bin/sh\n")
+    assert (
+        'exec /usr/bin/python3 -u /usr/lib/aismixer/aismixer.py "$@"'
+        in aismixer_wrapper
+    )
+
+    assert nmea_sproxy_wrapper.startswith("#!/bin/sh\n")
+    assert (
+        'exec /usr/bin/python3 -u /usr/lib/aismixer/nmea_sproxy/nmea_sproxy.py "$@"'
+        in nmea_sproxy_wrapper
+    )
+
+
 def test_openwrt_common_package_copies_complete_core_tree():
     recipe = read_text(PACKAGE_DIR / "Makefile")
     install = makefile_block(recipe, "Package/aismixer-common/install")

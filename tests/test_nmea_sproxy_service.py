@@ -80,6 +80,20 @@ def test_systemd_units_align_process_titles_and_syslog_identifiers():
     assert "SyslogIdentifier=nmea_sproxy@%i" in template
 
 
+def test_systemd_units_run_python_unbuffered_with_existing_arguments_intact():
+    singleton = read_proxy_file("nmea_sproxy.service")
+    template = read_proxy_file("nmea_sproxy@.service")
+
+    assert (
+        "ExecStart=/usr/bin/python3 -u /opt/nmea_sproxy/nmea_sproxy.py "
+        "--config /etc/nmea_sproxy/config.yaml --process-title nmea_sproxy"
+    ) in singleton
+    assert (
+        "ExecStart=/usr/bin/python3 -u /opt/nmea_sproxy/nmea_sproxy.py "
+        "--config /etc/nmea_sproxy/instances/%i.yaml --process-title nmea_sproxy@%i"
+    ) in template
+
+
 def test_install_creates_layout_without_mutating_identity_and_only_enables_singleton():
     install = read_proxy_file("install.sh")
     commands = shell_commands(install)
