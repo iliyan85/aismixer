@@ -1,6 +1,6 @@
 # Example only. This file is not loaded unless you copy/adapt it as config.yaml.
 #
-# This is a full AISMixer configuration that demonstrates static logical
+# This is a full aismixer configuration that demonstrates static logical
 # routing. It intentionally does not enable the runtime control socket.
 #
 # Routing source IDs and target IDs are internal opaque identifiers. They are

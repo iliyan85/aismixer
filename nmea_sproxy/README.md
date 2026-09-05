@@ -14,7 +14,7 @@ One `nmea_sproxy` process represents one runtime relation:
 
 `one local UDP or serial input → one UDPSEC or plain-UDP network output`
 
-It does not mix inputs, perform AISMixer routing or fan-out, deduplicate, or
+It does not mix inputs, perform aismixer routing or fan-out, deduplicate, or
 assemble multipart AIS. Run another process for every independent relation.
 A systemd template name or procd instance name identifies a supervised process;
 it is service-manager configuration, not a UDPSEC concept.
@@ -46,7 +46,7 @@ Complete the following workflow before starting UDPSEC:
 2. Generate the station identity and retain its printed public value.
 3. Install the trusted mixer key as
    `/etc/nmea_sproxy/keys/aismixer_public.pem`.
-4. Authorize the station public value under the same `station_id` in AISMixer.
+4. Authorize the station public value under the same `station_id` in aismixer.
 5. Start the proxy, then inspect status and logs.
 
 Generate a new canonical station identity only where both station identity files
@@ -183,7 +183,7 @@ and two relations must not compete for one device. Prefer stable device names.
 Each datagram or completed serial line is scanned for `!<talker>VDM` or
 `!<talker>VDO` substrings ending in an uppercase `*HH` checksum-shaped suffix,
 where `HH` represents two uppercase hexadecimal characters. The accepted
-talker IDs are the same AIS whitelist AISMixer core supports: `AI`, `AB`,
+talker IDs are the same AIS whitelist aismixer core supports: `AI`, `AB`,
 `AD`, `AN`, `AR`, `AS`, `AT`, `AX`, and `BS`. The proxy checks sentence syntax
 only: it does not calculate the checksum value.
 
@@ -225,20 +225,20 @@ output:
 
 Each bare match becomes one datagram; removed TAG/prefix material is not
 restored, and no JSON envelope or authenticated `station_id` is sent.
-AISMixer must derive source identity from its own plain-UDP listener policy.
+aismixer must derive source identity from its own plain-UDP listener policy.
 
 ## 🪪 Identity and trust
 
 Keep station identity (`station_private.pem` plus `station_public.pem`), trust
-in the mixer (`aismixer_public.pem`), and AISMixer's authorization mapping from
+in the mixer (`aismixer_public.pem`), and aismixer's authorization mapping from
 `station_id` to station public value separate. Repository example public keys
 are not deployment trust material. Protect `station_private.pem`; never copy it
-to AISMixer.
+to aismixer.
 
 ### Station identity
 
 For the canonical system key directory, the key tool creates a P-256 pair and
-prints the compressed public value used by AISMixer:
+prints the compressed public value used by aismixer:
 
 ```bash
 # Debian/systemd
@@ -274,7 +274,7 @@ Obtain the intended mixer public key through an authenticated channel and copy
 it to `remote_public_key`. Proxy tooling and lifecycle scripts never generate,
 download, exchange, replace, or repair this trust key.
 
-Add the station public value printed by the key tool to AISMixer's
+Add the station public value printed by the key tool to aismixer's
 `authorized_keys.yaml`, normally `/etc/aismixer/authorized_keys.yaml`:
 
 ```yaml
@@ -283,7 +283,7 @@ authorized_clients:
     pubkey: <compressed-public-key-base64>
 ```
 
-The name must match `station_id`. Restart AISMixer after authorization changes,
+The name must match `station_id`. Restart aismixer after authorization changes,
 then start the proxy. Plain UDP skips identity/trust handling.
 
 ## 🔐 UDPSEC behavior and recovery
@@ -395,7 +395,7 @@ package hooks enable and attempt to start the service during `apk add`, so an
 initial start can precede operator review.
 
 Install, stop the automatically started service, configure it, provision
-station identity and mixer trust, authorize the station at AISMixer, then start:
+station identity and mixer trust, authorize the station at aismixer, then start:
 
 ```sh
 apk -U add nmea_sproxy
@@ -501,7 +501,7 @@ Common symptoms:
 | --- | --- |
 | Server signature verification failed | Confirm `remote_public_key` contains the intended mixer's P-256 public key and the output endpoint is correct. Never bypass verification. |
 | No handshake response | Check the mixer UDPSEC listener, bidirectional UDP firewall/NAT rules, endpoint, address family, station authorization, and clocks. |
-| Unauthorized station | Match `station_id` exactly and install the station public value in AISMixer's `authorized_keys.yaml`; restart AISMixer after changes. |
+| Unauthorized station | Match `station_id` exactly and install the station public value in aismixer's `authorized_keys.yaml`; restart aismixer after changes. |
 | Repeated reconnects | Inspect bidirectional reachability, NAT timeout/rebinding, keepalive and peer-timeout values, and both endpoint logs. |
 | Identity startup failure | Stop a restarting unit; inspect both canonical station files. Repair only when the retained private key is known to be correct. |
 | Bind or address error | Check address-family agreement, local address ownership, duplicate listeners, and port availability. |
@@ -520,7 +520,7 @@ of `log_level` and does not scale with traffic volume.
 Current operator-visible limits:
 
 - one input-to-output relation per process;
-- no mixing, AISMixer routing, fan-out, deduplication, or multipart assembly;
+- no mixing, aismixer routing, fan-out, deduplication, or multipart assembly;
 - checksum-shaped syntax checking without checksum arithmetic verification;
 - ingress TAG blocks, prefixes, and surrounding material stripped;
 - lossy UDP delivery without payload buffering or retransmission;

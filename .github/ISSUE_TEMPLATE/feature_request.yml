@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest a practical improvement to AISMixer or nmea_sproxy
+description: Suggest a practical improvement to aismixer or nmea_sproxy
 title: "[Feature]: "
 body:
   - type: markdown

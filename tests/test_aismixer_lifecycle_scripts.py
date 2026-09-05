@@ -186,7 +186,7 @@ def test_uninstall_preserves_config_by_default_and_purges_only_when_requested():
 def test_repository_systemd_unit_defines_runtime_directory_and_service_behavior():
     unit = read_root_file("aismixer.service")
 
-    assert "Description=AISMixer Service" in unit
+    assert "Description=aismixer service" in unit
     assert "Description=AIS Mixer Service" not in unit
     assert "After=network-online.target" in unit
     assert "Wants=network-online.target" in unit

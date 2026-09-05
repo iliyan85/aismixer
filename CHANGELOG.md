@@ -2,7 +2,7 @@
 
 Notable AISMixer changes are documented in this file. The project uses
 Semantic Versioning during active pre-1.0 development; pre-1.0 releases may
-still change public APIs and configuration behavior as the service matures.
+still change public APIs and configuration behavior as the project matures.
 
 ## [Unreleased]
 
@@ -68,7 +68,7 @@ still change public APIs and configuration behavior as the service matures.
   serves as the expiry queue, removing the separate expiry-record queue that
   previously grew by one stale record on every refresh of an existing key.
 - Expands `nmea_sproxy`'s accepted AIS talker whitelist from `AI`-only to
-  the same closed set AISMixer core supports: `AI`, `AB`, `AD`, `AN`, `AR`,
+  the same closed set aismixer core supports: `AI`, `AB`, `AD`, `AN`, `AR`,
   `AS`, `AT`, `AX`, and `BS`.
 - Closes regression coverage confirming multipart TAG `s` handling: an
   exact-duplicate fragment arrival may update the cached `s`, a completing
@@ -82,7 +82,7 @@ still change public APIs and configuration behavior as the service matures.
   instead of `true`, so a fresh deployment no longer defaults to
   high-frequency, traffic-proportional debug logging.
 - Adds a sparse, debug-independent runtime statistics heartbeat to both
-  AISMixer and `nmea_sproxy`, supervised as an essential task alongside the
+  aismixer and `nmea_sproxy`, supervised as an essential task alongside the
   existing ingress/processing/egress stages.
 - Hardens configuration validation: `g_id_digits` must now be a plain
   integer in `1..32`, checked before any step with a persistent side effect
@@ -115,7 +115,7 @@ still change public APIs and configuration behavior as the service matures.
 - `nmea_sproxy/station_keys_gen.py` now prints an explicit deprecation
   notice naming its replacement on every invocation. The canonical key tool
   for both server and station identities remains `tools/aismixer_keys.py`.
-- AISMixer's UDPSEC server identity is now prepared through a shared
+- aismixer's UDPSEC server identity is now prepared through a shared
   identity service and only when `sec_inputs` actually configures secure
   ingress, instead of unconditionally. `nmea_sproxy` station identity
   preparation is now demand-driven at runtime instead of eager at
@@ -188,7 +188,7 @@ still change public APIs and configuration behavior as the service matures.
 
 - Adds bounded process-local queues for each ingress, shared processing
   admission, and egress handoff. Full stages wait and apply backpressure;
-  AISMixer has no stage-level drop-on-full branch, but UDP itself remains
+  aismixer has no stage-level drop-on-full branch, but UDP itself remains
   lossy and queued work is not durable.
 - Binds one immutable processing/routing snapshot after processing capacity is
   obtained, so admitted work retains its generation and target tuple while
@@ -255,20 +255,20 @@ still change public APIs and configuration behavior as the service matures.
 ### Networking and Deployment
 
 - Adds literal-IP/CIDR application-level ingress ACLs and outbound
-  source-address binding to AISMixer, with corresponding local-UDP ACL and
+  source-address binding to aismixer, with corresponding local-UDP ACL and
   UDPSEC/plain-UDP source-binding controls in `nmea_sproxy`. These controls
   complement rather than replace firewall and routing policy.
-- Makes AISMixer IPv4 and IPv6 listeners explicitly single-family; dual-stack
+- Makes aismixer IPv4 and IPv6 listeners explicitly single-family; dual-stack
   operation uses separate IPv4 and IPv6 listener entries, which may share a
   port.
 - Makes both lifecycle suites privilege-aware for direct-root or `sudo`
-  operation. AISMixer install/update now preflight their required source
+  operation. aismixer install/update now preflight their required source
   layouts, and installation preserves existing config files rather than
   overwriting them; existing key-preservation and incomplete-keypair safeguards
   remain.
 - Adds systemd-managed `/run/aismixer` through `RuntimeDirectory=aismixer` and
   installs `aismixerctl` globally as `/usr/local/bin/aismixerctl`.
-- Current service semantics are deliberate: the AISMixer installer enables but
+- Current service semantics are deliberate: the aismixer installer enables but
   does not start the service, and its updater reloads systemd and restarts the
   service. The proxy installer enables only the singleton and starts nothing;
   its updater reloads systemd but does not restart any proxy instance.
@@ -283,10 +283,10 @@ still change public APIs and configuration behavior as the service matures.
 - Numeric target IDs are internal declaration-order positions, not durable
   configuration identities; runtime routing remains process-local,
   non-persistent, and restored from configuration on restart.
-- Install/update workflows preserve existing AISMixer and `nmea_sproxy`
+- Install/update workflows preserve existing aismixer and `nmea_sproxy`
   configuration, identity keys, trust files, and authorization entries.
 - The v0.2.0 UDPSEC ECDHE wire handshake is not compatible with the v0.1.0
-  handshake and has no downgrade path. Upgrade AISMixer and `nmea_sproxy`
+  handshake and has no downgrade path. Upgrade aismixer and `nmea_sproxy`
   together in one maintenance window, then restart every running proxy process
   (the singleton, selected template instances, or a manual process) because the
   proxy updater intentionally does not restart them. Existing P-256 identity
@@ -307,7 +307,7 @@ still change public APIs and configuration behavior as the service matures.
 
 ### Known Limitations
 
-- AISMixer egress is UDP-only and provides no delivery guarantee; lost payloads
+- aismixer egress is UDP-only and provides no delivery guarantee; lost payloads
   are not replayed. UDPSEC sessions are process-local, non-durable, and do not
   migrate across client address/port changes.
 - There is no coordinator, separate ingress/egress worker process,
@@ -375,7 +375,7 @@ still change public APIs and configuration behavior as the service matures.
 
 - Documents UDPSEC as AISMixer's authenticated encrypted
   station-to-mixer UDP transport.
-- Documents `nmea_sproxy` as one local UDP input mapped to one AISMixer UDPSEC
+- Documents `nmea_sproxy` as one local UDP input mapped to one aismixer UDPSEC
   input.
 - Uses ECDSA station/server authentication.
 - Protects session traffic with AES-GCM.

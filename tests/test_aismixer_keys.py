@@ -110,7 +110,7 @@ def test_server_cli_runs_outside_repository_after_runtime_extraction(tmp_path):
         load_private_key(private_path).public_key().public_numbers()
         == load_public_key(public_path).public_numbers()
     )
-    assert "Generated AISMixer server key pair" in result.stdout
+    assert "Generated aismixer server key pair" in result.stdout
     assert f"Private key: {private_path}" in result.stdout
     assert f"Public key:  {public_path}" in result.stdout
 

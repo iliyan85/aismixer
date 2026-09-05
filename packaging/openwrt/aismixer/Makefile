@@ -1,5 +1,5 @@
 #
-# OpenWrt packaging for AISMixer and nmea_sproxy
+# OpenWrt packaging for aismixer and nmea_sproxy
 #
 
 include $(TOPDIR)/rules.mk
@@ -71,7 +71,7 @@ define Package/aismixer
 endef
 
 define Package/aismixer/description
- AISMixer combines AIS/NMEA inputs, performs assembly, deduplication,
+ aismixer combines AIS/NMEA inputs, performs assembly, deduplication,
  TAG handling and routing, and forwards the resulting logical stream
  to selected outputs. Includes UDPSEC server support and aismixerctl.
 endef

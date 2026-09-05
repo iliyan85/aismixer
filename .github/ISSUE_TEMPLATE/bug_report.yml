@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem with AISMixer or nmea_sproxy
+description: Report a reproducible problem with aismixer or nmea_sproxy
 title: "[Bug]: "
 body:
   - type: markdown
@@ -106,7 +106,7 @@ body:
       label: Reproduction steps
       description: Provide the smallest reliable sequence that demonstrates the problem.
       placeholder: |
-        1. Start AISMixer with ...
+        1. Start aismixer with ...
         2. Send ...
         3. Observe ...
     validations:

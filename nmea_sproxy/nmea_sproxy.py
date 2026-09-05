@@ -581,19 +581,19 @@ def ensure_station_identity(config):
 
 
 def load_peer_public_key(path):
-    """Load configured AISMixer trust without provisioning or mutation."""
+    """Load configured aismixer trust without provisioning or mutation."""
 
     peer_path = Path(path)
     _require_key_file(
         peer_path,
-        description="trusted AISMixer public key",
+        description="trusted aismixer public key",
         error_type=PeerTrustError,
     )
     try:
         public_key = load_public_key(peer_path)
     except (OSError, TypeError, ValueError, UnsupportedAlgorithm) as exc:
         raise PeerTrustError(
-            f"Unable to load trusted AISMixer public key {peer_path}: {exc}. "
+            f"Unable to load trusted aismixer public key {peer_path}: {exc}. "
             "Provision the correct peer trust explicitly; it is never generated "
             "or repaired automatically."
         ) from exc
@@ -601,7 +601,7 @@ def load_peer_public_key(path):
         public_key.curve, ec.SECP256R1
     ):
         raise PeerTrustError(
-            f"Trusted AISMixer public key must be an EC P-256 key: {peer_path}. "
+            f"Trusted aismixer public key must be an EC P-256 key: {peer_path}. "
             "Provision the correct peer trust explicitly."
         )
     return public_key

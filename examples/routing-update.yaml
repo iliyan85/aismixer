@@ -1,6 +1,6 @@
 # Direct routing-section example for aismixerctl replace --file.
 #
-# This file is not a full AISMixer config. It contains only the routing section
+# This file is not a full aismixer config. It contains only the routing section
 # shape accepted by aismixerctl and the routing-control service:
 #
 #   python3 aismixerctl.py --socket /run/aismixer/control.sock replace --file examples/routing-update.yaml

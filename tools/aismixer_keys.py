@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate or repair AISMixer and nmea_sproxy ECDSA P-256 key pairs."""
+"""Generate or repair aismixer and nmea_sproxy ECDSA P-256 key pairs."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def _add_common_options(parser, default_dir: Path, private_name: str, public_nam
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate or repair AISMixer server or nmea_sproxy station keys."
+        description="Generate or repair aismixer server or nmea_sproxy station keys."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _print_server_guidance(result: GeneratedKeyPair) -> None:
-    print("[+] Generated AISMixer server key pair")
+    print("[+] Generated aismixer server key pair")
     print(f"    Private key: {result.private_path}")
     print(f"    Public key:  {result.public_path}")
     print()
@@ -133,7 +133,7 @@ def _print_repair_status(result: PublicKeyRepairResult, key_owner: str) -> None:
 
 
 def _print_server_repair_guidance(result: PublicKeyRepairResult) -> None:
-    _print_repair_status(result, "AISMixer server")
+    _print_repair_status(result, "aismixer server")
 
 
 def _print_station_repair_guidance(

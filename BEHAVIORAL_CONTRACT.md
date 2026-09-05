@@ -583,7 +583,7 @@ validation. A validated peer close selects normal `reconnect_delay`, not an
 immediate re-handshake. It does not require or carry a ping sequence.
 
 Normal endpoint shutdown sends at most one such close per live relation before
-its UDP socket is closed. This includes proxy SIGINT or SIGTERM and AISMixer
+its UDP socket is closed. This includes proxy SIGINT or SIGTERM and aismixer
 async cancellation reached through SIGINT, SIGTERM, systemd, or procd service
 termination. Process crashes cannot send it, and UDP may lose it; active-session
 TTL, authenticated liveness, proactive re-handshake, and `peer_timeout` remain
@@ -879,7 +879,7 @@ One production `main()` invocation owns the following queue topology:
 All capacities count queue or work items, not payload bytes. A producer awaits
 its private ingress queue, each fan-in reader awaits processing admission, and
 the processor stage awaits egress-queue capacity. An operation that encounters
-a full stage queue waits and applies backpressure; these AISMixer queues do not
+a full stage queue waits and applies backpressure; these aismixer queues do not
 implement a drop-on-full branch. That waiting supplies no network-delivery,
 durability, replay, or recovery guarantee. UDP can lose data outside these
 queues, and fail-fast shutdown does not replay queued work.
@@ -890,7 +890,7 @@ and hold one supported frame while waiting for shared processing capacity, and
 the held frame is not included in private queue depth. Reader scheduling and
 shared admission define no fairness or total arrival-order guarantee between
 inputs. This contract is separate from the bounded serial-input queue inside
-`nmea_sproxy`, whose overflow policy is not an AISMixer runtime-stage policy.
+`nmea_sproxy`, whose overflow policy is not an aismixer runtime-stage policy.
 
 Processing admission reserves a shared capacity permit before invoking the
 work-item factory. While a frame waits for that permit, no routing snapshot is

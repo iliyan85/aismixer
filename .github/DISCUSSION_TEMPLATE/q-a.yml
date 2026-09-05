@@ -21,7 +21,7 @@ body:
     id: context_and_goal
     attributes:
       label: Context and goal
-      description: Explain what you are trying to achieve, the expected result, and where AISMixer or nmea_sproxy fits in your setup.
+      description: Explain what you are trying to achieve, the expected result, and where aismixer or nmea_sproxy fits in your setup.
     validations:
       required: true
 

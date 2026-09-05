@@ -45,7 +45,7 @@ Security-sensitive areas include:
 - plain UDP ingress;
 - UDPSEC authentication and encryption;
 - `nmea_sproxy` station private keys;
-- AISMixer server private keys;
+- aismixer server private keys;
 - authorized station public keys in `authorized_keys.yaml`;
 - NMEA sentence extraction, checksum-relevant handling, and multipart assembly;
 - NMEA TAG `s`/`c`/`g` metadata handling;
@@ -68,12 +68,12 @@ Security-sensitive areas include:
 - Runtime routing state and generations are process-local and are not currently
   persisted across restart.
 - UDPSEC authenticates and encrypts transport between a configured station and
-  AISMixer, but it does not prove the semantic truth of AIS payloads.
+  aismixer, but it does not prove the semantic truth of AIS payloads.
 - AIS spoof or anomaly detection is not currently implemented.
 
 ## Key And Secret Handling
 
-- Never commit station private keys, AISMixer server private keys, credentials,
+- Never commit station private keys, aismixer server private keys, credentials,
   or production-only configuration.
 - Protect private keys and sensitive configuration files with restrictive
   filesystem permissions.

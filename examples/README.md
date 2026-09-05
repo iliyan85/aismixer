@@ -5,10 +5,10 @@ loaded unless an operator copies or adapts them.
 
 ## Files
 
-- `config-routing.yaml` is a full inactive AISMixer configuration showing
+- `config-routing.yaml` is a full inactive aismixer configuration showing
   static logical routing with named UDP ingress, UDPSEC ingress, named UDP
   forwarders, logical zones, and target-scoped deduplication.
-- `config-routing-control.yaml` is a full inactive AISMixer configuration
+- `config-routing-control.yaml` is a full inactive aismixer configuration
   showing static routing plus `control.unix` enabled for the Unix-domain
   routing-control socket.
 - `routing-update.yaml` is not a full config. It is a direct routing section

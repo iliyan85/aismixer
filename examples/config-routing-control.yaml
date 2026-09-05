@@ -1,10 +1,10 @@
 # Example only. This file is not loaded unless you copy/adapt it as config.yaml.
 #
-# This is a full AISMixer configuration that demonstrates static logical
+# This is a full aismixer configuration that demonstrates static logical
 # routing plus the opt-in Unix-domain routing-control socket.
 #
 # The installed systemd unit provisions /run/aismixer while the service is
-# running through RuntimeDirectory=aismixer. If you run AISMixer outside that
+# running through RuntimeDirectory=aismixer. If you run aismixer outside that
 # unit, provide an equivalent parent directory for socket_path.
 # Socket filesystem ownership, group, and mode are the authorization boundary.
 # Runtime routing changes made through the control socket are process-local and

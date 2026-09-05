@@ -1158,7 +1158,7 @@ def test_openwrt_nmea_sproxy_preflight_rejects_missing_udpsec_peer_key(
     assert result.stdout.startswith(
         "Configuration preflight failed; service not started: "
     )
-    assert "trusted AISMixer public key is missing" in result.stdout
+    assert "trusted aismixer public key is missing" in result.stdout
     assert str(peer_path) in result.stdout
     assert not peer_path.exists()
 
@@ -1188,7 +1188,7 @@ def test_openwrt_nmea_sproxy_preflight_rejects_invalid_peer_without_mutation(
     assert result.stdout.startswith(
         "Configuration preflight failed; service not started: "
     )
-    assert "Unable to load trusted AISMixer public key" in result.stdout
+    assert "Unable to load trusted aismixer public key" in result.stdout
     assert str(peer_path) in result.stdout
     assert peer_path.read_bytes() == original_peer
 

@@ -32,7 +32,7 @@ prepare_server_identity() {
 		return 1
 	fi
 
-	logger -t aismixer "Generating local AISMixer server identity"
+	logger -t aismixer "Generating local aismixer server identity"
 
 	/usr/bin/python3 "$KEY_TOOL" server \
 		--keys-dir "$KEYS_DIR" || return 1
