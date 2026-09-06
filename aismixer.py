@@ -14,6 +14,7 @@ from core.data_plane import (
     ProcessingSnapshot,
     ProcessingWorkItem,
 )
+from core.endpoint_display import format_endpoint
 from core.ingress_frame import (
     IngressFrame,
     coerce_ingress_frame,
@@ -78,16 +79,12 @@ def ts() -> str:
     return str(time.time())
 
 
-def format_source(ip, port):
-    return f"[{ip}]:{port}" if ':' in ip else f"{ip}:{port}"
-
-
 def _ingress_task_name(role, index, entry, ip, port):
     configured_id = entry.get("id")
     label = (
         configured_id
         if isinstance(configured_id, str) and configured_id
-        else format_source(ip, port)
+        else format_endpoint(ip, port)
     )
     safe_label = label.encode("unicode_escape").decode("ascii")[:80]
     return f"{role}-ingress:{index}:{safe_label}"
@@ -888,7 +885,7 @@ async def handle_socket(
         )
 
         if DEBUG:
-            source_fmt = format_source(source_ip, source_port)
+            source_fmt = format_endpoint(source_ip, source_port)
             normalized_text = frame.payload.decode("utf-8")
             print(f"{ts()} INPUT {source_fmt} => {normalized_text}")
 
@@ -958,7 +955,7 @@ async def main(
             traffic = InputTrafficMetrics(task_name, "udpsec")
             input_traffic.append(traffic)
             sec_id = entry.get("id")
-            print(f"{ts()} Secure listening on {format_source(ip, port)}")
+            print(f"{ts()} Secure listening on {format_endpoint(ip, port)}")
             runtime_task_specs.append(
                 _RuntimeTaskSpec(
                     name=task_name,
@@ -1000,7 +997,7 @@ async def main(
             udp_sockets.append(sock)
             sock.bind((ip, port))
             sock.setblocking(False)
-            print(f"{ts()} Listening on {format_source(ip, port)}")
+            print(f"{ts()} Listening on {format_endpoint(ip, port)}")
             # ако има id -> фиксиран alias за целия вход
             fixed_alias = entry.get("id")
             runtime_task_specs.append(

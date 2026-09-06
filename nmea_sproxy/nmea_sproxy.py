@@ -40,6 +40,7 @@ from output_adapters import (
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 _SHARED_CORE_MODULES = (
+    "endpoint_display.py",
     "key_material.py",
     "network_policy.py",
     "udpsec_crypto.py",
@@ -61,6 +62,7 @@ def add_shared_module_path():
 
 add_shared_module_path()
 
+from core.endpoint_display import format_endpoint  # noqa: E402
 from core.key_material import (  # noqa: E402
     KeyFileExistsError,
     generate_key_pair,
@@ -1522,18 +1524,18 @@ def main(argv=None):
     else:
         print(
             f"📡 Listening on UDP "
-            f"{input_config['listen_ip']}:{input_config['listen_port']}"
+            f"{format_endpoint(input_config['listen_ip'], input_config['listen_port'])}"
         )
 
     if output_config["type"] == UDP_OUTPUT_TYPE:
         print(
             f"📤 Forwarding plain UDP packets to "
-            f"{output_config['host']}:{output_config['port']}"
+            f"{format_endpoint(output_config['host'], output_config['port'])}"
         )
     else:
         print(
             f"📤 Forwarding encrypted packets to "
-            f"{output_config['host']}:{output_config['port']}"
+            f"{format_endpoint(output_config['host'], output_config['port'])}"
         )
 
     active_session_key_material = None

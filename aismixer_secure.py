@@ -1,3 +1,4 @@
+import itertools
 import os
 import asyncio
 import base64
@@ -13,6 +14,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from core.endpoint_display import format_endpoint, format_endpoint_tuple
 from core.ingress_frame import frame_from_text_payload
 from core.network_policy import NetworkPolicy
 from core.source_identity import build_udpsec_source_id
@@ -301,15 +303,76 @@ def _require_endpoint_peer_key(relation_key):
 
 
 @dataclass
-class _SecureSession:
-    _relation_key: _EndpointPeerKey
-    _address: object
-    station_id: str
+class CryptoEpoch:
+    """One authenticated ECDHE handshake's key material and replay ledger.
+
+    A crypto epoch is replaceable as a unit: a successful authenticated
+    re-handshake (rekey) installs a fresh ``CryptoEpoch``. In this stage that
+    replacement still happens by replacing the whole owning `LogicalSession`
+    (see `promote_pending_session`), but the crypto state is now represented
+    as an explicit, independently referenceable object so a later stage can
+    swap only the epoch on an unchanged `LogicalSession` instead.
+    """
+
     client_to_server_aesgcm: AESGCM
     server_to_client_aesgcm: AESGCM
+    seen_data_nonces: _BoundedNonceSet
+    created_at: float
+
+
+@dataclass
+class PathState:
+    """The established session's currently authoritative outbound path.
+
+    Only `active_path` exists in this stage. Candidate/retired path tracking
+    and any path-validation/migration behavior are intentionally NOT
+    implemented yet; this type exists so a later stage can add them without
+    another ownership refactor.
+    """
+
+    active_path: object
+
+
+@dataclass
+class LogicalSession:
+    """One authenticated, established UDPSEC relation.
+
+    The wire/session lookup in this stage remains the exact endpoint-token/
+    peer-address relation (`_relation_key`), unchanged from before this
+    refactor -- there is no tuple-independent session locator yet. What
+    changes is that the session's cryptographic state and its outbound path
+    are now owned by distinct `current_epoch`/`path_state` objects instead of
+    being flat fields, and the session carries two separate process-local
+    identifiers that must never be conflated:
+
+    - `session_handle` identifies this exact `LogicalSession` *object*
+      incarnation. It is fresh on every construction, including a same-
+      relation authenticated replacement (today's rekey still replaces the
+      whole object), and is never reused merely because the relation key
+      matches.
+    - `assembly_namespace` identifies the secure multipart continuity
+      lineage. It is normally also fresh, but a same-relation authenticated
+      replacement of the *same authenticated station* carries it forward
+      from the session it replaces, so an in-flight multipart AIS message
+      is not split by a routine rekey. It never survives a genuine session
+      death (expiry, close, capacity eviction, nonce exhaustion, restart) or
+      a replacement whose authenticated station differs. This is a
+      transitional mechanism for the current stage, where rekey still
+      replaces the whole `LogicalSession`; once a later stage lets rekey
+      replace only `current_epoch` on an unchanged `LogicalSession`, the
+      assembly namespace will remain stable simply because the session
+      object itself persists, and this field's reuse logic will no longer
+      be needed.
+    """
+
+    _relation_key: _EndpointPeerKey
+    station_id: str
     created_at: float
     last_seen: float
-    seen_data_nonces: _BoundedNonceSet
+    session_handle: int
+    assembly_namespace: int
+    current_epoch: CryptoEpoch
+    path_state: PathState
 
 
 @dataclass
@@ -317,10 +380,8 @@ class _PendingSecureSession:
     _relation_key: _EndpointPeerKey
     _address: object
     station_id: str
-    client_to_server_aesgcm: AESGCM
-    server_to_client_aesgcm: AESGCM
     created_at: float
-    seen_data_nonces: _BoundedNonceSet
+    current_epoch: CryptoEpoch
 
 
 @dataclass(frozen=True)
@@ -392,6 +453,14 @@ class SecureState:
         )
         self._sessions = OrderedDict()
         self._pending_sessions = OrderedDict()
+        # Two deliberately separate counters -- see `LogicalSession`'s
+        # docstring. `session_handle` identifies one LogicalSession object
+        # incarnation and is always fresh. `assembly_namespace` identifies
+        # secure multipart continuity lineage and may be carried forward
+        # across a same-relation, same-station authenticated replacement.
+        # Both are process-local identifiers, never transmitted.
+        self._next_session_handle = itertools.count(1)
+        self._next_assembly_namespace = itertools.count(1)
 
         self._handshake_replay_accepted = 0
         self._handshake_replay_rejected = 0
@@ -485,7 +554,7 @@ class SecureState:
         return True
 
     def _discard_session_nonces(self, session):
-        discarded_nonces = session.seen_data_nonces.discard_all()
+        discarded_nonces = session.current_epoch.seen_data_nonces.discard_all()
         self._current_data_nonces -= discarded_nonces
         self._data_nonces_session_discarded += discarded_nonces
 
@@ -547,6 +616,29 @@ class SecureState:
             expired.append(relation_key)
         return expired
 
+    def _fresh_session_handle(self):
+        """Always mint a new LogicalSession-incarnation identity. Never
+        reused, including across a same-relation authenticated
+        replacement."""
+        return next(self._next_session_handle)
+
+    def _reused_or_fresh_assembly_namespace(self, relation_key, station_id):
+        """Preserve secure multipart continuity across a same-relation
+        authenticated replacement of the SAME authenticated station only.
+
+        A currently live session at `relation_key` whose authenticated
+        `station_id` matches contributes its `assembly_namespace` forward,
+        so an in-flight multipart AIS message is not split by a routine
+        rekey. Every other case -- a different authenticated station at the
+        same relation, a genuinely different/new relation, or no live
+        session at all (already-expired, closed, capacity-evicted, or
+        nonce-exhausted state) -- mints a fresh namespace. There is no
+        historical cache of removed relations/stations/namespaces."""
+        replaced = self._sessions.get(relation_key)
+        if replaced is not None and replaced.station_id == station_id:
+            return replaced.assembly_namespace
+        return next(self._next_assembly_namespace)
+
     def install_session(
         self,
         relation_key,
@@ -557,6 +649,9 @@ class SecureState:
     ):
         relation_key = _require_endpoint_peer_key(relation_key)
         self.cleanup_expired_sessions(now)
+        assembly_namespace = self._reused_or_fresh_assembly_namespace(
+            relation_key, station_id
+        )
 
         if relation_key in self._sessions:
             self._remove_session(relation_key, "replaced")
@@ -564,17 +659,22 @@ class SecureState:
             oldest_relation_key = next(iter(self._sessions))
             self._remove_session(oldest_relation_key, "capacity")
 
-        session = _SecureSession(
+        session = LogicalSession(
             _relation_key=relation_key,
-            _address=relation_key.peer_address,
             station_id=station_id,
-            client_to_server_aesgcm=client_to_server_aesgcm,
-            server_to_client_aesgcm=server_to_client_aesgcm,
             created_at=now,
             last_seen=now,
-            seen_data_nonces=_BoundedNonceSet(
-                self._data_nonce_max_per_session,
+            session_handle=self._fresh_session_handle(),
+            assembly_namespace=assembly_namespace,
+            current_epoch=CryptoEpoch(
+                client_to_server_aesgcm=client_to_server_aesgcm,
+                server_to_client_aesgcm=server_to_client_aesgcm,
+                seen_data_nonces=_BoundedNonceSet(
+                    self._data_nonce_max_per_session,
+                ),
+                created_at=now,
             ),
+            path_state=PathState(active_path=relation_key.peer_address),
         )
         self._sessions[relation_key] = session
         self._sessions_created += 1
@@ -605,11 +705,14 @@ class SecureState:
             _relation_key=relation_key,
             _address=relation_key.peer_address,
             station_id=station_id,
-            client_to_server_aesgcm=client_to_server_aesgcm,
-            server_to_client_aesgcm=server_to_client_aesgcm,
             created_at=now,
-            seen_data_nonces=_BoundedNonceSet(
-                self._data_nonce_max_per_session,
+            current_epoch=CryptoEpoch(
+                client_to_server_aesgcm=client_to_server_aesgcm,
+                server_to_client_aesgcm=server_to_client_aesgcm,
+                seen_data_nonces=_BoundedNonceSet(
+                    self._data_nonce_max_per_session,
+                ),
+                created_at=now,
             ),
         )
         self._pending_sessions[relation_key] = pending
@@ -692,6 +795,9 @@ class SecureState:
         self.cleanup_expired_sessions(now)
         self._pending_sessions.pop(relation_key)
         self._pending_sessions_promoted += 1
+        assembly_namespace = self._reused_or_fresh_assembly_namespace(
+            relation_key, pending.station_id
+        )
 
         if relation_key in self._sessions:
             self._remove_session(relation_key, "replaced")
@@ -699,19 +805,19 @@ class SecureState:
             oldest_relation_key = next(iter(self._sessions))
             self._remove_session(oldest_relation_key, "capacity")
 
-        session = _SecureSession(
+        session = LogicalSession(
             _relation_key=relation_key,
-            _address=relation_key.peer_address,
             station_id=pending.station_id,
-            client_to_server_aesgcm=(
-                pending.client_to_server_aesgcm
-            ),
-            server_to_client_aesgcm=(
-                pending.server_to_client_aesgcm
-            ),
             created_at=now,
             last_seen=now,
-            seen_data_nonces=pending.seen_data_nonces,
+            session_handle=self._fresh_session_handle(),
+            assembly_namespace=assembly_namespace,
+            # The confirmed epoch (both AES-GCM owners and the nonce set that
+            # already admitted the confirmation nonce) transfers unchanged
+            # from the pending candidate -- promotion does not derive new
+            # keys or reset replay state.
+            current_epoch=pending.current_epoch,
+            path_state=PathState(active_path=relation_key.peer_address),
         )
         self._sessions[relation_key] = session
         self._sessions_created += 1
@@ -726,7 +832,7 @@ class SecureState:
             session._relation_key, session, now
         ) is None:
             return False
-        seen = session.seen_data_nonces.contains(nonce)
+        seen = session.current_epoch.seen_data_nonces.contains(nonce)
         if seen:
             self._data_nonce_replays += 1
         return seen
@@ -736,7 +842,7 @@ class SecureState:
             pending._relation_key, pending, now
         ) is None:
             return False
-        return pending.seen_data_nonces.contains(nonce)
+        return pending.current_epoch.seen_data_nonces.contains(nonce)
 
     def _account_accepted_data_nonce(self):
         self._data_nonces_accepted += 1
@@ -765,7 +871,7 @@ class SecureState:
             session._relation_key, session, now
         ) is None:
             return _DataNonceAdmission.STALE
-        admission = session.seen_data_nonces.admit(nonce)
+        admission = session.current_epoch.seen_data_nonces.admit(nonce)
         if admission is _DataNonceAdmission.REPLAY:
             self._data_nonce_replays += 1
         elif admission is _DataNonceAdmission.EXHAUSTED:
@@ -786,7 +892,7 @@ class SecureState:
             pending._relation_key, pending, now
         ) is None:
             return _DataNonceAdmission.STALE
-        admission = pending.seen_data_nonces.admit(nonce)
+        admission = pending.current_epoch.seen_data_nonces.admit(nonce)
         if admission is _DataNonceAdmission.REPLAY:
             self._data_nonce_replays += 1
         elif admission is _DataNonceAdmission.EXHAUSTED:
@@ -887,7 +993,7 @@ def close_owned_sessions(
             local_now,
         ):
             continue
-        addr = session._address
+        addr = session.path_state.active_path
         try:
             message = build_session_close_message(
                 session.station_id,
@@ -895,14 +1001,15 @@ def close_owned_sessions(
             )
             sock.sendto(
                 encrypt_secure_json_message(
-                    session.server_to_client_aesgcm,
+                    session.current_epoch.server_to_client_aesgcm,
                     message,
                 ),
                 addr,
             )
         except Exception as exc:
             print(
-                f"[!] Best-effort secure close failed for {addr}: "
+                f"[!] Best-effort secure close failed for "
+                f"{format_endpoint_tuple(addr)}: "
                 f"{type(exc).__name__}: {exc}"
             )
         finally:
@@ -1009,7 +1116,7 @@ async def _secure_server_loop(
     wall_now = time.time if wall_clock is None else wall_clock
     monotonic_now = time.monotonic if monotonic_clock is None else monotonic_clock
 
-    print(f"[+] Secure listener started on {ip}:{port}")
+    print(f"[+] Secure listener started on {format_endpoint(ip, port)}")
 
     while True:
         try:
@@ -1103,12 +1210,13 @@ async def _secure_server_loop(
                 sock.sendto(response_packet, addr)
                 print(
                     f"[+] Sent authenticated ServerHello "
-                    f"to {station_id} @ {addr}"
+                    f"to {station_id} @ {format_endpoint_tuple(addr)}"
                 )
 
             except Exception as e:
                 print(
-                    f"[!] Handshake error from {addr}: {type(e).__name__}: {e}")
+                    f"[!] Handshake error from {format_endpoint_tuple(addr)}: "
+                    f"{type(e).__name__}: {e}")
 
         elif data.startswith(DATA_PREFIX):
             try:
@@ -1135,7 +1243,7 @@ async def _secure_server_loop(
                 ):
                     try:
                         pending_plaintext = (
-                            pending.client_to_server_aesgcm.decrypt(
+                            pending.current_epoch.client_to_server_aesgcm.decrypt(
                                 nonce,
                                 ciphertext,
                                 DATA_AAD,
@@ -1154,7 +1262,7 @@ async def _secure_server_loop(
                         ):
                             print(
                                 f"[!] Invalid session confirmation "
-                                f"from {addr}"
+                                f"from {format_endpoint_tuple(addr)}"
                             )
                             continue
                         admission = state_owner.admit_pending_data_nonce(
@@ -1163,7 +1271,7 @@ async def _secure_server_loop(
                         if admission is _DataNonceAdmission.REPLAY:
                             print(
                                 f"[!] Duplicate secure data nonce "
-                                f"from {addr}"
+                                f"from {format_endpoint_tuple(addr)}"
                             )
                             continue
                         if admission is _DataNonceAdmission.EXHAUSTED:
@@ -1178,7 +1286,7 @@ async def _secure_server_loop(
                                 )
                             print(
                                 f"[!] Pending secure session nonce capacity "
-                                f"exhausted for {addr}"
+                                f"exhausted for {format_endpoint_tuple(addr)}"
                             )
                             continue
                         if admission is not _DataNonceAdmission.ACCEPTED:
@@ -1210,16 +1318,21 @@ async def _secure_server_loop(
                             SESSION_CONFIRMATION_SEQUENCE,
                             int(wall_now()),
                         )
+                        # Pending-confirmation traffic is still tuple-bound:
+                        # this reply belongs to the handshake transaction, so
+                        # it addresses the confirming packet's own tuple, not
+                        # (yet) `session.path_state.active_path`.
                         sock.sendto(
                             encrypt_secure_json_message(
-                                session.server_to_client_aesgcm,
+                                session.current_epoch.server_to_client_aesgcm,
                                 response,
                             ),
                             addr,
                         )
                         print(
                             f"[+] Confirmed secure session for "
-                            f"{session.station_id} @ {addr}"
+                            f"{session.station_id} @ "
+                            f"{format_endpoint_tuple(addr)}"
                         )
                         continue
 
@@ -1228,10 +1341,13 @@ async def _secure_server_loop(
 
                 station_id = session.station_id
                 client_to_server_aesgcm = (
-                    session.client_to_server_aesgcm
+                    session.current_epoch.client_to_server_aesgcm
                 )
                 if state_owner.data_nonce_seen(session, nonce, local_now):
-                    print(f"[!] Duplicate secure data nonce from {addr}")
+                    print(
+                        "[!] Duplicate secure data nonce from "
+                        f"{format_endpoint_tuple(addr)}"
+                    )
                     continue
 
                 plaintext = client_to_server_aesgcm.decrypt(
@@ -1242,21 +1358,33 @@ async def _secure_server_loop(
 
                 msg = json.loads(plaintext.decode())
                 if msg.get("source_id") != station_id:
-                    print(f"[!] source_id mismatch from {addr}")
+                    print(
+                        f"[!] source_id mismatch from "
+                        f"{format_endpoint_tuple(addr)}"
+                    )
                     continue
 
                 message_type = msg.get("type")
                 if message_type == "ping":
                     if not is_ping_message(msg, station_id):
-                        print(f"[!] Invalid ping from {addr}")
+                        print(
+                            f"[!] Invalid ping from "
+                            f"{format_endpoint_tuple(addr)}"
+                        )
                         continue
                 elif message_type == "nmea":
                     if not isinstance(msg.get("payload"), str):
-                        print(f"[!] Invalid NMEA data from {addr}")
+                        print(
+                            f"[!] Invalid NMEA data from "
+                            f"{format_endpoint_tuple(addr)}"
+                        )
                         continue
                 elif message_type == SESSION_CLOSE_TYPE:
                     if not is_session_close_message(msg, station_id):
-                        print(f"[!] Invalid session close from {addr}")
+                        print(
+                            f"[!] Invalid session close from "
+                            f"{format_endpoint_tuple(addr)}"
+                        )
                         continue
                     if (
                         owned_sessions is not None
@@ -1264,14 +1392,20 @@ async def _secure_server_loop(
                     ):
                         continue
                 else:
-                    print(f"[!] Unknown secure message type from {addr}")
+                    print(
+                        f"[!] Unknown secure message type from "
+                        f"{format_endpoint_tuple(addr)}"
+                    )
                     continue
 
                 admission = state_owner.admit_data_nonce(
                     session, nonce, local_now
                 )
                 if admission is _DataNonceAdmission.REPLAY:
-                    print(f"[!] Duplicate secure data nonce from {addr}")
+                    print(
+                        "[!] Duplicate secure data nonce from "
+                        f"{format_endpoint_tuple(addr)}"
+                    )
                     continue
                 if admission is _DataNonceAdmission.EXHAUSTED:
                     if (
@@ -1281,7 +1415,7 @@ async def _secure_server_loop(
                         owned_sessions.pop(relation_key, None)
                     print(
                         f"[!] Secure session nonce capacity exhausted "
-                        f"for {addr}"
+                        f"for {format_endpoint_tuple(addr)}"
                     )
                     continue
                 if admission is not _DataNonceAdmission.ACCEPTED:
@@ -1307,12 +1441,19 @@ async def _secure_server_loop(
                         msg["seq"],
                         int(wall_now()),
                     )
+                    # Established-session traffic addresses the session's
+                    # authoritative outbound path, not necessarily the tuple
+                    # this particular packet happened to arrive from. In this
+                    # stage there is no migration yet, so `active_path` is
+                    # always the same value `addr` already has -- but this is
+                    # now the one place later path-validation work needs to
+                    # change.
                     sock.sendto(
                         encrypt_secure_json_message(
-                            session.server_to_client_aesgcm,
+                            session.current_epoch.server_to_client_aesgcm,
                             response,
                         ),
-                        addr,
+                        session.path_state.active_path,
                     )
                     continue
 
@@ -1320,8 +1461,13 @@ async def _secure_server_loop(
                 peer = addr if 'addr' in locals() else None
                 remote_ip = peer[0] if isinstance(
                     peer, tuple) and peer else None
-                assembler_key = f"{peer[0]}:{peer[1]}" if isinstance(
-                    peer, tuple) and peer else (remote_ip or "sec")
+                # assembly_namespace, not session_handle and not a rendered
+                # remote tuple: two fragments of one multipart message must
+                # group together even across a same-station same-relation
+                # rekey (or, later, a real path migration), while a
+                # different authenticated station or a genuinely different
+                # LogicalSession must never share a namespace.
+                assembler_key = f"udpsec-assembly:{session.assembly_namespace}"
                 frame = frame_from_text_payload(
                     kind="sec",
                     source_id=build_udpsec_source_id(station_id),
@@ -1342,7 +1488,8 @@ async def _secure_server_loop(
 
             except Exception as e:
                 print(
-                    f"[!] Secure data error from {addr}: {type(e).__name__}: {e}")
+                    f"[!] Secure data error from {format_endpoint_tuple(addr)}: "
+                    f"{type(e).__name__}: {e}")
 
 
 async def secure_server(

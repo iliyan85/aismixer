@@ -688,17 +688,18 @@ def test_real_udp_loopback_interoperability(
             )
 
             session = _assert_single_confirmed_session(server)
-            assert session._address[:2] == client.getsockname()[:2]
+            active_path = session.path_state.active_path
+            assert active_path[:2] == client.getsockname()[:2]
             if family == socket.AF_INET6:
-                assert len(session._address) == 4
+                assert len(active_path) == 4
                 assert len(server.remote_addr) == 4
             assert (
                 key_material.client_to_server_key
                 != key_material.server_to_client_key
             )
             assert (
-                session.client_to_server_aesgcm
-                is not session.server_to_client_aesgcm
+                session.current_epoch.client_to_server_aesgcm
+                is not session.current_epoch.server_to_client_aesgcm
             )
 
             endpoints.proxy.send_udpsec_nmea_sentence(
@@ -905,7 +906,10 @@ def test_real_client_proactively_recovers_after_server_restart(
             recovered_session = _assert_single_confirmed_session(
                 restarted_server
             )
-            assert recovered_session._address == client.getsockname()
+            assert (
+                recovered_session.path_state.active_path
+                == client.getsockname()
+            )
             assert recovered_material != initial_material
 
             recovered_payload = (
@@ -967,12 +971,12 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
 
             # The authenticated sequence-zero confirmation owns the first
             # replay slot in this traffic-key epoch.
-            assert len(initial_session.seen_data_nonces) == 1
+            assert len(initial_session.current_epoch.seen_data_nonces) == 1
             assert after_confirmation.current_data_nonces == 1
             assert after_confirmation.data_nonces_accepted == 1
 
             nonce_a = _nonce(950)
-            assert not initial_session.seen_data_nonces.contains(nonce_a)
+            assert not initial_session.current_epoch.seen_data_nonces.contains(nonce_a)
             payload_a = "!AIVDM,1,1,,A,nonce-capacity-a,0*00"
             packet_a = _encrypted_json_packet(
                 endpoints.proxy,
@@ -1000,8 +1004,8 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
                 ]
                 is initial_session
             )
-            assert len(initial_session.seen_data_nonces) == 2
-            assert initial_session.seen_data_nonces.contains(nonce_a)
+            assert len(initial_session.current_epoch.seen_data_nonces) == 2
+            assert initial_session.current_epoch.seen_data_nonces.contains(nonce_a)
             assert (
                 after_a.data_nonces_accepted
                 == after_confirmation.data_nonces_accepted + 1
@@ -1025,7 +1029,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
                 ]
                 is initial_session
             )
-            assert len(initial_session.seen_data_nonces) == 2
+            assert len(initial_session.current_epoch.seen_data_nonces) == 2
             assert after_replay.current_sessions == 1
             assert after_replay.current_data_nonces == 2
             assert (
@@ -1062,7 +1066,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
 
             assert server.state._sessions == {}
             assert server.owned_sessions == {}
-            assert len(initial_session.seen_data_nonces) == 0
+            assert len(initial_session.current_epoch.seen_data_nonces) == 0
             assert initial_session.last_seen == last_seen_before_exhaustion
             assert exhausted.current_pending_sessions == 0
             assert exhausted.current_data_nonces == 0
@@ -1129,8 +1133,8 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
             recovered = server.call_in_loop(server.state.stats)
             assert recovered_session is not initial_session
             assert recovered_material != initial_material
-            assert len(recovered_session.seen_data_nonces) == 1
-            assert not recovered_session.seen_data_nonces.contains(nonce_a)
+            assert len(recovered_session.current_epoch.seen_data_nonces) == 1
+            assert not recovered_session.current_epoch.seen_data_nonces.contains(nonce_a)
             assert recovered.current_data_nonces == 1
 
             fresh_nonce = _nonce(952)
@@ -1210,7 +1214,7 @@ def test_real_confirmed_same_address_rekey_replaces_traffic_keys(
                 server.remote_addr,
             )
             first_session = _assert_single_confirmed_session(server)
-            assert first_session._address == client_addr
+            assert first_session.path_state.active_path == client_addr
 
             second = _perform_real_handshake(
                 endpoints,
@@ -1219,7 +1223,7 @@ def test_real_confirmed_same_address_rekey_replaces_traffic_keys(
             )
             assert client.getsockname() == client_addr
             second_session = _assert_single_confirmed_session(server)
-            assert second_session._address == client_addr
+            assert second_session.path_state.active_path == client_addr
             assert second_session is not first_session
             assert (
                 first.client_to_server_key
@@ -1469,8 +1473,8 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
             session_b = server.state._sessions[
                 server.relation_key(client_b.getsockname())
             ]
-            assert shared_nonce in session_a.seen_data_nonces._live_by_key
-            assert shared_nonce in session_b.seen_data_nonces._live_by_key
+            assert shared_nonce in session_a.current_epoch.seen_data_nonces._live_by_key
+            assert shared_nonce in session_b.current_epoch.seen_data_nonces._live_by_key
 
             before_cross_key = server.call_in_loop(server.state.stats)
             cross_key_nonce = _nonce(701)
@@ -1511,7 +1515,7 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
             )
             assert (
                 cross_key_nonce
-                not in session_b.seen_data_nonces._live_by_key
+                not in session_b.current_epoch.seen_data_nonces._live_by_key
             )
             assert server.ingress.empty()
 
@@ -1614,8 +1618,8 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         assert relation_a.peer_address == relation_b.peer_address
         assert relation_a != relation_b
         assert session_a is not session_b
-        assert session_a._address == client_address
-        assert session_b._address == client_address
+        assert session_a.path_state.active_path == client_address
+        assert session_b.path_state.active_path == client_address
         assert material_a != material_b
         assert set(shared_state._sessions) == {relation_a, relation_b}
         assert server_a.owned_sessions == {relation_a: session_a}
@@ -1664,8 +1668,8 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         frame_b = server_b.ingress.get()
         assert decode_frame_slice(frame_b, 0, len(frame_b.payload)) == payload_b
         assert server_a.ingress.empty()
-        assert session_a.seen_data_nonces.contains(shared_nonce)
-        assert session_b.seen_data_nonces.contains(shared_nonce)
+        assert session_a.current_epoch.seen_data_nonces.contains(shared_nonce)
+        assert session_b.current_epoch.seen_data_nonces.contains(shared_nonce)
 
         endpoints.proxy.send_ping(
             client,
@@ -1698,8 +1702,8 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
 
         before_cross = server_a.call_in_loop(shared_state.stats)
         a_last_seen = session_a.last_seen
-        a_nonces = set(session_a.seen_data_nonces._live_by_key)
-        b_nonce_count = len(session_b.seen_data_nonces)
+        a_nonces = set(session_a.current_epoch.seen_data_nonces._live_by_key)
+        b_nonce_count = len(session_b.current_epoch.seen_data_nonces)
         cross_nmea_nonce = _nonce(751)
         cross_ping_nonce = _nonce(752)
         cross_nmea = _encrypted_json_packet(
@@ -1752,10 +1756,10 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         assert shared_state._sessions[relation_a] is session_a
         assert shared_state._sessions[relation_b] is session_b
         assert session_a.last_seen == a_last_seen
-        assert set(session_a.seen_data_nonces._live_by_key) == a_nonces
-        assert len(session_b.seen_data_nonces) == b_nonce_count + 1
-        assert not session_b.seen_data_nonces.contains(cross_nmea_nonce)
-        assert not session_b.seen_data_nonces.contains(cross_ping_nonce)
+        assert set(session_a.current_epoch.seen_data_nonces._live_by_key) == a_nonces
+        assert len(session_b.current_epoch.seen_data_nonces) == b_nonce_count + 1
+        assert not session_b.current_epoch.seen_data_nonces.contains(cross_nmea_nonce)
+        assert not session_b.current_epoch.seen_data_nonces.contains(cross_ping_nonce)
         assert after_cross.data_nonces_accepted == (
             before_cross.data_nonces_accepted + 1
         )
@@ -2351,11 +2355,11 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
             assert after.data_nonce_replays == before.data_nonce_replays + 1
             assert (
                 invalid_semantic_nonce
-                in session.seen_data_nonces._live_by_key
+                in session.current_epoch.seen_data_nonces._live_by_key
             )
             assert all(
                 _nonce(marker)
-                not in session.seen_data_nonces._live_by_key
+                not in session.current_epoch.seen_data_nonces._live_by_key
                 for marker in (813, *range(820, 827))
             )
             assert received_sequences == [41]
@@ -2466,9 +2470,9 @@ def test_real_active_ping_timestamp_requires_exact_integer_before_mutation(
                 after.current_data_nonces
                 == before.current_data_nonces + 1
             )
-            assert valid_nonce in session.seen_data_nonces._live_by_key
+            assert valid_nonce in session.current_epoch.seen_data_nonces._live_by_key
             assert all(
-                nonce not in session.seen_data_nonces._live_by_key
+                nonce not in session.current_epoch.seen_data_nonces._live_by_key
                 for nonce in invalid_nonces
             )
             assert server.ingress.empty()
@@ -2545,11 +2549,11 @@ def test_real_active_ping_sequence_requires_exact_positive_integer(
                 == before.data_nonces_accepted + 2
             )
             assert all(
-                nonce not in session.seen_data_nonces._live_by_key
+                nonce not in session.current_epoch.seen_data_nonces._live_by_key
                 for nonce in nonces[: len(negative_sequences)]
             )
             assert all(
-                nonce in session.seen_data_nonces._live_by_key
+                nonce in session.current_epoch.seen_data_nonces._live_by_key
                 for nonce in nonces[len(negative_sequences) :]
             )
             assert server.ingress.empty()
@@ -2651,27 +2655,38 @@ def test_session_state_retains_only_directional_cipher_contexts(
 
     assert active._relation_key is relation_key
     assert pending._relation_key is relation_key
-    assert active._address == address
+    assert active.path_state.active_path == address
     assert pending._address == address
     assert set(vars(active)) == {
         "_relation_key",
-        "_address",
         "station_id",
-        "client_to_server_aesgcm",
-        "server_to_client_aesgcm",
         "created_at",
         "last_seen",
-        "seen_data_nonces",
+        "session_handle",
+        "assembly_namespace",
+        "current_epoch",
+        "path_state",
     }
     assert set(vars(pending)) == {
         "_relation_key",
         "_address",
         "station_id",
+        "created_at",
+        "current_epoch",
+    }
+    assert set(vars(active.current_epoch)) == {
         "client_to_server_aesgcm",
         "server_to_client_aesgcm",
-        "created_at",
         "seen_data_nonces",
+        "created_at",
     }
+    assert set(vars(pending.current_epoch)) == {
+        "client_to_server_aesgcm",
+        "server_to_client_aesgcm",
+        "seen_data_nonces",
+        "created_at",
+    }
+    assert set(vars(active.path_state)) == {"active_path"}
     forbidden_field_fragments = {
         "ephemeral",
         "shared_secret",
@@ -2680,7 +2695,12 @@ def test_session_state_retains_only_directional_cipher_contexts(
         "client_to_server_key",
         "server_to_client_key",
     }
-    for retained in (active, pending):
+    for retained in (
+        active,
+        pending,
+        active.current_epoch,
+        pending.current_epoch,
+    ):
         assert not (
             forbidden_field_fragments
             & set(vars(retained))
@@ -3071,7 +3091,7 @@ def test_static_server_admission_order_policy_and_pending_fallback():
         if isinstance(node, ast.Try)
         and _calls(
             node,
-            "pending.client_to_server_aesgcm.decrypt",
+            "pending.current_epoch.client_to_server_aesgcm.decrypt",
         )
     ]
     pending_decrypt_try = min(

@@ -13,6 +13,7 @@ DEPLOYED_PYTHON_FILES = {
     "input_adapters.py": ROOT / "nmea_sproxy" / "input_adapters.py",
     "output_adapters.py": ROOT / "nmea_sproxy" / "output_adapters.py",
     "meta_cleaner.py": ROOT / "nmea_sproxy" / "meta_cleaner.py",
+    "core/endpoint_display.py": ROOT / "core" / "endpoint_display.py",
     "core/key_material.py": ROOT / "core" / "key_material.py",
     "core/network_policy.py": ROOT / "core" / "network_policy.py",
     "core/udpsec_crypto.py": ROOT / "core" / "udpsec_crypto.py",

@@ -772,14 +772,14 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
     ciphertext = secure.AESGCM(
         client_key_material.client_to_server_key
     ).encrypt(nonce, plaintext, secure.DATA_AAD)
-    assert pending.client_to_server_aesgcm.decrypt(
+    assert pending.current_epoch.client_to_server_aesgcm.decrypt(
         nonce,
         ciphertext,
         secure.DATA_AAD,
     ) == plaintext
     assert (
-        pending.client_to_server_aesgcm
-        is not pending.server_to_client_aesgcm
+        pending.current_epoch.client_to_server_aesgcm
+        is not pending.current_epoch.server_to_client_aesgcm
     )
     assert (
         client_key_material.client_to_server_key
@@ -1382,7 +1382,7 @@ def test_secure_server_valid_client_close_removes_exact_owned_active_session(
     assert fake_socket.sent == []
     assert _relation_key(secure, addr) not in state._sessions
     assert state._pending_sessions[_relation_key(secure, addr)] is pending
-    assert len(session.seen_data_nonces) == 0
+    assert len(session.current_epoch.seen_data_nonces) == 0
     assert stats.sessions_closed == 1
     assert stats.sessions_touched == 0
     assert stats.current_sessions == 0
@@ -1445,7 +1445,7 @@ def test_secure_server_forged_client_close_cannot_remove_active_session(
     assert fake_queue.items == []
     assert fake_socket.sent == []
     assert state._sessions[_relation_key(secure, addr)] is session
-    assert len(session.seen_data_nonces) == 0
+    assert len(session.current_epoch.seen_data_nonces) == 0
     assert session.last_seen == 1000.0
     assert stats.sessions_closed == 0
     assert stats.sessions_touched == 0
@@ -1497,7 +1497,7 @@ def test_secure_server_valid_client_close_requires_exact_listener_owner(
     assert fake_queue.items == []
     assert fake_socket.sent == []
     assert state._sessions[_relation_key(secure, addr)] is current
-    assert len(current.seen_data_nonces) == 0
+    assert len(current.current_epoch.seen_data_nonces) == 0
     assert current.last_seen == 1000.0
     assert stats.sessions_replaced == 1
     assert stats.sessions_closed == 0
@@ -1536,7 +1536,7 @@ def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
     assert frame.source_id == "udpsec:boat_001"
     assert frame.alias_for_s == "boat_001"
     assert frame.remote_ip == "127.0.0.1"
-    assert frame.assembler_key == "127.0.0.1:50123"
+    assert frame.assembler_key == f"udpsec-assembly:{session.assembly_namespace}"
     assert frame.payload == b"!AIVDM,1,1,,A,payload,0*00"
     assert frame.text_mode is PayloadTextMode.UTF8_SURROGATEPASS
     assert (
@@ -1544,7 +1544,7 @@ def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
         == "!AIVDM,1,1,,A,payload,0*00"
     )
     assert session.last_seen == 1010.0
-    assert len(session.seen_data_nonces) == 1
+    assert len(session.current_epoch.seen_data_nonces) == 1
     assert stats.sessions_touched == 1
     assert stats.data_nonces_accepted == 1
 
@@ -1814,7 +1814,7 @@ def test_secure_server_non_string_payload_is_rejected_and_later_valid_works(
                 kwargs["payload"],
                 stats.data_nonces_accepted,
                 stats.sessions_touched,
-                len(session.seen_data_nonces),
+                len(session.current_epoch.seen_data_nonces),
             )
         )
         return original_constructor(**kwargs)
@@ -1838,7 +1838,7 @@ def test_secure_server_non_string_payload_is_rejected_and_later_valid_works(
     assert isinstance(frame, IngressFrame)
     assert decode_frame_slice(frame, 0, len(frame.payload)) == "later valid"
     assert frame.text_mode is PayloadTextMode.UTF8_SURROGATEPASS
-    assert len(session.seen_data_nonces) == 1
+    assert len(session.current_epoch.seen_data_nonces) == 1
     assert session.last_seen == 1010.0
     stats = state.stats()
     assert stats.data_nonces_accepted == 1
@@ -1874,7 +1874,7 @@ def test_secure_server_rejects_duplicate_data_nonce_after_first_valid_packet(mon
 
     stats = state.stats()
     assert len(fake_queue.items) == 1
-    assert len(session.seen_data_nonces) == 1
+    assert len(session.current_epoch.seen_data_nonces) == 1
     assert stats.data_nonces_accepted == 1
     assert stats.data_nonce_replays == 1
     assert stats.sessions_touched == 1
@@ -1902,7 +1902,7 @@ def test_secure_server_failed_decrypt_does_not_record_data_nonce(monkeypatch):
     stats = state.stats()
     assert fake_queue.items == []
     assert session.last_seen == 1000.0
-    assert len(session.seen_data_nonces) == 0
+    assert len(session.current_epoch.seen_data_nonces) == 0
     assert stats.sessions_touched == 0
     assert stats.data_nonces_accepted == 0
 
@@ -1939,7 +1939,7 @@ def test_secure_server_rejects_data_encrypted_with_server_to_client_key(
     assert fake_queue.items == []
     assert fake_socket.sent == []
     assert session.last_seen == 1000.0
-    assert len(session.seen_data_nonces) == 0
+    assert len(session.current_epoch.seen_data_nonces) == 0
     assert state.stats().sessions_touched == 0
     assert state.stats().data_nonces_accepted == 0
 
@@ -1968,7 +1968,7 @@ def test_secure_server_malformed_framing_does_not_record_nonce_or_touch(
     assert fake_queue.items == []
     assert fake_socket.sent == []
     assert session.last_seen == 1000.0
-    assert len(session.seen_data_nonces) == 0
+    assert len(session.current_epoch.seen_data_nonces) == 0
     assert state.stats().sessions_touched == 0
     assert state.stats().data_nonces_accepted == 0
 
@@ -2000,7 +2000,7 @@ def test_secure_server_source_mismatch_does_not_record_data_nonce_or_touch(monke
     stats = state.stats()
     assert fake_queue.items == []
     assert session.last_seen == 1000.0
-    assert len(session.seen_data_nonces) == 0
+    assert len(session.current_epoch.seen_data_nonces) == 0
     assert stats.sessions_touched == 0
     assert stats.data_nonces_accepted == 0
 
@@ -2229,12 +2229,12 @@ def test_authenticated_hello_preserves_active_and_installs_pending_candidate(
     assert state._sessions[_relation_key(secure, addr)] is old
     assert pending is not old
     assert (
-        pending.client_to_server_aesgcm
-        is not old.client_to_server_aesgcm
+        pending.current_epoch.client_to_server_aesgcm
+        is not old.current_epoch.client_to_server_aesgcm
     )
     assert (
-        pending.server_to_client_aesgcm
-        is not old.server_to_client_aesgcm
+        pending.current_epoch.server_to_client_aesgcm
+        is not old.current_epoch.server_to_client_aesgcm
     )
     assert state._sessions[_relation_key(secure, other_addr)] is other
     assert tuple(state._sessions) == _relation_keys(
@@ -2356,7 +2356,7 @@ def test_secure_server_retains_nonce_for_live_traffic_key_epoch(monkeypatch):
     assert replay_queue.items == []
     assert state._sessions[_relation_key(secure, addr)] is session
     assert session.last_seen == 299.0
-    assert session.seen_data_nonces.contains(first_nonce)
+    assert session.current_epoch.seen_data_nonces.contains(first_nonce)
     stats = state.stats()
     assert stats.data_nonces_accepted == 2
     assert stats.data_nonce_replays == 1
@@ -2432,7 +2432,7 @@ def test_secure_server_valid_new_nonce_at_capacity_invalidates_epoch_without_act
     assert _relation_key(secure, addr) not in state._sessions
     assert owned_sessions == {}
     assert session.last_seen == 1000.0
-    assert len(session.seen_data_nonces) == 0
+    assert len(session.current_epoch.seen_data_nonces) == 0
     assert stats.data_nonces_accepted == 1
     assert stats.data_nonce_exhaustions == 1
     assert stats.data_nonces_session_discarded == 1
@@ -2496,9 +2496,9 @@ def test_secure_server_invalid_packet_at_nonce_capacity_preserves_epoch(
     assert fake_socket.sent == []
     assert state._sessions[_relation_key(secure, addr)] is session
     assert session.last_seen == 1000.0
-    assert session.seen_data_nonces.contains(retained_nonce)
-    assert not session.seen_data_nonces.contains(rejected_nonce)
-    assert len(session.seen_data_nonces) == 1
+    assert session.current_epoch.seen_data_nonces.contains(retained_nonce)
+    assert not session.current_epoch.seen_data_nonces.contains(rejected_nonce)
+    assert len(session.current_epoch.seen_data_nonces) == 1
     assert stats.data_nonces_accepted == 1
     assert stats.data_nonce_exhaustions == 0
     assert stats.data_nonces_session_discarded == 0
@@ -4314,8 +4314,8 @@ def test_runtime_end_to_end_ecdhe_and_directional_encryption(monkeypatch):
     )
     server_session = state._sessions[_relation_key(secure, client_addr)]
     assert (
-        server_session.client_to_server_aesgcm
-        is not server_session.server_to_client_aesgcm
+        server_session.current_epoch.client_to_server_aesgcm
+        is not server_session.current_epoch.server_to_client_aesgcm
     )
 
     nmea_packet = proxy.encrypt_secure_json_message(
@@ -5770,11 +5770,11 @@ def test_secure_session_stores_identity_crypto_and_monotonic_timestamps(monkeypa
     )
 
     assert session.station_id == "boat_001"
-    assert session.client_to_server_aesgcm is client_to_server_aesgcm
-    assert session.server_to_client_aesgcm is server_to_client_aesgcm
+    assert session.current_epoch.client_to_server_aesgcm is client_to_server_aesgcm
+    assert session.current_epoch.server_to_client_aesgcm is server_to_client_aesgcm
     assert session.created_at == 100.0
     assert session.last_seen == 100.0
-    assert len(session.seen_data_nonces) == 0
+    assert len(session.current_epoch.seen_data_nonces) == 0
     assert tuple(state._sessions) == _relation_keys(secure, (addr,))
     assert state.stats().sessions_created == 1
 
@@ -5842,7 +5842,7 @@ def test_data_nonce_lookup_does_not_expire_retained_records(monkeypatch):
     assert state.accept_data_nonce(session, second_nonce, now=20.0)
     assert not state.data_nonce_seen(session, b"\x03" * 12, now=900.0)
 
-    assert set(session.seen_data_nonces._live_by_key) == {
+    assert set(session.current_epoch.seen_data_nonces._live_by_key) == {
         first_nonce,
         second_nonce,
     }
@@ -5877,13 +5877,19 @@ def test_data_nonce_admission_checks_replay_before_capacity(monkeypatch):
         session, one, now=102.0
     ) is secure._DataNonceAdmission.REPLAY
 
-    assert state._sessions[_relation_key(secure, session._address)] is session
-    assert set(session.seen_data_nonces._live_by_key) == {one, two}
+    assert (
+        state._sessions[_relation_key(secure, session.path_state.active_path)]
+        is session
+    )
+    assert set(session.current_epoch.seen_data_nonces._live_by_key) == {one, two}
     assert state.admit_data_nonce(
         session, three, now=103.0
     ) is secure._DataNonceAdmission.EXHAUSTED
-    assert _relation_key(secure, session._address) not in state._sessions
-    assert len(session.seen_data_nonces) == 0
+    assert (
+        _relation_key(secure, session.path_state.active_path)
+        not in state._sessions
+    )
+    assert len(session.current_epoch.seen_data_nonces) == 0
     stats = state.stats()
     assert stats.data_nonce_replays == 1
     assert stats.data_nonce_exhaustions == 1
@@ -5922,8 +5928,14 @@ def test_data_nonce_exhaustion_removes_only_exact_owning_session(monkeypatch):
         exhausted, triggering, now=1.0
     ) is secure._DataNonceAdmission.EXHAUSTED
 
-    assert _relation_key(secure, exhausted._address) not in state._sessions
-    assert state._sessions[_relation_key(secure, other._address)] is other
+    assert (
+        _relation_key(secure, exhausted.path_state.active_path)
+        not in state._sessions
+    )
+    assert (
+        state._sessions[_relation_key(secure, other.path_state.active_path)]
+        is other
+    )
     stats = state.stats()
     assert stats.data_nonce_exhaustions == 1
     assert stats.data_nonces_capacity_evicted == 0
@@ -6193,11 +6205,11 @@ def test_live_session_replacement_discards_nonce_state_without_other_eviction(
     assert new is state._sessions[_relation_key(secure, replaced_addr)]
     assert new is not old
     assert (
-        new.client_to_server_aesgcm
+        new.current_epoch.client_to_server_aesgcm
         is new_client_to_server_aesgcm
     )
     assert (
-        new.server_to_client_aesgcm
+        new.current_epoch.server_to_client_aesgcm
         is new_server_to_client_aesgcm
     )
     assert tuple(state._sessions) == _relation_keys(
@@ -6331,8 +6343,8 @@ def test_same_address_stale_session_handle_cannot_admit_or_exhaust_nonce(
 
     assert admission is secure._DataNonceAdmission.STALE
     assert state._sessions[_relation_key(secure, addr)] is replacement
-    assert len(stale.seen_data_nonces) == 0
-    assert len(replacement.seen_data_nonces) == 0
+    assert len(stale.current_epoch.seen_data_nonces) == 0
+    assert len(replacement.current_epoch.seen_data_nonces) == 0
     assert state.stats() == before
 
 
@@ -6366,8 +6378,8 @@ def test_same_address_stale_pending_handle_cannot_admit_or_exhaust_nonce(
 
     assert admission is secure._DataNonceAdmission.STALE
     assert state._pending_sessions[_relation_key(secure, addr)] is replacement
-    assert len(stale.seen_data_nonces) == 0
-    assert len(replacement.seen_data_nonces) == 0
+    assert len(stale.current_epoch.seen_data_nonces) == 0
+    assert len(replacement.current_epoch.seen_data_nonces) == 0
     assert state.stats() == before
 
 
@@ -6408,9 +6420,9 @@ def test_stale_nonce_check_does_not_cleanup_unrelated_expired_session(
     before_stats = state.stats()
     before_sessions = tuple(state._sessions.items())
     before_expiring_nonces = set(
-        expiring.seen_data_nonces._live_by_key
+        expiring.current_epoch.seen_data_nonces._live_by_key
     )
-    before_stale_nonces = set(stale.seen_data_nonces._live_by_key)
+    before_stale_nonces = set(stale.current_epoch.seen_data_nonces._live_by_key)
 
     assert not state.data_nonce_seen(
         stale, b"\x02" * 12, now=12.0
@@ -6420,11 +6432,11 @@ def test_stale_nonce_check_does_not_cleanup_unrelated_expired_session(
     assert tuple(state._sessions.items()) == before_sessions
     assert state._sessions[_relation_key(secure, expiring_addr)] is expiring
     assert (
-        set(expiring.seen_data_nonces._live_by_key)
+        set(expiring.current_epoch.seen_data_nonces._live_by_key)
         == before_expiring_nonces
     )
     assert (
-        set(stale.seen_data_nonces._live_by_key)
+        set(stale.current_epoch.seen_data_nonces._live_by_key)
         == before_stale_nonces
     )
 
@@ -6470,9 +6482,9 @@ def test_stale_nonce_accept_does_not_cleanup_unrelated_expired_session(
     before_stats = state.stats()
     before_sessions = tuple(state._sessions.items())
     before_expiring_nonces = set(
-        expiring.seen_data_nonces._live_by_key
+        expiring.current_epoch.seen_data_nonces._live_by_key
     )
-    before_stale_nonces = set(stale.seen_data_nonces._live_by_key)
+    before_stale_nonces = set(stale.current_epoch.seen_data_nonces._live_by_key)
 
     assert not state.accept_data_nonce(
         stale, b"\x03" * 12, now=12.0
@@ -6482,11 +6494,11 @@ def test_stale_nonce_accept_does_not_cleanup_unrelated_expired_session(
     assert tuple(state._sessions.items()) == before_sessions
     assert state._sessions[_relation_key(secure, expiring_addr)] is expiring
     assert (
-        set(expiring.seen_data_nonces._live_by_key)
+        set(expiring.current_epoch.seen_data_nonces._live_by_key)
         == before_expiring_nonces
     )
     assert (
-        set(stale.seen_data_nonces._live_by_key)
+        set(stale.current_epoch.seen_data_nonces._live_by_key)
         == before_stale_nonces
     )
 
@@ -7261,17 +7273,21 @@ def test_d66_pending_representation_and_creation_stats(monkeypatch):
         "_address",
         "_relation_key",
         "station_id",
+        "created_at",
+        "current_epoch",
+    }
+    assert set(vars(pending.current_epoch)) == {
         "client_to_server_aesgcm",
         "server_to_client_aesgcm",
-        "created_at",
         "seen_data_nonces",
+        "created_at",
     }
     assert pending._address == addr
     assert pending.station_id == "boat_001"
     assert pending.created_at == 12.5
     assert (
-        pending.client_to_server_aesgcm
-        is not pending.server_to_client_aesgcm
+        pending.current_epoch.client_to_server_aesgcm
+        is not pending.current_epoch.server_to_client_aesgcm
     )
     for forbidden_name in (
         "ephemeral_private_key",
@@ -7453,8 +7469,8 @@ def test_d66_pending_replacement_preserves_active_and_accounts_cache(
 
     assert state._sessions[_relation_key(secure, addr)] is active
     assert state._pending_sessions[_relation_key(secure, addr)] is second_pending
-    assert len(first_pending.seen_data_nonces) == 0
-    assert active.seen_data_nonces.contains(active_nonce)
+    assert len(first_pending.current_epoch.seen_data_nonces) == 0
+    assert active.current_epoch.seen_data_nonces.contains(active_nonce)
     stats = state.stats()
     assert stats.pending_sessions_created == 2
     assert stats.pending_sessions_replaced == 1
@@ -7535,17 +7551,17 @@ def test_d66_promotion_transfers_nonce_cache_and_discards_old_once(
         confirmation_nonce,
         1.1,
     )
-    transferred_cache = pending.seen_data_nonces
+    transferred_cache = pending.current_epoch.seen_data_nonces
 
     promoted = state.promote_pending_session(_relation_key(secure, addr), pending, 2.0)
 
     assert promoted is state._sessions[_relation_key(secure, addr)]
     assert _relation_key(secure, addr) not in state._pending_sessions
-    assert promoted.seen_data_nonces is transferred_cache
-    assert promoted.seen_data_nonces.contains(
+    assert promoted.current_epoch.seen_data_nonces is transferred_cache
+    assert promoted.current_epoch.seen_data_nonces.contains(
         confirmation_nonce,
     )
-    assert len(old_active.seen_data_nonces) == 0
+    assert len(old_active.current_epoch.seen_data_nonces) == 0
     stats = state.stats()
     assert stats.pending_sessions_promoted == 1
     assert stats.current_pending_sessions == 0
@@ -7581,21 +7597,21 @@ def test_d66_authenticated_hello_is_pending_until_exact_expiry(
     pending = state._pending_sessions[_relation_key(secure, addr)]
     assert state.get_active_session(_relation_key(secure, addr), 100.0) is None
     assert (
-        pending.client_to_server_aesgcm
-        is not pending.server_to_client_aesgcm
+        pending.current_epoch.client_to_server_aesgcm
+        is not pending.current_epoch.server_to_client_aesgcm
     )
     nonce = b"\x31" * 12
     plaintext = b"directional pending key check"
     ciphertext = secure.AESGCM(
         key_material.client_to_server_key
     ).encrypt(nonce, plaintext, secure.DATA_AAD)
-    assert pending.client_to_server_aesgcm.decrypt(
+    assert pending.current_epoch.client_to_server_aesgcm.decrypt(
         nonce,
         ciphertext,
         secure.DATA_AAD,
     ) == plaintext
     with pytest.raises(InvalidTag):
-        pending.server_to_client_aesgcm.decrypt(
+        pending.current_epoch.server_to_client_aesgcm.decrypt(
             nonce,
             ciphertext,
             secure.DATA_AAD,
@@ -7654,8 +7670,8 @@ def test_d66_valid_confirmation_promotes_and_sends_directional_pong(
     assert queue.items == []
     assert _relation_key(secure, addr) not in state._pending_sessions
     active = state._sessions[_relation_key(secure, addr)]
-    assert active.seen_data_nonces is pending.seen_data_nonces
-    assert active.seen_data_nonces.contains(nonce)
+    assert active.current_epoch.seen_data_nonces is pending.current_epoch.seen_data_nonces
+    assert active.current_epoch.seen_data_nonces.contains(nonce)
     assert active.last_seen == 1.0
     assert len(fake_socket.sent) == 1
     response_packet, response_addr = fake_socket.sent[0]
@@ -7743,7 +7759,7 @@ def test_d66_pending_confirmation_requires_exact_listener_owner(
     assert other_active == {relation_key: old_active}
     assert other_pending == {relation_key: stale_pending}
     assert stale_pending is not pending
-    assert not pending.seen_data_nonces.contains(nonce)
+    assert not pending.current_epoch.seen_data_nonces.contains(nonce)
     stats = state.stats()
     assert stats.pending_sessions_replaced == 1
     assert stats.pending_sessions_promoted == 0
@@ -7774,7 +7790,7 @@ def test_d66_pending_confirmation_requires_exact_listener_owner(
     assert owner_active == {relation_key: replacement}
     assert owner_pending == {}
     assert _relation_key(secure, addr) not in state._pending_sessions
-    assert replacement.seen_data_nonces.contains(nonce)
+    assert replacement.current_epoch.seen_data_nonces.contains(nonce)
     assert state.stats().pending_sessions_promoted == 1
     assert state.stats().sessions_replaced == 1
 
@@ -7850,8 +7866,8 @@ def test_d66_confirmation_nonce_counts_toward_active_capacity(monkeypatch):
     active = state._sessions[_relation_key(secure, addr)]
     assert confirmation_queue.items == []
     assert len(confirmation_socket.sent) == 1
-    assert active.seen_data_nonces.contains(confirmation_nonce)
-    assert len(active.seen_data_nonces) == 1
+    assert active.current_epoch.seen_data_nonces.contains(confirmation_nonce)
+    assert len(active.current_epoch.seen_data_nonces) == 1
 
     accepted_packet = _encrypted_data_packet(
         secure,
@@ -7867,9 +7883,9 @@ def test_d66_confirmation_nonce_counts_toward_active_capacity(monkeypatch):
         monotonic_clock=_FakeClock(2.0),
     )
     assert len(accepted_queue.items) == 1
-    assert active.seen_data_nonces.contains(confirmation_nonce)
-    assert active.seen_data_nonces.contains(accepted_nonce)
-    assert len(active.seen_data_nonces) == 2
+    assert active.current_epoch.seen_data_nonces.contains(confirmation_nonce)
+    assert active.current_epoch.seen_data_nonces.contains(accepted_nonce)
+    assert len(active.current_epoch.seen_data_nonces) == 2
 
     exhausting_packet = _encrypted_data_packet(
         secure,
@@ -7889,7 +7905,7 @@ def test_d66_confirmation_nonce_counts_toward_active_capacity(monkeypatch):
     assert exhausting_queue.items == []
     assert exhausting_socket.sent == []
     assert _relation_key(secure, addr) not in state._sessions
-    assert len(active.seen_data_nonces) == 0
+    assert len(active.current_epoch.seen_data_nonces) == 0
     assert stats.pending_sessions_promoted == 1
     assert stats.data_nonces_accepted == 2
     assert stats.data_nonce_exhaustions == 1
@@ -7957,9 +7973,9 @@ def test_d66_pending_nonce_exhaustion_preserves_previous_active(monkeypatch):
     assert owned_sessions == {relation_key: active}
     assert owned_pending_sessions == {}
     assert active.last_seen == 0.0
-    assert active.seen_data_nonces.contains(active_nonce)
-    assert len(active.seen_data_nonces) == 1
-    assert len(pending.seen_data_nonces) == 0
+    assert active.current_epoch.seen_data_nonces.contains(active_nonce)
+    assert len(active.current_epoch.seen_data_nonces) == 1
+    assert len(pending.current_epoch.seen_data_nonces) == 0
     assert stats.pending_sessions_promoted == 0
     assert stats.pending_sessions_replaced == 0
     assert stats.pending_sessions_expired == 0
@@ -8008,7 +8024,7 @@ def test_d66_active_session_rejects_fresh_reserved_sequence_zero(
     assert fake_socket.sent == []
     assert state._sessions[_relation_key(secure, addr)] is active
     assert active.last_seen == 0.0
-    assert not active.seen_data_nonces.contains(nonce)
+    assert not active.current_epoch.seen_data_nonces.contains(nonce)
     assert state.stats().sessions_touched == 0
     assert state.stats().data_nonces_accepted == 0
 
@@ -8126,7 +8142,7 @@ def test_d66_invalid_pending_packets_do_not_promote_or_consume_nonce(
     assert fake_socket.sent == []
     assert state._pending_sessions[_relation_key(secure, addr)] is pending
     assert state.get_active_session(_relation_key(secure, addr), 1.0) is None
-    assert not pending.seen_data_nonces.contains(nonce)
+    assert not pending.current_epoch.seen_data_nonces.contains(nonce)
     stats = state.stats()
     assert stats.pending_sessions_promoted == 0
     assert stats.current_pending_sessions == 1
@@ -8227,8 +8243,8 @@ def test_d66_pending_auth_failure_and_seen_nonce_fall_back_to_active(
     assert state._sessions[_relation_key(secure, addr)] is active
     assert state._pending_sessions[_relation_key(secure, addr)] is pending
     assert active.last_seen == 1.0
-    assert pending.seen_data_nonces.contains(shared_nonce)
-    assert active.seen_data_nonces.contains(shared_nonce)
+    assert pending.current_epoch.seen_data_nonces.contains(shared_nonce)
+    assert active.current_epoch.seen_data_nonces.contains(shared_nonce)
     assert len(fake_socket.sent) == 1
     assert _d66_decrypt_json(
         secure,
@@ -8289,8 +8305,8 @@ def test_d66_authenticated_invalid_pending_plaintext_is_exclusive(
     assert state._sessions[_relation_key(secure, addr)] is active
     assert state._pending_sessions[_relation_key(secure, addr)] is pending
     assert active.last_seen == 0.0
-    assert not active.seen_data_nonces.contains(nonce)
-    assert not pending.seen_data_nonces.contains(nonce)
+    assert not active.current_epoch.seen_data_nonces.contains(nonce)
+    assert not pending.current_epoch.seen_data_nonces.contains(nonce)
     assert state.stats().sessions_touched == 0
     assert state.stats().data_nonces_accepted == 0
 
@@ -8341,8 +8357,8 @@ def test_d66_only_invalid_tag_selects_active_key_fallback(monkeypatch):
     assert state._sessions[_relation_key(secure, addr)] is active
     assert state._pending_sessions[_relation_key(secure, addr)] is pending
     assert active.last_seen == 0.0
-    assert not active.seen_data_nonces.contains(nonce)
-    assert not pending.seen_data_nonces.contains(nonce)
+    assert not active.current_epoch.seen_data_nonces.contains(nonce)
+    assert not pending.current_epoch.seen_data_nonces.contains(nonce)
     assert state.stats().sessions_touched == 0
     assert state.stats().data_nonces_accepted == 0
 
@@ -8436,7 +8452,7 @@ def test_d66_same_address_confirmed_rekey_preserves_then_replaces_active(
         first_keys.server_to_client_key,
     )["seq"] == secure.SESSION_CONFIRMATION_SEQUENCE
     first_active = state._sessions[_relation_key(secure, addr)]
-    first_cache = first_active.seen_data_nonces
+    first_cache = first_active.current_epoch.seen_data_nonces
 
     # Treat the first pong as lost: the server is active, and a later fresh
     # handshake must retain it while installing the next pending candidate.
@@ -8532,10 +8548,10 @@ def test_d66_same_address_confirmed_rekey_preserves_then_replaces_active(
     second_active = state._sessions[_relation_key(secure, addr)]
     assert second_active is not first_active
     assert _relation_key(secure, addr) not in state._pending_sessions
-    assert second_active.seen_data_nonces is (
-        second_pending.seen_data_nonces
+    assert second_active.current_epoch.seen_data_nonces is (
+        second_pending.current_epoch.seen_data_nonces
     )
-    assert second_active.seen_data_nonces.contains(
+    assert second_active.current_epoch.seen_data_nonces.contains(
         second_confirmation_nonce,
     )
     assert len(first_cache) == 0
@@ -8599,13 +8615,13 @@ def test_d66_same_address_confirmed_rekey_preserves_then_replaces_active(
             new_socket.sent[0][0],
             first_keys.server_to_client_key,
         )
-    assert not second_active.seen_data_nonces.contains(
+    assert not second_active.current_epoch.seen_data_nonces.contains(
         late_old_nonce,
     )
-    assert second_active.seen_data_nonces.contains(
+    assert second_active.current_epoch.seen_data_nonces.contains(
         new_data_nonce,
     )
-    assert second_active.seen_data_nonces.contains(
+    assert second_active.current_epoch.seen_data_nonces.contains(
         new_ping_nonce,
     )
 
@@ -8651,7 +8667,9 @@ def test_endpoint_namespace_same_peer_active_and_pending_are_independent(
     assert active_b._relation_key == relation_b
     assert pending_a._relation_key == relation_a
     assert pending_b._relation_key == relation_b
-    assert {item._address for item in (active_a, active_b)} == {peer}
+    assert {
+        item.path_state.active_path for item in (active_a, active_b)
+    } == {peer}
     assert {item._address for item in (pending_a, pending_b)} == {peer}
     assert state._sessions == {
         relation_a: active_a,
@@ -8731,7 +8749,7 @@ def test_endpoint_namespace_fresh_incarnation_cannot_select_retained_state(
     assert state._sessions == {relation_a: active_a}
     assert relation_b not in state._sessions
     assert active_a.last_seen == 0.0
-    assert not active_a.seen_data_nonces.contains(nonce)
+    assert not active_a.current_epoch.seen_data_nonces.contains(nonce)
     stats = state.stats()
     assert stats.sessions_touched == 0
     assert stats.data_nonces_accepted == 0
@@ -8765,7 +8783,7 @@ def test_endpoint_namespace_promotion_replaces_only_same_relation(
     assert state.accept_pending_data_nonce(
         pending_b, confirmation_nonce, 1.1
     )
-    transferred_ledger = pending_b.seen_data_nonces
+    transferred_ledger = pending_b.current_epoch.seen_data_nonces
 
     assert state.promote_pending_session(
         relation_a, pending_b, 2.0
@@ -8779,12 +8797,12 @@ def test_endpoint_namespace_promotion_replaces_only_same_relation(
     )
 
     assert state._sessions[relation_a] is active_a
-    assert active_a.seen_data_nonces.contains(nonce_a)
+    assert active_a.current_epoch.seen_data_nonces.contains(nonce_a)
     assert active_a.last_seen == 0.0
     assert promoted_b is state._sessions[relation_b]
-    assert promoted_b.seen_data_nonces is transferred_ledger
-    assert promoted_b.seen_data_nonces.contains(confirmation_nonce)
-    assert len(active_b.seen_data_nonces) == 0
+    assert promoted_b.current_epoch.seen_data_nonces is transferred_ledger
+    assert promoted_b.current_epoch.seen_data_nonces.contains(confirmation_nonce)
+    assert len(active_b.current_epoch.seen_data_nonces) == 0
     assert state.stats().pending_sessions_promoted == 1
     assert state.stats().sessions_replaced == 1
 
@@ -8873,7 +8891,7 @@ def test_endpoint_namespace_active_replay_and_exhaustion_are_isolated(
 
     assert relation_a not in state._sessions
     assert state._sessions[relation_b] is active_b
-    assert active_b.seen_data_nonces.contains(shared_nonce)
+    assert active_b.current_epoch.seen_data_nonces.contains(shared_nonce)
     assert active_b.last_seen == 0.0
     stats = state.stats()
     assert stats.data_nonces_accepted == 2
@@ -8920,7 +8938,7 @@ def test_endpoint_namespace_pending_exhaustion_preserves_all_active_state(
     assert state._sessions[relation_b] is active_b
     assert relation_a not in state._pending_sessions
     assert state._pending_sessions[relation_b] is pending_b
-    assert pending_b.seen_data_nonces.contains(shared_nonce)
+    assert pending_b.current_epoch.seen_data_nonces.contains(shared_nonce)
     assert active_a.last_seen == 0.0
     assert active_b.last_seen == 0.0
 
@@ -8962,7 +8980,7 @@ def test_endpoint_namespace_expiry_uses_complete_relation_key(
     assert state.cleanup_expired_pending_sessions(10.0) == [relation_a]
     assert state._sessions[relation_b] is active_b
     assert state._pending_sessions[relation_b] is pending_b
-    assert active_b._address == peer
+    assert active_b.path_state.active_path == peer
     assert pending_b._address == peer
 
 
@@ -9006,8 +9024,8 @@ def test_endpoint_namespace_stale_handles_cannot_cross_relations(monkeypatch):
     assert state._sessions[relation_b] is active_b
     assert state._pending_sessions[relation_a] is replacement_pending_a
     assert state._pending_sessions[relation_b] is pending_b
-    assert len(active_b.seen_data_nonces) == 0
-    assert len(pending_b.seen_data_nonces) == 0
+    assert len(active_b.current_epoch.seen_data_nonces) == 0
+    assert len(pending_b.current_epoch.seen_data_nonces) == 0
 
 
 @pytest.mark.parametrize("message_type", ("nmea", "ping", "close"))
@@ -9087,8 +9105,8 @@ def test_endpoint_namespace_cross_listener_active_data_is_inert(
     assert state._sessions[relation_b] is active_b
     assert active_a.last_seen == 0.0
     assert active_b.last_seen == 0.0
-    assert len(active_a.seen_data_nonces) == 0
-    assert len(active_b.seen_data_nonces) == 0
+    assert len(active_a.current_epoch.seen_data_nonces) == 0
+    assert len(active_b.current_epoch.seen_data_nonces) == 0
     stats = state.stats()
     assert stats.sessions_touched == 0
     assert stats.sessions_closed == 0
@@ -9151,9 +9169,661 @@ def test_endpoint_namespace_wrong_listener_confirmation_is_inert(monkeypatch):
     assert state._sessions[relation_a] is active_a
     assert state._sessions[relation_b] is active_b
     assert state._pending_sessions[relation_a] is pending_a
-    assert not pending_a.seen_data_nonces.contains(nonce)
+    assert not pending_a.current_epoch.seen_data_nonces.contains(nonce)
     assert active_a.last_seen == 0.0
     assert active_b.last_seen == 0.0
     assert state.stats().pending_sessions_promoted == 0
     assert state.stats().sessions_touched == 0
     assert state.stats().data_nonces_accepted == 0
+
+
+# LogicalSession / CryptoEpoch / PathState ownership refactor.
+#
+# The wire lookup remains tuple-bound in this stage: there is no session
+# locator and no migration. These tests prove the *internal* ownership split
+# (session vs. crypto epoch vs. path) exists and behaves identically to the
+# pre-refactor flat representation for every currently-supported scenario.
+
+
+def test_logical_session_owns_distinct_crypto_epoch_and_path_state(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("192.0.2.10", 50000)
+    session, c2s, s2c = _install_test_session(
+        secure, state, addr, b"\x01" * 32, b"\x02" * 32
+    )
+
+    assert isinstance(session, secure.LogicalSession)
+    assert isinstance(session.current_epoch, secure.CryptoEpoch)
+    assert isinstance(session.path_state, secure.PathState)
+    assert session.current_epoch.client_to_server_aesgcm is c2s
+    assert session.current_epoch.server_to_client_aesgcm is s2c
+    assert isinstance(session.current_epoch.seen_data_nonces, secure._BoundedNonceSet)
+
+
+def test_active_path_initially_equals_relation_peer_address(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("192.0.2.11", 50001)
+    session, _, _ = _install_test_session(
+        secure, state, addr, b"\x03" * 32, b"\x04" * 32
+    )
+
+    assert session.path_state.active_path == addr
+    assert session.path_state.active_path == session._relation_key.peer_address
+
+
+def test_promoted_session_epoch_and_path_state_are_fresh_objects(monkeypatch):
+    """Promotion still replaces the whole LogicalSession in this stage, but
+    the confirmed epoch (keys + already-admitted confirmation nonce) is the
+    exact object transferred from the pending candidate, not re-derived."""
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    state = secure.SecureState()
+    addr = ("192.0.2.12", 50002)
+    packet = _signed_handshake_packet(
+        secure, client_private_key, "boat_001", 1000
+    )
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(0.0),
+    )
+    pending = state._pending_sessions[_relation_key(secure, addr)]
+    pending_epoch = pending.current_epoch
+    nonce = b"\x05" * 12
+
+    # Promote directly through SecureState to keep this test focused on
+    # object identity rather than re-deriving a second real handshake.
+    assert state.accept_pending_data_nonce(pending, nonce, now=0.0)
+    session = state.promote_pending_session(
+        _relation_key(secure, addr), pending, now=0.0
+    )
+
+    assert isinstance(session, secure.LogicalSession)
+    assert session.current_epoch is pending_epoch
+    assert isinstance(session.path_state, secure.PathState)
+    assert session.path_state.active_path == addr
+
+
+def test_session_handle_is_stable_and_distinct_per_logical_session(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    session_a, _, _ = _install_test_session(
+        secure, state, ("192.0.2.20", 50010), b"\x06" * 32, b"\x07" * 32
+    )
+    session_b, _, _ = _install_test_session(
+        secure, state, ("192.0.2.21", 50011), b"\x08" * 32, b"\x09" * 32
+    )
+
+    assert isinstance(session_a.session_handle, int)
+    assert isinstance(session_b.session_handle, int)
+    assert session_a.session_handle != session_b.session_handle
+
+    relation_key = _relation_key(secure, ("192.0.2.20", 50010))
+    handle_before_touch = session_a.session_handle
+    state.touch_session(relation_key, session_a, now=1.0)
+    assert session_a.session_handle == handle_before_touch
+
+
+def test_created_at_last_seen_capacity_and_stale_handle_semantics_unchanged(
+    monkeypatch,
+):
+    """Regression: the ownership refactor must not change created_at/
+    last_seen bookkeeping, LRU/capacity eviction, or exact-object
+    stale-handle protection."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=1)
+    first, _, _ = _install_test_session(
+        secure, state, ("192.0.2.30", 50020), b"\x0a" * 32, b"\x0b" * 32,
+        now=5.0,
+    )
+    assert first.created_at == 5.0
+    assert first.last_seen == 5.0
+
+    assert state.touch_session(
+        _relation_key(secure, ("192.0.2.30", 50020)), first, now=6.0
+    )
+    assert first.created_at == 5.0
+    assert first.last_seen == 6.0
+
+    # Capacity eviction (max_sessions=1): installing a second session evicts
+    # the first; the evicted object becomes a stale handle everywhere.
+    second, _, _ = _install_test_session(
+        secure, state, ("192.0.2.31", 50021), b"\x0c" * 32, b"\x0d" * 32,
+        now=7.0,
+    )
+    assert state.stats().sessions_capacity_evicted == 1
+    assert not state.touch_session(
+        _relation_key(secure, ("192.0.2.30", 50020)), first, now=8.0
+    )
+    assert not state.is_live_session_handle(
+        _relation_key(secure, ("192.0.2.30", 50020)), first, now=8.0
+    )
+    assert state.is_live_session_handle(
+        _relation_key(secure, ("192.0.2.31", 50021)), second, now=8.0
+    )
+
+
+# Established-session outbound destination authority.
+
+
+def test_active_ping_pong_reply_resolves_through_path_state_active_path(
+    monkeypatch,
+):
+    """The key wiring proof: mutate `path_state.active_path` directly (a
+    stand-in for what a later migration stage's atomic switch would do) and
+    confirm the established ping->pong reply follows it, not the arriving
+    packet's own address. The wire lookup itself remains tuple-bound in this
+    stage, so the confirming/ping packet must still physically arrive at the
+    session's original relation address; only the *reply destination* is
+    proven to come from `active_path`."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    original_addr = ("192.0.2.40", 50030)
+    relocated_path = ("203.0.113.9", 60000)
+    client_to_server_key = b"\x0e" * 32
+    server_to_client_key = b"\x0f" * 32
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        original_addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+
+    # No migration performed here: this is a direct, explicit mutation of
+    # the new internal field to prove the reply path depends on it.
+    session.path_state.active_path = relocated_path
+
+    ping_packet = _encrypted_control_packet(
+        secure,
+        client_to_server_key,
+        b"\x10" * 12,
+        {
+            "type": "ping",
+            "seq": 1,
+            "timestamp": 1000,
+            "source_id": "boat_001",
+        },
+    )
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(ping_packet, original_addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert len(fake_socket.sent) == 1
+    _, reply_addr = fake_socket.sent[0]
+    assert reply_addr == relocated_path
+    assert reply_addr != original_addr
+
+
+def test_shutdown_close_resolves_through_path_state_active_path(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    original_addr = ("192.0.2.41", 50031)
+    relocated_path = ("203.0.113.10", 60001)
+    session, _, _ = _install_test_session(
+        secure, state, original_addr, b"\x11" * 32, b"\x12" * 32
+    )
+    session.path_state.active_path = relocated_path
+
+    fake_socket = _FakeSecureSocket()
+    owned = {session._relation_key: session}
+    secure.close_owned_sessions(
+        fake_socket,
+        state,
+        owned,
+        wall_clock=lambda: 1234.0,
+        monotonic_clock=lambda: 2.0,
+    )
+
+    assert len(fake_socket.sent) == 1
+    _, close_addr = fake_socket.sent[0]
+    assert close_addr == relocated_path
+    assert close_addr != original_addr
+
+
+def test_initial_server_hello_still_replies_to_handshake_tuple(monkeypatch):
+    """Initial establishment is still tuple-bound: there is no session yet
+    to own a path, so the ServerHello must reply to the ClientHello's own
+    address regardless of the ownership refactor."""
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    addr = ("192.0.2.42", 50032)
+    packet = _signed_handshake_packet(
+        secure, client_private_key, "boat_001", 1000
+    )
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        wall_clock=lambda: 1000.0,
+        monotonic_clock=_FakeClock(0.0),
+    )
+
+    assert len(fake_socket.sent) == 1
+    _, reply_addr = fake_socket.sent[0]
+    assert reply_addr == addr
+
+
+def test_pending_confirmation_pong_still_replies_to_pending_tuple(
+    monkeypatch,
+):
+    """Pending confirmation is still tuple-bound: the confirmation pong
+    replies to the confirming packet's own address, not to any path_state,
+    even though the freshly-promoted session now owns a PathState."""
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    state = secure.SecureState()
+    addr = ("192.0.2.43", 50033)
+    hello_packet, client_hello, client_ephemeral_private_key = (
+        _signed_client_hello(
+            secure, client_private_key, "boat_001", 1000
+        )
+    )
+    _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(hello_packet, addr)],
+        state=state,
+        wall_clock=lambda: 1000.0,
+        monotonic_clock=_FakeClock(0.0),
+    )
+    pending = state._pending_sessions[_relation_key(secure, addr)]
+    confirmation = _confirmation_packet_for(secure, pending, b"\x13" * 12)
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(confirmation, addr)],
+        state=state,
+        wall_clock=lambda: 1000.0,
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert len(fake_socket.sent) == 1
+    _, reply_addr = fake_socket.sent[0]
+    assert reply_addr == addr
+    session = state._sessions[_relation_key(secure, addr)]
+    assert session.path_state.active_path == addr
+
+
+def _confirmation_packet_for(secure, pending, nonce):
+    message = {
+        "type": "ping",
+        "seq": secure.SESSION_CONFIRMATION_SEQUENCE,
+        "timestamp": 1000,
+        "source_id": pending.station_id,
+    }
+    plaintext = secure.json.dumps(message).encode()
+    ciphertext = pending.current_epoch.client_to_server_aesgcm.encrypt(
+        nonce, plaintext, secure.DATA_AAD
+    )
+    return secure.DATA_PREFIX + nonce + ciphertext
+
+
+# Secure-ingress assembler namespace.
+
+
+def test_assembler_namespace_is_session_scoped_not_path_derived(monkeypatch):
+    """Proves `assembler_key` is derived from the LogicalSession's stable
+    `assembly_namespace`, independent of `path_state.active_path` -- so a
+    later migration stage changing only the path cannot split one multipart
+    stream. No migration is implemented or faked here: the wire lookup
+    address is unchanged between the two fragments; only the internal
+    `active_path` field (irrelevant to assembler identity) is mutated."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("192.0.2.50", 50040)
+    client_to_server_key = b"\x14" * 32
+    session, _, _ = _install_test_session(
+        secure, state, addr, client_to_server_key, b"\x15" * 32
+    )
+
+    packet_one = _encrypted_data_packet(
+        secure, client_to_server_key, b"\x16" * 12
+    )
+    fake_queue_one, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet_one, addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(1.0),
+    )
+    assembler_key_before = fake_queue_one.items[0].assembler_key
+
+    # Stand-in for a future path change: mutate only the path, not the
+    # session's identity or wire-lookup relation.
+    session.path_state.active_path = ("203.0.113.20", 61000)
+
+    packet_two = _encrypted_data_packet(
+        secure, client_to_server_key, b"\x17" * 12
+    )
+    fake_queue_two, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet_two, addr)],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(2.0),
+    )
+    assembler_key_after = fake_queue_two.items[0].assembler_key
+
+    assert assembler_key_before == assembler_key_after
+    assert (
+        assembler_key_before
+        == f"udpsec-assembly:{session.assembly_namespace}"
+    )
+    # Not a rendered remote tuple: neither the original nor the mutated
+    # active_path's host/port ever appears in the assembler namespace.
+    assert "192.0.2.50" not in assembler_key_before
+    assert "203.0.113.20" not in assembler_key_before
+
+
+def test_assembler_namespace_differs_across_sessions_with_same_station_id(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    key_one = b"\x18" * 32
+    key_two = b"\x19" * 32
+    session_one, _, _ = _install_test_session(
+        secure, state, ("192.0.2.51", 50041), key_one, b"\x1a" * 32,
+        station_id="boat_001",
+    )
+    session_two, _, _ = _install_test_session(
+        secure, state, ("192.0.2.52", 50042), key_two, b"\x1b" * 32,
+        station_id="boat_001",
+    )
+    assert session_one.station_id == session_two.station_id
+    # Same station, different relation: distinct session_handle AND
+    # distinct assembly_namespace -- no cross-session multipart mixing.
+    assert session_one.session_handle != session_two.session_handle
+    assert session_one.assembly_namespace != session_two.assembly_namespace
+
+    queue_one, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(_encrypted_data_packet(secure, key_one, b"\x1c" * 12), ("192.0.2.51", 50041))],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(1.0),
+    )
+    queue_two, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(_encrypted_data_packet(secure, key_two, b"\x1d" * 12), ("192.0.2.52", 50042))],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(2.0),
+    )
+
+    key_one_ns = queue_one.items[0].assembler_key
+    key_two_ns = queue_two.items[0].assembler_key
+    assert key_one_ns != key_two_ns
+    assert key_one_ns == f"udpsec-assembly:{session_one.assembly_namespace}"
+    assert key_two_ns == f"udpsec-assembly:{session_two.assembly_namespace}"
+
+
+def _nmea_data_packet_with_aesgcm(secure, aesgcm, nonce, payload, source_id="boat_001"):
+    """Like `_encrypted_data_packet`, but encrypts under an already-derived
+    AESGCM object instead of raw key bytes -- needed once a session's keys
+    only exist as `current_epoch.client_to_server_aesgcm`."""
+    plaintext = secure.json.dumps({
+        "type": "nmea",
+        "payload": payload,
+        "timestamp": 1000,
+        "source_id": source_id,
+    }).encode()
+    ciphertext = aesgcm.encrypt(nonce, plaintext, secure.DATA_AAD)
+    return secure.DATA_PREFIX + nonce + ciphertext
+
+
+def test_multipart_assembler_namespace_survives_same_relation_replacement(
+    monkeypatch,
+):
+    """Regression: an authenticated replacement handshake (rekey) at the
+    SAME relation, for the SAME authenticated station, must not split one
+    multipart AIS message across two assembler namespaces -- even though it
+    installs a brand-new LogicalSession object with a fresh `session_handle`
+    and fresh traffic keys. Current wire/rekey semantics (full session
+    replacement, fresh ECDHE, fresh keys) are unchanged; only
+    `assembly_namespace` is carried forward across this same-station,
+    same-relation replacement. `session_handle` itself is NOT reused -- it
+    must always identify the exact LogicalSession incarnation."""
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    state = secure.SecureState()
+    addr = ("192.0.2.70", 50060)
+    wall_clock = _FakeClock(1000.0)
+    monotonic_clock = _FakeClock(0.0)
+
+    # --- Initial establishment: ClientHello -> confirm -> fragment 1. ---
+    hello_1 = _signed_handshake_packet(
+        secure, client_private_key, "boat_001", 1000
+    )
+    _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(hello_1, addr)],
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
+    )
+    pending_1 = state._pending_sessions[_relation_key(secure, addr)]
+
+    monotonic_clock.now = 1.0
+    confirmation_1 = _confirmation_packet_for(secure, pending_1, b"\x20" * 12)
+    fragment_1_text = "!AIVDM,2,1,9,A,fragment-one,0*00"
+    fragment_1 = _nmea_data_packet_with_aesgcm(
+        secure,
+        pending_1.current_epoch.client_to_server_aesgcm,
+        b"\x21" * 12,
+        fragment_1_text,
+    )
+    queue_1, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(confirmation_1, addr), (fragment_1, addr)],
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
+    )
+    session_1 = state._sessions[_relation_key(secure, addr)]
+    assembler_key_1 = queue_1.items[0].assembler_key
+
+    # --- Same-relation authenticated replacement: a fresh, distinct
+    #     ClientHello/confirmation from the same address, exactly like a
+    #     proactive rekey or planned refresh. ---
+    monotonic_clock.now = 2.0
+    hello_2, _, _ = _signed_client_hello(
+        secure,
+        client_private_key,
+        "boat_001",
+        1010,
+        client_random=b"\x22" * 32,
+        client_ephemeral_private_key=ec.derive_private_key(3, ec.SECP256R1()),
+    )
+    _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(hello_2, addr)],
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
+    )
+    pending_2 = state._pending_sessions[_relation_key(secure, addr)]
+    assert pending_2 is not pending_1
+
+    monotonic_clock.now = 3.0
+    confirmation_2 = _confirmation_packet_for(secure, pending_2, b"\x23" * 12)
+    fragment_2_text = "!AIVDM,2,2,9,A,fragment-two,0*00"
+    fragment_2 = _nmea_data_packet_with_aesgcm(
+        secure,
+        pending_2.current_epoch.client_to_server_aesgcm,
+        b"\x24" * 12,
+        fragment_2_text,
+    )
+    queue_2, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(confirmation_2, addr), (fragment_2, addr)],
+        state=state,
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
+    )
+    session_2 = state._sessions[_relation_key(secure, addr)]
+    assembler_key_2 = queue_2.items[0].assembler_key
+
+    # The replacement is a genuine rekey: a brand-new LogicalSession object
+    # with fresh traffic keys, counted as an ordinary replacement -- wire
+    # and rekey semantics are completely unchanged.
+    assert session_2 is not session_1
+    assert (
+        session_2.current_epoch.client_to_server_aesgcm
+        is not session_1.current_epoch.client_to_server_aesgcm
+    )
+    assert state.stats().sessions_replaced == 1
+
+    # session_handle identifies the LogicalSession *incarnation* and is
+    # never reused, even across this same-relation, same-station
+    # replacement.
+    assert session_2.session_handle != session_1.session_handle
+
+    # ...but assembly_namespace -- and therefore the assembler key derived
+    # from it -- is carried forward, because the replacement is the same
+    # authenticated station at the same live relation.
+    assert session_2.assembly_namespace == session_1.assembly_namespace
+    assert assembler_key_1 == assembler_key_2
+
+    # And a real assembler completes the multipart group spanning both
+    # fragments despite the intervening key replacement.
+    from assembler import AIVDMAssembler, AssemblyStatus
+
+    real_assembler = AIVDMAssembler(timeout=30.0)
+    outcome_1 = real_assembler.feed_outcome(assembler_key_1, fragment_1_text)
+    assert outcome_1.status is AssemblyStatus.PENDING
+    outcome_2 = real_assembler.feed_outcome(assembler_key_2, fragment_2_text)
+    assert outcome_2.status is AssemblyStatus.COMPLETE
+    assert outcome_2.sentences == (fragment_1_text, fragment_2_text)
+
+
+def test_same_relation_different_station_replacement_gets_fresh_namespace(
+    monkeypatch,
+):
+    """Security-relevant: an authenticated replacement at the SAME relation
+    but a DIFFERENT authenticated station must never inherit the old
+    station's assembly namespace. Relation equality alone is insufficient
+    for continuity -- authenticated identity continuity is mandatory."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    relation_key = _relation_key(secure, ("192.0.2.80", 50070))
+
+    boat_001 = state.install_session(
+        relation_key, "boat_001", object(), object(), 0.0
+    )
+
+    pending_boat_002 = state.install_pending_session(
+        relation_key, "boat_002", object(), object(), 0.0
+    )
+    boat_002 = state.promote_pending_session(
+        relation_key, pending_boat_002, now=1.0
+    )
+
+    assert boat_002 is not None
+    assert boat_002 is not boat_001
+    assert boat_002.station_id == "boat_002"
+    assert boat_002.session_handle != boat_001.session_handle
+    assert boat_002.assembly_namespace != boat_001.assembly_namespace
+
+
+def test_expired_same_relation_reestablishment_gets_fresh_namespace(
+    monkeypatch,
+):
+    """No continuity survives real session death: once the old session at a
+    relation has genuinely expired (removed via idle TTL, not merely
+    superseded by a live replacement), a later re-establishment for the SAME
+    station at the SAME relation must not resurrect the old assembly
+    namespace. There is no historical namespace cache."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0)
+    relation_key = _relation_key(secure, ("192.0.2.81", 50071))
+
+    original = state.install_session(
+        relation_key, "boat_001", object(), object(), 0.0
+    )
+
+    assert state.cleanup_expired_sessions(10.0) == [relation_key]
+    assert relation_key not in state._sessions
+
+    reestablished = state.install_session(
+        relation_key, "boat_001", object(), object(), 10.0
+    )
+
+    assert reestablished.session_handle != original.session_handle
+    assert reestablished.assembly_namespace != original.assembly_namespace
+
+
+def test_install_session_replacement_matches_promotion_semantics(
+    monkeypatch,
+):
+    """`install_session()` (a supported direct/test construction path) must
+    not diverge from real `promote_pending_session()` semantics: a same-
+    relation, same-station replacement keeps `assembly_namespace` (with a
+    fresh `session_handle`); a same-relation, different-station replacement
+    gets both fresh."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    relation_key = _relation_key(secure, ("192.0.2.82", 50072))
+
+    first = state.install_session(
+        relation_key, "boat_001", object(), object(), 0.0
+    )
+    same_station_replacement = state.install_session(
+        relation_key, "boat_001", object(), object(), 1.0
+    )
+
+    assert same_station_replacement is not first
+    assert same_station_replacement.session_handle != first.session_handle
+    assert (
+        same_station_replacement.assembly_namespace
+        == first.assembly_namespace
+    )
+
+    different_station_replacement = state.install_session(
+        relation_key, "boat_002", object(), object(), 2.0
+    )
+
+    assert different_station_replacement is not same_station_replacement
+    assert (
+        different_station_replacement.session_handle
+        != same_station_replacement.session_handle
+    )
+    assert (
+        different_station_replacement.assembly_namespace
+        != same_station_replacement.assembly_namespace
+    )
+
+
+# Plain UDP's assembler_key remains tuple-derived and unchanged by this
+# stage; that boundary is already covered by
+# tests/test_aismixer_forward_loop.py::test_handle_socket_creates_ingress_frame_with_udp_source_id
+# and its neighboring `handle_socket` tests.

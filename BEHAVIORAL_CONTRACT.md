@@ -320,14 +320,67 @@ default is module-wide, while an isolated state owner and clocks may be
 injected into a secure listener. This state is in-memory and process-local; it
 is neither durable nor shared across processes.
 
+An established relation is internally represented as three separate
+ownership layers: a `LogicalSession` (authenticated station identity, its
+endpoint/peer relation, two distinct process-local identifiers described
+below, and `created_at`/`last_seen`), the `LogicalSession`'s `current_epoch`
+(the directional AES-GCM owners and the private data-nonce set -- exactly
+what earlier revisions of this section described as flat session fields),
+and the `LogicalSession`'s `path_state` (currently only `active_path`, the
+address ordinary established-session replies are sent to). This separation
+exists so a later development stage can let path and cryptographic epoch
+change independently of the logical session; as of this revision it changes
+nothing externally observable. **The wire lookup remains exactly the
+endpoint-token/peer-address relation described below: there is no
+tuple-independent session locator, no path migration, and a fresh
+authenticated re-handshake still replaces the whole `LogicalSession`,
+including its epoch, exactly as before.** A pending relation is represented
+the same way, minus `path_state` and minus both identifiers below (pending
+traffic remains addressed by the handshake's own tuple; see below).
+
+A `LogicalSession` carries two deliberately separate process-local
+identifiers that must not be conflated. `session_handle` identifies one
+concrete `LogicalSession` *object* incarnation: it is always freshly minted
+on construction, including when a same-relation authenticated replacement
+occurs, is never reused merely because the relation key matches, and is
+unaffected by touch/activity. `assembly_namespace` identifies secure
+multipart continuity lineage: it is normally also freshly minted, but a
+same-relation authenticated replacement carries it forward from the session
+it replaces *only* when that replacement's authenticated `station_id`
+exactly matches the station_id of the live session currently at that
+relation. Relation equality alone is never sufficient for this carry-
+forward -- a replacement authenticating as a different station always gets
+a fresh `assembly_namespace`, with no exception. Neither identifier survives
+a relation that is not currently live: expiry, close, capacity eviction,
+nonce exhaustion, or process restart all mean the next establishment at that
+relation gets both a fresh `session_handle` and a fresh `assembly_namespace`;
+there is no historical cache of removed relations, stations, or namespaces.
+This carry-forward is a transitional mechanism for the current stage, where
+a rekey still replaces the whole `LogicalSession` object; it is not the
+final rekey architecture. Once a later stage lets an authenticated refresh
+replace only `current_epoch` on an unchanged `LogicalSession`, both
+identifiers will naturally remain stable across rekey simply because the
+session object itself persists, and this reuse logic will no longer be
+needed.
+
 Each physical secure-listener socket incarnation owns one opaque endpoint
 token. The token has process-local object-identity semantics, remains stable
 for that socket's lifetime, and is never transmitted or derived from listener
 configuration, network addresses, station identity, or cryptographic key
 material. Pending and active relation identity is the exact combination of
 that endpoint token and the raw peer socket address returned by `recvfrom()`.
-The raw address remains separately retained for replies, source metadata,
-assembler identity, logging, and diagnostics. Identical raw peer addresses on
+The raw address remains separately retained for pending-handshake replies,
+source metadata, logging, and diagnostics; an established session's
+`path_state.active_path` -- initialized to that same raw address and not
+otherwise mutated in this revision -- is the sole address ordinary
+established-session replies use. A secure-ingress `IngressFrame`'s assembler
+namespace is derived instead from the owning `LogicalSession`'s
+`assembly_namespace` -- never from `session_handle`, the address, or
+`path_state` -- so that two fragments of one multipart message reaching the
+same continuing authenticated station at the same relation remain in one
+assembly group regardless of which address either arrived from, while a
+replacement authenticating as a different station never inherits that
+group. Identical raw peer addresses on
 different physical listener incarnations are independent relations. A
 replacement socket receives a fresh endpoint token and cannot select retained
 state from the prior incarnation; abnormally retained old state remains
@@ -365,9 +418,9 @@ ordered front prefix during admission, and evicts the oldest live record
 deterministically when capacity remains full.
 
 A pending session is identified by its exact endpoint-token/peer-address
-relation and retains the raw peer address, authenticated station ID, separate
-client-to-server and server-to-client AES-GCM owners, its monotonic creation
-time, and a private data-nonce set.
+relation and retains the raw peer address, authenticated station ID, its
+monotonic creation time, and a `current_epoch` (separate client-to-server and
+server-to-client AES-GCM owners plus a private data-nonce set).
 Pending sessions have their own TTL, capacity, and creation order, independent
 of active-session TTL, capacity, and activity order. Pending lifetime is not
 refreshed by traffic. Expiry removes only the expired ordered front prefix. A
@@ -398,11 +451,17 @@ its still-current pending object or close its exact active object. A missing,
 stale, replaced, or wrong-endpoint handle cannot consume nonce state, transfer
 promotion ownership, touch, exhaust, or close another listener's relation.
 
-An active session is identified by its exact endpoint-token/peer-address
-relation and retains the raw peer address, authenticated station ID, separate
-client-to-server and server-to-client AES-GCM owners, monotonic creation and
-last-seen times, and a private data-nonce set. Active sessions are ordered from
-least to most recently seen across the process-wide `SecureState`.
+An active session (a `LogicalSession`) is identified by its exact
+endpoint-token/peer-address relation and retains a `session_handle`
+(identifying this exact object incarnation) and an `assembly_namespace`
+(identifying secure multipart continuity lineage; see above for how the two
+differ and when the second may be carried forward across a replacement),
+authenticated station ID, monotonic creation and last-seen times, a
+`current_epoch` (separate client-to-server and server-to-client AES-GCM
+owners plus a private data-nonce set), and a `path_state` whose
+`active_path` is the address ordinary established-session replies use.
+Active sessions are ordered from least to most recently seen across the
+process-wide `SecureState`.
 Installation and valid activity place a session at the most-recent end. Only
 promotion or a fully validated active secure NMEA or ping packet counts as
 activity; invalid, malformed, mismatched, expired, or replayed traffic does not
@@ -502,13 +561,25 @@ pending station ID. The packet nonce is admitted to the pending session before
 promotion. Promotion removes the pending entry and, as one state-model
 transition, replaces any live active session in the same endpoint/peer
 relation.
-The station identity, both directional AES-GCM owners, and the pending nonce
-set become the new active state; active creation and last-seen time begin at
-promotion. The transferred confirmation nonce remains retained and counts
-against `DATA_NONCE_MAX_PER_SESSION` for the promoted traffic-key epoch. The
-server then returns an encrypted sequence-zero pong using the promoted
-server-to-client owner; the proxy requires the same sequence and timestamp
-rules before accepting that confirmation pong.
+The station identity and the pending `current_epoch` (both directional
+AES-GCM owners and the pending nonce set, including the already-admitted
+confirmation nonce) become the new `LogicalSession`'s state exactly as one
+transferred object, not re-derived; active creation and last-seen time begin
+at promotion, a fresh `path_state` is created with `active_path` set to the
+confirming packet's address, and a fresh `session_handle` is always minted
+(promotion is never object-identity-preserving in this stage). The new
+session's `assembly_namespace` is carried forward from the exact live
+session this promotion replaces only when that session's authenticated
+`station_id` matches the promoted station_id; otherwise -- a different
+authenticated station, or no live session currently at this relation -- a
+fresh `assembly_namespace` is minted instead. The transferred confirmation
+nonce remains
+retained and counts against `DATA_NONCE_MAX_PER_SESSION` for the promoted
+traffic-key epoch. The server then returns an encrypted sequence-zero pong
+using the promoted server-to-client owner, addressed to the confirming
+packet's own tuple (pending confirmation remains tuple-bound; this reply
+does not consult `path_state`); the proxy requires the same sequence and
+timestamp rules before accepting that confirmation pong.
 
 For promotion at a new endpoint/peer relation, expired active sessions are
 removed before active capacity is considered; if capacity remains full, the
@@ -577,7 +648,9 @@ stale-handle, or cross-listener close attempts cannot remove a session.
 
 A server close is encrypted under the current server-to-client AES-GCM owner
 and sent only through the listener socket that owns the exact retained live
-session. The proxy considers it only from its pinned remote tuple and leaves the
+session, addressed to that session's `path_state.active_path` (in this
+revision always the address the session was established or last promoted
+at). The proxy considers it only from its pinned remote tuple and leaves the
 current session only after successful decryption and canonical source and shape
 validation. A validated peer close selects normal `reconnect_delay`, not an
 immediate re-handshake. It does not require or carry a ping sequence.
