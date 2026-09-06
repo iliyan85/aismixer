@@ -595,9 +595,12 @@ def test_explicit_udp_adapter_binds_normalized_listener(monkeypatch):
 def test_serial_payload_is_encrypted_through_existing_udpsec_format(monkeypatch):
     proxy = load_proxy_module()
     client_to_server_key = b"\x01" * 32
-    session_key_material = proxy.SessionKeyMaterial(
-        client_to_server_key=client_to_server_key,
-        server_to_client_key=b"\x02" * 32,
+    confirmed_session = proxy.ConfirmedUdpsecSession(
+        session_locator=b"\x03" * 16,
+        key_material=proxy.SessionKeyMaterial(
+            client_to_server_key=client_to_server_key,
+            server_to_client_key=b"\x02" * 32,
+        ),
     )
     remote_addr = ("192.0.2.10", 19999)
     timeouts = []
@@ -648,7 +651,7 @@ def test_serial_payload_is_encrypted_through_existing_udpsec_format(monkeypatch)
             "peer_timeout": 90,
             "session_refresh_interval": 0,
         },
-        session_key_material,
+        confirmed_session,
         remote_addr,
     )
 
@@ -660,6 +663,7 @@ def test_serial_payload_is_encrypted_through_existing_udpsec_format(monkeypatch)
     assert proxy.decrypt_secure_json_message(
         packet,
         client_to_server_key,
+        confirmed_session.session_locator,
     ) == {
         "type": "nmea",
         "payload": "!AIVDM,1,1,,A,payload,0*00",
@@ -676,9 +680,12 @@ def test_serial_payload_with_non_ai_talker_is_encrypted_through_udpsec_format(
     serial-input forwarding loop, not just at the extraction unit boundary."""
     proxy = load_proxy_module()
     client_to_server_key = b"\x01" * 32
-    session_key_material = proxy.SessionKeyMaterial(
-        client_to_server_key=client_to_server_key,
-        server_to_client_key=b"\x02" * 32,
+    confirmed_session = proxy.ConfirmedUdpsecSession(
+        session_locator=b"\x03" * 16,
+        key_material=proxy.SessionKeyMaterial(
+            client_to_server_key=client_to_server_key,
+            server_to_client_key=b"\x02" * 32,
+        ),
     )
     remote_addr = ("192.0.2.10", 19999)
     sentence = "!BSVDM,1,1,,A,payload,0*00"
@@ -728,7 +735,7 @@ def test_serial_payload_with_non_ai_talker_is_encrypted_through_udpsec_format(
             "peer_timeout": 90,
             "session_refresh_interval": 0,
         },
-        session_key_material,
+        confirmed_session,
         remote_addr,
     )
 
@@ -739,6 +746,7 @@ def test_serial_payload_with_non_ai_talker_is_encrypted_through_udpsec_format(
     assert proxy.decrypt_secure_json_message(
         packet,
         client_to_server_key,
+        confirmed_session.session_locator,
     ) == {
         "type": "nmea",
         "payload": sentence,
@@ -774,9 +782,12 @@ def test_forward_loop_prints_sparse_heartbeat_with_session_state(
     tracing every forwarded sentence."""
     proxy = load_proxy_module()
     client_to_server_key = b"\x01" * 32
-    session_key_material = proxy.SessionKeyMaterial(
-        client_to_server_key=client_to_server_key,
-        server_to_client_key=b"\x02" * 32,
+    confirmed_session = proxy.ConfirmedUdpsecSession(
+        session_locator=b"\x03" * 16,
+        key_material=proxy.SessionKeyMaterial(
+            client_to_server_key=client_to_server_key,
+            server_to_client_key=b"\x02" * 32,
+        ),
     )
     remote_addr = ("192.0.2.10", 19999)
 
@@ -833,7 +844,7 @@ def test_forward_loop_prints_sparse_heartbeat_with_session_state(
             "peer_timeout": 90,
             "session_refresh_interval": 0,
         },
-        session_key_material,
+        confirmed_session,
         remote_addr,
     )
 
@@ -856,9 +867,12 @@ def test_forward_loop_stats_persist_across_successive_sessions(monkeypatch):
     keep accumulating rather than resetting per session."""
     proxy = load_proxy_module()
     client_to_server_key = b"\x01" * 32
-    session_key_material = proxy.SessionKeyMaterial(
-        client_to_server_key=client_to_server_key,
-        server_to_client_key=b"\x02" * 32,
+    confirmed_session = proxy.ConfirmedUdpsecSession(
+        session_locator=b"\x03" * 16,
+        key_material=proxy.SessionKeyMaterial(
+            client_to_server_key=client_to_server_key,
+            server_to_client_key=b"\x02" * 32,
+        ),
     )
     remote_addr = ("192.0.2.10", 19999)
     shared_stats = proxy.ForwardingStats()
@@ -907,7 +921,7 @@ def test_forward_loop_stats_persist_across_successive_sessions(monkeypatch):
             FakeAdapter(),
             out_sock,
             config,
-            session_key_material,
+            confirmed_session,
             remote_addr,
             None,
             shared_stats,
@@ -929,9 +943,12 @@ def test_forward_loop_heartbeat_schedule_persists_across_successive_sessions(
     than the heartbeat interval could suppress the heartbeat indefinitely."""
     proxy = load_proxy_module()
     client_to_server_key = b"\x01" * 32
-    session_key_material = proxy.SessionKeyMaterial(
-        client_to_server_key=client_to_server_key,
-        server_to_client_key=b"\x02" * 32,
+    confirmed_session = proxy.ConfirmedUdpsecSession(
+        session_locator=b"\x03" * 16,
+        key_material=proxy.SessionKeyMaterial(
+            client_to_server_key=client_to_server_key,
+            server_to_client_key=b"\x02" * 32,
+        ),
     )
     remote_addr = ("192.0.2.10", 19999)
     shared_stats = proxy.ForwardingStats()
@@ -976,7 +993,7 @@ def test_forward_loop_heartbeat_schedule_persists_across_successive_sessions(
         FakeAdapter(),
         out_sock,
         config,
-        session_key_material,
+        confirmed_session,
         remote_addr,
         None,
         shared_stats,
@@ -994,7 +1011,7 @@ def test_forward_loop_heartbeat_schedule_persists_across_successive_sessions(
         FakeAdapter(),
         out_sock,
         config,
-        session_key_material,
+        confirmed_session,
         remote_addr,
         None,
         shared_stats,

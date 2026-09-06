@@ -34,20 +34,24 @@ from core.udpsec_crypto import (
 )
 from core.udpsec_protocol import (
     CLIENT_HELLO_PREFIX,
+    DATA_PREFIX,
     SESSION_CLOSE_TYPE,
     SESSION_CONFIRMATION_SEQUENCE,
+    SESSION_LOCATOR_BYTES,
+    UDPSEC_PROTOCOL_VERSION,
     ServerHello,
+    build_data_aad,
+    build_data_packet,
     build_pong_message,
     build_session_close_message,
     build_server_hello_packet,
     is_ping_message,
     is_session_close_message,
     parse_client_hello_packet,
+    parse_data_packet,
 )
 
 
-DATA_PREFIX = b"NMEA-D"
-DATA_AAD = b"NMEA"
 SESSION_TTL_SECONDS = 300
 SESSION_MAX = 100000
 PENDING_SESSION_TTL_SECONDS = 30
@@ -55,6 +59,7 @@ PENDING_SESSION_MAX = SESSION_MAX
 HANDSHAKE_REPLAY_TTL_SECONDS = 60
 HANDSHAKE_REPLAY_MAX = 100000
 DATA_NONCE_MAX_PER_SESSION = 100000
+SESSION_LOCATOR_GENERATION_ATTEMPTS = 8
 
 _HANDSHAKE_REPLAY_LABEL = b"HANDSHAKE-REPLAY"
 
@@ -302,6 +307,74 @@ def _require_endpoint_peer_key(relation_key):
     return relation_key
 
 
+@dataclass(frozen=True)
+class _EndpointSessionKey:
+    """Process-local identity for one listener/session-locator relation.
+
+    This -- not the remote peer tuple -- is the authoritative key for an
+    established `LogicalSession`. `endpoint_token` scopes identity to one
+    physical listener incarnation exactly as `_EndpointPeerKey` already does
+    for pending relations; the same raw locator bytes on a different
+    `endpoint_token` is an independent identity.
+    """
+
+    endpoint_token: _EndpointToken
+    session_locator: bytes
+
+    def __post_init__(self):
+        if not isinstance(self.endpoint_token, _EndpointToken):
+            raise TypeError("endpoint_token must be an _EndpointToken")
+        if not isinstance(self.session_locator, bytes):
+            raise TypeError("session_locator must be bytes")
+        if len(self.session_locator) != SESSION_LOCATOR_BYTES:
+            raise ValueError(
+                "session_locator must be exactly "
+                f"{SESSION_LOCATOR_BYTES} bytes"
+            )
+
+
+def _require_endpoint_session_key(session_key):
+    if not isinstance(session_key, _EndpointSessionKey):
+        raise TypeError("session_key must be an _EndpointSessionKey")
+    return session_key
+
+
+def _require_session_locator(value):
+    if not isinstance(value, bytes):
+        raise TypeError("session_locator must be bytes")
+    if len(value) != SESSION_LOCATOR_BYTES:
+        raise ValueError(
+            f"session_locator must be exactly {SESSION_LOCATOR_BYTES} bytes"
+        )
+    return value
+
+
+class SessionLocatorExhaustedError(RuntimeError):
+    """Raised when secure-random session-locator generation cannot find a
+    free value within the bounded attempt limit.
+
+    This is a fail-closed condition: callers must not retry unboundedly or
+    fall back to a weaker/derived locator.
+    """
+
+
+class SessionLocatorCollisionError(RuntimeError):
+    """Raised when `install_session`/`install_pending_session` is given a
+    `session_locator` that already identifies a *different* live pending
+    or active session on the same `endpoint_token`.
+
+    Locator uniqueness is a `SecureState` invariant enforced at the point
+    of installation, not merely a convention observed by
+    `generate_session_locator()`: a direct/internal caller that supplies
+    an already-claimed locator must fail closed here rather than silently
+    overwriting the existing session's `_sessions`/`_pending_locator_owners`
+    entry (which would orphan the original session while leaving stale
+    bookkeeping, or leave two live pending objects sharing one ownership
+    record). Callers should mint locators via `generate_session_locator()`,
+    which already avoids this by construction.
+    """
+
+
 @dataclass
 class CryptoEpoch:
     """One authenticated ECDHE handshake's key material and replay ledger.
@@ -318,6 +391,68 @@ class CryptoEpoch:
     server_to_client_aesgcm: AESGCM
     seen_data_nonces: _BoundedNonceSet
     created_at: float
+
+
+def _structured_paths_match(a, b):
+    """Compare two raw socket address tuples by structured identity, not
+    by display formatting. IPv4 endpoints (2-tuples) are compared by
+    ``(ip, port)``. IPv6 endpoints (4-tuples) are compared by
+    ``(ip, port, scope_id)``: ``flowinfo`` (index 2) is deliberately
+    excluded so it never distinguishes an otherwise-identical path, while
+    ``scope_id`` (index 3) is significant because it disambiguates
+    link-local addresses. Global-unicast IPv6 endpoints keep scope_id 0
+    on both sides, so this is behavior-preserving for the non-scoped
+    case."""
+
+    if not (
+        isinstance(a, tuple)
+        and isinstance(b, tuple)
+        and len(a) >= 2
+        and len(b) >= 2
+    ):
+        return a == b
+    if a[0] != b[0] or a[1] != b[1]:
+        return False
+    if len(a) >= 4 and len(b) >= 4:
+        return a[3] == b[3]
+    return True
+
+
+def _canonical_active_relation_key(relation_key):
+    """Canonicalize one `_EndpointPeerKey` for `_relation_index` lookups
+    so that active-relation identity agrees with `_structured_paths_match`
+    exactly: IPv4 identity is ``(ip, port)``; IPv6 identity is
+    ``(ip, port, scope_id)``, with ``flowinfo`` forced to a canonical 0 so
+    it never distinguishes an otherwise-identical active relation.
+
+    `_relation_index` is a plain dict keyed by `_EndpointPeerKey`, whose
+    equality is raw tuple equality over the *entire* Python socket address
+    -- including flowinfo. Without this normalization, two packets from
+    the same IPv6 relation that merely carry different flowinfo values
+    would hash to different relation-index entries even though the wrong-
+    path check (`_structured_paths_match`) treats them as the same path,
+    breaking same-relation replacement detection and assembly-namespace
+    carry-forward for exactly the link-local/flow-labeled traffic this
+    index exists to serve.
+
+    Pending handshake lookup (`SecureState._pending_sessions`,
+    `_pending_locator_owners`) is intentionally exact/tuple-bound per the
+    UDPSEC V2 spec and must never be passed through this helper.
+    """
+
+    peer_address = relation_key.peer_address
+    if isinstance(peer_address, tuple) and len(peer_address) >= 4:
+        canonical_address = (
+            peer_address[0],
+            peer_address[1],
+            0,
+            peer_address[3],
+        )
+        if canonical_address != peer_address:
+            return _EndpointPeerKey(
+                relation_key.endpoint_token, canonical_address
+            )
+    return relation_key
 
 
 @dataclass
@@ -337,18 +472,23 @@ class PathState:
 class LogicalSession:
     """One authenticated, established UDPSEC relation.
 
-    The wire/session lookup in this stage remains the exact endpoint-token/
-    peer-address relation (`_relation_key`), unchanged from before this
-    refactor -- there is no tuple-independent session locator yet. What
-    changes is that the session's cryptographic state and its outbound path
-    are now owned by distinct `current_epoch`/`path_state` objects instead of
-    being flat fields, and the session carries two separate process-local
-    identifiers that must never be conflated:
+    The wire/session lookup is now tuple-independent: `_session_key` (an
+    `_EndpointSessionKey` of endpoint token + server-minted session locator)
+    is the authoritative identity for `SecureState._sessions`, replacing the
+    endpoint-token/peer-address relation used before UDPSEC protocol
+    revision 2. The remote peer tuple survives only as transport/path state
+    in `path_state.active_path`; it is no longer part of session identity.
+
+    The session's cryptographic state and its outbound path are owned by
+    distinct `current_epoch`/`path_state` objects instead of being flat
+    fields, and the session carries two separate process-local identifiers
+    that must never be conflated:
 
     - `session_handle` identifies this exact `LogicalSession` *object*
       incarnation. It is fresh on every construction, including a same-
       relation authenticated replacement (today's rekey still replaces the
-      whole object), and is never reused merely because the relation key
+      whole object -- and therefore also always mints a fresh
+      `session_locator`), and is never reused merely because the relation
       matches.
     - `assembly_namespace` identifies the secure multipart continuity
       lineage. It is normally also fresh, but a same-relation authenticated
@@ -359,13 +499,13 @@ class LogicalSession:
       a replacement whose authenticated station differs. This is a
       transitional mechanism for the current stage, where rekey still
       replaces the whole `LogicalSession`; once a later stage lets rekey
-      replace only `current_epoch` on an unchanged `LogicalSession`, the
-      assembly namespace will remain stable simply because the session
-      object itself persists, and this field's reuse logic will no longer
-      be needed.
+      replace only `current_epoch` on an unchanged `LogicalSession`
+      (keeping the same `session_locator`), the assembly namespace will
+      remain stable simply because the session object itself persists, and
+      this field's reuse logic will no longer be needed.
     """
 
-    _relation_key: _EndpointPeerKey
+    _session_key: _EndpointSessionKey
     station_id: str
     created_at: float
     last_seen: float
@@ -380,6 +520,7 @@ class _PendingSecureSession:
     _relation_key: _EndpointPeerKey
     _address: object
     station_id: str
+    session_locator: bytes
     created_at: float
     current_epoch: CryptoEpoch
 
@@ -451,8 +592,27 @@ class SecureState:
             self._handshake_replay_ttl,
             self._handshake_replay_max,
         )
+        # Authoritative established-session store: keyed by
+        # `_EndpointSessionKey` (endpoint token + session locator), NOT by
+        # remote peer tuple.
         self._sessions = OrderedDict()
+        # Pending (unconfirmed handshake) store: still keyed by the exact
+        # endpoint-token/peer-address relation -- migration of an
+        # unconfirmed handshake is out of scope; a NAT/path change during
+        # the pending handshake causes ordinary handshake failure/retry.
         self._pending_sessions = OrderedDict()
+        # Bounded secondary index: current relation -> the active session
+        # key currently occupying it. NOT authentication/lookup authority
+        # for DATA traffic -- used only for same-relation replacement
+        # detection, assembly-namespace carry-forward, and diagnostics. Kept
+        # exactly one-to-one with live active sessions by every removal path.
+        self._relation_index = {}
+        # Bounded collision-prevention index for pending locators: maps
+        # (endpoint_token, session_locator) -> the exact pending relation
+        # that reserved it. Active-session locator collision is checked
+        # directly against `self._sessions` (see `_locator_is_free`), since
+        # that store is already locator-keyed.
+        self._pending_locator_owners = {}
         # Two deliberately separate counters -- see `LogicalSession`'s
         # docstring. `session_handle` identifies one LogicalSession object
         # incarnation and is always fresh. `assembly_namespace` identifies
@@ -558,8 +718,15 @@ class SecureState:
         self._current_data_nonces -= discarded_nonces
         self._data_nonces_session_discarded += discarded_nonces
 
-    def _remove_session(self, relation_key, reason):
-        session = self._sessions.pop(relation_key)
+    def _remove_session(self, session_key, reason):
+        session = self._sessions.pop(session_key)
+        relation_key = _canonical_active_relation_key(
+            _EndpointPeerKey(
+                session_key.endpoint_token, session.path_state.active_path
+            )
+        )
+        if self._relation_index.get(relation_key) == session_key:
+            del self._relation_index[relation_key]
         self._discard_session_nonces(session)
 
         if reason == "expired":
@@ -578,6 +745,9 @@ class SecureState:
 
     def _remove_pending_session(self, relation_key, reason):
         pending = self._pending_sessions.pop(relation_key)
+        locator_key = (relation_key.endpoint_token, pending.session_locator)
+        if self._pending_locator_owners.get(locator_key) == relation_key:
+            del self._pending_locator_owners[locator_key]
         self._discard_session_nonces(pending)
 
         if reason == "expired":
@@ -597,11 +767,11 @@ class SecureState:
     def cleanup_expired_sessions(self, now):
         expired = []
         while self._sessions:
-            relation_key, session = next(iter(self._sessions.items()))
+            session_key, session = next(iter(self._sessions.items()))
             if now - session.last_seen < self._session_ttl:
                 break
-            self._remove_session(relation_key, "expired")
-            expired.append(relation_key)
+            self._remove_session(session_key, "expired")
+            expired.append(session_key)
         return expired
 
     def cleanup_expired_pending_sessions(self, now):
@@ -622,45 +792,150 @@ class SecureState:
         replacement."""
         return next(self._next_session_handle)
 
+    def _active_session_at_relation(self, relation_key):
+        """Return the LogicalSession currently occupying this exact
+        relation via the bounded secondary relation index, or None.
+
+        This index is NOT authentication or lookup authority for DATA
+        traffic -- it exists only for same-relation replacement detection,
+        assembly-namespace carry-forward, and diagnostics. The lookup key
+        is canonicalized so IPv6 flowinfo never distinguishes an
+        otherwise-identical relation, matching `_structured_paths_match`.
+        """
+        session_key = self._relation_index.get(
+            _canonical_active_relation_key(relation_key)
+        )
+        if session_key is None:
+            return None
+        return self._sessions.get(session_key)
+
+    def _remove_active_at_relation_if_present(self, relation_key):
+        session_key = self._relation_index.get(
+            _canonical_active_relation_key(relation_key)
+        )
+        if session_key is None:
+            return False
+        self._remove_session(session_key, "replaced")
+        return True
+
     def _reused_or_fresh_assembly_namespace(self, relation_key, station_id):
         """Preserve secure multipart continuity across a same-relation
         authenticated replacement of the SAME authenticated station only.
 
-        A currently live session at `relation_key` whose authenticated
-        `station_id` matches contributes its `assembly_namespace` forward,
-        so an in-flight multipart AIS message is not split by a routine
-        rekey. Every other case -- a different authenticated station at the
-        same relation, a genuinely different/new relation, or no live
-        session at all (already-expired, closed, capacity-evicted, or
-        nonce-exhausted state) -- mints a fresh namespace. There is no
-        historical cache of removed relations/stations/namespaces."""
-        replaced = self._sessions.get(relation_key)
+        A currently live session at `relation_key` (via the relation index)
+        whose authenticated `station_id` matches contributes its
+        `assembly_namespace` forward, so an in-flight multipart AIS message
+        is not split by a routine rekey. Every other case -- a different
+        authenticated station at the same relation, a genuinely
+        different/new relation, or no live session at all (already-expired,
+        closed, capacity-evicted, or nonce-exhausted state) -- mints a fresh
+        namespace. There is no historical cache of removed
+        relations/stations/namespaces."""
+        replaced = self._active_session_at_relation(relation_key)
         if replaced is not None and replaced.station_id == station_id:
             return replaced.assembly_namespace
         return next(self._next_assembly_namespace)
+
+    def _locator_is_free(self, endpoint_token, candidate):
+        if (endpoint_token, candidate) in self._pending_locator_owners:
+            return False
+        if _EndpointSessionKey(endpoint_token, candidate) in self._sessions:
+            return False
+        return True
+
+    def _pending_exclusively_owns_locator(self, relation_key, candidate):
+        """Pure query, never a mutation: True only when `candidate` is
+        both free of any live active session AND currently reserved by
+        this exact pending relation -- not by another pending candidate,
+        and not missing or pointing elsewhere.
+
+        Unlike `_locator_is_free()`, this deliberately treats the
+        pending's OWN reservation as expected rather than as a
+        collision, so promotion can validate self-ownership before
+        performing any destructive state transition instead of having to
+        temporarily release the reservation just to make
+        `_locator_is_free()` return True.
+        """
+        if _EndpointSessionKey(
+            relation_key.endpoint_token, candidate
+        ) in self._sessions:
+            return False
+        owner = self._pending_locator_owners.get(
+            (relation_key.endpoint_token, candidate)
+        )
+        return owner == relation_key
+
+    def generate_session_locator(self, endpoint_token):
+        """Generate a fresh, unique 16-byte session locator for one
+        physical listener incarnation.
+
+        Uniqueness is checked against every currently live pending AND
+        active session on this exact `endpoint_token` -- the same raw
+        locator bytes on a different endpoint token is an independent
+        identity and is not considered a collision. Bounded retry; fails
+        closed (`SessionLocatorExhaustedError`) rather than spinning
+        forever or falling back to a weaker value. This method does not
+        mutate state: reservation happens when the caller actually installs
+        the pending/active session with the returned locator.
+        """
+
+        if not isinstance(endpoint_token, _EndpointToken):
+            raise TypeError("endpoint_token must be an _EndpointToken")
+        for _ in range(SESSION_LOCATOR_GENERATION_ATTEMPTS):
+            candidate = os.urandom(SESSION_LOCATOR_BYTES)
+            if self._locator_is_free(endpoint_token, candidate):
+                return candidate
+        raise SessionLocatorExhaustedError(
+            "unable to generate a unique UDPSEC session locator after "
+            f"{SESSION_LOCATOR_GENERATION_ATTEMPTS} attempts"
+        )
 
     def install_session(
         self,
         relation_key,
         station_id,
+        session_locator,
         client_to_server_aesgcm,
         server_to_client_aesgcm,
         now,
     ):
         relation_key = _require_endpoint_peer_key(relation_key)
+        session_locator = _require_session_locator(session_locator)
         self.cleanup_expired_sessions(now)
+
+        # Preflight, before any destructive mutation: a locator already
+        # identifying ANY live session or pending candidate on this
+        # endpoint_token -- including this exact relation's own current
+        # session -- fails closed here, leaving that relation's session
+        # (and every other live session, the relation index, nonce
+        # ledgers, and lifecycle statistics) untouched. Checking against
+        # unmodified state also enforces that a same-relation replacement
+        # can never reuse the outgoing session's own locator: V2 requires
+        # a fresh server-minted locator for every whole-LogicalSession
+        # replacement, so if it were the same locator this check would
+        # (correctly) still see it occupied by the very session it would
+        # otherwise replace.
+        if not self._locator_is_free(
+            relation_key.endpoint_token, session_locator
+        ):
+            raise SessionLocatorCollisionError(
+                "session_locator already identifies a different live "
+                "session on this endpoint_token"
+            )
+
         assembly_namespace = self._reused_or_fresh_assembly_namespace(
             relation_key, station_id
         )
+        replaced = self._remove_active_at_relation_if_present(relation_key)
+        if not replaced and len(self._sessions) >= self._max_sessions:
+            oldest_session_key = next(iter(self._sessions))
+            self._remove_session(oldest_session_key, "capacity")
 
-        if relation_key in self._sessions:
-            self._remove_session(relation_key, "replaced")
-        elif len(self._sessions) >= self._max_sessions:
-            oldest_relation_key = next(iter(self._sessions))
-            self._remove_session(oldest_relation_key, "capacity")
-
+        session_key = _EndpointSessionKey(
+            relation_key.endpoint_token, session_locator
+        )
         session = LogicalSession(
-            _relation_key=relation_key,
+            _session_key=session_key,
             station_id=station_id,
             created_at=now,
             last_seen=now,
@@ -676,7 +951,10 @@ class SecureState:
             ),
             path_state=PathState(active_path=relation_key.peer_address),
         )
-        self._sessions[relation_key] = session
+        self._sessions[session_key] = session
+        self._relation_index[
+            _canonical_active_relation_key(relation_key)
+        ] = session_key
         self._sessions_created += 1
         self._peak_sessions = max(
             self._peak_sessions,
@@ -688,12 +966,36 @@ class SecureState:
         self,
         relation_key,
         station_id,
+        session_locator,
         client_to_server_aesgcm,
         server_to_client_aesgcm,
         now,
     ):
         relation_key = _require_endpoint_peer_key(relation_key)
+        session_locator = _require_session_locator(session_locator)
         self.cleanup_expired_pending_sessions(now)
+
+        # Preflight, before any destructive mutation (own-relation
+        # replacement or capacity eviction): a locator already
+        # identifying ANY live pending candidate or active session on
+        # this endpoint_token -- including this exact relation's own
+        # current pending candidate -- fails closed here, leaving that
+        # relation's pending entry (and every other live pending entry,
+        # its position in the capacity/eviction order, owner-index
+        # entries, nonce ledgers, and lifecycle statistics) untouched.
+        # Checking against unmodified state also enforces that a
+        # same-relation pending replacement can never reuse the outgoing
+        # candidate's own locator: each ServerHello mints its own fresh
+        # locator, so if it were the same locator this check would
+        # (correctly) still see it reserved by the very candidate it
+        # would otherwise replace.
+        if not self._locator_is_free(
+            relation_key.endpoint_token, session_locator
+        ):
+            raise SessionLocatorCollisionError(
+                "session_locator already identifies a different live "
+                "session on this endpoint_token"
+            )
 
         if relation_key in self._pending_sessions:
             self._remove_pending_session(relation_key, "replaced")
@@ -705,6 +1007,7 @@ class SecureState:
             _relation_key=relation_key,
             _address=relation_key.peer_address,
             station_id=station_id,
+            session_locator=session_locator,
             created_at=now,
             current_epoch=CryptoEpoch(
                 client_to_server_aesgcm=client_to_server_aesgcm,
@@ -716,6 +1019,9 @@ class SecureState:
             ),
         )
         self._pending_sessions[relation_key] = pending
+        self._pending_locator_owners[
+            (relation_key.endpoint_token, session_locator)
+        ] = relation_key
         self._pending_sessions_created += 1
         self._peak_pending_sessions = max(
             self._peak_pending_sessions,
@@ -723,34 +1029,29 @@ class SecureState:
         )
         return pending
 
-    def get_active_session(self, relation_key, now):
-        relation_key = _require_endpoint_peer_key(relation_key)
+    def get_active_session(self, session_key, now):
+        session_key = _require_endpoint_session_key(session_key)
         self.cleanup_expired_sessions(now)
-        return self._sessions.get(relation_key)
+        return self._sessions.get(session_key)
 
     def get_pending_session(self, relation_key, now):
         relation_key = _require_endpoint_peer_key(relation_key)
         self.cleanup_expired_pending_sessions(now)
         return self._pending_sessions.get(relation_key)
 
-    def _get_live_session_handle(self, relation_key, session, now):
-        relation_key = _require_endpoint_peer_key(relation_key)
-        if self._sessions.get(relation_key) is not session:
+    def _get_live_session_handle(self, session, now):
+        session_key = session._session_key
+        if self._sessions.get(session_key) is not session:
             return None
 
         self.cleanup_expired_sessions(now)
-        if self._sessions.get(relation_key) is not session:
+        if self._sessions.get(session_key) is not session:
             return None
 
         return session
 
-    def _get_live_pending_session_handle(
-        self,
-        relation_key,
-        pending,
-        now,
-    ):
-        relation_key = _require_endpoint_peer_key(relation_key)
+    def _get_live_pending_session_handle(self, pending, now):
+        relation_key = pending._relation_key
         if self._pending_sessions.get(relation_key) is not pending:
             return None
 
@@ -760,53 +1061,72 @@ class SecureState:
 
         return pending
 
-    def _touch_active_session(self, relation_key, session, now):
+    def _touch_active_session(self, session, now):
         session.last_seen = now
-        self._sessions.move_to_end(relation_key)
+        self._sessions.move_to_end(session._session_key)
         self._sessions_touched += 1
 
-    def touch_session(self, relation_key, session, now):
-        if self._get_live_session_handle(
-            relation_key, session, now
-        ) is None:
+    def touch_session(self, session, now):
+        if self._get_live_session_handle(session, now) is None:
             return False
-        self._touch_active_session(relation_key, session, now)
+        self._touch_active_session(session, now)
         return True
 
-    def is_live_session_handle(self, relation_key, session, now):
-        return self._get_live_session_handle(
-            relation_key, session, now
-        ) is not None
+    def is_live_session_handle(self, session, now):
+        return self._get_live_session_handle(session, now) is not None
 
-    def close_session(self, relation_key, session, now):
-        if self._get_live_session_handle(
-            relation_key, session, now
-        ) is None:
+    def close_session(self, session, now):
+        if self._get_live_session_handle(session, now) is None:
             return False
-        self._remove_session(relation_key, "closed")
+        self._remove_session(session._session_key, "closed")
         return True
 
-    def promote_pending_session(self, relation_key, pending, now):
-        if self._get_live_pending_session_handle(
-            relation_key, pending, now
-        ) is None:
+    def promote_pending_session(self, pending, now):
+        relation_key = pending._relation_key
+        if self._get_live_pending_session_handle(pending, now) is None:
             return None
 
         self.cleanup_expired_sessions(now)
+
+        # Preflight, before any destructive mutation: defense in depth
+        # alongside install_session()'s and install_pending_session()'s
+        # own checks. The pending's locator was already reserved (and
+        # checked free) when the pending was installed, so an inconsistent
+        # claim here should be unreachable in practice -- but promotion
+        # writes `_sessions` directly rather than going through
+        # install_session(), so the invariant is verified here too rather
+        # than assumed. This is a pure query: it does not temporarily
+        # release the pending's own reservation just to ask the question,
+        # so a failure leaves the pending session, its locator
+        # reservation, any current active session at this relation, and
+        # every lifecycle statistic below untouched.
+        if not self._pending_exclusively_owns_locator(
+            relation_key, pending.session_locator
+        ):
+            raise SessionLocatorCollisionError(
+                "pending session_locator is not exclusively owned by "
+                "this pending candidate"
+            )
+
         self._pending_sessions.pop(relation_key)
+        locator_key = (relation_key.endpoint_token, pending.session_locator)
+        if self._pending_locator_owners.get(locator_key) == relation_key:
+            del self._pending_locator_owners[locator_key]
         self._pending_sessions_promoted += 1
         assembly_namespace = self._reused_or_fresh_assembly_namespace(
             relation_key, pending.station_id
         )
 
-        if relation_key in self._sessions:
-            self._remove_session(relation_key, "replaced")
-        elif len(self._sessions) >= self._max_sessions:
-            oldest_relation_key = next(iter(self._sessions))
-            self._remove_session(oldest_relation_key, "capacity")
+        replaced = self._remove_active_at_relation_if_present(relation_key)
+        if not replaced and len(self._sessions) >= self._max_sessions:
+            oldest_session_key = next(iter(self._sessions))
+            self._remove_session(oldest_session_key, "capacity")
 
+        session_key = _EndpointSessionKey(
+            relation_key.endpoint_token, pending.session_locator
+        )
         session = LogicalSession(
-            _relation_key=relation_key,
+            _session_key=session_key,
             station_id=pending.station_id,
             created_at=now,
             last_seen=now,
@@ -815,11 +1135,16 @@ class SecureState:
             # The confirmed epoch (both AES-GCM owners and the nonce set that
             # already admitted the confirmation nonce) transfers unchanged
             # from the pending candidate -- promotion does not derive new
-            # keys or reset replay state.
+            # keys or reset replay state. The pending's already-reserved
+            # session_locator transfers unchanged too: promotion mints no
+            # second locator.
             current_epoch=pending.current_epoch,
             path_state=PathState(active_path=relation_key.peer_address),
         )
-        self._sessions[relation_key] = session
+        self._sessions[session_key] = session
+        self._relation_index[
+            _canonical_active_relation_key(relation_key)
+        ] = session_key
         self._sessions_created += 1
         self._peak_sessions = max(
             self._peak_sessions,
@@ -828,9 +1153,7 @@ class SecureState:
         return session
 
     def data_nonce_seen(self, session, nonce, now):
-        if self._get_live_session_handle(
-            session._relation_key, session, now
-        ) is None:
+        if self._get_live_session_handle(session, now) is None:
             return False
         seen = session.current_epoch.seen_data_nonces.contains(nonce)
         if seen:
@@ -838,9 +1161,7 @@ class SecureState:
         return seen
 
     def pending_data_nonce_seen(self, pending, nonce, now):
-        if self._get_live_pending_session_handle(
-            pending._relation_key, pending, now
-        ) is None:
+        if self._get_live_pending_session_handle(pending, now) is None:
             return False
         return pending.current_epoch.seen_data_nonces.contains(nonce)
 
@@ -853,10 +1174,10 @@ class SecureState:
         )
 
     def _remove_exact_session(self, session, reason):
-        relation_key = session._relation_key
-        if self._sessions.get(relation_key) is not session:
+        session_key = session._session_key
+        if self._sessions.get(session_key) is not session:
             return False
-        self._remove_session(relation_key, reason)
+        self._remove_session(session_key, reason)
         return True
 
     def _remove_exact_pending_session(self, pending, reason):
@@ -867,9 +1188,7 @@ class SecureState:
         return True
 
     def admit_data_nonce(self, session, nonce, now):
-        if self._get_live_session_handle(
-            session._relation_key, session, now
-        ) is None:
+        if self._get_live_session_handle(session, now) is None:
             return _DataNonceAdmission.STALE
         admission = session.current_epoch.seen_data_nonces.admit(nonce)
         if admission is _DataNonceAdmission.REPLAY:
@@ -889,7 +1208,7 @@ class SecureState:
 
     def admit_pending_data_nonce(self, pending, nonce, now):
         if self._get_live_pending_session_handle(
-            pending._relation_key, pending, now
+            pending, now
         ) is None:
             return _DataNonceAdmission.STALE
         admission = pending.current_epoch.seen_data_nonces.admit(nonce)
@@ -949,21 +1268,21 @@ def build_handshake_replay_key(
     return digest.finalize()
 
 
-def parse_secure_data_packet(data):
-    min_len = len(DATA_PREFIX) + 12 + 16
-    if not data.startswith(DATA_PREFIX):
-        raise ValueError("Invalid secure data packet prefix")
-    if len(data) < min_len:
-        raise ValueError("Secure data packet too short")
-    nonce = data[len(DATA_PREFIX):len(DATA_PREFIX)+12]
-    ciphertext = data[len(DATA_PREFIX)+12:]
-    return nonce, ciphertext
+def encrypt_secure_json_message(aesgcm, session_locator, message):
+    """Encrypt one JSON DATA-channel message as one canonical V2 packet.
 
+    Every direction/message kind (NMEA, ordinary ping/pong, confirmation
+    ping/pong, graceful close) must use this exact construction so that
+    changing the plaintext locator on a captured ciphertext invalidates
+    AEAD authentication under the correct key.
+    """
 
-def encrypt_secure_json_message(aesgcm, message):
     nonce = os.urandom(12)
     plaintext = json.dumps(message, separators=(",", ":")).encode()
-    return DATA_PREFIX + nonce + aesgcm.encrypt(nonce, plaintext, DATA_AAD)
+    ciphertext = aesgcm.encrypt(
+        nonce, plaintext, build_data_aad(session_locator)
+    )
+    return build_data_packet(session_locator, nonce, ciphertext)
 
 
 def close_owned_sessions(
@@ -985,13 +1304,9 @@ def close_owned_sessions(
         if monotonic_clock is None
         else monotonic_clock
     )
-    for relation_key, session in list(owned_sessions.items()):
+    for session_key, session in list(owned_sessions.items()):
         local_now = monotonic_now()
-        if not state_owner.is_live_session_handle(
-            relation_key,
-            session,
-            local_now,
-        ):
+        if not state_owner.is_live_session_handle(session, local_now):
             continue
         addr = session.path_state.active_path
         try:
@@ -1002,6 +1317,7 @@ def close_owned_sessions(
             sock.sendto(
                 encrypt_secure_json_message(
                     session.current_epoch.server_to_client_aesgcm,
+                    session_key.session_locator,
                     message,
                 ),
                 addr,
@@ -1014,7 +1330,6 @@ def close_owned_sessions(
             )
         finally:
             state_owner.close_session(
-                relation_key,
                 session,
                 local_now,
             )
@@ -1023,20 +1338,30 @@ def close_owned_sessions(
 def _build_server_handshake(
     client_hello,
     client_ephemeral_public_key,
+    session_locator,
     *,
     server_private_key=None,
 ):
-    """Build one authenticated ServerHello and directional session ciphers."""
+    """Build one authenticated ServerHello and directional session ciphers.
+
+    `session_locator` must already be generated (and, by the time this
+    response is actually installed, reserved) by the caller -- it is
+    cryptographically bound into the server authentication digest and the
+    session transcript hash below, so tampering with it invalidates both
+    signature verification and the derived traffic keys.
+    """
 
     active_server_private_key = _require_prepared_server_private_key(
         server_private_key
     )
+    session_locator = _require_session_locator(session_locator)
     server_random = os.urandom(32)
     server_ephemeral_private_key = generate_ephemeral_private_key()
     server_ephemeral_public_bytes = serialize_ephemeral_public_key(
         server_ephemeral_private_key.public_key()
     )
     server_auth_digest = build_server_auth_digest(
+        protocol_version=client_hello.protocol_version,
         station_id=client_hello.station_id,
         timestamp=client_hello.timestamp,
         client_random=client_hello.client_random,
@@ -1044,6 +1369,7 @@ def _build_server_handshake(
             client_hello.client_ephemeral_public_key
         ),
         client_signature=client_hello.client_signature,
+        session_locator=session_locator,
         server_random=server_random,
         server_ephemeral_public_key=server_ephemeral_public_bytes,
     )
@@ -1056,6 +1382,7 @@ def _build_server_handshake(
         client_ephemeral_public_key,
     )
     session_transcript_hash = build_session_transcript_hash(
+        protocol_version=client_hello.protocol_version,
         station_id=client_hello.station_id,
         timestamp=client_hello.timestamp,
         client_random=client_hello.client_random,
@@ -1063,6 +1390,7 @@ def _build_server_handshake(
             client_hello.client_ephemeral_public_key
         ),
         client_signature=client_hello.client_signature,
+        session_locator=session_locator,
         server_random=server_random,
         server_ephemeral_public_key=server_ephemeral_public_bytes,
         server_signature=server_signature,
@@ -1072,6 +1400,8 @@ def _build_server_handshake(
         session_transcript_hash,
     )
     server_hello = ServerHello(
+        protocol_version=UDPSEC_PROTOCOL_VERSION,
+        session_locator=session_locator,
         server_random=server_random,
         server_ephemeral_public_key=server_ephemeral_public_bytes,
         server_signature=server_signature,
@@ -1160,6 +1490,7 @@ async def _secure_server_loop(
                     continue
 
                 client_auth_digest = build_client_auth_digest(
+                    protocol_version=client_hello.protocol_version,
                     station_id=station_id,
                     timestamp=timestamp,
                     client_random=client_hello.client_random,
@@ -1188,6 +1519,12 @@ async def _secure_server_loop(
                     print(f"[!] Rejected {station_id}: handshake replay")
                     continue
 
+                # Minted before the ServerHello is signed and built: the
+                # locator is cryptographically bound into the server
+                # authentication digest and the session transcript hash.
+                session_locator = state_owner.generate_session_locator(
+                    endpoint_token
+                )
                 (
                     response_packet,
                     client_to_server_aesgcm,
@@ -1195,11 +1532,13 @@ async def _secure_server_loop(
                 ) = _build_server_handshake(
                     client_hello,
                     client_ephemeral_public_key,
+                    session_locator,
                     server_private_key=active_server_private_key,
                 )
                 pending = state_owner.install_pending_session(
                     relation_key,
                     station_id,
+                    session_locator,
                     client_to_server_aesgcm,
                     server_to_client_aesgcm,
                     local_now,
@@ -1220,6 +1559,13 @@ async def _secure_server_loop(
 
         elif data.startswith(DATA_PREFIX):
             try:
+                try:
+                    packet_locator, nonce, ciphertext = parse_data_packet(
+                        data
+                    )
+                except ValueError:
+                    continue
+
                 pending = state_owner.get_pending_session(
                     relation_key, local_now
                 )
@@ -1228,115 +1574,138 @@ async def _secure_server_loop(
                     and owned_pending_sessions.get(relation_key) is not pending
                 ):
                     pending = None
-                session = state_owner.get_active_session(
-                    relation_key, local_now
-                )
-                if pending is None and session is None:
-                    continue
 
-                nonce, ciphertext = parse_secure_data_packet(data)
-
-                if pending is not None and not (
-                    state_owner.pending_data_nonce_seen(
-                        pending, nonce, local_now
-                    )
+                if pending is not None and packet_locator == (
+                    pending.session_locator
                 ):
+                    # The locator identifies this packet as a pending-
+                    # confirmation candidate for THIS exact pending relation
+                    # -- process only as that, regardless of outcome. Never
+                    # fall through to active lookup: a pending locator is
+                    # guaranteed distinct from every currently active
+                    # locator on this listener, so it could never match an
+                    # active session anyway.
+                    if state_owner.pending_data_nonce_seen(
+                        pending, nonce, local_now
+                    ):
+                        print(
+                            "[!] Duplicate secure data nonce from "
+                            f"{format_endpoint_tuple(addr)}"
+                        )
+                        continue
                     try:
                         pending_plaintext = (
                             pending.current_epoch.client_to_server_aesgcm.decrypt(
                                 nonce,
                                 ciphertext,
-                                DATA_AAD,
+                                build_data_aad(packet_locator),
                             )
                         )
                     except InvalidTag:
-                        pass
-                    else:
-                        pending_message = json.loads(
-                            pending_plaintext.decode()
+                        continue
+                    pending_message = json.loads(
+                        pending_plaintext.decode()
+                    )
+                    if not is_ping_message(
+                        pending_message,
+                        pending.station_id,
+                        confirmation=True,
+                    ):
+                        print(
+                            f"[!] Invalid session confirmation "
+                            f"from {format_endpoint_tuple(addr)}"
                         )
-                        if not is_ping_message(
-                            pending_message,
-                            pending.station_id,
-                            confirmation=True,
-                        ):
-                            print(
-                                f"[!] Invalid session confirmation "
-                                f"from {format_endpoint_tuple(addr)}"
-                            )
-                            continue
-                        admission = state_owner.admit_pending_data_nonce(
-                            pending, nonce, local_now
+                        continue
+                    admission = state_owner.admit_pending_data_nonce(
+                        pending, nonce, local_now
+                    )
+                    if admission is _DataNonceAdmission.REPLAY:
+                        print(
+                            f"[!] Duplicate secure data nonce "
+                            f"from {format_endpoint_tuple(addr)}"
                         )
-                        if admission is _DataNonceAdmission.REPLAY:
-                            print(
-                                f"[!] Duplicate secure data nonce "
-                                f"from {format_endpoint_tuple(addr)}"
-                            )
-                            continue
-                        if admission is _DataNonceAdmission.EXHAUSTED:
-                            if (
-                                owned_pending_sessions is not None
-                                and owned_pending_sessions.get(
-                                    relation_key
-                                ) is pending
-                            ):
-                                owned_pending_sessions.pop(
-                                    relation_key, None
-                                )
-                            print(
-                                f"[!] Pending secure session nonce capacity "
-                                f"exhausted for {format_endpoint_tuple(addr)}"
-                            )
-                            continue
-                        if admission is not _DataNonceAdmission.ACCEPTED:
-                            continue
-
-                        session = state_owner.promote_pending_session(
-                            relation_key,
-                            pending,
-                            local_now,
-                        )
-                        if session is None:
-                            continue
-                        if not state_owner.touch_session(
-                            relation_key, session, local_now
-                        ):
-                            continue
+                        continue
+                    if admission is _DataNonceAdmission.EXHAUSTED:
                         if (
                             owned_pending_sessions is not None
                             and owned_pending_sessions.get(
                                 relation_key
                             ) is pending
                         ):
-                            owned_pending_sessions.pop(relation_key, None)
-                        if owned_sessions is not None:
-                            owned_sessions[relation_key] = session
-
-                        response = build_pong_message(
-                            session.station_id,
-                            SESSION_CONFIRMATION_SEQUENCE,
-                            int(wall_now()),
-                        )
-                        # Pending-confirmation traffic is still tuple-bound:
-                        # this reply belongs to the handshake transaction, so
-                        # it addresses the confirming packet's own tuple, not
-                        # (yet) `session.path_state.active_path`.
-                        sock.sendto(
-                            encrypt_secure_json_message(
-                                session.current_epoch.server_to_client_aesgcm,
-                                response,
-                            ),
-                            addr,
-                        )
+                            owned_pending_sessions.pop(
+                                relation_key, None
+                            )
                         print(
-                            f"[+] Confirmed secure session for "
-                            f"{session.station_id} @ "
-                            f"{format_endpoint_tuple(addr)}"
+                            f"[!] Pending secure session nonce capacity "
+                            f"exhausted for {format_endpoint_tuple(addr)}"
                         )
                         continue
+                    if admission is not _DataNonceAdmission.ACCEPTED:
+                        continue
 
+                    session = state_owner.promote_pending_session(
+                        pending,
+                        local_now,
+                    )
+                    if session is None:
+                        continue
+                    if not state_owner.touch_session(session, local_now):
+                        continue
+                    if (
+                        owned_pending_sessions is not None
+                        and owned_pending_sessions.get(
+                            relation_key
+                        ) is pending
+                    ):
+                        owned_pending_sessions.pop(relation_key, None)
+                    if owned_sessions is not None:
+                        owned_sessions[session._session_key] = session
+
+                    response = build_pong_message(
+                        session.station_id,
+                        SESSION_CONFIRMATION_SEQUENCE,
+                        int(wall_now()),
+                    )
+                    # Pending-confirmation traffic is still tuple-bound:
+                    # this reply belongs to the handshake transaction, so
+                    # it addresses the confirming packet's own tuple, not
+                    # (yet) `session.path_state.active_path`.
+                    sock.sendto(
+                        encrypt_secure_json_message(
+                            session.current_epoch.server_to_client_aesgcm,
+                            session._session_key.session_locator,
+                            response,
+                        ),
+                        addr,
+                    )
+                    print(
+                        f"[+] Confirmed secure session for "
+                        f"{session.station_id} @ "
+                        f"{format_endpoint_tuple(addr)}"
+                    )
+                    continue
+
+                # Tuple-independent established lookup: the remote address
+                # is no longer part of session identity.
+                session = state_owner.get_active_session(
+                    _EndpointSessionKey(endpoint_token, packet_locator),
+                    local_now,
+                )
                 if session is None:
+                    # Unknown locator: silent drop. No trial decryption
+                    # against other sessions, no state created/touched, no
+                    # reply -- and this reveals nothing about whether any
+                    # station identity exists.
+                    continue
+
+                # No migration in this stage: a locator match from any path
+                # other than the session's currently validated active_path
+                # is dropped before any cryptographic work, exactly like an
+                # unknown locator. A later stage will turn this into
+                # authenticated candidate-path evaluation.
+                if not _structured_paths_match(
+                    addr, session.path_state.active_path
+                ):
                     continue
 
                 station_id = session.station_id
@@ -1353,7 +1722,7 @@ async def _secure_server_loop(
                 plaintext = client_to_server_aesgcm.decrypt(
                     nonce,
                     ciphertext,
-                    DATA_AAD,
+                    build_data_aad(packet_locator),
                 )
 
                 msg = json.loads(plaintext.decode())
@@ -1388,7 +1757,9 @@ async def _secure_server_loop(
                         continue
                     if (
                         owned_sessions is not None
-                        and owned_sessions.get(relation_key) is not session
+                        and owned_sessions.get(
+                            session._session_key
+                        ) is not session
                     ):
                         continue
                 else:
@@ -1410,9 +1781,11 @@ async def _secure_server_loop(
                 if admission is _DataNonceAdmission.EXHAUSTED:
                     if (
                         owned_sessions is not None
-                        and owned_sessions.get(relation_key) is session
+                        and owned_sessions.get(
+                            session._session_key
+                        ) is session
                     ):
-                        owned_sessions.pop(relation_key, None)
+                        owned_sessions.pop(session._session_key, None)
                     print(
                         f"[!] Secure session nonce capacity exhausted "
                         f"for {format_endpoint_tuple(addr)}"
@@ -1423,14 +1796,12 @@ async def _secure_server_loop(
 
                 if message_type == SESSION_CLOSE_TYPE:
                     state_owner.close_session(
-                        relation_key,
                         session,
                         local_now,
                     )
                     continue
 
                 state_owner.touch_session(
-                    relation_key,
                     session,
                     local_now,
                 )
@@ -1451,6 +1822,7 @@ async def _secure_server_loop(
                     sock.sendto(
                         encrypt_secure_json_message(
                             session.current_epoch.server_to_client_aesgcm,
+                            session._session_key.session_locator,
                             response,
                         ),
                         session.path_state.active_path,

@@ -30,7 +30,10 @@ from core.udpsec_crypto import (
 )
 
 
+TEST_SESSION_LOCATOR = bytes(range(200, 216))
+
 CLIENT_ARGS = {
+    "protocol_version": 2,
     "station_id": "boat_001",
     "timestamp": 1234567890,
     "client_random": b"client-random",
@@ -39,6 +42,7 @@ CLIENT_ARGS = {
 SERVER_ARGS = {
     **CLIENT_ARGS,
     "client_signature": b"client-signature",
+    "session_locator": TEST_SESSION_LOCATOR,
     "server_random": b"server-random",
     "server_ephemeral_public_key": b"server-ephemeral",
 }
@@ -123,7 +127,7 @@ def _binary_field_cases(replacement):
         )
         for name, builder, arguments in BUILDERS
         for field in arguments
-        if field not in ("station_id", "timestamp")
+        if field not in ("station_id", "timestamp", "protocol_version")
     ]
 
 
@@ -198,6 +202,7 @@ def _build_pure_handshake():
     )
 
     client_arguments = {
+        "protocol_version": 2,
         "station_id": "boat_001",
         "timestamp": 0x0102030405060708,
         "client_random": bytes(range(16)),
@@ -212,6 +217,7 @@ def _build_pure_handshake():
     server_arguments = {
         **client_arguments,
         "client_signature": client_signature,
+        "session_locator": bytes(range(64, 80)),
         "server_random": bytes(range(16, 32)),
         "server_ephemeral_public_key": server_ephemeral_public_bytes,
     }
@@ -285,44 +291,46 @@ def test_protocol_constants_fix_curve_hash_domain_and_roles():
         pytest.param(
             build_client_auth_digest,
             {
+                "protocol_version": 2,
                 "station_id": "лодка_⚓",
                 "timestamp": 0x0102030405060708,
                 "client_random": b"client-random",
                 "client_ephemeral_public_key": b"client-ephemeral",
             },
-            "71048db17aba3853082ee8ebccfb495a"
-            "79a8bcdaf9c4a84a503dc154557dc1b7",
+            "f96adafffd2751d5784917f9e809db9129a117028ba39e8884a28a05cc14c2ee",
             id="client",
         ),
         pytest.param(
             build_server_auth_digest,
             {
+                "protocol_version": 2,
                 "station_id": "лодка_⚓",
                 "timestamp": 0x0102030405060708,
                 "client_random": b"client-random",
                 "client_ephemeral_public_key": b"client-ephemeral",
                 "client_signature": b"client-signature",
+                "session_locator": bytes(range(64, 80)),
                 "server_random": b"server-random",
                 "server_ephemeral_public_key": b"server-ephemeral",
             },
-            "a6ba92ec6a327665b777549b591efe1d"
-            "949784d409d782e7de801b2896f2ff53",
+            "fcf81addd7b5be705ffceb9349c9463f48745ccfc221e4e8cd5749f2127d1271",
             id="server",
         ),
         pytest.param(
             build_session_transcript_hash,
             {
+                "protocol_version": 2,
                 "station_id": "лодка_⚓",
                 "timestamp": 0x0102030405060708,
                 "client_random": b"client-random",
                 "client_ephemeral_public_key": b"client-ephemeral",
                 "client_signature": b"client-signature",
+                "session_locator": bytes(range(64, 80)),
                 "server_random": b"server-random",
                 "server_ephemeral_public_key": b"server-ephemeral",
                 "server_signature": b"server-signature",
             },
-            "baa61ee499efc953d4a3c7cb30988d17"
-            "ed02ddbb7f6797c08e20788fae8a9d28",
+            "96d02da895c8e89fea269c483f19ada4b26a81d68a3b54018d89a8fd03bfe5d4",
             id="session",
         ),
     ),
@@ -351,11 +359,13 @@ def test_digests_are_deterministic_bytes_of_sha256_length(builder, arguments):
     ("builder", "arguments", "field", "replacement"),
     _field_cases(
         lambda field: {
+            "protocol_version": 3,
             "station_id": "boat_002",
             "timestamp": 1234567891,
             "client_random": b"Client-random",
             "client_ephemeral_public_key": b"Client-ephemeral",
             "client_signature": b"Client-signature",
+            "session_locator": bytes(range(216, 232)),
             "server_random": b"Server-random",
             "server_ephemeral_public_key": b"Server-ephemeral",
             "server_signature": b"Server-signature",
@@ -429,6 +439,72 @@ def test_binary_field_exceeding_framing_limit_is_rejected(monkeypatch):
         build_client_auth_digest(**arguments)
 
 
+@pytest.mark.parametrize(
+    ("builder", "arguments"),
+    [
+        pytest.param(builder, arguments, id=name)
+        for name, builder, arguments in BUILDERS
+    ],
+)
+@pytest.mark.parametrize("version", (True, False, 1.0, "2", b"2", None))
+def test_protocol_version_rejects_non_integer_types_and_bool(
+    builder,
+    arguments,
+    version,
+):
+    changed = {**arguments, "protocol_version": version}
+
+    with pytest.raises(TypeError, match="protocol_version must be an integer"):
+        builder(**changed)
+
+
+@pytest.mark.parametrize(
+    ("builder", "arguments"),
+    [
+        pytest.param(builder, arguments, id=name)
+        for name, builder, arguments in BUILDERS
+    ],
+)
+@pytest.mark.parametrize("version", (-1, 256, 1000))
+def test_protocol_version_rejects_values_outside_unsigned_8_bit_range(
+    builder,
+    arguments,
+    version,
+):
+    changed = {**arguments, "protocol_version": version}
+
+    with pytest.raises(
+        ValueError,
+        match="protocol_version must fit in an unsigned 8-bit integer",
+    ):
+        builder(**changed)
+
+
+@pytest.mark.parametrize("version", (0, 1, 2, 255))
+def test_protocol_version_accepts_the_full_unsigned_8_bit_range(version):
+    changed = {**CLIENT_ARGS, "protocol_version": version}
+
+    digest = build_client_auth_digest(**changed)
+
+    assert type(digest) is bytes
+    assert len(digest) == 32
+
+
+@pytest.mark.parametrize("length", (0, 15, 17, 32))
+def test_session_locator_requires_exactly_16_bytes_at_crypto_layer(length):
+    changed = {**SERVER_ARGS, "session_locator": b"x" * length}
+
+    if length == 0:
+        with pytest.raises(ValueError, match="session_locator must not be empty"):
+            build_server_auth_digest(**changed)
+    else:
+        with pytest.raises(
+            ValueError,
+            match="session_locator must be exactly 16 bytes",
+        ):
+            build_server_auth_digest(**changed)
+
+
 def test_utf8_station_ids_are_deterministic_without_normalization():
     precomposed = {**CLIENT_ARGS, "station_id": "bååt_⚓"}
     decomposed = {**CLIENT_ARGS, "station_id": "ba\u030aat_⚓"}
@@ -491,11 +567,13 @@ def test_bool_timestamps_are_rejected(builder, arguments, timestamp):
     ("builder", "arguments", "field", "replacement"),
     _field_cases(
         lambda field: {
+            "protocol_version": "2",
             "station_id": b"boat_001",
             "timestamp": 1234.5,
             "client_random": "client-random",
             "client_ephemeral_public_key": "client-ephemeral",
             "client_signature": "client-signature",
+            "session_locator": "session-locator",
             "server_random": "server-random",
             "server_ephemeral_public_key": "server-ephemeral",
             "server_signature": "server-signature",
@@ -575,7 +653,7 @@ def test_bytearray_and_memoryview_fields_are_normalized_to_bytes():
     binary_fields = {
         field
         for field in SESSION_ARGS
-        if field not in ("station_id", "timestamp")
+        if field not in ("station_id", "timestamp", "protocol_version")
     }
     bytearrays = {
         field: bytearray(value) if field in binary_fields else value
@@ -1140,11 +1218,13 @@ def test_client_signature_does_not_verify_for_server_or_session_digest():
     ("builder", "arguments", "field", "replacement"),
     _field_cases(
         lambda field: {
+            "protocol_version": 3,
             "station_id": "boat_002",
             "timestamp": 1234567891,
             "client_random": b"Client-random",
             "client_ephemeral_public_key": b"Client-ephemeral",
             "client_signature": b"Client-signature",
+            "session_locator": bytes(range(216, 232)),
             "server_random": b"Server-random",
             "server_ephemeral_public_key": b"Server-ephemeral",
             "server_signature": b"Server-signature",
@@ -2087,6 +2167,105 @@ def test_changing_authenticated_field_changes_composed_session_keys():
         handshake["client_identity_private_key"].public_key(),
         handshake["client_signature"],
         changed_client_digest,
+    ) is False
+    assert changed_transcript_hash != handshake["session_transcript_hash"]
+    assert (
+        changed_material.client_to_server_key
+        != baseline_material.client_to_server_key
+    )
+    assert (
+        changed_material.server_to_client_key
+        != baseline_material.server_to_client_key
+    )
+
+
+def test_changing_session_locator_invalidates_server_signature_and_keys():
+    handshake = _build_pure_handshake()
+    baseline_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        handshake["session_transcript_hash"],
+    )
+    changed_locator = bytes(range(232, 248))
+    assert changed_locator != handshake["server_arguments"]["session_locator"]
+
+    changed_server_arguments = {
+        **handshake["server_arguments"],
+        "session_locator": changed_locator,
+    }
+    changed_server_digest = build_server_auth_digest(
+        **changed_server_arguments
+    )
+    changed_session_arguments = {
+        **handshake["session_arguments"],
+        "session_locator": changed_locator,
+    }
+    changed_transcript_hash = build_session_transcript_hash(
+        **changed_session_arguments
+    )
+    changed_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        changed_transcript_hash,
+    )
+
+    assert verify_transcript_signature(
+        handshake["server_identity_private_key"].public_key(),
+        handshake["server_signature"],
+        changed_server_digest,
+    ) is False
+    assert changed_transcript_hash != handshake["session_transcript_hash"]
+    assert (
+        changed_material.client_to_server_key
+        != baseline_material.client_to_server_key
+    )
+    assert (
+        changed_material.server_to_client_key
+        != baseline_material.server_to_client_key
+    )
+
+
+def test_changing_protocol_version_invalidates_both_signatures_and_keys():
+    handshake = _build_pure_handshake()
+    baseline_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        handshake["session_transcript_hash"],
+    )
+    changed_version = handshake["client_arguments"]["protocol_version"] + 1
+
+    changed_client_arguments = {
+        **handshake["client_arguments"],
+        "protocol_version": changed_version,
+    }
+    changed_client_digest = build_client_auth_digest(
+        **changed_client_arguments
+    )
+    changed_server_arguments = {
+        **handshake["server_arguments"],
+        "protocol_version": changed_version,
+    }
+    changed_server_digest = build_server_auth_digest(
+        **changed_server_arguments
+    )
+    changed_session_arguments = {
+        **handshake["session_arguments"],
+        "protocol_version": changed_version,
+    }
+    changed_transcript_hash = build_session_transcript_hash(
+        **changed_session_arguments
+    )
+    changed_material = derive_session_key_material(
+        handshake["client_shared_secret"],
+        changed_transcript_hash,
+    )
+
+    assert verify_transcript_signature(
+        handshake["client_identity_private_key"].public_key(),
+        handshake["client_signature"],
+        changed_client_digest,
+    ) is False
+    assert verify_transcript_signature(
+        handshake["server_identity_private_key"].public_key(),
+        handshake["server_signature"],
+        changed_server_digest,
     ) is False
     assert changed_transcript_hash != handshake["session_transcript_hash"]
     assert (

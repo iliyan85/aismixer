@@ -87,19 +87,23 @@ from core.udpsec_crypto import (  # noqa: E402
 )
 from core.udpsec_protocol import (  # noqa: E402
     ClientHello,
+    DATA_PREFIX,
     SESSION_CONFIRMATION_SEQUENCE,
+    SESSION_LOCATOR_BYTES,
+    UDPSEC_PROTOCOL_VERSION,
     build_client_hello_packet,
+    build_data_aad,
+    build_data_packet,
     build_ping_message,
     build_session_close_message,
     is_matching_pong_message,
     is_session_close_message,
+    parse_data_packet,
     parse_server_hello_packet,
 )
 
 
 # Константи
-DATA_PREFIX = b"NMEA-D"
-DATA_AAD = b"NMEA"
 SERVER_PACKET_IGNORED = "ignored"
 SERVER_PACKET_AUTHENTICATED = "authenticated"
 SERVER_PACKET_PEER_CLOSE = "peer_close"
@@ -609,41 +613,73 @@ def load_peer_public_key(path):
     return public_key
 
 
-def encrypt_message_aes_gcm(plaintext, key):
+@dataclass(frozen=True)
+class ConfirmedUdpsecSession:
+    """The authenticated context confirmed by one ServerHello plus a
+    successful session confirmation: the server-minted, tuple-independent
+    session locator and the derived directional key material.
+
+    The locator is a process-local lookup hint bound into every DATA
+    packet's AEAD associated data -- it is not itself credential material,
+    so it is kept named and typed distinctly from `SessionKeyMaterial`."""
+
+    session_locator: bytes
+    key_material: SessionKeyMaterial
+
+
+def encrypt_message_aes_gcm(plaintext, key, aad):
     iv = os.urandom(12)
     encryptor = Cipher(
         algorithms.AES(key),
         modes.GCM(iv)
     ).encryptor()
-    encryptor.authenticate_additional_data(DATA_AAD)
+    encryptor.authenticate_additional_data(aad)
     ciphertext = encryptor.update(plaintext) + encryptor.finalize()
-    return iv + ciphertext + encryptor.tag
+    return iv, ciphertext + encryptor.tag
 
 
-def decrypt_secure_json_message(data, key):
-    min_len = len(DATA_PREFIX) + 12 + 16
-    if not data.startswith(DATA_PREFIX) or len(data) < min_len:
-        raise ValueError("Invalid secure server packet")
-    nonce = data[len(DATA_PREFIX):len(DATA_PREFIX)+12]
-    ciphertext = data[len(DATA_PREFIX)+12:]
-    plaintext = AESGCM(key).decrypt(nonce, ciphertext, DATA_AAD)
+def decrypt_secure_json_message(data, key, session_locator):
+    packet_locator, nonce, ciphertext = parse_data_packet(data)
+    if packet_locator != session_locator:
+        raise ValueError(
+            "secure packet locator does not match the current session"
+        )
+    plaintext = AESGCM(key).decrypt(
+        nonce, ciphertext, build_data_aad(session_locator)
+    )
     return json.loads(plaintext.decode())
 
 
-def encrypt_secure_json_message(message, key):
+def encrypt_secure_json_message(message, key, session_locator):
     plaintext = json.dumps(message, separators=(",", ":")).encode()
-    return DATA_PREFIX + encrypt_message_aes_gcm(plaintext, key)
+    nonce, ciphertext = encrypt_message_aes_gcm(
+        plaintext, key, build_data_aad(session_locator)
+    )
+    return build_data_packet(session_locator, nonce, ciphertext)
 
 
 def remote_addresses_match(addr, remote_addr):
-    return (
+    """Compare two socket address tuples by structured identity rather
+    than by display formatting. IPv4 endpoints (2-tuples) are compared by
+    (ip, port). IPv6 endpoints (4-tuples) are compared by
+    (ip, port, scope_id): flowinfo (index 2) is deliberately excluded so
+    it never distinguishes an otherwise-identical path, while scope_id
+    (index 3) is significant because it is required to disambiguate
+    link-local addresses. Global-unicast IPv6 endpoints keep scope_id 0
+    on both sides, so this is behavior-preserving for the non-scoped
+    case."""
+    if not (
         isinstance(addr, tuple)
         and isinstance(remote_addr, tuple)
         and len(addr) >= 2
         and len(remote_addr) >= 2
-        and addr[0] == remote_addr[0]
-        and addr[1] == remote_addr[1]
-    )
+    ):
+        return False
+    if addr[0] != remote_addr[0] or addr[1] != remote_addr[1]:
+        return False
+    if len(addr) >= 4 and len(remote_addr) >= 4:
+        return addr[3] == remote_addr[3]
+    return True
 
 
 def address_family_name(family):
@@ -717,14 +753,23 @@ def handle_server_packet(
     addr,
     remote_addr,
     server_to_client_key,
+    session_locator,
     station_id,
     expected_ping_seq,
 ):
+    """Accept a server DATA packet only when both the sender matches the
+    pinned/configured server endpoint AND the packet's locator matches the
+    current confirmed session -- and only then attempt AEAD/message
+    validation. Locator equality alone is never treated as liveness
+    evidence or as a substitute for the pinned-address check."""
+
     if not remote_addresses_match(addr, remote_addr):
         return SERVER_PACKET_IGNORED
 
     try:
-        message = decrypt_secure_json_message(data, server_to_client_key)
+        message = decrypt_secure_json_message(
+            data, server_to_client_key, session_locator
+        )
     except Exception:
         return SERVER_PACKET_IGNORED
 
@@ -906,6 +951,7 @@ def send_udpsec_nmea_sentence(
     out_sock,
     config,
     client_to_server_key,
+    session_locator,
     remote_addr,
 ):
     json_obj = {
@@ -915,7 +961,9 @@ def send_udpsec_nmea_sentence(
         "source_id": config["station_id"],
     }
     out_sock.sendto(
-        encrypt_secure_json_message(json_obj, client_to_server_key),
+        encrypt_secure_json_message(
+            json_obj, client_to_server_key, session_locator
+        ),
         remote_addr,
     )
 
@@ -934,10 +982,14 @@ def forward_pending_input(input_adapter, send_sentence, stats=None):
         forward_input_payload(data, send_sentence, stats)
 
 
-def send_ping(sock, remote_addr, client_to_server_key, station_id, seq):
+def send_ping(
+    sock, remote_addr, client_to_server_key, session_locator, station_id, seq
+):
     message = build_ping_message(station_id, seq, int(time.time()))
     sock.sendto(
-        encrypt_secure_json_message(message, client_to_server_key),
+        encrypt_secure_json_message(
+            message, client_to_server_key, session_locator
+        ),
         remote_addr,
     )
 
@@ -946,6 +998,7 @@ def send_session_close(
     sock,
     remote_addr,
     client_to_server_key,
+    session_locator,
     station_id,
 ):
     message = build_session_close_message(
@@ -953,7 +1006,9 @@ def send_session_close(
         int(time.time()),
     )
     sock.sendto(
-        encrypt_secure_json_message(message, client_to_server_key),
+        encrypt_secure_json_message(
+            message, client_to_server_key, session_locator
+        ),
         remote_addr,
     )
 
@@ -973,6 +1028,7 @@ def perform_handshake(
         client_ephemeral_private_key.public_key()
     )
     client_digest = build_client_auth_digest(
+        protocol_version=UDPSEC_PROTOCOL_VERSION,
         station_id=station_id,
         timestamp=timestamp,
         client_random=client_random,
@@ -983,6 +1039,7 @@ def perform_handshake(
         client_digest,
     )
     client_hello = ClientHello(
+        protocol_version=UDPSEC_PROTOCOL_VERSION,
         station_id=station_id,
         timestamp=timestamp,
         client_random=client_random,
@@ -1038,6 +1095,7 @@ def perform_handshake(
                 continue
 
             server_digest = build_server_auth_digest(
+                protocol_version=client_hello.protocol_version,
                 station_id=client_hello.station_id,
                 timestamp=client_hello.timestamp,
                 client_random=client_hello.client_random,
@@ -1045,6 +1103,7 @@ def perform_handshake(
                     client_hello.client_ephemeral_public_key
                 ),
                 client_signature=client_hello.client_signature,
+                session_locator=server_hello.session_locator,
                 server_random=server_hello.server_random,
                 server_ephemeral_public_key=(
                     server_hello.server_ephemeral_public_key
@@ -1063,6 +1122,7 @@ def perform_handshake(
                 server_ephemeral_public_key,
             )
             session_transcript_hash = build_session_transcript_hash(
+                protocol_version=client_hello.protocol_version,
                 station_id=client_hello.station_id,
                 timestamp=client_hello.timestamp,
                 client_random=client_hello.client_random,
@@ -1070,6 +1130,7 @@ def perform_handshake(
                     client_hello.client_ephemeral_public_key
                 ),
                 client_signature=client_hello.client_signature,
+                session_locator=server_hello.session_locator,
                 server_random=server_hello.server_random,
                 server_ephemeral_public_key=(
                     server_hello.server_ephemeral_public_key
@@ -1080,11 +1141,13 @@ def perform_handshake(
                 shared_secret,
                 session_transcript_hash,
             )
+            session_locator = server_hello.session_locator
             try:
                 send_ping(
                     sock,
                     remote_addr,
                     session_key_material.client_to_server_key,
+                    session_locator,
                     station_id,
                     SESSION_CONFIRMATION_SEQUENCE,
                 )
@@ -1127,6 +1190,7 @@ def perform_handshake(
                     confirmation_addr,
                     remote_addr,
                     session_key_material.server_to_client_key,
+                    session_locator,
                     station_id,
                     SESSION_CONFIRMATION_SEQUENCE,
                 )
@@ -1137,7 +1201,10 @@ def perform_handshake(
                     return None
 
                 print("Mutual ECDHE session confirmed.")
-                return session_key_material
+                return ConfirmedUdpsecSession(
+                    session_locator=session_locator,
+                    key_material=session_key_material,
+                )
     finally:
         if settimeout:
             settimeout(original_timeout)
@@ -1147,7 +1214,7 @@ def forward_loop(
     local_input,
     out_sock,
     config,
-    session_key_material,
+    confirmed_session,
     remote_addr,
     ingress_policy=None,
     stats=None,
@@ -1159,8 +1226,9 @@ def forward_loop(
     successive calls; a fresh instance is created only when none is given.
     """
     input_adapter = _coerce_input_adapter(local_input, ingress_policy)
-    client_to_server_key = session_key_material.client_to_server_key
-    server_to_client_key = session_key_material.server_to_client_key
+    session_locator = confirmed_session.session_locator
+    client_to_server_key = confirmed_session.key_material.client_to_server_key
+    server_to_client_key = confirmed_session.key_material.server_to_client_key
     session_started_at = time.monotonic()
     last_authenticated_peer = session_started_at
     last_ping_at = session_started_at
@@ -1172,6 +1240,7 @@ def forward_loop(
         out_sock,
         config,
         client_to_server_key,
+        session_locator,
         remote_addr,
     )
 
@@ -1192,6 +1261,7 @@ def forward_loop(
                     out_sock,
                     remote_addr,
                     client_to_server_key,
+                    session_locator,
                     config["station_id"],
                     next_ping_seq,
                 )
@@ -1288,6 +1358,7 @@ def forward_loop(
                 addr,
                 remote_addr,
                 server_to_client_key,
+                session_locator,
                 config["station_id"],
                 expected_ping_seq,
             )
@@ -1538,7 +1609,7 @@ def main(argv=None):
             f"{format_endpoint(output_config['host'], output_config['port'])}"
         )
 
-    active_session_key_material = None
+    active_confirmed_session = None
     # One ForwardingStats instance is owned for the whole process/relation
     # lifetime here, so cumulative counters survive UDPSEC reconnect/rekey
     # and plain-UDP output-socket recreation across successive forwarding
@@ -1557,26 +1628,26 @@ def main(argv=None):
             )
 
         while True:
-            session_key_material = perform_handshake(
+            confirmed_session = perform_handshake(
                 out_sock,
                 config,
                 station_identity_private_key,
                 server_identity_public_key,
                 remote_addr,
             )
-            if session_key_material:
-                active_session_key_material = session_key_material
+            if confirmed_session:
+                active_confirmed_session = confirmed_session
                 reason = forward_loop(
                     local_input,
                     out_sock,
                     config,
-                    session_key_material,
+                    confirmed_session,
                     remote_addr,
                     ingress_policy,
                     stats,
                 )
                 if reason == SESSION_END_PEER_GRACEFUL_CLOSE:
-                    active_session_key_material = None
+                    active_confirmed_session = None
             else:
                 reason = HANDSHAKE_FAILURE
 
@@ -1591,13 +1662,14 @@ def main(argv=None):
         try:
             if (
                 output_config["type"] == UDPSEC_OUTPUT_TYPE
-                and active_session_key_material is not None
+                and active_confirmed_session is not None
             ):
                 try:
                     send_session_close(
                         out_sock,
                         remote_addr,
-                        active_session_key_material.client_to_server_key,
+                        active_confirmed_session.key_material.client_to_server_key,
+                        active_confirmed_session.session_locator,
                         config["station_id"],
                     )
                 except Exception as exc:

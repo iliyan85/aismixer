@@ -3,6 +3,7 @@ import ast
 import base64
 import importlib.util
 import io
+import itertools
 import json
 import os
 import queue
@@ -29,7 +30,9 @@ from core.ingress_frame import (
 from core.udpsec_crypto import SessionKeyMaterial
 from core.udpsec_protocol import (
     ClientHello,
+    SESSION_LOCATOR_BYTES,
     ServerHello,
+    UDPSEC_PROTOCOL_VERSION,
     build_client_hello_packet,
     build_server_hello_packet,
     parse_client_hello_packet,
@@ -294,6 +297,19 @@ class _LoopbackSecureServer:
             peer_address,
         )
 
+    def active_session_for(self, peer_address):
+        """The current active session at one relation, via the bounded
+        relation index -- the active store itself is keyed by
+        (endpoint_token, session_locator), not by peer address. Delegates
+        to the production `_active_session_at_relation` method so this
+        helper follows the same IPv6-flowinfo canonicalization production
+        code applies, rather than duplicating a raw (and therefore
+        flowinfo-sensitive) dict lookup."""
+
+        return self.state._active_session_at_relation(
+            self.relation_key(peer_address)
+        )
+
     def close(self):
         loop = self._loop
         task = self._task
@@ -416,28 +432,41 @@ def _nonce(marker):
     return marker.to_bytes(12, "big")
 
 
+_TEST_LOCATOR_COUNTER = itertools.count(1)
+
+
+def _fresh_test_locator():
+    # A monotonic counter, not os.urandom: some tests monkeypatch/inspect
+    # os.urandom call sequencing for client ephemeral/nonce generation and
+    # must not have it perturbed by test-harness locator bookkeeping.
+    return next(_TEST_LOCATOR_COUNTER).to_bytes(SESSION_LOCATOR_BYTES, "big")
+
+
 def _encrypted_plaintext_packet(
     proxy,
     key,
     nonce,
     plaintext,
+    session_locator,
     *,
     aad=None,
 ):
-    associated_data = proxy.DATA_AAD if aad is None else aad
-    return (
-        proxy.DATA_PREFIX
-        + nonce
-        + AESGCM(key).encrypt(nonce, plaintext, associated_data)
+    associated_data = (
+        proxy.build_data_aad(session_locator) if aad is None else aad
     )
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext, associated_data)
+    return proxy.build_data_packet(session_locator, nonce, ciphertext)
 
 
-def _encrypted_json_packet(proxy, key, nonce, message, *, aad=None):
+def _encrypted_json_packet(
+    proxy, key, nonce, message, session_locator, *, aad=None
+):
     return _encrypted_plaintext_packet(
         proxy,
         key,
         nonce,
         json.dumps(message, separators=(",", ":")).encode(),
+        session_locator,
         aad=aad,
     )
 
@@ -450,6 +479,7 @@ def _signed_client_hello(
     client_random=None,
     ephemeral_scalar=17,
     identity_private_key=None,
+    protocol_version=None,
 ):
     if timestamp is None:
         timestamp = int(time.time())
@@ -457,6 +487,8 @@ def _signed_client_hello(
         client_random = b"\x31" * 32
     if identity_private_key is None:
         identity_private_key = endpoints.station_private_key
+    if protocol_version is None:
+        protocol_version = UDPSEC_PROTOCOL_VERSION
     ephemeral_private_key = ec.derive_private_key(
         ephemeral_scalar,
         ec.SECP256R1(),
@@ -465,6 +497,7 @@ def _signed_client_hello(
         ephemeral_private_key.public_key()
     )
     digest = udpsec_crypto.build_client_auth_digest(
+        protocol_version=protocol_version,
         station_id=station_id,
         timestamp=timestamp,
         client_random=client_random,
@@ -475,6 +508,7 @@ def _signed_client_hello(
         digest,
     )
     hello = ClientHello(
+        protocol_version=protocol_version,
         station_id=station_id,
         timestamp=timestamp,
         client_random=client_random,
@@ -496,11 +530,15 @@ def _compose_controlled_handshake(
     *,
     client_ephemeral_scalar,
     server_ephemeral_scalar,
+    session_locator=None,
 ):
     station_id = STATION_ID
     timestamp = 1_700_000_000
+    protocol_version = UDPSEC_PROTOCOL_VERSION
     client_random = b"\x51" * 32
     server_random = b"\x52" * 32
+    if session_locator is None:
+        session_locator = _fresh_test_locator()
     client_ephemeral_private_key = ec.derive_private_key(
         client_ephemeral_scalar,
         ec.SECP256R1(),
@@ -520,6 +558,7 @@ def _compose_controlled_handshake(
         )
     )
     client_digest = udpsec_crypto.build_client_auth_digest(
+        protocol_version=protocol_version,
         station_id=station_id,
         timestamp=timestamp,
         client_random=client_random,
@@ -530,11 +569,13 @@ def _compose_controlled_handshake(
         client_digest,
     )
     server_digest = udpsec_crypto.build_server_auth_digest(
+        protocol_version=protocol_version,
         station_id=station_id,
         timestamp=timestamp,
         client_random=client_random,
         client_ephemeral_public_key=client_ephemeral_public_key,
         client_signature=client_signature,
+        session_locator=session_locator,
         server_random=server_random,
         server_ephemeral_public_key=server_ephemeral_public_key,
     )
@@ -556,11 +597,13 @@ def _compose_controlled_handshake(
     )
     assert client_shared_secret == server_shared_secret
     transcript_hash = udpsec_crypto.build_session_transcript_hash(
+        protocol_version=protocol_version,
         station_id=station_id,
         timestamp=timestamp,
         client_random=client_random,
         client_ephemeral_public_key=client_ephemeral_public_key,
         client_signature=client_signature,
+        session_locator=session_locator,
         server_random=server_random,
         server_ephemeral_public_key=server_ephemeral_public_key,
         server_signature=server_signature,
@@ -570,6 +613,7 @@ def _compose_controlled_handshake(
         transcript_hash,
     )
     client_hello = ClientHello(
+        protocol_version=protocol_version,
         station_id=station_id,
         timestamp=timestamp,
         client_random=client_random,
@@ -577,6 +621,8 @@ def _compose_controlled_handshake(
         client_signature=client_signature,
     )
     server_hello = ServerHello(
+        protocol_version=protocol_version,
+        session_locator=session_locator,
         server_random=server_random,
         server_ephemeral_public_key=server_ephemeral_public_key,
         server_signature=server_signature,
@@ -588,6 +634,7 @@ def _compose_controlled_handshake(
         server_packet=build_server_hello_packet(server_hello),
         client_digest=client_digest,
         server_digest=server_digest,
+        session_locator=session_locator,
         shared_secret=client_shared_secret,
         transcript_hash=transcript_hash,
         key_material=key_material,
@@ -595,15 +642,16 @@ def _compose_controlled_handshake(
 
 
 def _perform_real_handshake(endpoints, client, remote_addr):
-    key_material = endpoints.proxy.perform_handshake(
+    confirmed_session = endpoints.proxy.perform_handshake(
         client,
         {"station_id": STATION_ID},
         endpoints.station_private_key,
         endpoints.server_public_key,
         remote_addr,
     )
-    assert isinstance(key_material, SessionKeyMaterial)
-    return key_material
+    assert isinstance(confirmed_session, endpoints.proxy.ConfirmedUdpsecSession)
+    assert isinstance(confirmed_session.key_material, SessionKeyMaterial)
+    return confirmed_session
 
 
 def _assert_single_confirmed_session(server):
@@ -612,7 +660,7 @@ def _assert_single_confirmed_session(server):
     assert stats.current_pending_sessions == 0
     assert len(server.state._sessions) == 1
     session = next(iter(server.state._sessions.values()))
-    assert session._relation_key.endpoint_token is server.endpoint_token
+    assert session._session_key.endpoint_token is server.endpoint_token
     return session
 
 
@@ -642,7 +690,7 @@ def _receive_authenticated_pong(
     proxy,
     client,
     remote_addr,
-    key_material,
+    confirmed_session,
     sequence,
 ):
     packet, sender = client.recvfrom(8192)
@@ -651,7 +699,8 @@ def _receive_authenticated_pong(
         packet,
         sender,
         remote_addr,
-        key_material.server_to_client_key,
+        confirmed_session.key_material.server_to_client_key,
+        confirmed_session.session_locator,
         STATION_ID,
         sequence,
     ) == proxy.SERVER_PACKET_AUTHENTICATED
@@ -681,11 +730,13 @@ def test_real_udp_loopback_interoperability(
         host,
     ) as server:
         with _client_socket(family, host) as client:
-            key_material = _perform_real_handshake(
+            confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 server.remote_addr,
             )
+            key_material = confirmed_session.key_material
+            session_locator = confirmed_session.session_locator
 
             session = _assert_single_confirmed_session(server)
             active_path = session.path_state.active_path
@@ -694,19 +745,21 @@ def test_real_udp_loopback_interoperability(
                 assert len(active_path) == 4
                 assert len(server.remote_addr) == 4
             assert (
-                key_material.client_to_server_key
-                != key_material.server_to_client_key
+                confirmed_session.key_material.client_to_server_key
+                != confirmed_session.key_material.server_to_client_key
             )
             assert (
                 session.current_epoch.client_to_server_aesgcm
                 is not session.current_epoch.server_to_client_aesgcm
             )
+            assert session._session_key.session_locator == session_locator
 
             endpoints.proxy.send_udpsec_nmea_sentence(
                 NMEA_PAYLOAD,
                 client,
                 {"station_id": STATION_ID},
-                key_material.client_to_server_key,
+                confirmed_session.key_material.client_to_server_key,
+                session_locator,
                 server.remote_addr,
             )
             frame = server.ingress.get()
@@ -726,7 +779,8 @@ def test_real_udp_loopback_interoperability(
             endpoints.proxy.send_ping(
                 client,
                 server.remote_addr,
-                key_material.client_to_server_key,
+                confirmed_session.key_material.client_to_server_key,
+                session_locator,
                 STATION_ID,
                 sequence,
             )
@@ -734,13 +788,14 @@ def test_real_udp_loopback_interoperability(
                 endpoints.proxy,
                 client,
                 server.remote_addr,
-                key_material,
+                confirmed_session,
                 sequence,
             )
             with pytest.raises(InvalidTag):
                 endpoints.proxy.decrypt_secure_json_message(
                     pong_packet,
-                    key_material.client_to_server_key,
+                    confirmed_session.key_material.client_to_server_key,
+                    session_locator,
                 )
 
 
@@ -755,7 +810,7 @@ def test_real_client_graceful_close_removes_server_session_without_ack(
         "127.0.0.1",
     ) as server:
         with _client_socket(socket.AF_INET, "127.0.0.1") as client:
-            key_material = _perform_real_handshake(
+            confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 server.remote_addr,
@@ -765,7 +820,8 @@ def test_real_client_graceful_close_removes_server_session_without_ack(
             endpoints.proxy.send_session_close(
                 client,
                 server.remote_addr,
-                key_material.client_to_server_key,
+                confirmed_session.key_material.client_to_server_key,
+                confirmed_session.session_locator,
                 STATION_ID,
             )
 
@@ -801,7 +857,7 @@ def test_real_server_graceful_close_ends_proxy_session_with_backoff(
     ).start()
     try:
         with _client_socket(socket.AF_INET, "127.0.0.1") as client:
-            key_material = _perform_real_handshake(
+            confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 server.remote_addr,
@@ -821,7 +877,7 @@ def test_real_server_graceful_close_ends_proxy_session_with_backoff(
                 _IdleInput(),
                 client,
                 config,
-                key_material,
+                confirmed_session,
                 server.remote_addr,
             )
 
@@ -851,7 +907,7 @@ def test_real_client_proactively_recovers_after_server_restart(
             "127.0.0.1",
         ) as initial_server:
             initial_remote_addr = initial_server.remote_addr
-            initial_material = _perform_real_handshake(
+            initial_confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 initial_remote_addr,
@@ -879,7 +935,7 @@ def test_real_client_proactively_recovers_after_server_restart(
                 _IdleInput(),
                 client,
                 config,
-                initial_material,
+                initial_confirmed_session,
                 restarted_server.remote_addr,
             )
             recovery_elapsed = time.monotonic() - recovery_started
@@ -898,7 +954,7 @@ def test_real_client_proactively_recovers_after_server_restart(
             assert lost_state_stats.data_nonces_accepted == 0
             assert restarted_server.ingress.empty()
 
-            recovered_material = _perform_real_handshake(
+            recovered_confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 restarted_server.remote_addr,
@@ -910,7 +966,9 @@ def test_real_client_proactively_recovers_after_server_restart(
                 recovered_session.path_state.active_path
                 == client.getsockname()
             )
-            assert recovered_material != initial_material
+            assert (
+                recovered_confirmed_session != initial_confirmed_session
+            )
 
             recovered_payload = (
                 "!AIVDM,1,1,,A,recovered-after-server-restart,0*00"
@@ -919,7 +977,8 @@ def test_real_client_proactively_recovers_after_server_restart(
                 recovered_payload,
                 client,
                 {"station_id": STATION_ID},
-                recovered_material.client_to_server_key,
+                recovered_confirmed_session.key_material.client_to_server_key,
+                recovered_confirmed_session.session_locator,
                 restarted_server.remote_addr,
             )
             frame = restarted_server.ingress.get()
@@ -932,7 +991,8 @@ def test_real_client_proactively_recovers_after_server_restart(
             endpoints.proxy.send_ping(
                 client,
                 restarted_server.remote_addr,
-                recovered_material.client_to_server_key,
+                recovered_confirmed_session.key_material.client_to_server_key,
+                recovered_confirmed_session.session_locator,
                 STATION_ID,
                 sequence,
             )
@@ -940,7 +1000,7 @@ def test_real_client_proactively_recovers_after_server_restart(
                 endpoints.proxy,
                 client,
                 restarted_server.remote_addr,
-                recovered_material,
+                recovered_confirmed_session,
                 sequence,
             )
 
@@ -961,7 +1021,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
         state=state,
     ) as server:
         with _client_socket(socket.AF_INET, "127.0.0.1") as client:
-            initial_material = _perform_real_handshake(
+            initial_confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 server.remote_addr,
@@ -980,7 +1040,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
             payload_a = "!AIVDM,1,1,,A,nonce-capacity-a,0*00"
             packet_a = _encrypted_json_packet(
                 endpoints.proxy,
-                initial_material.client_to_server_key,
+                initial_confirmed_session.key_material.client_to_server_key,
                 nonce_a,
                 {
                     "type": "nmea",
@@ -988,6 +1048,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
                     "timestamp": 1000,
                     "source_id": STATION_ID,
                 },
+                initial_confirmed_session.session_locator,
             )
             client.sendto(packet_a, server.remote_addr)
 
@@ -999,9 +1060,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
             assert server.ingress.empty()
             after_a = server.call_in_loop(server.state.stats)
             assert (
-                server.state._sessions[
-                    server.relation_key(client.getsockname())
-                ]
+                server.active_session_for(client.getsockname())
                 is initial_session
             )
             assert len(initial_session.current_epoch.seen_data_nonces) == 2
@@ -1024,9 +1083,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
                 "server did not classify exact full-capacity replay",
             )
             assert (
-                server.state._sessions[
-                    server.relation_key(client.getsockname())
-                ]
+                server.active_session_for(client.getsockname())
                 is initial_session
             )
             assert len(initial_session.current_epoch.seen_data_nonces) == 2
@@ -1043,7 +1100,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
             payload_b = "!AIVDM,1,1,,A,must-drop-on-exhaustion,0*00"
             packet_b = _encrypted_json_packet(
                 endpoints.proxy,
-                initial_material.client_to_server_key,
+                initial_confirmed_session.key_material.client_to_server_key,
                 nonce_b,
                 {
                     "type": "nmea",
@@ -1051,6 +1108,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
                     "timestamp": 1001,
                     "source_id": STATION_ID,
                 },
+                initial_confirmed_session.session_locator,
             )
             last_seen_before_exhaustion = initial_session.last_seen
             client.sendto(packet_b, server.remote_addr)
@@ -1100,7 +1158,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
                 _IdleInput(),
                 client,
                 config,
-                initial_material,
+                initial_confirmed_session,
                 server.remote_addr,
             )
             recovery_elapsed = time.monotonic() - recovery_started
@@ -1124,7 +1182,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
             )
             assert server.ingress.empty()
 
-            recovered_material = _perform_real_handshake(
+            recovered_confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 server.remote_addr,
@@ -1132,7 +1190,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
             recovered_session = _assert_single_confirmed_session(server)
             recovered = server.call_in_loop(server.state.stats)
             assert recovered_session is not initial_session
-            assert recovered_material != initial_material
+            assert recovered_confirmed_session != initial_confirmed_session
             assert len(recovered_session.current_epoch.seen_data_nonces) == 1
             assert not recovered_session.current_epoch.seen_data_nonces.contains(nonce_a)
             assert recovered.current_data_nonces == 1
@@ -1141,7 +1199,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
             fresh_payload = "!AIVDM,1,1,,A,fresh-after-exhaustion,0*00"
             fresh_packet = _encrypted_json_packet(
                 endpoints.proxy,
-                recovered_material.client_to_server_key,
+                recovered_confirmed_session.key_material.client_to_server_key,
                 fresh_nonce,
                 {
                     "type": "nmea",
@@ -1149,6 +1207,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
                     "timestamp": 1002,
                     "source_id": STATION_ID,
                 },
+                recovered_confirmed_session.session_locator,
             )
 
             # The old packet uses an unseen nonce in the fresh ledger, so its
@@ -1177,9 +1236,7 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
 
             final = server.call_in_loop(server.state.stats)
             assert (
-                server.state._sessions[
-                    server.relation_key(client.getsockname())
-                ]
+                server.active_session_for(client.getsockname())
                 is recovered_session
             )
             assert final.current_sessions == 1
@@ -1225,17 +1282,18 @@ def test_real_confirmed_same_address_rekey_replaces_traffic_keys(
             second_session = _assert_single_confirmed_session(server)
             assert second_session.path_state.active_path == client_addr
             assert second_session is not first_session
+            assert first.session_locator != second.session_locator
             assert (
-                first.client_to_server_key
-                != second.client_to_server_key
+                first.key_material.client_to_server_key
+                != second.key_material.client_to_server_key
             )
             assert (
-                first.server_to_client_key
-                != second.server_to_client_key
+                first.key_material.server_to_client_key
+                != second.key_material.server_to_client_key
             )
             assert (
-                second.client_to_server_key
-                != second.server_to_client_key
+                second.key_material.client_to_server_key
+                != second.key_material.server_to_client_key
             )
 
             touches_before_traffic = server.state.stats().sessions_touched
@@ -1248,7 +1306,8 @@ def test_real_confirmed_same_address_rekey_replaces_traffic_keys(
                         "timestamp": 1,
                         "source_id": STATION_ID,
                     },
-                    first.client_to_server_key,
+                    first.key_material.client_to_server_key,
+                    first.session_locator,
                 ),
                 server.remote_addr,
             )
@@ -1258,14 +1317,16 @@ def test_real_confirmed_same_address_rekey_replaces_traffic_keys(
                 new_payload,
                 client,
                 {"station_id": STATION_ID},
-                second.client_to_server_key,
+                second.key_material.client_to_server_key,
+                second.session_locator,
                 server.remote_addr,
             )
             sequence = 23
             endpoints.proxy.send_ping(
                 client,
                 server.remote_addr,
-                second.client_to_server_key,
+                second.key_material.client_to_server_key,
+                second.session_locator,
                 STATION_ID,
                 sequence,
             )
@@ -1291,14 +1352,25 @@ def test_real_confirmed_same_address_rekey_replaces_traffic_keys(
                 pong_packet,
                 sender,
                 server.remote_addr,
-                first.server_to_client_key,
+                first.key_material.server_to_client_key,
+                first.session_locator,
                 STATION_ID,
                 sequence,
             ) == endpoints.proxy.SERVER_PACKET_IGNORED
+            # The wrong key still fails cryptographically even when paired
+            # with the packet's own (correct) locator.
             with pytest.raises(InvalidTag):
                 endpoints.proxy.decrypt_secure_json_message(
                     pong_packet,
-                    first.server_to_client_key,
+                    first.key_material.server_to_client_key,
+                    second.session_locator,
+                )
+            # The wrong locator alone is also rejected, regardless of key.
+            with pytest.raises(ValueError):
+                endpoints.proxy.decrypt_secure_json_message(
+                    pong_packet,
+                    second.key_material.server_to_client_key,
+                    first.session_locator,
                 )
 
 
@@ -1368,7 +1440,8 @@ def test_real_packet_loss_requires_fresh_handshake_retry(
                 dropping_client,
                 server.remote_addr,
             )
-            assert isinstance(second_result, SessionKeyMaterial)
+            assert isinstance(second_result, endpoints.proxy.ConfirmedUdpsecSession)
+            assert isinstance(second_result.key_material, SessionKeyMaterial)
             assert len(dropping_client.client_hello_packets) == 2
             first_hello = parse_client_hello_packet(
                 dropping_client.client_hello_packets[0]
@@ -1423,18 +1496,21 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
                 server.remote_addr,
             )
             assert client_a.getsockname() != client_b.getsockname()
+            session_a = server.active_session_for(client_a.getsockname())
+            session_b = server.active_session_for(client_b.getsockname())
             assert set(server.state._sessions) == {
-                server.relation_key(client_a.getsockname()),
-                server.relation_key(client_b.getsockname()),
+                session_a._session_key,
+                session_b._session_key,
             }
             assert material_a != material_b
+            assert material_a.session_locator != material_b.session_locator
 
             shared_nonce = _nonce(700)
             payload_a = "!AIVDM,1,1,,A,client-a,0*00"
             payload_b = "!AIVDM,1,1,,A,client-b,0*00"
             packet_a = _encrypted_json_packet(
                 endpoints.proxy,
-                material_a.client_to_server_key,
+                material_a.key_material.client_to_server_key,
                 shared_nonce,
                 {
                     "type": "nmea",
@@ -1442,10 +1518,11 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
                     "timestamp": 1000,
                     "source_id": STATION_ID,
                 },
+                material_a.session_locator,
             )
             packet_b = _encrypted_json_packet(
                 endpoints.proxy,
-                material_b.client_to_server_key,
+                material_b.key_material.client_to_server_key,
                 shared_nonce,
                 {
                     "type": "nmea",
@@ -1453,6 +1530,7 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
                     "timestamp": 1000,
                     "source_id": STATION_ID,
                 },
+                material_b.session_locator,
             )
             client_a.sendto(packet_a, server.remote_addr)
             client_b.sendto(packet_b, server.remote_addr)
@@ -1467,20 +1545,17 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
             assert received_payloads == {payload_a, payload_b}
             assert server.ingress.empty()
 
-            session_a = server.state._sessions[
-                server.relation_key(client_a.getsockname())
-            ]
-            session_b = server.state._sessions[
-                server.relation_key(client_b.getsockname())
-            ]
             assert shared_nonce in session_a.current_epoch.seen_data_nonces._live_by_key
             assert shared_nonce in session_b.current_epoch.seen_data_nonces._live_by_key
 
             before_cross_key = server.call_in_loop(server.state.stats)
             cross_key_nonce = _nonce(701)
+            # Correct (b's) locator/path but the WRONG key -- isolates key
+            # authentication specifically, distinct from locator/path
+            # routing which is exercised separately below.
             cross_key_packet = _encrypted_json_packet(
                 endpoints.proxy,
-                material_a.client_to_server_key,
+                material_a.key_material.client_to_server_key,
                 cross_key_nonce,
                 {
                     "type": "nmea",
@@ -1488,12 +1563,14 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
                     "timestamp": 1000,
                     "source_id": STATION_ID,
                 },
+                material_b.session_locator,
             )
             client_b.sendto(cross_key_packet, server.remote_addr)
             endpoints.proxy.send_ping(
                 client_b,
                 server.remote_addr,
-                material_b.client_to_server_key,
+                material_b.key_material.client_to_server_key,
+                material_b.session_locator,
                 STATION_ID,
                 31,
             )
@@ -1541,7 +1618,8 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
                 client_c,
                 server.remote_addr,
             )
-            assert isinstance(material_c, SessionKeyMaterial)
+            assert isinstance(material_c, endpoints.proxy.ConfirmedUdpsecSession)
+            assert isinstance(material_c.key_material, SessionKeyMaterial)
             assert len(server.state._sessions) == 3
 
             exact_client_hello = recording_client_a.client_hello_packets[0]
@@ -1550,7 +1628,8 @@ def test_real_sessions_are_isolated_by_complete_udp_peer_address(
             endpoints.proxy.send_ping(
                 client_a,
                 server.remote_addr,
-                material_a.client_to_server_key,
+                material_a.key_material.client_to_server_key,
+                material_a.session_locator,
                 STATION_ID,
                 32,
             )
@@ -1603,7 +1682,7 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
             server_a.remote_addr,
         )
         relation_a = server_a.relation_key(client_address)
-        session_a = shared_state._sessions[relation_a]
+        session_a = server_a.active_session_for(client_address)
 
         material_b = _perform_real_handshake(
             endpoints,
@@ -1611,7 +1690,7 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
             server_b.remote_addr,
         )
         relation_b = server_b.relation_key(client_address)
-        session_b = shared_state._sessions[relation_b]
+        session_b = server_b.active_session_for(client_address)
 
         assert server_a.remote_addr != server_b.remote_addr
         assert server_a.endpoint_token is not server_b.endpoint_token
@@ -1621,9 +1700,13 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         assert session_a.path_state.active_path == client_address
         assert session_b.path_state.active_path == client_address
         assert material_a != material_b
-        assert set(shared_state._sessions) == {relation_a, relation_b}
-        assert server_a.owned_sessions == {relation_a: session_a}
-        assert server_b.owned_sessions == {relation_b: session_b}
+        assert material_a.session_locator != material_b.session_locator
+        assert set(shared_state._sessions) == {
+            session_a._session_key,
+            session_b._session_key,
+        }
+        assert server_a.owned_sessions == {session_a._session_key: session_a}
+        assert server_b.owned_sessions == {session_b._session_key: session_b}
 
         confirmed = server_a.call_in_loop(shared_state.stats)
         assert confirmed.current_sessions == 2
@@ -1638,7 +1721,7 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         payload_b = "!AIVDM,1,1,,A,listener-b,0*00"
         packet_a = _encrypted_json_packet(
             endpoints.proxy,
-            material_a.client_to_server_key,
+            material_a.key_material.client_to_server_key,
             shared_nonce,
             {
                 "type": "nmea",
@@ -1646,10 +1729,11 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
                 "timestamp": 1000,
                 "source_id": STATION_ID,
             },
+            material_a.session_locator,
         )
         packet_b = _encrypted_json_packet(
             endpoints.proxy,
-            material_b.client_to_server_key,
+            material_b.key_material.client_to_server_key,
             shared_nonce,
             {
                 "type": "nmea",
@@ -1657,6 +1741,7 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
                 "timestamp": 1000,
                 "source_id": STATION_ID,
             },
+            material_b.session_locator,
         )
 
         client.sendto(packet_a, server_a.remote_addr)
@@ -1674,7 +1759,8 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         endpoints.proxy.send_ping(
             client,
             server_a.remote_addr,
-            material_a.client_to_server_key,
+            material_a.key_material.client_to_server_key,
+            material_a.session_locator,
             STATION_ID,
             41,
         )
@@ -1688,7 +1774,8 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         endpoints.proxy.send_ping(
             client,
             server_b.remote_addr,
-            material_b.client_to_server_key,
+            material_b.key_material.client_to_server_key,
+            material_b.session_locator,
             STATION_ID,
             42,
         )
@@ -1706,9 +1793,14 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         b_nonce_count = len(session_b.current_epoch.seen_data_nonces)
         cross_nmea_nonce = _nonce(751)
         cross_ping_nonce = _nonce(752)
+        # These carry listener A's own locator but are physically delivered
+        # to listener B: (endpoint_token_b, locator_a) must match nothing in
+        # the shared session store, so they are dropped as an unknown
+        # locator -- proving cross-listener locator values do not select
+        # another listener's session.
         cross_nmea = _encrypted_json_packet(
             endpoints.proxy,
-            material_a.client_to_server_key,
+            material_a.key_material.client_to_server_key,
             cross_nmea_nonce,
             {
                 "type": "nmea",
@@ -1716,10 +1808,11 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
                 "timestamp": 1000,
                 "source_id": STATION_ID,
             },
+            material_a.session_locator,
         )
         cross_ping = _encrypted_json_packet(
             endpoints.proxy,
-            material_a.client_to_server_key,
+            material_a.key_material.client_to_server_key,
             cross_ping_nonce,
             {
                 "type": "ping",
@@ -1727,6 +1820,7 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
                 "timestamp": 1000,
                 "source_id": STATION_ID,
             },
+            material_a.session_locator,
         )
 
         client.sendto(cross_nmea, server_b.remote_addr)
@@ -1734,13 +1828,15 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         endpoints.proxy.send_session_close(
             client,
             server_b.remote_addr,
-            material_a.client_to_server_key,
+            material_a.key_material.client_to_server_key,
+            material_a.session_locator,
             STATION_ID,
         )
         endpoints.proxy.send_ping(
             client,
             server_b.remote_addr,
-            material_b.client_to_server_key,
+            material_b.key_material.client_to_server_key,
+            material_b.session_locator,
             STATION_ID,
             44,
         )
@@ -1753,8 +1849,8 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         )
 
         after_cross = server_a.call_in_loop(shared_state.stats)
-        assert shared_state._sessions[relation_a] is session_a
-        assert shared_state._sessions[relation_b] is session_b
+        assert server_a.active_session_for(client_address) is session_a
+        assert server_b.active_session_for(client_address) is session_b
         assert session_a.last_seen == a_last_seen
         assert set(session_a.current_epoch.seen_data_nonces._live_by_key) == a_nonces
         assert len(session_b.current_epoch.seen_data_nonces) == b_nonce_count + 1
@@ -1771,7 +1867,8 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         endpoints.proxy.send_session_close(
             client,
             server_a.remote_addr,
-            material_a.client_to_server_key,
+            material_a.key_material.client_to_server_key,
+            material_a.session_locator,
             STATION_ID,
         )
         closed = _wait_for_server_stats(
@@ -1779,14 +1876,15 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
             lambda stats: stats.current_sessions == 1,
             "listener A did not close its endpoint-scoped session",
         )
-        assert relation_a not in shared_state._sessions
-        assert shared_state._sessions[relation_b] is session_b
+        assert server_a.active_session_for(client_address) is None
+        assert server_b.active_session_for(client_address) is session_b
         assert closed.sessions_closed == before_cross.sessions_closed + 1
 
         endpoints.proxy.send_ping(
             client,
             server_b.remote_addr,
-            material_b.client_to_server_key,
+            material_b.key_material.client_to_server_key,
+            material_b.session_locator,
             STATION_ID,
             45,
         )
@@ -1797,18 +1895,30 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
             material_b,
             45,
         )
-        assert shared_state._sessions[relation_b] is session_b
+        assert server_b.active_session_for(client_address) is session_b
 
 
-def test_ipv6_remote_comparison_uses_ip_and_port_from_four_tuple(
+def test_ipv6_remote_comparison_uses_ip_port_and_scope_from_four_tuple(
     real_udpsec_endpoints,
 ):
+    """Structured IPv6 path equality: flowinfo (tuple index 2) never
+    distinguishes an otherwise-identical path, but scope_id (index 3) is
+    significant because it disambiguates link-local addresses. Global-
+    unicast/scope-0 behavior is unchanged."""
     proxy = real_udpsec_endpoints.proxy
     remote = ("::1", 19999, 7, 11)
 
-    assert proxy.remote_addresses_match(("::1", 19999, 0, 0), remote)
+    assert proxy.remote_addresses_match(("::1", 19999, 0, 11), remote)
+    assert proxy.remote_addresses_match(("::1", 19999, 99, 11), remote)
+    assert not proxy.remote_addresses_match(("::1", 19999, 7, 0), remote)
+    assert not proxy.remote_addresses_match(("::1", 19999, 7, 12), remote)
     assert not proxy.remote_addresses_match(("::1", 20000, 7, 11), remote)
     assert not proxy.remote_addresses_match(("::2", 19999, 7, 11), remote)
+
+    global_remote = ("2001:db8::1", 19999, 0, 0)
+    assert proxy.remote_addresses_match(
+        ("2001:db8::1", 19999, 5, 0), global_remote
+    )
 
 
 def test_real_listener_survives_deterministic_client_hello_corpus(
@@ -1831,6 +1941,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
 
     off_curve_point = b"\x02" + b"\xff" * 32
     off_curve_digest = udpsec_crypto.build_client_auth_digest(
+        protocol_version=UDPSEC_PROTOCOL_VERSION,
         station_id=STATION_ID,
         timestamp=now,
         client_random=b"\x33" * 32,
@@ -1838,6 +1949,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
     )
     off_curve_packet = build_client_hello_packet(
         ClientHello(
+            protocol_version=UDPSEC_PROTOCOL_VERSION,
             station_id=STATION_ID,
             timestamp=now,
             client_random=b"\x33" * 32,
@@ -1858,6 +1970,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
     )
     high_s_packet = build_client_hello_packet(
         ClientHello(
+            protocol_version=valid_hello.protocol_version,
             station_id=valid_hello.station_id,
             timestamp=valid_hello.timestamp,
             client_random=valid_hello.client_random,
@@ -1887,6 +2000,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
     )
     changed_field_packet = build_client_hello_packet(
         ClientHello(
+            protocol_version=valid_hello.protocol_version,
             station_id=valid_hello.station_id,
             timestamp=valid_hello.timestamp,
             client_random=b"\x36" * 32,
@@ -1905,24 +2019,24 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
             b"NMEA-H|boat_001|"
             + str(now).encode()
             + b"|"
-            + valid_fields[5],
+            + valid_fields[6],
         ),
         ("missing-field", b"|".join(valid_fields[:-1])),
         ("extra-field", valid_packet + b"|extra"),
         ("trailing-delimiter", valid_packet + b"|"),
         (
             "invalid-station-utf8",
-            _replace_wire_field(valid_packet, 1, b"\xff"),
+            _replace_wire_field(valid_packet, 2, b"\xff"),
         ),
         (
             "embedded-station-nul",
-            _replace_wire_field(valid_packet, 1, b"boat\x00_001"),
+            _replace_wire_field(valid_packet, 2, b"boat\x00_001"),
         ),
         (
             "leading-zero-timestamp",
             _replace_wire_field(
                 valid_packet,
-                2,
+                3,
                 b"0" + str(now).encode(),
             ),
         ),
@@ -1930,31 +2044,31 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
             "plus-timestamp",
             _replace_wire_field(
                 valid_packet,
-                2,
+                3,
                 b"+" + str(now).encode(),
             ),
         ),
         ("stale-signed-timestamp", stale_packet),
-        ("empty-random", _replace_wire_field(valid_packet, 3, b"")),
-        ("empty-point", _replace_wire_field(valid_packet, 4, b"")),
-        ("empty-signature", _replace_wire_field(valid_packet, 5, b"")),
+        ("empty-random", _replace_wire_field(valid_packet, 4, b"")),
+        ("empty-point", _replace_wire_field(valid_packet, 5, b"")),
+        ("empty-signature", _replace_wire_field(valid_packet, 6, b"")),
         (
             "bad-base64-alphabet",
-            _replace_wire_field(valid_packet, 3, b"%%%%"),
+            _replace_wire_field(valid_packet, 4, b"%%%%"),
         ),
         (
             "bad-base64-padding",
             _replace_wire_field(
                 valid_packet,
-                3,
-                valid_fields[3] + b"=",
+                4,
+                valid_fields[4] + b"=",
             ),
         ),
         (
             "oversized-bounded-base64",
             _replace_wire_field(
                 valid_packet,
-                3,
+                4,
                 base64.b64encode(b"\x41" * 4096),
             ),
         ),
@@ -1962,7 +2076,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
             "short-random",
             _replace_wire_field(
                 valid_packet,
-                3,
+                4,
                 base64.b64encode(b"\x41" * 31),
             ),
         ),
@@ -1970,7 +2084,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
             "long-random",
             _replace_wire_field(
                 valid_packet,
-                3,
+                4,
                 base64.b64encode(b"\x41" * 33),
             ),
         ),
@@ -1978,7 +2092,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
             "short-point",
             _replace_wire_field(
                 valid_packet,
-                4,
+                5,
                 base64.b64encode(b"\x02" + b"\x41" * 31),
             ),
         ),
@@ -1986,7 +2100,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
             "long-point",
             _replace_wire_field(
                 valid_packet,
-                4,
+                5,
                 base64.b64encode(b"\x02" + b"\x41" * 33),
             ),
         ),
@@ -1994,7 +2108,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
             "uncompressed-point-prefix",
             _replace_wire_field(
                 valid_packet,
-                4,
+                5,
                 base64.b64encode(b"\x04" + b"\x41" * 32),
             ),
         ),
@@ -2003,7 +2117,7 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
             "malformed-der",
             _replace_wire_field(
                 valid_packet,
-                5,
+                6,
                 base64.b64encode(b"\x30\x00"),
             ),
         ),
@@ -2049,12 +2163,12 @@ def test_real_listener_survives_deterministic_client_hello_corpus(
             assert server.ingress.empty()
 
             client.settimeout(NETWORK_TIMEOUT)
-            key_material = _perform_real_handshake(
+            confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 server.remote_addr,
             )
-            assert isinstance(key_material, SessionKeyMaterial)
+            assert isinstance(confirmed_session.key_material, SessionKeyMaterial)
             final_stats = server.call_in_loop(server.state.stats)
             assert final_stats.handshake_replay_accepted == 1
             assert final_stats.handshake_replay_rejected == 0
@@ -2076,7 +2190,7 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
         "127.0.0.1",
     ) as server:
         with _client_socket(socket.AF_INET, "127.0.0.1") as client:
-            key_material = _perform_real_handshake(
+            confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 server.remote_addr,
@@ -2092,10 +2206,10 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
             }
             valid_base = _encrypted_json_packet(
                 endpoints.proxy,
-                key_material.client_to_server_key,
+                confirmed_session.key_material.client_to_server_key,
                 _nonce(800),
                 valid_shape,
-            )
+                confirmed_session.session_locator)
             corrupted_nonce = bytearray(valid_base)
             corrupted_nonce[len(endpoints.proxy.DATA_PREFIX)] ^= 1
             corrupted_ciphertext = bytearray(valid_base)
@@ -2119,10 +2233,10 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                     "reverse-direction-key",
                     _encrypted_json_packet(
                         endpoints.proxy,
-                        key_material.server_to_client_key,
+                        confirmed_session.key_material.server_to_client_key,
                         _nonce(802),
                         valid_shape,
-                    ),
+                        confirmed_session.session_locator),
                 ),
                 (
                     "unrelated-key",
@@ -2131,45 +2245,45 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                         b"\xf0" * 32,
                         _nonce(803),
                         valid_shape,
-                    ),
+                        confirmed_session.session_locator),
                 ),
                 (
                     "wrong-aad",
                     _encrypted_json_packet(
                         endpoints.proxy,
-                        key_material.client_to_server_key,
+                        confirmed_session.key_material.client_to_server_key,
                         _nonce(804),
                         valid_shape,
-                        aad=b"wrong-aad",
-                    ),
+                        confirmed_session.session_locator,
+                        aad=b"wrong-aad"),
                 ),
                 (
                     "invalid-utf8",
                     _encrypted_plaintext_packet(
                         endpoints.proxy,
-                        key_material.client_to_server_key,
+                        confirmed_session.key_material.client_to_server_key,
                         _nonce(805),
                         b"\xff",
-                    ),
+                        confirmed_session.session_locator),
                 ),
                 (
                     "invalid-json",
                     _encrypted_plaintext_packet(
                         endpoints.proxy,
-                        key_material.client_to_server_key,
+                        confirmed_session.key_material.client_to_server_key,
                         _nonce(806),
                         b"{",
-                    ),
+                        confirmed_session.session_locator),
                 ),
                 *[
                     (
                         f"non-dict-{index}",
                         _encrypted_plaintext_packet(
                             endpoints.proxy,
-                            key_material.client_to_server_key,
+                            confirmed_session.key_material.client_to_server_key,
                             _nonce(807 + index),
                             json.dumps(value).encode(),
-                        ),
+                            confirmed_session.session_locator),
                     )
                     for index, value in enumerate(
                         (None, "text", 7, ["list"])
@@ -2179,44 +2293,44 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                     "missing-type",
                     _encrypted_json_packet(
                         endpoints.proxy,
-                        key_material.client_to_server_key,
+                        confirmed_session.key_material.client_to_server_key,
                         _nonce(811),
                         {
                             "payload": "missing-type",
                             "source_id": STATION_ID,
                         },
-                    ),
+                        confirmed_session.session_locator),
                 ),
                 (
                     "unknown-type-reusable-nonce",
                     _encrypted_json_packet(
                         endpoints.proxy,
-                        key_material.client_to_server_key,
+                        confirmed_session.key_material.client_to_server_key,
                         invalid_semantic_nonce,
                         {
                             "type": "unknown",
                             "source_id": STATION_ID,
                         },
-                    ),
+                        confirmed_session.session_locator),
                 ),
                 (
                     "wrong-source",
                     _encrypted_json_packet(
                         endpoints.proxy,
-                        key_material.client_to_server_key,
+                        confirmed_session.key_material.client_to_server_key,
                         _nonce(812),
                         {
                             "type": "nmea",
                             "payload": "wrong-source",
                             "source_id": "other-station",
                         },
-                    ),
+                        confirmed_session.session_locator),
                 ),
                 (
                     "active-confirmation-sequence",
                     _encrypted_json_packet(
                         endpoints.proxy,
-                        key_material.client_to_server_key,
+                        confirmed_session.key_material.client_to_server_key,
                         _nonce(813),
                         {
                             "type": "ping",
@@ -2224,14 +2338,14 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                             "timestamp": 1000,
                             "source_id": STATION_ID,
                         },
-                    ),
+                        confirmed_session.session_locator),
                 ),
                     *[
                         (
                             f"invalid-sequence-{index}",
                             _encrypted_json_packet(
                                 endpoints.proxy,
-                                key_material.client_to_server_key,
+                                confirmed_session.key_material.client_to_server_key,
                                 _nonce(820 + index),
                                 {
                                     "type": "ping",
@@ -2239,7 +2353,7 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                                     "timestamp": 1000,
                                     "source_id": STATION_ID,
                                 },
-                            ),
+                                confirmed_session.session_locator),
                         )
                         for index, sequence in enumerate(
                             (
@@ -2256,36 +2370,36 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                         "missing-sequence",
                         _encrypted_json_packet(
                             endpoints.proxy,
-                            key_material.client_to_server_key,
+                            confirmed_session.key_material.client_to_server_key,
                             _nonce(826),
                             {
                                 "type": "ping",
                                 "timestamp": 1000,
                                 "source_id": STATION_ID,
                             },
-                        ),
+                            confirmed_session.session_locator),
                     ),
                     (
                         "missing-nmea-payload",
                         _encrypted_json_packet(
                             endpoints.proxy,
-                            key_material.client_to_server_key,
+                            confirmed_session.key_material.client_to_server_key,
                             _nonce(827),
                             {
                                 "type": "nmea",
                                 "source_id": STATION_ID,
                         },
-                    ),
+                            confirmed_session.session_locator),
                 ),
                 ("truncated-authenticated-packet", valid_base[:-1]),
                 (
                     "authenticated-listener-limit-invalid-json",
                         _encrypted_plaintext_packet(
                             endpoints.proxy,
-                            key_material.client_to_server_key,
+                            confirmed_session.key_material.client_to_server_key,
                             _nonce(828),
-                            b"x" * 8158,
-                        ),
+                            b"x" * 8141,
+                            confirmed_session.session_locator),
                     ),
                 ]
             assert len(corpus) == 28
@@ -2297,7 +2411,7 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
             accepted_payload = "!AIVDM,1,1,,A,after-adversarial,0*00"
             accepted_packet = _encrypted_json_packet(
                 endpoints.proxy,
-                key_material.client_to_server_key,
+                confirmed_session.key_material.client_to_server_key,
                 invalid_semantic_nonce,
                 {
                     "type": "nmea",
@@ -2305,16 +2419,16 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                     "timestamp": 1000,
                     "source_id": STATION_ID,
                 },
-            )
+                confirmed_session.session_locator)
             client.sendto(accepted_packet, server.remote_addr)
             client.sendto(accepted_packet, server.remote_addr)
             endpoints.proxy.send_ping(
                 client,
                 server.remote_addr,
-                key_material.client_to_server_key,
+                confirmed_session.key_material.client_to_server_key,
+                confirmed_session.session_locator,
                 STATION_ID,
-                41,
-            )
+                41)
 
             frame = server.ingress.get()
             assert (
@@ -2332,8 +2446,8 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                 response_message = (
                     endpoints.proxy.decrypt_secure_json_message(
                         response_packet,
-                        key_material.server_to_client_key,
-                    )
+                        confirmed_session.key_material.server_to_client_key,
+                        confirmed_session.session_locator)
                 )
                 assert response_message.get("type") == "pong"
                 received_sequences.append(response_message.get("seq"))
@@ -2342,9 +2456,7 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                 client.recvfrom(8192)
 
             after = server.call_in_loop(server.state.stats)
-            assert server.state._sessions[
-                server.relation_key(client.getsockname())
-            ] is session
+            assert server.active_session_for(client.getsockname()) is session
             assert after.current_sessions == 1
             assert after.current_pending_sessions == 0
             assert after.sessions_touched == before.sessions_touched + 2
@@ -2376,7 +2488,7 @@ def test_real_active_ping_timestamp_requires_exact_integer_before_mutation(
         "127.0.0.1",
     ) as server:
         with _client_socket(socket.AF_INET, "127.0.0.1") as client:
-            key_material = _perform_real_handshake(
+            confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 server.remote_addr,
@@ -2419,10 +2531,10 @@ def test_real_active_ping_timestamp_requires_exact_integer_before_mutation(
                 client.sendto(
                     _encrypted_json_packet(
                         endpoints.proxy,
-                        key_material.client_to_server_key,
+                        confirmed_session.key_material.client_to_server_key,
                         nonce,
                         message,
-                    ),
+                        confirmed_session.session_locator),
                     server.remote_addr,
                 )
 
@@ -2430,7 +2542,7 @@ def test_real_active_ping_timestamp_requires_exact_integer_before_mutation(
             client.sendto(
                 _encrypted_json_packet(
                     endpoints.proxy,
-                    key_material.client_to_server_key,
+                    confirmed_session.key_material.client_to_server_key,
                     valid_nonce,
                     {
                         "type": "ping",
@@ -2438,7 +2550,7 @@ def test_real_active_ping_timestamp_requires_exact_integer_before_mutation(
                         "timestamp": 1000,
                         "source_id": STATION_ID,
                     },
-                ),
+                    confirmed_session.session_locator),
                 server.remote_addr,
             )
 
@@ -2449,8 +2561,8 @@ def test_real_active_ping_timestamp_requires_exact_integer_before_mutation(
             )
             message = endpoints.proxy.decrypt_secure_json_message(
                 packet,
-                key_material.server_to_client_key,
-            )
+                confirmed_session.key_material.server_to_client_key,
+                confirmed_session.session_locator)
             assert message["type"] == "pong"
             assert message["seq"] == 52
             assert type(message["timestamp"]) is int
@@ -2489,7 +2601,7 @@ def test_real_active_ping_sequence_requires_exact_positive_integer(
         "127.0.0.1",
     ) as server:
         with _client_socket(socket.AF_INET, "127.0.0.1") as client:
-            key_material = _perform_real_handshake(
+            confirmed_session = _perform_real_handshake(
                 endpoints,
                 client,
                 server.remote_addr,
@@ -2512,7 +2624,7 @@ def test_real_active_ping_sequence_requires_exact_positive_integer(
                 client.sendto(
                     _encrypted_json_packet(
                         endpoints.proxy,
-                        key_material.client_to_server_key,
+                        confirmed_session.key_material.client_to_server_key,
                         nonce,
                         {
                             "type": "ping",
@@ -2520,7 +2632,7 @@ def test_real_active_ping_sequence_requires_exact_positive_integer(
                             "timestamp": 1000,
                             "source_id": STATION_ID,
                         },
-                    ),
+                        confirmed_session.session_locator),
                     server.remote_addr,
                 )
 
@@ -2533,8 +2645,8 @@ def test_real_active_ping_sequence_requires_exact_positive_integer(
                 )
                 message = endpoints.proxy.decrypt_secure_json_message(
                     packet,
-                    key_material.server_to_client_key,
-                )
+                    confirmed_session.key_material.server_to_client_key,
+                    confirmed_session.session_locator)
                 assert message.get("type") == "pong"
                 received_sequences.append(message.get("seq"))
             client.settimeout(0.05)
@@ -2569,6 +2681,7 @@ def test_proxy_rejects_non_integer_authenticated_pong_sequence(
 ):
     proxy = real_udpsec_endpoints.proxy
     key = b"\x71" * 32
+    locator = _fresh_test_locator()
     remote_addr = ("127.0.0.1", 19999)
     packet = _encrypted_json_packet(
         proxy,
@@ -2580,6 +2693,7 @@ def test_proxy_rejects_non_integer_authenticated_pong_sequence(
             "timestamp": 1000,
             "source_id": STATION_ID,
         },
+        locator,
     )
 
     assert proxy.handle_server_packet(
@@ -2587,6 +2701,7 @@ def test_proxy_rejects_non_integer_authenticated_pong_sequence(
         remote_addr,
         remote_addr,
         key,
+        locator,
         STATION_ID,
         1,
     ) == proxy.SERVER_PACKET_IGNORED
@@ -2605,6 +2720,7 @@ def test_expired_pending_handle_cannot_replace_live_active_session(
     active = state.install_session(
         relation_key,
         STATION_ID,
+        _fresh_test_locator(),
         AESGCM(b"\x61" * 32),
         AESGCM(b"\x62" * 32),
         0,
@@ -2612,13 +2728,14 @@ def test_expired_pending_handle_cannot_replace_live_active_session(
     pending = state.install_pending_session(
         relation_key,
         STATION_ID,
+        _fresh_test_locator(),
         AESGCM(b"\x63" * 32),
         AESGCM(b"\x64" * 32),
         1,
     )
 
-    assert state.promote_pending_session(relation_key, pending, 6) is None
-    assert state.get_active_session(relation_key, 6) is active
+    assert state.promote_pending_session(pending, 6) is None
+    assert state.get_active_session(active._session_key, 6) is active
     assert state.get_pending_session(relation_key, 6) is None
     stats = state.stats()
     assert stats.pending_sessions_expired == 1
@@ -2641,6 +2758,7 @@ def test_session_state_retains_only_directional_cipher_contexts(
     active = state.install_session(
         relation_key,
         STATION_ID,
+        _fresh_test_locator(),
         AESGCM(b"\x65" * 32),
         AESGCM(b"\x66" * 32),
         10,
@@ -2648,17 +2766,18 @@ def test_session_state_retains_only_directional_cipher_contexts(
     pending = state.install_pending_session(
         relation_key,
         STATION_ID,
+        _fresh_test_locator(),
         AESGCM(b"\x67" * 32),
         AESGCM(b"\x68" * 32),
         11,
     )
 
-    assert active._relation_key is relation_key
+    assert active._session_key.endpoint_token is relation_key.endpoint_token
     assert pending._relation_key is relation_key
     assert active.path_state.active_path == address
     assert pending._address == address
     assert set(vars(active)) == {
-        "_relation_key",
+        "_session_key",
         "station_id",
         "created_at",
         "last_seen",
@@ -2671,6 +2790,7 @@ def test_session_state_retains_only_directional_cipher_contexts(
         "_relation_key",
         "_address",
         "station_id",
+        "session_locator",
         "created_at",
         "current_epoch",
     }
@@ -2705,9 +2825,18 @@ def test_session_state_retains_only_directional_cipher_contexts(
             forbidden_field_fragments
             & set(vars(retained))
         )
+        # session_locator is the one intentionally public, non-credential
+        # bytes value retained directly: it is server-minted, transcript-
+        # bound, and never proof of authentication -- everything else
+        # bytes-typed here would be raw key/secret material.
+        non_locator_values = {
+            name: value
+            for name, value in vars(retained).items()
+            if name != "session_locator"
+        }
         assert not any(
             isinstance(value, bytes)
-            for value in vars(retained).values()
+            for value in non_locator_values.values()
         )
 
     key_material = SessionKeyMaterial(b"\x69" * 32, b"\x6a" * 32)
@@ -2716,6 +2845,7 @@ def test_session_state_retains_only_directional_cipher_contexts(
     assert key_material.server_to_client_key.hex() not in material_repr
 
     client_hello = ClientHello(
+        protocol_version=UDPSEC_PROTOCOL_VERSION,
         station_id=STATION_ID,
         timestamp=1,
         client_random=b"\x01" * 32,
@@ -2723,6 +2853,8 @@ def test_session_state_retains_only_directional_cipher_contexts(
         client_signature=b"client-secret-signature",
     )
     server_hello = ServerHello(
+        protocol_version=UDPSEC_PROTOCOL_VERSION,
+        session_locator=_fresh_test_locator(),
         server_random=b"\x03" * 32,
         server_ephemeral_public_key=b"\x03" + b"\x04" * 32,
         server_signature=b"server-secret-signature",
@@ -2983,7 +3115,11 @@ def test_static_runtime_has_no_legacy_helpers_or_secret_logging():
 
     for tree in runtime_trees:
         identifiers = _referenced_identifiers(tree)
-        assert "session_key" not in identifiers
+        # "session_key" is now a legitimate, non-secret identifier: an
+        # _EndpointSessionKey(endpoint_token, session_locator) is a lookup
+        # identity, never cryptographic key material, so it is
+        # deliberately absent from secret_identifiers/secret_phrases
+        # below rather than banned outright here.
         assert not (obsolete_identifiers & identifiers)
         for obsolete_wire_text in ("KEEPALIVE", "NOSESSION"):
             assert not [

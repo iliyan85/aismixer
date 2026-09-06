@@ -50,9 +50,12 @@ def legacy_config(**overrides):
 
 def _install_udpsec_main_fakes(monkeypatch, proxy, events):
     remote_addr = ("192.0.2.10", 19999)
-    key_material = SimpleNamespace(
-        client_to_server_key=b"\x11" * 32,
-        server_to_client_key=b"\x22" * 32,
+    confirmed_session = SimpleNamespace(
+        session_locator=b"\x33" * 16,
+        key_material=SimpleNamespace(
+            client_to_server_key=b"\x11" * 32,
+            server_to_client_key=b"\x22" * 32,
+        ),
     )
     config = {
         "input": {
@@ -127,9 +130,9 @@ def _install_udpsec_main_fakes(monkeypatch, proxy, events):
     monkeypatch.setattr(
         proxy,
         "perform_handshake",
-        lambda *_args: key_material,
+        lambda *_args: confirmed_session,
     )
-    return config, remote_addr, key_material
+    return config, remote_addr, confirmed_session
 
 
 def test_output_omitted_preserves_legacy_udpsec_behavior():
@@ -1359,7 +1362,7 @@ def test_udpsec_main_sends_one_authenticated_close_before_socket_close(
 ):
     proxy = load_proxy_module()
     events = []
-    config, remote_addr, key_material = _install_udpsec_main_fakes(
+    config, remote_addr, confirmed_session = _install_udpsec_main_fakes(
         monkeypatch,
         proxy,
         events,
@@ -1380,7 +1383,8 @@ def test_udpsec_main_sends_one_authenticated_close_before_socket_close(
     assert destination == remote_addr
     assert proxy.decrypt_secure_json_message(
         packet,
-        key_material.client_to_server_key,
+        confirmed_session.key_material.client_to_server_key,
+        confirmed_session.session_locator,
     ) == {
         "type": "close",
         "reason": "shutdown",

@@ -320,23 +320,47 @@ default is module-wide, while an isolated state owner and clocks may be
 injected into a secure listener. This state is in-memory and process-local; it
 is neither durable nor shared across processes.
 
+UDPSEC is protocol revision 2 (`UDPSEC_PROTOCOL_VERSION = 2`). There is no
+negotiation or downgrade: a ClientHello or ServerHello whose declared version
+is not exactly `2` fails closed, and the version is itself part of the
+authenticated handshake transcript (the client digest, the server auth
+digest, and the session transcript hash all bind it). Revision 1 wire
+compatibility does not exist.
+
 An established relation is internally represented as three separate
 ownership layers: a `LogicalSession` (authenticated station identity, its
-endpoint/peer relation, two distinct process-local identifiers described
-below, and `created_at`/`last_seen`), the `LogicalSession`'s `current_epoch`
-(the directional AES-GCM owners and the private data-nonce set -- exactly
-what earlier revisions of this section described as flat session fields),
-and the `LogicalSession`'s `path_state` (currently only `active_path`, the
-address ordinary established-session replies are sent to). This separation
-exists so a later development stage can let path and cryptographic epoch
-change independently of the logical session; as of this revision it changes
-nothing externally observable. **The wire lookup remains exactly the
-endpoint-token/peer-address relation described below: there is no
-tuple-independent session locator, no path migration, and a fresh
-authenticated re-handshake still replaces the whole `LogicalSession`,
-including its epoch, exactly as before.** A pending relation is represented
-the same way, minus `path_state` and minus both identifiers below (pending
-traffic remains addressed by the handshake's own tuple; see below).
+endpoint token, two distinct process-local identifiers described below, and
+`created_at`/`last_seen`), the `LogicalSession`'s `current_epoch` (the
+directional AES-GCM owners and the private data-nonce set -- exactly what
+earlier revisions of this section described as flat session fields), and the
+`LogicalSession`'s `path_state` (currently only `active_path`, the address
+ordinary established-session replies are sent to). This separation exists so
+a later development stage can let path and cryptographic epoch change
+independently of the logical session; as of this revision it changes nothing
+externally observable beyond the locator-based lookup described next.
+
+**Established (active) session identity is the exact combination of the
+endpoint token and a server-minted, opaque 16-byte `session_locator` -- not
+the remote peer tuple.** The server mints this locator during ServerHello
+(bounded collision-retry against currently live locators on that
+endpoint_token, failing closed on exhaustion), and it is bound into both the
+server auth digest and the session transcript hash, so a client cannot be
+tricked into accepting a substituted locator. The locator is a process-local,
+session-lifetime lookup hint, never a credential: it is never derived from
+station identity, network address, or ECDHE material, and by itself it
+cannot bypass AEAD authentication, `allow_from`, active-path checks, replay
+admission, or listener scoping. Every DATA packet (NMEA payload, ping, pong,
+and graceful close alike) uses V2 framing: `DATA_PREFIX` (`b"NMEA-D2"`)
+followed by the 16-byte `session_locator`, a 12-byte nonce, and the AES-GCM
+ciphertext plus tag; associated data is `build_data_aad(session_locator) =
+DATA_PREFIX || session_locator`, so the locator is cryptographically bound
+into every authenticated DATA exchange in both directions, not merely used
+for lookup. A packet whose locator identifies no live pending or active
+session on the receiving endpoint_token is dropped without attempting
+decryption or any trial across other locators. A pending relation remains
+represented the same way, minus `path_state` and minus both identifiers
+below, and -- unlike an active session -- pending identity is still the
+exact endpoint-token/peer-address tuple from the handshake; see below.
 
 A `LogicalSession` carries two deliberately separate process-local
 identifiers that must not be conflated. `session_handle` identifies one
@@ -367,24 +391,58 @@ Each physical secure-listener socket incarnation owns one opaque endpoint
 token. The token has process-local object-identity semantics, remains stable
 for that socket's lifetime, and is never transmitted or derived from listener
 configuration, network addresses, station identity, or cryptographic key
-material. Pending and active relation identity is the exact combination of
-that endpoint token and the raw peer socket address returned by `recvfrom()`.
-The raw address remains separately retained for pending-handshake replies,
-source metadata, logging, and diagnostics; an established session's
-`path_state.active_path` -- initialized to that same raw address and not
-otherwise mutated in this revision -- is the sole address ordinary
-established-session replies use. A secure-ingress `IngressFrame`'s assembler
-namespace is derived instead from the owning `LogicalSession`'s
-`assembly_namespace` -- never from `session_handle`, the address, or
-`path_state` -- so that two fragments of one multipart message reaching the
-same continuing authenticated station at the same relation remain in one
-assembly group regardless of which address either arrived from, while a
-replacement authenticating as a different station never inherits that
-group. Identical raw peer addresses on
-different physical listener incarnations are independent relations. A
-replacement socket receives a fresh endpoint token and cannot select retained
-state from the prior incarnation; abnormally retained old state remains
-unreachable until its existing lifecycle removes it.
+material. Pending relation identity is the exact combination of that
+endpoint token and the raw peer socket address returned by `recvfrom()`.
+Active session identity is the combination of that endpoint token and the
+session's `session_locator`, as described above; the raw address a session
+was established or last promoted at is retained separately as
+`path_state.active_path`, the sole address ordinary established-session
+replies use and the sole transport authority for admitting DATA traffic --
+it is not otherwise mutated in this revision, so there is no path migration.
+A DATA packet whose locator matches a live active session but whose source
+address does not structurally match that session's `active_path` is dropped
+before decryption is attempted, exactly as an unknown locator is; a locator
+is a lookup hint, never a bypass for path admission. Structural path
+equality compares `(ip, port)` for IPv4 and `(ip, port, scope_id)` for IPv6;
+IPv6 flow label (`flowinfo`) is not significant to path identity.
+
+A bounded secondary relation index, keyed by endpoint token and the
+structurally-canonicalized active path, maps a relation to its current
+active session key for same-relation-replacement detection and
+`assembly_namespace` carry-forward only -- it is never consulted for
+admission, authentication, or DATA lookup, and it is kept consistent with
+the flowinfo-insensitive path equality above. Pending-session lookup never
+uses this canonicalization; it stays exactly tuple-bound as described above.
+Session-locator uniqueness per endpoint_token is enforced as a `SecureState`
+invariant at installation time (covering direct installation, pending
+installation, and promotion alike), not merely by convention of locator
+generation: installing a session whose locator already identifies a
+different live session or live pending candidate on that endpoint_token
+fails closed rather than silently overwriting or aliasing state. The same
+raw locator bytes on a different endpoint_token are an entirely independent
+identity. This locator-collision (or otherwise inconsistent-ownership) check
+is always a precondition, never a rollback: it is evaluated against
+still-live state before any replacement, capacity eviction, or promotion
+mutation begins, so a rejected installation or promotion leaves every
+previously-live active/pending session, the relation index, locator
+ownership records, nonce ledgers, and lifecycle statistics exactly as they
+were -- normal expiry cleanup already due at the operation's own timestamp
+is the only state change a failed attempt may still produce. A secure-ingress `IngressFrame`'s assembler namespace is derived
+instead from the owning `LogicalSession`'s `assembly_namespace` -- never
+from `session_handle`, the address, `path_state`, or the locator -- so that
+two fragments of one multipart message reaching the same continuing
+authenticated station at the same relation remain in one assembly group
+regardless of which address either arrived from, while a replacement
+authenticating as a different station never inherits that group. This
+path-independence is internal to how a session's own admitted fragments are
+grouped; it does not mean a session accepts DATA from more than one path --
+the active-path admission check above still drops a wrong-path packet before
+it can reach assembly. Identical
+raw peer addresses on different physical listener incarnations are
+independent relations. A replacement socket receives a fresh endpoint token
+and cannot select retained state from the prior incarnation; abnormally
+retained old state remains unreachable until its existing lifecycle removes
+it.
 
 Wall time and monotonic time have separate ownership. Wall time is used only
 for externally meaningful protocol or diagnostic timestamps: the transmitted
@@ -433,8 +491,7 @@ deterministic installation order. At most `PENDING_SESSION_MAX` pending
 sessions are retained across the process-wide `SecureState`.
 
 Installing or replacing a pending session does not remove, replace, or touch
-an active session in the same endpoint/peer relation. While the candidate
-remains pending,
+any active session at that relation. While the candidate remains pending,
 confirmation failure or client timeout leaves any existing active session
 intact; it does not promote the pending entry and does not itself delete
 server-side pending state. Pending expiry, same-relation replacement, capacity
@@ -452,15 +509,16 @@ stale, replaced, or wrong-endpoint handle cannot consume nonce state, transfer
 promotion ownership, touch, exhaust, or close another listener's relation.
 
 An active session (a `LogicalSession`) is identified by its exact
-endpoint-token/peer-address relation and retains a `session_handle`
+endpoint-token/`session_locator` combination and retains a `session_handle`
 (identifying this exact object incarnation) and an `assembly_namespace`
 (identifying secure multipart continuity lineage; see above for how the two
 differ and when the second may be carried forward across a replacement),
 authenticated station ID, monotonic creation and last-seen times, a
 `current_epoch` (separate client-to-server and server-to-client AES-GCM
 owners plus a private data-nonce set), and a `path_state` whose
-`active_path` is the address ordinary established-session replies use.
-Active sessions are ordered from least to most recently seen across the
+`active_path` is the address ordinary established-session replies use and
+the transport authority DATA admission checks against (see above). Active
+sessions are ordered from least to most recently seen across the
 process-wide `SecureState`.
 Installation and valid activity place a session at the most-recent end. Only
 promotion or a fully validated active secure NMEA or ping packet counts as
@@ -472,15 +530,18 @@ packet type, the expired ordered prefixes of both pending and active session
 stores are removed before packet-type-specific handling. Expired state may
 therefore remain physically present until later allowed traffic, but an
 expired directly addressed session is never treated as live. State operations
-receiving an active or pending handle first require exact retained-object
-identity at its endpoint/peer relation. A replaced, capacity-evicted,
-promoted, expired,
+receiving an active handle first require exact retained-object identity at
+its endpoint-token/`session_locator` key; a pending handle requires exact
+retained-object identity at its endpoint-token/peer-address tuple. A
+replaced, capacity-evicted, promoted, expired,
 nonce-exhausted, or otherwise stale handle cannot mutate state or trigger
 unrelated cleanup.
 
 UDPSEC has no plaintext session-reset or other unauthenticated session-control
-packet. A DATA packet received through an endpoint/peer relation with no live
-pending or active session is dropped without a wire response. Plaintext,
+packet. A DATA packet's locator is checked against an exact pending match on
+its endpoint_token first, then against a live active session on that
+endpoint_token; a locator matching neither is dropped without a wire response
+and without attempting decryption. Plaintext,
 malformed, unknown, or
 otherwise unauthenticated datagrams cannot touch, promote, replace, extend, or
 delete a live session. The monotonic cleanup of state that has already reached
@@ -559,15 +620,20 @@ requires type `"ping"`, reserved sequence `0` as a built-in integer and not a
 boolean, a built-in-integer timestamp, and a source identity equal to the
 pending station ID. The packet nonce is admitted to the pending session before
 promotion. Promotion removes the pending entry and, as one state-model
-transition, replaces any live active session in the same endpoint/peer
-relation.
-The station identity and the pending `current_epoch` (both directional
-AES-GCM owners and the pending nonce set, including the already-admitted
-confirmation nonce) become the new `LogicalSession`'s state exactly as one
-transferred object, not re-derived; active creation and last-seen time begin
-at promotion, a fresh `path_state` is created with `active_path` set to the
-confirming packet's address, and a fresh `session_handle` is always minted
-(promotion is never object-identity-preserving in this stage). The new
+transition, replaces any live active session found through the relation
+index at the confirming packet's structural path on that endpoint_token.
+The station identity, `session_locator` (already minted for this candidate
+during its own ServerHello and transferred, not re-derived, at promotion),
+and the pending `current_epoch` (both directional AES-GCM owners and the
+pending nonce set, including the already-admitted confirmation nonce) become
+the new `LogicalSession`'s state exactly as one transferred object; active
+creation and last-seen time begin at promotion, a fresh `path_state` is
+created with `active_path` set to the confirming packet's address, and a
+fresh `session_handle` is always minted (promotion is never
+object-identity-preserving in this stage). Because each ServerHello mints an
+independent locator, the promoted session's locator is always different from
+whatever locator any live session it replaces was using -- there is no
+notion of a rekey that preserves a locator in this revision. The new
 session's `assembly_namespace` is carried forward from the exact live
 session this promotion replaces only when that session's authenticated
 `station_id` matches the promoted station_id; otherwise -- a different
@@ -590,11 +656,12 @@ expiry, session-capacity eviction, graceful close, or nonce exhaustion, makes
 that exact traffic-key epoch unusable before discarding its nonce state.
 
 Active and pending capacity limits remain aggregate process-wide resource
-policy. Exact endpoint/peer equality controls replacement, so a same-peer
-relation on another endpoint is never mistaken for the relation being
-replaced. When an aggregate store is genuinely full, its existing
-deterministic global capacity policy may nevertheless evict the oldest live
-entry belonging to another endpoint.
+policy. Exact endpoint-token equality plus the structural (flowinfo-
+insensitive) path equality described above controls relation-index
+replacement, so a same-path relation on another endpoint is never mistaken
+for the relation being replaced. When an aggregate store is genuinely full,
+its existing deterministic global capacity policy may nevertheless evict the
+oldest live entry belonging to another endpoint.
 
 Secure-data replay identity is the exact 12-byte nonce within its receiver-side
 directional traffic-key epoch. Identical bytes under distinct epochs are
@@ -634,17 +701,21 @@ identity in `source_id`. It is carried inside the existing encrypted DATA
 channel; there is no plaintext close prefix. It is best-effort and
 unacknowledged, and neither endpoint waits for a reply.
 
-A client close is encrypted under the current client-to-server AES-GCM owner.
-The server accepts it only in the receiving endpoint's exact active
-endpoint/peer relation and through the listener that retained that exact live
-session object. Source identity and the
+A client close is encrypted under the current client-to-server AES-GCM owner
+and framed like any other DATA packet, so it is subject to the same locator
+lookup and active-path admission described above. The server accepts it only
+against the receiving endpoint_token's exact live active session identified
+by the packet's locator, whose source address structurally matches that
+session's `active_path`, and only through the listener that retained that
+exact live session object. Source identity and the
 complete canonical message shape must match. Decryption, canonical validation,
 and authoritative active data-nonce admission occur before close-specific state
 changes. Only `ACCEPTED` processes the packet as a graceful close; `EXHAUSTED`
 follows the fail-closed epoch-invalidating path above and is not counted as a
-normal close. Pending state in the same relation and same-peer sessions owned
-by other listeners remain unchanged. Forged, plaintext, wrong-key, replayed,
-stale-handle, or cross-listener close attempts cannot remove a session.
+normal close. Pending state on the same endpoint_token and sessions owned
+by other listeners remain unchanged. Forged, plaintext, wrong-key,
+wrong-locator, wrong-path, replayed, stale-handle, or cross-listener close
+attempts cannot remove a session.
 
 A server close is encrypted under the current server-to-client AES-GCM owner
 and sent only through the listener socket that owns the exact retained live

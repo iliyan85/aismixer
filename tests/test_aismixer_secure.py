@@ -93,6 +93,19 @@ def _relation_key(endpoint_token, address):
     return secure._EndpointPeerKey(endpoint_token, address)
 
 
+_TEST_LOCATOR_COUNTER = 0
+
+
+def _fresh_test_locator():
+    # A monotonic counter, not os.urandom: several tests monkeypatch
+    # os.urandom (client ephemeral/nonce generation) and must not have
+    # their call counts or return-value sequencing perturbed by test-
+    # harness locator bookkeeping.
+    global _TEST_LOCATOR_COUNTER
+    _TEST_LOCATOR_COUNTER += 1
+    return _TEST_LOCATOR_COUNTER.to_bytes(16, "big")
+
+
 def _install_session(
     state,
     endpoint_token,
@@ -100,27 +113,30 @@ def _install_session(
     client_key,
     server_key,
 ):
-    state.install_session(
+    return state.install_session(
         _relation_key(endpoint_token, address),
         "boat_001",
+        _fresh_test_locator(),
         AESGCM(client_key),
         AESGCM(server_key),
         now=1000.0,
     )
 
 
-def _secure_data_packet(key, nonce, message):
+def _secure_data_packet(session_locator, key, nonce, message):
     plaintext = json.dumps(message).encode()
-    ciphertext = AESGCM(key).encrypt(nonce, plaintext, secure.DATA_AAD)
-    return secure.DATA_PREFIX + nonce + ciphertext
+    ciphertext = AESGCM(key).encrypt(
+        nonce, plaintext, secure.build_data_aad(session_locator)
+    )
+    return secure.build_data_packet(session_locator, nonce, ciphertext)
 
 
 def _decrypt_server_message(packet, server_to_client_key):
-    nonce, ciphertext = secure.parse_secure_data_packet(packet)
+    locator, nonce, ciphertext = secure.parse_data_packet(packet)
     plaintext = AESGCM(server_to_client_key).decrypt(
         nonce,
         ciphertext,
-        secure.DATA_AAD,
+        secure.build_data_aad(locator),
     )
     return json.loads(plaintext.decode())
 
@@ -134,17 +150,21 @@ def _install_owned_session(
     station_id="boat_001",
     client_key=b"\x01" * 32,
     server_key=b"\x02" * 32,
+    session_locator=None,
     now=1000.0,
 ):
+    if session_locator is None:
+        session_locator = _fresh_test_locator()
     relation_key = _relation_key(endpoint_token, address)
     session = state.install_session(
         relation_key,
         station_id,
+        session_locator,
         AESGCM(client_key),
         AESGCM(server_key),
         now=now,
     )
-    owned_sessions[relation_key] = session
+    owned_sessions[session._session_key] = session
     return session
 
 
@@ -435,9 +455,10 @@ def test_close_owned_sessions_ignores_stale_replaced_handle():
         unrelated_address,
     )
     state = secure.SecureState(session_ttl=5.0)
-    state.install_session(
+    unrelated_session = state.install_session(
         unrelated_relation_key,
         "unrelated",
+        _fresh_test_locator(),
         AESGCM(b"\x31" * 32),
         AESGCM(b"\x32" * 32),
         now=0.0,
@@ -454,6 +475,7 @@ def test_close_owned_sessions_ignores_stale_replaced_handle():
     replacement = state.install_session(
         relation_key,
         "boat_001",
+        _fresh_test_locator(),
         AESGCM(b"\x41" * 32),
         AESGCM(b"\x42" * 32),
         now=4.0,
@@ -469,8 +491,8 @@ def test_close_owned_sessions_ignores_stale_replaced_handle():
     )
 
     assert old_session is not replacement
-    assert state._sessions[relation_key] is replacement
-    assert unrelated_relation_key in state._sessions
+    assert state._sessions[replacement._session_key] is replacement
+    assert unrelated_session._session_key in state._sessions
     assert fake_socket.sent == []
     assert fake_socket.events == []
     stats = state.stats()
@@ -484,8 +506,6 @@ def test_shared_state_listener_close_sends_only_exact_owned_session():
     address = ("127.0.0.1", 50126)
     first_endpoint_token = secure._new_endpoint_token()
     second_endpoint_token = secure._new_endpoint_token()
-    first_relation_key = _relation_key(first_endpoint_token, address)
-    second_relation_key = _relation_key(second_endpoint_token, address)
     first_server_key = b"\x52" * 32
     second_server_key = b"\x62" * 32
     state = secure.SecureState()
@@ -527,9 +547,9 @@ def test_shared_state_listener_close_sends_only_exact_owned_session():
         secure.build_session_close_message("boat_first", 1010)
     )
     assert second_socket.sent == []
-    assert state.get_active_session(first_relation_key, 1010.0) is None
+    assert state.get_active_session(first_session._session_key, 1010.0) is None
     assert (
-        state.get_active_session(second_relation_key, 1010.0)
+        state.get_active_session(second_session._session_key, 1010.0)
         is second_session
     )
     assert first_session is not second_session
@@ -604,16 +624,18 @@ def test_udpsec_handshake_ping_replay_and_rejected_data_are_transport_only(
     wrong_key = b"\x03" * 32
     state = secure.SecureState()
     endpoint_token = secure._new_endpoint_token()
-    _install_session(
+    session = _install_session(
         state,
         endpoint_token,
         address,
         client_key,
         server_key,
     )
+    session_locator = session._session_key.session_locator
 
     malformed_handshake = secure.CLIENT_HELLO_PREFIX + b"malformed"
     ping = _secure_data_packet(
+        session_locator,
         client_key,
         b"\x10" * 12,
         {
@@ -624,6 +646,7 @@ def test_udpsec_handshake_ping_replay_and_rejected_data_are_transport_only(
         },
     )
     rejected = _secure_data_packet(
+        session_locator,
         wrong_key,
         b"\x11" * 12,
         {
@@ -673,6 +696,7 @@ def test_udpsec_successful_handshake_is_transport_only(monkeypatch):
         ephemeral_private_key.public_key()
     )
     client_auth_digest = secure.build_client_auth_digest(
+        protocol_version=secure.UDPSEC_PROTOCOL_VERSION,
         station_id=station_id,
         timestamp=timestamp,
         client_random=client_random,
@@ -680,6 +704,7 @@ def test_udpsec_successful_handshake_is_transport_only(monkeypatch):
     )
     packet = build_client_hello_packet(
         ClientHello(
+            protocol_version=secure.UDPSEC_PROTOCOL_VERSION,
             station_id=station_id,
             timestamp=timestamp,
             client_random=client_random,
@@ -724,7 +749,7 @@ def test_udpsec_valid_nmea_accounts_admitted_frame_payload_bytes(monkeypatch):
     payload = " before\ud800after "
     state = secure.SecureState()
     endpoint_token = secure._new_endpoint_token()
-    _install_session(
+    session = _install_session(
         state,
         endpoint_token,
         address,
@@ -732,6 +757,7 @@ def test_udpsec_valid_nmea_accounts_admitted_frame_payload_bytes(monkeypatch):
         server_key,
     )
     packet = _secure_data_packet(
+        session._session_key.session_locator,
         client_key,
         b"\x20" * 12,
         {
@@ -772,8 +798,11 @@ def test_udpsec_debug_true_prints_data_trace(monkeypatch, capsys):
     payload = "!AIVDM,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*5C"
     state = secure.SecureState()
     endpoint_token = secure._new_endpoint_token()
-    _install_session(state, endpoint_token, address, client_key, server_key)
+    session = _install_session(
+        state, endpoint_token, address, client_key, server_key
+    )
     packet = _secure_data_packet(
+        session._session_key.session_locator,
         client_key,
         b"\x21" * 12,
         {
@@ -811,8 +840,11 @@ def test_udpsec_debug_false_prints_no_data_trace(monkeypatch, capsys):
     payload = "!AIVDM,1,1,,A,15Muq?002>G?svP00<:O?vN60<0,0*5C"
     state = secure.SecureState()
     endpoint_token = secure._new_endpoint_token()
-    _install_session(state, endpoint_token, address, client_key, server_key)
+    session = _install_session(
+        state, endpoint_token, address, client_key, server_key
+    )
     packet = _secure_data_packet(
+        session._session_key.session_locator,
         client_key,
         b"\x22" * 12,
         {
@@ -881,7 +913,7 @@ def test_udpsec_queue_exit_does_not_account_frame_as_accepted(
     server_key = b"\x02" * 32
     state = secure.SecureState()
     endpoint_token = secure._new_endpoint_token()
-    _install_session(
+    session = _install_session(
         state,
         endpoint_token,
         address,
@@ -889,6 +921,7 @@ def test_udpsec_queue_exit_does_not_account_frame_as_accepted(
         server_key,
     )
     packet = _secure_data_packet(
+        session._session_key.session_locator,
         client_key,
         b"\x30" * 12,
         {
@@ -947,10 +980,13 @@ def test_secure_server_loop_contains_recoverable_recv_error(
     server_key = b"\x02" * 32
     state = secure.SecureState()
     endpoint_token = secure._new_endpoint_token()
-    _install_session(state, endpoint_token, address, client_key, server_key)
+    session = _install_session(
+        state, endpoint_token, address, client_key, server_key
+    )
     stats_before = state.stats()
 
     packet = _secure_data_packet(
+        session._session_key.session_locator,
         client_key,
         b"\x50" * 12,
         {
@@ -1062,9 +1098,12 @@ def test_secure_server_loop_propagates_mid_stream_cancellation(monkeypatch):
     server_key = b"\x02" * 32
     state = secure.SecureState()
     endpoint_token = secure._new_endpoint_token()
-    _install_session(state, endpoint_token, address, client_key, server_key)
+    session = _install_session(
+        state, endpoint_token, address, client_key, server_key
+    )
 
     packet = _secure_data_packet(
+        session._session_key.session_locator,
         client_key,
         b"\x51" * 12,
         {

@@ -25,6 +25,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from core.udpsec_protocol import SESSION_LOCATOR_BYTES
+
 
 ECDHE_CURVE = ec.SECP256R1()
 TRANSCRIPT_HASH = hashes.SHA256()
@@ -415,13 +417,34 @@ def derive_session_key_material(
     )
 
 
+def _protocol_version_bytes(version: object) -> bytes:
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("protocol_version must be an integer")
+    if not 0 <= version <= 0xFF:
+        raise ValueError(
+            "protocol_version must fit in an unsigned 8-bit integer"
+        )
+    return version.to_bytes(1, "big", signed=False)
+
+
+def _session_locator_bytes(value: object) -> bytes:
+    normalized = _required_bytes("session_locator", value)
+    if len(normalized) != SESSION_LOCATOR_BYTES:
+        raise ValueError(
+            f"session_locator must be exactly {SESSION_LOCATOR_BYTES} bytes"
+        )
+    return normalized
+
+
 def _client_hello_fields(
+    protocol_version: object,
     station_id: object,
     timestamp: object,
     client_random: object,
     client_ephemeral_public_key: object,
 ) -> tuple[bytes, ...]:
     return (
+        _protocol_version_bytes(protocol_version),
         _station_id_bytes(station_id),
         _timestamp_bytes(timestamp),
         _required_bytes("client_random", client_random),
@@ -433,10 +456,12 @@ def _client_hello_fields(
 
 
 def _server_hello_fields(
+    session_locator: object,
     server_random: object,
     server_ephemeral_public_key: object,
 ) -> tuple[bytes, ...]:
     return (
+        _session_locator_bytes(session_locator),
         _required_bytes("server_random", server_random),
         _required_bytes(
             "server_ephemeral_public_key",
@@ -461,6 +486,7 @@ def _digest_fields(label: bytes, fields: tuple[bytes, ...]) -> bytes:
 
 def build_client_auth_digest(
     *,
+    protocol_version: int,
     station_id: str,
     timestamp: int,
     client_random: bytes | bytearray | memoryview,
@@ -468,11 +494,14 @@ def build_client_auth_digest(
 ) -> bytes:
     """Hash the ClientHello authentication transcript.
 
-    Field order is domain, client-auth label, UTF-8 station ID, timestamp,
-    client random, and client ephemeral public key.
+    Field order is domain, client-auth label, protocol version, UTF-8
+    station ID, timestamp, client random, and client ephemeral public key.
+    A v2 ClientHello signature therefore cannot be reinterpreted as
+    authenticating any other protocol revision.
     """
 
     client_hello = _client_hello_fields(
+        protocol_version,
         station_id,
         timestamp,
         client_random,
@@ -483,21 +512,27 @@ def build_client_auth_digest(
 
 def build_server_auth_digest(
     *,
+    protocol_version: int,
     station_id: str,
     timestamp: int,
     client_random: bytes | bytearray | memoryview,
     client_ephemeral_public_key: bytes | bytearray | memoryview,
     client_signature: bytes | bytearray | memoryview,
+    session_locator: bytes | bytearray | memoryview,
     server_random: bytes | bytearray | memoryview,
     server_ephemeral_public_key: bytes | bytearray | memoryview,
 ) -> bytes:
     """Hash the ServerHello authentication transcript.
 
-    Field order is domain, server-auth label, all ClientHello fields, client
-    signature, server random, and server ephemeral public key.
+    Field order is domain, server-auth label, all ClientHello fields
+    (including protocol version), client signature, session locator, server
+    random, and server ephemeral public key. Modifying the protocol version
+    or the session locator therefore invalidates server signature
+    verification.
     """
 
     client_hello = _client_hello_fields(
+        protocol_version,
         station_id,
         timestamp,
         client_random,
@@ -508,6 +543,7 @@ def build_server_auth_digest(
         client_signature,
     )
     server_hello = _server_hello_fields(
+        session_locator,
         server_random,
         server_ephemeral_public_key,
     )
@@ -519,22 +555,28 @@ def build_server_auth_digest(
 
 def build_session_transcript_hash(
     *,
+    protocol_version: int,
     station_id: str,
     timestamp: int,
     client_random: bytes | bytearray | memoryview,
     client_ephemeral_public_key: bytes | bytearray | memoryview,
     client_signature: bytes | bytearray | memoryview,
+    session_locator: bytes | bytearray | memoryview,
     server_random: bytes | bytearray | memoryview,
     server_ephemeral_public_key: bytes | bytearray | memoryview,
     server_signature: bytes | bytearray | memoryview,
 ) -> bytes:
     """Hash the final authenticated session transcript.
 
-    Field order is domain, session-transcript label, all ClientHello fields,
-    client signature, all ServerHello fields, and server signature.
+    Field order is domain, session-transcript label, all ClientHello fields
+    (including protocol version), client signature, all ServerHello fields
+    (including session locator), and server signature. This hash is used as
+    the HKDF salt for directional key derivation, so changing the protocol
+    version or the session locator changes the derived traffic keys.
     """
 
     client_hello = _client_hello_fields(
+        protocol_version,
         station_id,
         timestamp,
         client_random,
@@ -545,6 +587,7 @@ def build_session_transcript_hash(
         client_signature,
     )
     server_hello = _server_hello_fields(
+        session_locator,
         server_random,
         server_ephemeral_public_key,
     )

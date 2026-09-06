@@ -1,4 +1,5 @@
 import base64
+import os
 from dataclasses import FrozenInstanceError, fields, is_dataclass
 
 import pytest
@@ -7,12 +8,17 @@ import core.udpsec_protocol as udpsec_protocol
 from core.udpsec_protocol import (
     CLIENT_HELLO_PREFIX,
     ClientHello,
+    DATA_PREFIX,
     SESSION_CLOSE_REASON_SHUTDOWN,
     SESSION_CLOSE_TYPE,
     SESSION_CONFIRMATION_SEQUENCE,
+    SESSION_LOCATOR_BYTES,
     SERVER_HELLO_PREFIX,
     ServerHello,
+    UDPSEC_PROTOCOL_VERSION,
     build_client_hello_packet,
+    build_data_aad,
+    build_data_packet,
     build_ping_message,
     build_pong_message,
     build_session_close_message,
@@ -21,6 +27,7 @@ from core.udpsec_protocol import (
     is_ping_message,
     is_session_close_message,
     parse_client_hello_packet,
+    parse_data_packet,
     parse_server_hello_packet,
 )
 
@@ -38,6 +45,7 @@ SERVER_EPHEMERAL_PUBLIC_KEY = bytes.fromhex(
 )
 CLIENT_SIGNATURE = bytes.fromhex("3006020101020101")
 SERVER_SIGNATURE = bytes.fromhex("3006020102020103")
+SESSION_LOCATOR = bytes(range(64, 80))
 
 CLIENT_RANDOM_B64 = (
     b"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
@@ -53,15 +61,18 @@ SERVER_EPHEMERAL_PUBLIC_KEY_B64 = (
     b"A3zyexiNA09+ilI4AwS1GsPAiWnid/IbNaYLSPxHZpl4"
 )
 SERVER_SIGNATURE_B64 = b"MAYCAQICAQM="
+SESSION_LOCATOR_B64 = b"QEFCQ0RFRkdISUpLTE1OTw=="
+PROTOCOL_VERSION_ASCII = b"2"
 
 CLIENT_PACKET = (
-    b"NMEA-H|boat_001|18446744073709551615|"
+    b"NMEA-H|2|boat_001|18446744073709551615|"
     b"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=|"
     b"A2sX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKW|"
     b"MAYCAQECAQE="
 )
 SERVER_PACKET = (
-    b"OK|ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=|"
+    b"OK|2|QEFCQ0RFRkdISUpLTE1OTw==|"
+    b"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=|"
     b"A3zyexiNA09+ilI4AwS1GsPAiWnid/IbNaYLSPxHZpl4|"
     b"MAYCAQICAQM="
 )
@@ -74,6 +85,7 @@ class _BytesConvertible:
 
 def _client_hello(**changes):
     values = {
+        "protocol_version": UDPSEC_PROTOCOL_VERSION,
         "station_id": "boat_001",
         "timestamp": MAX_TIMESTAMP,
         "client_random": CLIENT_RANDOM,
@@ -86,6 +98,8 @@ def _client_hello(**changes):
 
 def _server_hello(**changes):
     values = {
+        "protocol_version": UDPSEC_PROTOCOL_VERSION,
+        "session_locator": SESSION_LOCATOR,
         "server_random": SERVER_RANDOM,
         "server_ephemeral_public_key": SERVER_EPHEMERAL_PUBLIC_KEY,
         "server_signature": SERVER_SIGNATURE,
@@ -142,39 +156,46 @@ BINARY_WIRE_FIELDS = (
     pytest.param(
         parse_client_hello_packet,
         CLIENT_PACKET,
-        3,
+        4,
         id="client-random",
     ),
     pytest.param(
         parse_client_hello_packet,
         CLIENT_PACKET,
-        4,
+        5,
         id="client-ephemeral-public-key",
     ),
     pytest.param(
         parse_client_hello_packet,
         CLIENT_PACKET,
-        5,
+        6,
         id="client-signature",
     ),
     pytest.param(
         parse_server_hello_packet,
         SERVER_PACKET,
-        1,
+        3,
         id="server-random",
     ),
     pytest.param(
         parse_server_hello_packet,
         SERVER_PACKET,
-        2,
+        4,
         id="server-ephemeral-public-key",
     ),
     pytest.param(
         parse_server_hello_packet,
         SERVER_PACKET,
-        3,
+        5,
         id="server-signature",
     ),
+)
+
+SESSION_LOCATOR_WIRE_FIELD = pytest.param(
+    parse_server_hello_packet,
+    SERVER_PACKET,
+    2,
+    id="server-session-locator",
 )
 
 
@@ -182,12 +203,17 @@ def test_protocol_api_and_wire_prefixes_are_public():
     assert {
         "CLIENT_HELLO_PREFIX",
         "ClientHello",
+        "DATA_PREFIX",
         "SESSION_CLOSE_REASON_SHUTDOWN",
         "SESSION_CLOSE_TYPE",
         "SESSION_CONFIRMATION_SEQUENCE",
+        "SESSION_LOCATOR_BYTES",
         "SERVER_HELLO_PREFIX",
         "ServerHello",
+        "UDPSEC_PROTOCOL_VERSION",
         "build_client_hello_packet",
+        "build_data_aad",
+        "build_data_packet",
         "build_ping_message",
         "build_pong_message",
         "build_session_close_message",
@@ -196,13 +222,17 @@ def test_protocol_api_and_wire_prefixes_are_public():
         "is_ping_message",
         "is_session_close_message",
         "parse_client_hello_packet",
+        "parse_data_packet",
         "parse_server_hello_packet",
     } <= set(udpsec_protocol.__all__)
     assert CLIENT_HELLO_PREFIX == b"NMEA-H"
+    assert DATA_PREFIX == b"NMEA-D2"
     assert SESSION_CLOSE_REASON_SHUTDOWN == "shutdown"
     assert SESSION_CLOSE_TYPE == "close"
     assert SESSION_CONFIRMATION_SEQUENCE == 0
+    assert SESSION_LOCATOR_BYTES == 16
     assert SERVER_HELLO_PREFIX == b"OK"
+    assert UDPSEC_PROTOCOL_VERSION == 2
 
 
 @pytest.mark.parametrize(
@@ -532,10 +562,11 @@ def test_exact_client_hello_wire_vector():
     packet = build_client_hello_packet(client_hello)
 
     assert packet == CLIENT_PACKET
-    assert len(packet) == 139
+    assert len(packet) == 141
     assert type(packet) is bytes
     assert packet.split(b"|") == [
         b"NMEA-H",
+        PROTOCOL_VERSION_ASCII,
         b"boat_001",
         b"18446744073709551615",
         CLIENT_RANDOM_B64,
@@ -551,10 +582,12 @@ def test_exact_server_hello_wire_vector():
     packet = build_server_hello_packet(server_hello)
 
     assert packet == SERVER_PACKET
-    assert len(packet) == 105
+    assert len(packet) == 132
     assert type(packet) is bytes
     assert packet.split(b"|") == [
         b"OK",
+        PROTOCOL_VERSION_ASCII,
+        SESSION_LOCATOR_B64,
         SERVER_RANDOM_B64,
         SERVER_EPHEMERAL_PUBLIC_KEY_B64,
         SERVER_SIGNATURE_B64,
@@ -593,6 +626,7 @@ def test_build_parse_round_trip_is_deterministic(value, builder, parser):
         pytest.param(
             _client_hello(),
             (
+                "protocol_version",
                 "station_id",
                 "timestamp",
                 "client_random",
@@ -606,6 +640,8 @@ def test_build_parse_round_trip_is_deterministic(value, builder, parser):
         pytest.param(
             _server_hello(),
             (
+                "protocol_version",
+                "session_locator",
                 "server_random",
                 "server_ephemeral_public_key",
                 "server_signature",
@@ -644,6 +680,7 @@ def test_parsed_binary_fields_are_immutable_bytes():
     assert type(client_hello.client_random) is bytes
     assert type(client_hello.client_ephemeral_public_key) is bytes
     assert type(client_hello.client_signature) is bytes
+    assert type(server_hello.session_locator) is bytes
     assert type(server_hello.server_random) is bytes
     assert type(server_hello.server_ephemeral_public_key) is bytes
     assert type(server_hello.server_signature) is bytes
@@ -655,7 +692,7 @@ def test_unicode_station_id_round_trips_as_strict_utf8():
 
     packet = build_client_hello_packet(client_hello)
 
-    assert packet.split(b"|")[1] == station_id.encode("utf-8")
+    assert packet.split(b"|")[2] == station_id.encode("utf-8")
     assert parse_client_hello_packet(packet).station_id == station_id
 
 
@@ -696,7 +733,7 @@ def test_station_id_rejects_invalid_values(station_id, message):
 
 
 def test_parser_rejects_invalid_station_id_utf8():
-    packet = _replace_wire_field(CLIENT_PACKET, 1, b"\xff")
+    packet = _replace_wire_field(CLIENT_PACKET, 2, b"\xff")
 
     with pytest.raises(ValueError, match="station_id must use valid UTF-8"):
         parse_client_hello_packet(packet)
@@ -707,7 +744,7 @@ def test_timestamp_unsigned_64_bit_boundaries_round_trip(timestamp):
     client_hello = _client_hello(timestamp=timestamp)
     packet = build_client_hello_packet(client_hello)
 
-    assert packet.split(b"|")[2] == str(timestamp).encode("ascii")
+    assert packet.split(b"|")[3] == str(timestamp).encode("ascii")
     assert parse_client_hello_packet(packet).timestamp == timestamp
 
 
@@ -743,7 +780,7 @@ def test_timestamp_rejects_out_of_range_values(timestamp):
     ),
 )
 def test_parser_rejects_noncanonical_timestamp_wire_forms(encoded):
-    packet = _replace_wire_field(CLIENT_PACKET, 2, encoded)
+    packet = _replace_wire_field(CLIENT_PACKET, 3, encoded)
 
     with pytest.raises(ValueError, match="canonical unsigned ASCII decimal"):
         parse_client_hello_packet(packet)
@@ -757,9 +794,9 @@ def test_parser_rejects_noncanonical_timestamp_wire_forms(encoded):
     ),
 )
 def test_parser_rejects_out_of_range_timestamp_wire_forms(encoded):
-    packet = _replace_wire_field(CLIENT_PACKET, 2, encoded)
+    packet = _replace_wire_field(CLIENT_PACKET, 3, encoded)
 
-    with pytest.raises(ValueError, match="unsigned 64-bit"):
+    with pytest.raises(ValueError, match="exceeds the supported range"):
         parse_client_hello_packet(packet)
 
 
@@ -1041,7 +1078,7 @@ def test_parsers_accept_only_bytes_packets(parser, packet):
         ),
         pytest.param(
             parse_client_hello_packet,
-            _replace_wire_field(CLIENT_PACKET, 1, b"boat|001"),
+            _replace_wire_field(CLIENT_PACKET, 2, b"boat|001"),
             id="client-delimiter-in-station",
         ),
         pytest.param(
@@ -1098,7 +1135,7 @@ def test_parsers_reject_wrong_prefixes_and_field_counts(parser, packet):
 
 @pytest.mark.parametrize(
     ("parser", "packet", "field_index"),
-    BINARY_WIRE_FIELDS,
+    BINARY_WIRE_FIELDS + (SESSION_LOCATOR_WIRE_FIELD,),
 )
 @pytest.mark.parametrize("mutation", BASE64_MUTATIONS)
 def test_all_binary_wire_fields_require_strict_standard_base64(
@@ -1124,7 +1161,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         noncanonical,
         validate=True,
     ) == CLIENT_RANDOM
-    packet = _replace_wire_field(CLIENT_PACKET, 3, noncanonical)
+    packet = _replace_wire_field(CLIENT_PACKET, 4, noncanonical)
 
     with pytest.raises(ValueError, match="canonical standard base64"):
         parse_client_hello_packet(packet)
@@ -1136,7 +1173,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         pytest.param(
             parse_client_hello_packet,
             CLIENT_PACKET,
-            3,
+            4,
             b"x" * 31,
             "client_random must be exactly 32 bytes",
             id="client-random-short",
@@ -1144,7 +1181,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         pytest.param(
             parse_client_hello_packet,
             CLIENT_PACKET,
-            3,
+            4,
             b"x" * 33,
             "client_random must be exactly 32 bytes",
             id="client-random-long",
@@ -1152,7 +1189,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         pytest.param(
             parse_server_hello_packet,
             SERVER_PACKET,
-            1,
+            3,
             b"x" * 31,
             "server_random must be exactly 32 bytes",
             id="server-random-short",
@@ -1160,7 +1197,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         pytest.param(
             parse_server_hello_packet,
             SERVER_PACKET,
-            1,
+            3,
             b"x" * 33,
             "server_random must be exactly 32 bytes",
             id="server-random-long",
@@ -1168,7 +1205,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         pytest.param(
             parse_client_hello_packet,
             CLIENT_PACKET,
-            4,
+            5,
             b"\x02" + b"x" * 31,
             "client_ephemeral_public_key must be exactly 33 bytes",
             id="client-key-short",
@@ -1176,7 +1213,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         pytest.param(
             parse_client_hello_packet,
             CLIENT_PACKET,
-            4,
+            5,
             b"\x02" + b"x" * 33,
             "client_ephemeral_public_key must be exactly 33 bytes",
             id="client-key-long",
@@ -1184,7 +1221,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         pytest.param(
             parse_server_hello_packet,
             SERVER_PACKET,
-            2,
+            4,
             b"\x02" + b"x" * 31,
             "server_ephemeral_public_key must be exactly 33 bytes",
             id="server-key-short",
@@ -1192,7 +1229,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         pytest.param(
             parse_server_hello_packet,
             SERVER_PACKET,
-            2,
+            4,
             b"\x02" + b"x" * 33,
             "server_ephemeral_public_key must be exactly 33 bytes",
             id="server-key-long",
@@ -1200,7 +1237,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         pytest.param(
             parse_client_hello_packet,
             CLIENT_PACKET,
-            4,
+            5,
             b"\x04" + b"x" * 32,
             "client_ephemeral_public_key must start with 0x02 or 0x03",
             id="client-key-prefix",
@@ -1208,7 +1245,7 @@ def test_parser_rejects_noncanonical_base64_with_nonzero_pad_bits():
         pytest.param(
             parse_server_hello_packet,
             SERVER_PACKET,
-            2,
+            4,
             b"\x04" + b"x" * 32,
             "server_ephemeral_public_key must start with 0x02 or 0x03",
             id="server-key-prefix",
@@ -1238,13 +1275,13 @@ def test_parsers_enforce_decoded_binary_field_shapes(
         pytest.param(
             parse_client_hello_packet,
             CLIENT_PACKET,
-            5,
+            6,
             id="client",
         ),
         pytest.param(
             parse_server_hello_packet,
             SERVER_PACKET,
-            3,
+            5,
             id="server",
         ),
     ),
@@ -1258,7 +1295,7 @@ def test_parsers_reject_empty_signature_fields(parser, packet, field_index):
 
 @pytest.mark.parametrize(
     ("parser", "packet", "field_index"),
-    BINARY_WIRE_FIELDS,
+    BINARY_WIRE_FIELDS + (SESSION_LOCATOR_WIRE_FIELD,),
 )
 def test_builders_emit_canonical_base64_for_every_binary_field(
     parser,
@@ -1273,3 +1310,324 @@ def test_builders_emit_canonical_base64_for_every_binary_field(
         assert build_client_hello_packet(parsed) == packet
     else:
         assert build_server_hello_packet(parsed) == packet
+
+
+# ---------------------------------------------------------------------------
+# UDPSEC protocol revision 2: explicit protocol_version field.
+# ---------------------------------------------------------------------------
+
+
+def test_client_hello_and_server_hello_default_to_protocol_version_2():
+    assert _client_hello().protocol_version == UDPSEC_PROTOCOL_VERSION
+    assert _server_hello().protocol_version == UDPSEC_PROTOCOL_VERSION
+    assert UDPSEC_PROTOCOL_VERSION == 2
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (_client_hello, _server_hello),
+    ids=("client", "server"),
+)
+@pytest.mark.parametrize("version", (True, False, 1.0, "2", b"2", None))
+def test_protocol_version_rejects_non_integer_types_and_bool(factory, version):
+    with pytest.raises(TypeError, match="protocol_version must be an integer"):
+        factory(protocol_version=version)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (_client_hello, _server_hello),
+    ids=("client", "server"),
+)
+@pytest.mark.parametrize("version", (0, 1, 3, -1, 255))
+def test_protocol_version_rejects_any_value_other_than_current(
+    factory,
+    version,
+):
+    with pytest.raises(
+        ValueError,
+        match=f"unsupported UDPSEC protocol version: {version}",
+    ):
+        factory(protocol_version=version)
+
+
+@pytest.mark.parametrize(
+    ("parser", "packet"),
+    (
+        pytest.param(parse_client_hello_packet, CLIENT_PACKET, id="client"),
+        pytest.param(parse_server_hello_packet, SERVER_PACKET, id="server"),
+    ),
+)
+@pytest.mark.parametrize("encoded", (b"1", b"3", b"0", b"255"))
+def test_parsers_reject_any_wire_version_other_than_current(
+    parser,
+    packet,
+    encoded,
+):
+    malformed_packet = _replace_wire_field(packet, 1, encoded)
+
+    with pytest.raises(ValueError, match="unsupported UDPSEC protocol version"):
+        parser(malformed_packet)
+
+
+@pytest.mark.parametrize(
+    ("parser", "packet"),
+    (
+        pytest.param(parse_client_hello_packet, CLIENT_PACKET, id="client"),
+        pytest.param(parse_server_hello_packet, SERVER_PACKET, id="server"),
+    ),
+)
+@pytest.mark.parametrize(
+    "encoded",
+    (b"", b"+2", b"-2", b"02", b" 2", b"2 ", b"\t2", b"2\n", b"2.0", b"two"),
+)
+def test_parsers_reject_noncanonical_protocol_version_wire_forms(
+    parser,
+    packet,
+    encoded,
+):
+    malformed_packet = _replace_wire_field(packet, 1, encoded)
+
+    with pytest.raises(ValueError, match="canonical unsigned ASCII decimal"):
+        parser(malformed_packet)
+
+
+@pytest.mark.parametrize(
+    ("parser", "packet"),
+    (
+        pytest.param(parse_client_hello_packet, CLIENT_PACKET, id="client"),
+        pytest.param(parse_server_hello_packet, SERVER_PACKET, id="server"),
+    ),
+)
+def test_parsers_reject_out_of_range_protocol_version_wire_forms(
+    parser,
+    packet,
+):
+    malformed_packet = _replace_wire_field(packet, 1, b"256")
+
+    with pytest.raises(ValueError, match="exceeds the supported range"):
+        parser(malformed_packet)
+
+
+def test_old_v1_client_hello_shape_without_version_field_is_rejected():
+    old_v1_packet = (
+        b"NMEA-H|boat_001|18446744073709551615|"
+        + CLIENT_RANDOM_B64
+        + b"|"
+        + CLIENT_EPHEMERAL_PUBLIC_KEY_B64
+        + b"|"
+        + CLIENT_SIGNATURE_B64
+    )
+
+    with pytest.raises(ValueError, match="invalid .* packet format"):
+        parse_client_hello_packet(old_v1_packet)
+
+
+def test_old_v1_server_hello_shape_without_version_or_locator_is_rejected():
+    old_v1_packet = (
+        b"OK|"
+        + SERVER_RANDOM_B64
+        + b"|"
+        + SERVER_EPHEMERAL_PUBLIC_KEY_B64
+        + b"|"
+        + SERVER_SIGNATURE_B64
+    )
+
+    with pytest.raises(ValueError, match="invalid .* packet format"):
+        parse_server_hello_packet(old_v1_packet)
+
+
+# ---------------------------------------------------------------------------
+# UDPSEC protocol revision 2: server-minted session locator.
+# ---------------------------------------------------------------------------
+
+
+def test_server_hello_default_locator_is_exactly_16_bytes():
+    assert len(SESSION_LOCATOR) == SESSION_LOCATOR_BYTES == 16
+    assert _server_hello().session_locator == SESSION_LOCATOR
+
+
+@pytest.mark.parametrize(
+    "value",
+    (None, "locator", bytearray(SESSION_LOCATOR), memoryview(SESSION_LOCATOR)),
+)
+def test_session_locator_rejects_non_bytes_types(value):
+    with pytest.raises(TypeError, match="session_locator must be bytes"):
+        _server_hello(session_locator=value)
+
+
+@pytest.mark.parametrize("length", (0, 15, 17, 32))
+def test_session_locator_requires_exactly_16_bytes(length):
+    with pytest.raises(
+        ValueError,
+        match="session_locator must be exactly 16 bytes",
+    ):
+        _server_hello(session_locator=b"x" * length)
+
+
+@pytest.mark.parametrize("length", (15, 17))
+def test_parser_rejects_wrong_length_locator_wire_forms(length):
+    malformed_packet = _replace_wire_field(
+        SERVER_PACKET,
+        2,
+        base64.b64encode(b"x" * length),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="session_locator must be exactly 16 bytes",
+    ):
+        parse_server_hello_packet(malformed_packet)
+
+
+def test_locator_is_never_reused_as_random_or_transcript_material():
+    server_hello = _server_hello()
+
+    assert server_hello.session_locator != server_hello.server_random
+    assert (
+        server_hello.session_locator
+        != server_hello.server_ephemeral_public_key[:16]
+    )
+
+
+# ---------------------------------------------------------------------------
+# UDPSEC protocol revision 2: DATA framing (NMEA-D2 | locator | nonce | ct).
+# ---------------------------------------------------------------------------
+
+
+DATA_LOCATOR = SESSION_LOCATOR
+DATA_NONCE = bytes(range(80, 92))
+DATA_CIPHERTEXT = b"ciphertext-and-gcm-tag-placeholder"
+
+
+def test_data_prefix_is_version_distinct_from_v1():
+    assert DATA_PREFIX == b"NMEA-D2"
+    assert DATA_PREFIX != b"NMEA-D"
+
+
+def test_data_aad_is_prefix_concatenated_with_locator():
+    aad = build_data_aad(DATA_LOCATOR)
+
+    assert aad == DATA_PREFIX + DATA_LOCATOR
+
+
+def test_build_data_aad_rejects_wrong_length_locator():
+    with pytest.raises(
+        ValueError,
+        match="session_locator must be exactly 16 bytes",
+    ):
+        build_data_aad(b"x" * 15)
+
+
+def test_data_packet_round_trips_exactly():
+    packet = build_data_packet(DATA_LOCATOR, DATA_NONCE, DATA_CIPHERTEXT)
+
+    assert packet == DATA_PREFIX + DATA_LOCATOR + DATA_NONCE + DATA_CIPHERTEXT
+    assert type(packet) is bytes
+
+    locator, nonce, ciphertext = parse_data_packet(packet)
+
+    assert locator == DATA_LOCATOR
+    assert type(locator) is bytes
+    assert nonce == DATA_NONCE
+    assert type(nonce) is bytes
+    assert ciphertext == DATA_CIPHERTEXT
+    assert type(ciphertext) is bytes
+
+
+def test_build_data_packet_rejects_wrong_length_locator():
+    with pytest.raises(
+        ValueError,
+        match="session_locator must be exactly 16 bytes",
+    ):
+        build_data_packet(b"x" * 17, DATA_NONCE, DATA_CIPHERTEXT)
+
+
+def test_build_data_packet_rejects_wrong_length_nonce():
+    with pytest.raises(ValueError, match="nonce must be exactly 12 bytes"):
+        build_data_packet(DATA_LOCATOR, b"x" * 11, DATA_CIPHERTEXT)
+
+
+def test_parse_data_packet_rejects_old_v1_prefix():
+    old_v1_packet = b"NMEA-D" + DATA_LOCATOR + DATA_NONCE + DATA_CIPHERTEXT
+
+    with pytest.raises(ValueError):
+        parse_data_packet(old_v1_packet)
+
+
+@pytest.mark.parametrize(
+    "packet",
+    (
+        b"",
+        DATA_PREFIX,
+        DATA_PREFIX + b"x" * 10,
+        DATA_PREFIX + DATA_LOCATOR,
+        DATA_PREFIX + DATA_LOCATOR + DATA_NONCE,
+        DATA_PREFIX + DATA_LOCATOR + DATA_NONCE + b"x" * 15,
+    ),
+)
+def test_parse_data_packet_rejects_too_short_packets(packet):
+    with pytest.raises(ValueError):
+        parse_data_packet(packet)
+
+
+def test_parse_data_packet_accepts_exact_minimum_length():
+    minimum_packet = (
+        DATA_PREFIX + DATA_LOCATOR + DATA_NONCE + b"x" * 16
+    )
+
+    locator, nonce, ciphertext = parse_data_packet(minimum_packet)
+
+    assert locator == DATA_LOCATOR
+    assert nonce == DATA_NONCE
+    assert ciphertext == b"x" * 16
+
+
+def test_parse_data_packet_preserves_arbitrary_length_ciphertext():
+    long_ciphertext = b"y" * 1000
+    packet = build_data_packet(DATA_LOCATOR, DATA_NONCE, long_ciphertext)
+
+    _, _, ciphertext = parse_data_packet(packet)
+
+    assert ciphertext == long_ciphertext
+
+
+def test_captured_ciphertext_with_modified_locator_fails_aead_under_same_key():
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    key = AESGCM.generate_key(bit_length=256)
+    aesgcm = AESGCM(key)
+    plaintext = b'{"type":"ping"}'
+    nonce = os.urandom(12)
+    original_locator = DATA_LOCATOR
+    tampered_locator = bytes([original_locator[0] ^ 0xFF]) + original_locator[1:]
+
+    ciphertext = aesgcm.encrypt(
+        nonce, plaintext, build_data_aad(original_locator)
+    )
+    captured_packet = build_data_packet(original_locator, nonce, ciphertext)
+
+    tampered_packet = (
+        DATA_PREFIX
+        + tampered_locator
+        + captured_packet[len(DATA_PREFIX) + SESSION_LOCATOR_BYTES:]
+    )
+    tampered_locator_out, tampered_nonce, tampered_ciphertext = parse_data_packet(
+        tampered_packet
+    )
+
+    assert tampered_locator_out == tampered_locator
+
+    with pytest.raises(Exception):
+        aesgcm.decrypt(
+            tampered_nonce,
+            tampered_ciphertext,
+            build_data_aad(tampered_locator_out),
+        )
+
+    # The original locator with the original ciphertext still authenticates.
+    locator_out, nonce_out, ciphertext_out = parse_data_packet(captured_packet)
+    assert (
+        aesgcm.decrypt(nonce_out, ciphertext_out, build_data_aad(locator_out))
+        == plaintext
+    )
