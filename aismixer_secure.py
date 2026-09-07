@@ -1,9 +1,9 @@
-import itertools
 import os
 import asyncio
 import base64
 import binascii
 import json
+import threading
 import time
 import weakref
 import yaml
@@ -17,6 +17,15 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from core.endpoint_display import format_endpoint, format_endpoint_tuple
 from core.ingress_frame import frame_from_text_payload
 from core.network_policy import NetworkPolicy
+from core.session_identity_registry import (
+    SessionIdentityExhaustedError,
+    SessionIdentityRegistry,
+)
+from core.sockaddr_identity import (
+    MalformedSockaddrError,
+    normalize_sockaddr,
+    sockaddrs_match,
+)
 from core.source_identity import build_udpsec_source_id
 from core.udp_listener import create_udp_listener_socket
 from core.udpsec_crypto import (
@@ -289,6 +298,23 @@ def _new_endpoint_token():
     return _EndpointToken()
 
 
+# The one process-wide registry every SecureState owner shares for
+# session_handle/assembly_namespace reservation. See
+# core/session_identity_registry.py for the full design rationale: unlike
+# an unchecked os.urandom() draw, this checks-and-reserves atomically under
+# its own lock, so two independent owners -- including two genuinely
+# concurrent real OS threads, which this project's own test suite exercises
+# for multi-listener isolation -- can never both believe they hold the same
+# value. Every SecureState instance constructed through the normal
+# `import aismixer_secure` path shares this exact object (Python's import
+# system caches by module name); a test harness that deliberately loads
+# this module a second time under a synthetic name gets its own
+# independent registry, exactly like it gets its own independent
+# `AUTHORIZED_KEYS` and `secure_state` -- a fully separate simulated
+# process for everything, not a partial gap in identifier sharing alone.
+_SESSION_IDENTITY_REGISTRY = SessionIdentityRegistry()
+
+
 @dataclass(frozen=True)
 class _EndpointPeerKey:
     """Process-local identity for one listener/remote-peer relation."""
@@ -395,64 +421,49 @@ class CryptoEpoch:
 
 def _structured_paths_match(a, b):
     """Compare two raw socket address tuples by structured identity, not
-    by display formatting. IPv4 endpoints (2-tuples) are compared by
-    ``(ip, port)``. IPv6 endpoints (4-tuples) are compared by
-    ``(ip, port, scope_id)``: ``flowinfo`` (index 2) is deliberately
-    excluded so it never distinguishes an otherwise-identical path, while
-    ``scope_id`` (index 3) is significant because it disambiguates
-    link-local addresses. Global-unicast IPv6 endpoints keep scope_id 0
-    on both sides, so this is behavior-preserving for the non-scoped
-    case."""
+    by display formatting.
 
-    if not (
-        isinstance(a, tuple)
-        and isinstance(b, tuple)
-        and len(a) >= 2
-        and len(b) >= 2
-    ):
-        return a == b
-    if a[0] != b[0] or a[1] != b[1]:
-        return False
-    if len(a) >= 4 and len(b) >= 4:
-        return a[3] == b[3]
-    return True
+    Delegates to the shared `core.sockaddr_identity` model (also used by
+    the client's `remote_addresses_match`) so both sides of the protocol
+    apply identical, strict semantics: IPv4 is ``(family, ip, port)``;
+    IPv6 is ``(family, ip, port, scope_id)`` with ``flowinfo`` excluded
+    and a missing scope defaulting to 0 (never a wildcard). A malformed or
+    ambiguous sockaddr raises `MalformedSockaddrError` rather than being
+    treated as equivalent to a valid address.
+    """
+
+    return sockaddrs_match(a, b)
 
 
 def _canonical_active_relation_key(relation_key):
     """Canonicalize one `_EndpointPeerKey` for `_relation_index` lookups
     so that active-relation identity agrees with `_structured_paths_match`
-    exactly: IPv4 identity is ``(ip, port)``; IPv6 identity is
-    ``(ip, port, scope_id)``, with ``flowinfo`` forced to a canonical 0 so
-    it never distinguishes an otherwise-identical active relation.
+    exactly -- built from the same `normalize_sockaddr` both use, so a
+    2-tuple and a native 4-tuple IPv6 address that identify the same path
+    (per `_structured_paths_match`) always hash to the same relation-index
+    entry, and flowinfo never distinguishes an otherwise-identical
+    relation.
 
     `_relation_index` is a plain dict keyed by `_EndpointPeerKey`, whose
     equality is raw tuple equality over the *entire* Python socket address
-    -- including flowinfo. Without this normalization, two packets from
-    the same IPv6 relation that merely carry different flowinfo values
-    would hash to different relation-index entries even though the wrong-
-    path check (`_structured_paths_match`) treats them as the same path,
-    breaking same-relation replacement detection and assembly-namespace
-    carry-forward for exactly the link-local/flow-labeled traffic this
-    index exists to serve.
+    -- including flowinfo, and treating a bare 2-tuple as distinct from an
+    equivalent 4-tuple. Without this normalization, two packets from the
+    same IPv6 relation that merely carry different flowinfo values (or a
+    scope-less vs. scope-0 shape) would hash to different relation-index
+    entries even though the wrong-path check (`_structured_paths_match`)
+    treats them as the same path, breaking same-relation replacement
+    detection and assembly-namespace carry-forward for exactly the
+    link-local/flow-labeled traffic this index exists to serve.
 
     Pending handshake lookup (`SecureState._pending_sessions`,
     `_pending_locator_owners`) is intentionally exact/tuple-bound per the
     UDPSEC V2 spec and must never be passed through this helper.
     """
 
-    peer_address = relation_key.peer_address
-    if isinstance(peer_address, tuple) and len(peer_address) >= 4:
-        canonical_address = (
-            peer_address[0],
-            peer_address[1],
-            0,
-            peer_address[3],
-        )
-        if canonical_address != peer_address:
-            return _EndpointPeerKey(
-                relation_key.endpoint_token, canonical_address
-            )
-    return relation_key
+    return _EndpointPeerKey(
+        relation_key.endpoint_token,
+        normalize_sockaddr(relation_key.peer_address),
+    )
 
 
 @dataclass
@@ -503,14 +514,21 @@ class LogicalSession:
       (keeping the same `session_locator`), the assembly namespace will
       remain stable simply because the session object itself persists, and
       this field's reuse logic will no longer be needed.
+
+    Both fields are opaque `bytes` values reserved through the shared
+    `core.session_identity_registry.SessionIdentityRegistry` singleton
+    (`_SESSION_IDENTITY_REGISTRY` below; see that module's docstring for
+    why a checked random reservation, not a shared counter, is used):
+    neither is stringified except `assembly_namespace` into the
+    `udpsec-assembly:` assembler key, and neither is ever transmitted.
     """
 
     _session_key: _EndpointSessionKey
     station_id: str
     created_at: float
     last_seen: float
-    session_handle: int
-    assembly_namespace: int
+    session_handle: bytes
+    assembly_namespace: bytes
     current_epoch: CryptoEpoch
     path_state: PathState
 
@@ -588,6 +606,25 @@ class SecureState:
         self._data_nonce_max_per_session = _validate_positive_int(
             "data_nonce_max_per_session", data_nonce_max_per_session)
 
+        # One reentrant lock protects every composite state transaction
+        # below (replay admission, pending/active install/replace/remove,
+        # locator reservation, promotion, nonce admission, capacity
+        # eviction, and statistics snapshots). It is reentrant because
+        # several public entry points call other public entry points as
+        # an internal implementation detail (e.g. `install_session` and
+        # `promote_pending_session` both call `cleanup_expired_sessions`;
+        # `accept_data_nonce` calls `admit_data_nonce`) -- a plain Lock
+        # would deadlock a thread against itself on those paths. Every
+        # `_`-prefixed helper below relies on its caller already holding
+        # this lock rather than acquiring its own: it must never be called
+        # directly from outside a public method's `with self._lock:`
+        # block. The lock is held only for in-memory dict/set/counter
+        # work -- never across `_SESSION_IDENTITY_REGISTRY` calls that
+        # would need to re-enter it, never across ECDHE/AEAD/JSON/network
+        # I/O, and never across an `await` -- so lock order is always
+        # this lock first, the identity registry's own internal lock (if
+        # any) second, never the reverse.
+        self._lock = threading.RLock()
         self._handshake_replays = _BoundedExpiringSet(
             self._handshake_replay_ttl,
             self._handshake_replay_max,
@@ -613,14 +650,17 @@ class SecureState:
         # directly against `self._sessions` (see `_locator_is_free`), since
         # that store is already locator-keyed.
         self._pending_locator_owners = {}
-        # Two deliberately separate counters -- see `LogicalSession`'s
-        # docstring. `session_handle` identifies one LogicalSession object
-        # incarnation and is always fresh. `assembly_namespace` identifies
-        # secure multipart continuity lineage and may be carried forward
-        # across a same-relation, same-station authenticated replacement.
-        # Both are process-local identifiers, never transmitted.
-        self._next_session_handle = itertools.count(1)
-        self._next_assembly_namespace = itertools.count(1)
+        # `session_handle` identifies one LogicalSession object incarnation
+        # and is always fresh. `assembly_namespace` identifies secure
+        # multipart continuity lineage and may be carried forward across a
+        # same-relation, same-station authenticated replacement. Both are
+        # process-local values, never transmitted, reserved through the
+        # shared `_SESSION_IDENTITY_REGISTRY` (see
+        # `core.session_identity_registry` for why this is a checked random
+        # reservation rather than a shared counter, and how its own short
+        # internal lock is what keeps two independent SecureState owners --
+        # including different OS threads -- from ever holding the same
+        # value at once).
 
         self._handshake_replay_accepted = 0
         self._handshake_replay_rejected = 0
@@ -656,78 +696,100 @@ class SecureState:
         self._peak_data_nonces = 0
 
     def stats(self) -> SecureStateStats:
-        return SecureStateStats(
-            handshake_replay_accepted=self._handshake_replay_accepted,
-            handshake_replay_rejected=self._handshake_replay_rejected,
-            handshake_replay_expired=self._handshake_replay_expired,
-            handshake_replay_capacity_evicted=(
-                self._handshake_replay_capacity_evicted
-            ),
-            sessions_created=self._sessions_created,
-            sessions_replaced=self._sessions_replaced,
-            sessions_touched=self._sessions_touched,
-            sessions_expired=self._sessions_expired,
-            sessions_closed=self._sessions_closed,
-            sessions_capacity_evicted=self._sessions_capacity_evicted,
-            pending_sessions_created=self._pending_sessions_created,
-            pending_sessions_replaced=self._pending_sessions_replaced,
-            pending_sessions_promoted=self._pending_sessions_promoted,
-            pending_sessions_expired=self._pending_sessions_expired,
-            pending_sessions_capacity_evicted=(
-                self._pending_sessions_capacity_evicted
-            ),
-            data_nonces_accepted=self._data_nonces_accepted,
-            data_nonce_replays=self._data_nonce_replays,
-            data_nonces_expired=self._data_nonces_expired,
-            data_nonces_capacity_evicted=(
-                self._data_nonces_capacity_evicted
-            ),
-            data_nonce_exhaustions=self._data_nonce_exhaustions,
-            data_nonces_session_discarded=(
-                self._data_nonces_session_discarded
-            ),
-            current_handshake_replays=len(self._handshake_replays),
-            peak_handshake_replays=self._peak_handshake_replays,
-            current_sessions=len(self._sessions),
-            peak_sessions=self._peak_sessions,
-            current_pending_sessions=len(self._pending_sessions),
-            peak_pending_sessions=self._peak_pending_sessions,
-            current_data_nonces=self._current_data_nonces,
-            peak_data_nonces=self._peak_data_nonces,
-        )
+        with self._lock:
+            return SecureStateStats(
+                handshake_replay_accepted=self._handshake_replay_accepted,
+                handshake_replay_rejected=self._handshake_replay_rejected,
+                handshake_replay_expired=self._handshake_replay_expired,
+                handshake_replay_capacity_evicted=(
+                    self._handshake_replay_capacity_evicted
+                ),
+                sessions_created=self._sessions_created,
+                sessions_replaced=self._sessions_replaced,
+                sessions_touched=self._sessions_touched,
+                sessions_expired=self._sessions_expired,
+                sessions_closed=self._sessions_closed,
+                sessions_capacity_evicted=self._sessions_capacity_evicted,
+                pending_sessions_created=self._pending_sessions_created,
+                pending_sessions_replaced=self._pending_sessions_replaced,
+                pending_sessions_promoted=self._pending_sessions_promoted,
+                pending_sessions_expired=self._pending_sessions_expired,
+                pending_sessions_capacity_evicted=(
+                    self._pending_sessions_capacity_evicted
+                ),
+                data_nonces_accepted=self._data_nonces_accepted,
+                data_nonce_replays=self._data_nonce_replays,
+                data_nonces_expired=self._data_nonces_expired,
+                data_nonces_capacity_evicted=(
+                    self._data_nonces_capacity_evicted
+                ),
+                data_nonce_exhaustions=self._data_nonce_exhaustions,
+                data_nonces_session_discarded=(
+                    self._data_nonces_session_discarded
+                ),
+                current_handshake_replays=len(self._handshake_replays),
+                peak_handshake_replays=self._peak_handshake_replays,
+                current_sessions=len(self._sessions),
+                peak_sessions=self._peak_sessions,
+                current_pending_sessions=len(self._pending_sessions),
+                peak_pending_sessions=self._peak_pending_sessions,
+                current_data_nonces=self._current_data_nonces,
+                peak_data_nonces=self._peak_data_nonces,
+            )
 
     def accept_handshake_replay(self, key, now):
-        admission = self._handshake_replays.accept(key, now)
-        self._handshake_replay_expired += admission.expired
-        self._handshake_replay_capacity_evicted += (
-            admission.capacity_evicted
-        )
-        if not admission.accepted:
-            self._handshake_replay_rejected += 1
-            return False
+        with self._lock:
+            admission = self._handshake_replays.accept(key, now)
+            self._handshake_replay_expired += admission.expired
+            self._handshake_replay_capacity_evicted += (
+                admission.capacity_evicted
+            )
+            if not admission.accepted:
+                self._handshake_replay_rejected += 1
+                return False
 
-        self._handshake_replay_accepted += 1
-        self._peak_handshake_replays = max(
-            self._peak_handshake_replays,
-            len(self._handshake_replays),
-        )
-        return True
+            self._handshake_replay_accepted += 1
+            self._peak_handshake_replays = max(
+                self._peak_handshake_replays,
+                len(self._handshake_replays),
+            )
+            return True
 
     def _discard_session_nonces(self, session):
         discarded_nonces = session.current_epoch.seen_data_nonces.discard_all()
         self._current_data_nonces -= discarded_nonces
         self._data_nonces_session_discarded += discarded_nonces
 
-    def _remove_session(self, session_key, reason):
-        session = self._sessions.pop(session_key)
+    def _remove_session(self, session_key, reason, now):
+        # Canonicalize before popping: `_canonical_active_relation_key` can
+        # raise `MalformedSockaddrError` for a genuinely malformed
+        # `active_path` (unreachable for a session whose path was already
+        # validated at install/promotion time, since that value is never
+        # mutated afterward -- but this ordering makes the invariant hold
+        # by construction rather than by relying on that argument alone).
+        # A raise here must leave `_sessions` and every other store
+        # untouched, not a session already popped with nothing else done.
+        session = self._sessions[session_key]
         relation_key = _canonical_active_relation_key(
             _EndpointPeerKey(
                 session_key.endpoint_token, session.path_state.active_path
             )
         )
+        del self._sessions[session_key]
         if self._relation_index.get(relation_key) == session_key:
             del self._relation_index[relation_key]
         self._discard_session_nonces(session)
+        # session_handle has exactly one owner for its whole life and is
+        # released immediately. assembly_namespace may still be claimed by
+        # a replacement installed later in this same transaction (see
+        # `_reused_or_fresh_assembly_namespace`, always called before this
+        # removal for a "replaced" reason) or by a downstream assembler
+        # group that outlives this exact session -- release() accounts for
+        # both by reference count and retirement window rather than
+        # deleting the reservation outright. See
+        # core/session_identity_registry.py.
+        _SESSION_IDENTITY_REGISTRY.release(session.session_handle, now)
+        _SESSION_IDENTITY_REGISTRY.release(session.assembly_namespace, now)
 
         if reason == "expired":
             self._sessions_expired += 1
@@ -765,32 +827,56 @@ class SecureState:
         return pending
 
     def cleanup_expired_sessions(self, now):
-        expired = []
-        while self._sessions:
-            session_key, session = next(iter(self._sessions.items()))
-            if now - session.last_seen < self._session_ttl:
-                break
-            self._remove_session(session_key, "expired")
-            expired.append(session_key)
-        return expired
+        with self._lock:
+            expired = []
+            while self._sessions:
+                session_key, session = next(iter(self._sessions.items()))
+                if now - session.last_seen < self._session_ttl:
+                    break
+                self._remove_session(session_key, "expired", now)
+                expired.append(session_key)
+            # Bounded registry housekeeping piggybacked on this already-
+            # existing monotonic cleanup pass, not a dedicated thread or a
+            # per-packet full-registry scan: purge only retired-and-elapsed
+            # identifier reservations (see
+            # core.session_identity_registry.SessionIdentityRegistry).
+            _SESSION_IDENTITY_REGISTRY.purge_expired(now)
+            return expired
 
     def cleanup_expired_pending_sessions(self, now):
-        expired = []
-        while self._pending_sessions:
-            relation_key, pending = next(
-                iter(self._pending_sessions.items())
-            )
-            if now < pending.created_at + self._pending_session_ttl:
-                break
-            self._remove_pending_session(relation_key, "expired")
-            expired.append(relation_key)
-        return expired
+        with self._lock:
+            expired = []
+            while self._pending_sessions:
+                relation_key, pending = next(
+                    iter(self._pending_sessions.items())
+                )
+                if now < pending.created_at + self._pending_session_ttl:
+                    break
+                self._remove_pending_session(relation_key, "expired")
+                expired.append(relation_key)
+            return expired
 
     def _fresh_session_handle(self):
-        """Always mint a new LogicalSession-incarnation identity. Never
-        reused, including across a same-relation authenticated
-        replacement."""
-        return next(self._next_session_handle)
+        """Always mint a new, process-wide-unique LogicalSession-incarnation
+        identity, atomically reserved in `_SESSION_IDENTITY_REGISTRY`.
+        Never reused, including across a same-relation authenticated
+        replacement, and never repeated by a different SecureState owner
+        in this process. Released exactly once, in `_remove_session`, when
+        this exact LogicalSession incarnation is removed for any reason."""
+        return _SESSION_IDENTITY_REGISTRY.reserve()
+
+    def _active_session_at_canonical_relation(self, canonical_relation_key):
+        """Same as `_active_session_at_relation`, but takes an already-
+        canonical key: callers performing more than one relation-indexed
+        lookup or mutation within a single state transaction
+        (`install_session`, `promote_pending_session`) canonicalize the raw
+        `relation_key` exactly once and pass the result through, rather
+        than each step independently (and, for a malformed peer address,
+        redundantly-fallibly) re-canonicalizing the same input."""
+        session_key = self._relation_index.get(canonical_relation_key)
+        if session_key is None:
+            return None
+        return self._sessions.get(session_key)
 
     def _active_session_at_relation(self, relation_key):
         """Return the LogicalSession currently occupying this exact
@@ -802,39 +888,65 @@ class SecureState:
         is canonicalized so IPv6 flowinfo never distinguishes an
         otherwise-identical relation, matching `_structured_paths_match`.
         """
-        session_key = self._relation_index.get(
+        return self._active_session_at_canonical_relation(
             _canonical_active_relation_key(relation_key)
         )
-        if session_key is None:
-            return None
-        return self._sessions.get(session_key)
 
-    def _remove_active_at_relation_if_present(self, relation_key):
-        session_key = self._relation_index.get(
-            _canonical_active_relation_key(relation_key)
-        )
+    def _remove_active_at_canonical_relation_if_present(
+        self, canonical_relation_key, now
+    ):
+        session_key = self._relation_index.get(canonical_relation_key)
         if session_key is None:
             return False
-        self._remove_session(session_key, "replaced")
+        self._remove_session(session_key, "replaced", now)
         return True
 
-    def _reused_or_fresh_assembly_namespace(self, relation_key, station_id):
+    def _remove_active_at_relation_if_present(self, relation_key, now):
+        return self._remove_active_at_canonical_relation_if_present(
+            _canonical_active_relation_key(relation_key), now
+        )
+
+    def _reused_or_fresh_assembly_namespace(
+        self, canonical_relation_key, station_id
+    ):
         """Preserve secure multipart continuity across a same-relation
         authenticated replacement of the SAME authenticated station only.
 
-        A currently live session at `relation_key` (via the relation index)
-        whose authenticated `station_id` matches contributes its
-        `assembly_namespace` forward, so an in-flight multipart AIS message
-        is not split by a routine rekey. Every other case -- a different
-        authenticated station at the same relation, a genuinely
+        A currently live session at `canonical_relation_key` (via the
+        relation index) whose authenticated `station_id` matches
+        contributes its `assembly_namespace` forward -- `claim()`ing an
+        additional live reference to the SAME reservation (not drawing a
+        new one) in `_SESSION_IDENTITY_REGISTRY`, so an in-flight multipart
+        AIS message is not split by a routine rekey. Every other case -- a
+        different authenticated station at the same relation, a genuinely
         different/new relation, or no live session at all (already-expired,
-        closed, capacity-evicted, or nonce-exhausted state) -- mints a fresh
-        namespace. There is no historical cache of removed
-        relations/stations/namespaces."""
-        replaced = self._active_session_at_relation(relation_key)
+        closed, capacity-evicted, or nonce-exhausted state) -- reserves a
+        fresh, process-wide-unique namespace that no other SecureState
+        owner in this process can ever also mint. There is no historical
+        cache of removed relations/stations/namespaces: a retired
+        namespace's reservation is purged after its retirement window (see
+        `core.session_identity_registry`), not kept forever.
+
+        Takes an already-canonical relation key, not a raw `relation_key`:
+        callers (`install_session`, `promote_pending_session`) canonicalize
+        the raw key exactly once per transaction and pass the result to
+        every relation-indexed step, rather than each step independently
+        re-canonicalizing (and re-risking `MalformedSockaddrError` on) the
+        same input.
+
+        Must be called before the old session (if any) is removed: the
+        claim/reserve here and that removal's own release in
+        `_remove_session` both touch the same registry entry, and this
+        call reading `_active_session_at_canonical_relation` needs the old
+        session to still be live to decide reuse-vs-fresh correctly.
+        """
+        replaced = self._active_session_at_canonical_relation(
+            canonical_relation_key
+        )
         if replaced is not None and replaced.station_id == station_id:
+            _SESSION_IDENTITY_REGISTRY.claim(replaced.assembly_namespace)
             return replaced.assembly_namespace
-        return next(self._next_assembly_namespace)
+        return _SESSION_IDENTITY_REGISTRY.reserve()
 
     def _locator_is_free(self, endpoint_token, candidate):
         if (endpoint_token, candidate) in self._pending_locator_owners:
@@ -878,17 +990,17 @@ class SecureState:
         mutate state: reservation happens when the caller actually installs
         the pending/active session with the returned locator.
         """
-
         if not isinstance(endpoint_token, _EndpointToken):
             raise TypeError("endpoint_token must be an _EndpointToken")
-        for _ in range(SESSION_LOCATOR_GENERATION_ATTEMPTS):
-            candidate = os.urandom(SESSION_LOCATOR_BYTES)
-            if self._locator_is_free(endpoint_token, candidate):
-                return candidate
-        raise SessionLocatorExhaustedError(
-            "unable to generate a unique UDPSEC session locator after "
-            f"{SESSION_LOCATOR_GENERATION_ATTEMPTS} attempts"
-        )
+        with self._lock:
+            for _ in range(SESSION_LOCATOR_GENERATION_ATTEMPTS):
+                candidate = os.urandom(SESSION_LOCATOR_BYTES)
+                if self._locator_is_free(endpoint_token, candidate):
+                    return candidate
+            raise SessionLocatorExhaustedError(
+                "unable to generate a unique UDPSEC session locator after "
+                f"{SESSION_LOCATOR_GENERATION_ATTEMPTS} attempts"
+            )
 
     def install_session(
         self,
@@ -901,66 +1013,76 @@ class SecureState:
     ):
         relation_key = _require_endpoint_peer_key(relation_key)
         session_locator = _require_session_locator(session_locator)
-        self.cleanup_expired_sessions(now)
+        with self._lock:
+            self.cleanup_expired_sessions(now)
 
-        # Preflight, before any destructive mutation: a locator already
-        # identifying ANY live session or pending candidate on this
-        # endpoint_token -- including this exact relation's own current
-        # session -- fails closed here, leaving that relation's session
-        # (and every other live session, the relation index, nonce
-        # ledgers, and lifecycle statistics) untouched. Checking against
-        # unmodified state also enforces that a same-relation replacement
-        # can never reuse the outgoing session's own locator: V2 requires
-        # a fresh server-minted locator for every whole-LogicalSession
-        # replacement, so if it were the same locator this check would
-        # (correctly) still see it occupied by the very session it would
-        # otherwise replace.
-        if not self._locator_is_free(
-            relation_key.endpoint_token, session_locator
-        ):
-            raise SessionLocatorCollisionError(
-                "session_locator already identifies a different live "
-                "session on this endpoint_token"
+            # Preflight, before any destructive mutation: a locator already
+            # identifying ANY live session or pending candidate on this
+            # endpoint_token -- including this exact relation's own current
+            # session -- fails closed here, leaving that relation's session
+            # (and every other live session, the relation index, nonce
+            # ledgers, and lifecycle statistics) untouched. Checking against
+            # unmodified state also enforces that a same-relation replacement
+            # can never reuse the outgoing session's own locator: V2 requires
+            # a fresh server-minted locator for every whole-LogicalSession
+            # replacement, so if it were the same locator this check would
+            # (correctly) still see it occupied by the very session it would
+            # otherwise replace.
+            if not self._locator_is_free(
+                relation_key.endpoint_token, session_locator
+            ):
+                raise SessionLocatorCollisionError(
+                    "session_locator already identifies a different live "
+                    "session on this endpoint_token"
+                )
+
+            # Canonicalize exactly once per transaction (can raise
+            # `MalformedSockaddrError` for a malformed peer address; still
+            # before any destructive mutation, so a raise here leaves
+            # everything above untouched too) and reuse the result for
+            # every relation-indexed step below, instead of each
+            # independently re-canonicalizing the same unchanged input.
+            canonical_relation_key = _canonical_active_relation_key(
+                relation_key
             )
+            assembly_namespace = self._reused_or_fresh_assembly_namespace(
+                canonical_relation_key, station_id
+            )
+            replaced = self._remove_active_at_canonical_relation_if_present(
+                canonical_relation_key, now
+            )
+            if not replaced and len(self._sessions) >= self._max_sessions:
+                oldest_session_key = next(iter(self._sessions))
+                self._remove_session(oldest_session_key, "capacity", now)
 
-        assembly_namespace = self._reused_or_fresh_assembly_namespace(
-            relation_key, station_id
-        )
-        replaced = self._remove_active_at_relation_if_present(relation_key)
-        if not replaced and len(self._sessions) >= self._max_sessions:
-            oldest_session_key = next(iter(self._sessions))
-            self._remove_session(oldest_session_key, "capacity")
-
-        session_key = _EndpointSessionKey(
-            relation_key.endpoint_token, session_locator
-        )
-        session = LogicalSession(
-            _session_key=session_key,
-            station_id=station_id,
-            created_at=now,
-            last_seen=now,
-            session_handle=self._fresh_session_handle(),
-            assembly_namespace=assembly_namespace,
-            current_epoch=CryptoEpoch(
-                client_to_server_aesgcm=client_to_server_aesgcm,
-                server_to_client_aesgcm=server_to_client_aesgcm,
-                seen_data_nonces=_BoundedNonceSet(
-                    self._data_nonce_max_per_session,
-                ),
+            session_key = _EndpointSessionKey(
+                relation_key.endpoint_token, session_locator
+            )
+            session = LogicalSession(
+                _session_key=session_key,
+                station_id=station_id,
                 created_at=now,
-            ),
-            path_state=PathState(active_path=relation_key.peer_address),
-        )
-        self._sessions[session_key] = session
-        self._relation_index[
-            _canonical_active_relation_key(relation_key)
-        ] = session_key
-        self._sessions_created += 1
-        self._peak_sessions = max(
-            self._peak_sessions,
-            len(self._sessions),
-        )
-        return session
+                last_seen=now,
+                session_handle=self._fresh_session_handle(),
+                assembly_namespace=assembly_namespace,
+                current_epoch=CryptoEpoch(
+                    client_to_server_aesgcm=client_to_server_aesgcm,
+                    server_to_client_aesgcm=server_to_client_aesgcm,
+                    seen_data_nonces=_BoundedNonceSet(
+                        self._data_nonce_max_per_session,
+                    ),
+                    created_at=now,
+                ),
+                path_state=PathState(active_path=relation_key.peer_address),
+            )
+            self._sessions[session_key] = session
+            self._relation_index[canonical_relation_key] = session_key
+            self._sessions_created += 1
+            self._peak_sessions = max(
+                self._peak_sessions,
+                len(self._sessions),
+            )
+            return session
 
     def install_pending_session(
         self,
@@ -973,71 +1095,74 @@ class SecureState:
     ):
         relation_key = _require_endpoint_peer_key(relation_key)
         session_locator = _require_session_locator(session_locator)
-        self.cleanup_expired_pending_sessions(now)
+        with self._lock:
+            self.cleanup_expired_pending_sessions(now)
 
-        # Preflight, before any destructive mutation (own-relation
-        # replacement or capacity eviction): a locator already
-        # identifying ANY live pending candidate or active session on
-        # this endpoint_token -- including this exact relation's own
-        # current pending candidate -- fails closed here, leaving that
-        # relation's pending entry (and every other live pending entry,
-        # its position in the capacity/eviction order, owner-index
-        # entries, nonce ledgers, and lifecycle statistics) untouched.
-        # Checking against unmodified state also enforces that a
-        # same-relation pending replacement can never reuse the outgoing
-        # candidate's own locator: each ServerHello mints its own fresh
-        # locator, so if it were the same locator this check would
-        # (correctly) still see it reserved by the very candidate it
-        # would otherwise replace.
-        if not self._locator_is_free(
-            relation_key.endpoint_token, session_locator
-        ):
-            raise SessionLocatorCollisionError(
-                "session_locator already identifies a different live "
-                "session on this endpoint_token"
-            )
+            # Preflight, before any destructive mutation (own-relation
+            # replacement or capacity eviction): a locator already
+            # identifying ANY live pending candidate or active session on
+            # this endpoint_token -- including this exact relation's own
+            # current pending candidate -- fails closed here, leaving that
+            # relation's pending entry (and every other live pending entry,
+            # its position in the capacity/eviction order, owner-index
+            # entries, nonce ledgers, and lifecycle statistics) untouched.
+            # Checking against unmodified state also enforces that a
+            # same-relation pending replacement can never reuse the outgoing
+            # candidate's own locator: each ServerHello mints its own fresh
+            # locator, so if it were the same locator this check would
+            # (correctly) still see it reserved by the very candidate it
+            # would otherwise replace.
+            if not self._locator_is_free(
+                relation_key.endpoint_token, session_locator
+            ):
+                raise SessionLocatorCollisionError(
+                    "session_locator already identifies a different live "
+                    "session on this endpoint_token"
+                )
 
-        if relation_key in self._pending_sessions:
-            self._remove_pending_session(relation_key, "replaced")
-        elif len(self._pending_sessions) >= self._max_pending_sessions:
-            oldest_relation_key = next(iter(self._pending_sessions))
-            self._remove_pending_session(oldest_relation_key, "capacity")
+            if relation_key in self._pending_sessions:
+                self._remove_pending_session(relation_key, "replaced")
+            elif len(self._pending_sessions) >= self._max_pending_sessions:
+                oldest_relation_key = next(iter(self._pending_sessions))
+                self._remove_pending_session(oldest_relation_key, "capacity")
 
-        pending = _PendingSecureSession(
-            _relation_key=relation_key,
-            _address=relation_key.peer_address,
-            station_id=station_id,
-            session_locator=session_locator,
-            created_at=now,
-            current_epoch=CryptoEpoch(
-                client_to_server_aesgcm=client_to_server_aesgcm,
-                server_to_client_aesgcm=server_to_client_aesgcm,
-                seen_data_nonces=_BoundedNonceSet(
-                    self._data_nonce_max_per_session,
-                ),
+            pending = _PendingSecureSession(
+                _relation_key=relation_key,
+                _address=relation_key.peer_address,
+                station_id=station_id,
+                session_locator=session_locator,
                 created_at=now,
-            ),
-        )
-        self._pending_sessions[relation_key] = pending
-        self._pending_locator_owners[
-            (relation_key.endpoint_token, session_locator)
-        ] = relation_key
-        self._pending_sessions_created += 1
-        self._peak_pending_sessions = max(
-            self._peak_pending_sessions,
-            len(self._pending_sessions),
-        )
-        return pending
+                current_epoch=CryptoEpoch(
+                    client_to_server_aesgcm=client_to_server_aesgcm,
+                    server_to_client_aesgcm=server_to_client_aesgcm,
+                    seen_data_nonces=_BoundedNonceSet(
+                        self._data_nonce_max_per_session,
+                    ),
+                    created_at=now,
+                ),
+            )
+            self._pending_sessions[relation_key] = pending
+            self._pending_locator_owners[
+                (relation_key.endpoint_token, session_locator)
+            ] = relation_key
+            self._pending_sessions_created += 1
+            self._peak_pending_sessions = max(
+                self._peak_pending_sessions,
+                len(self._pending_sessions),
+            )
+            return pending
 
     def get_active_session(self, session_key, now):
         session_key = _require_endpoint_session_key(session_key)
-        self.cleanup_expired_sessions(now)
-        return self._sessions.get(session_key)
+        with self._lock:
+            self.cleanup_expired_sessions(now)
+            return self._sessions.get(session_key)
 
     def get_pending_session(self, relation_key, now):
         relation_key = _require_endpoint_peer_key(relation_key)
-        self.cleanup_expired_pending_sessions(now)
-        return self._pending_sessions.get(relation_key)
+        with self._lock:
+            self.cleanup_expired_pending_sessions(now)
+            return self._pending_sessions.get(relation_key)
 
     def _get_live_session_handle(self, session, now):
         session_key = session._session_key
@@ -1067,103 +1192,126 @@ class SecureState:
         self._sessions_touched += 1
 
     def touch_session(self, session, now):
-        if self._get_live_session_handle(session, now) is None:
-            return False
-        self._touch_active_session(session, now)
-        return True
+        with self._lock:
+            if self._get_live_session_handle(session, now) is None:
+                return False
+            self._touch_active_session(session, now)
+            return True
 
     def is_live_session_handle(self, session, now):
-        return self._get_live_session_handle(session, now) is not None
+        with self._lock:
+            return self._get_live_session_handle(session, now) is not None
 
     def close_session(self, session, now):
-        if self._get_live_session_handle(session, now) is None:
-            return False
-        self._remove_session(session._session_key, "closed")
-        return True
+        with self._lock:
+            if self._get_live_session_handle(session, now) is None:
+                return False
+            self._remove_session(session._session_key, "closed", now)
+            return True
 
     def promote_pending_session(self, pending, now):
         relation_key = pending._relation_key
-        if self._get_live_pending_session_handle(pending, now) is None:
-            return None
+        with self._lock:
+            if self._get_live_pending_session_handle(pending, now) is None:
+                return None
 
-        self.cleanup_expired_sessions(now)
+            self.cleanup_expired_sessions(now)
 
-        # Preflight, before any destructive mutation: defense in depth
-        # alongside install_session()'s and install_pending_session()'s
-        # own checks. The pending's locator was already reserved (and
-        # checked free) when the pending was installed, so an inconsistent
-        # claim here should be unreachable in practice -- but promotion
-        # writes `_sessions` directly rather than going through
-        # install_session(), so the invariant is verified here too rather
-        # than assumed. This is a pure query: it does not temporarily
-        # release the pending's own reservation just to ask the question,
-        # so a failure leaves the pending session, its locator
-        # reservation, any current active session at this relation, and
-        # every lifecycle statistic below untouched.
-        if not self._pending_exclusively_owns_locator(
-            relation_key, pending.session_locator
-        ):
-            raise SessionLocatorCollisionError(
-                "pending session_locator is not exclusively owned by "
-                "this pending candidate"
+            # Preflight, before any destructive mutation: defense in depth
+            # alongside install_session()'s and install_pending_session()'s
+            # own checks. The pending's locator was already reserved (and
+            # checked free) when the pending was installed, so an inconsistent
+            # claim here should be unreachable in practice -- but promotion
+            # writes `_sessions` directly rather than going through
+            # install_session(), so the invariant is verified here too rather
+            # than assumed. This is a pure query: it does not temporarily
+            # release the pending's own reservation just to ask the question,
+            # so a failure leaves the pending session, its locator
+            # reservation, any current active session at this relation, and
+            # every lifecycle statistic below untouched.
+            if not self._pending_exclusively_owns_locator(
+                relation_key, pending.session_locator
+            ):
+                raise SessionLocatorCollisionError(
+                    "pending session_locator is not exclusively owned by "
+                    "this pending candidate"
+                )
+
+            # Also before any destructive mutation: canonicalizing
+            # `relation_key` (see `_canonical_active_relation_key`) can
+            # raise `MalformedSockaddrError` for a malformed peer address.
+            # Pending identity is exact-tuple-bound and is never itself
+            # canonicalized at install time, so this is the first point
+            # that shape is validated -- doing it here, before popping the
+            # pending entry or releasing its locator reservation, ensures a
+            # validation failure leaves the pending session, its
+            # reservation, and every statistic below untouched, exactly
+            # like the locator-ownership check above. The result is reused
+            # for every relation-indexed step below (computed exactly once
+            # per transaction), rather than each step independently
+            # re-canonicalizing the same unchanged input.
+            canonical_relation_key = _canonical_active_relation_key(
+                relation_key
+            )
+            assembly_namespace = self._reused_or_fresh_assembly_namespace(
+                canonical_relation_key, pending.station_id
             )
 
-        self._pending_sessions.pop(relation_key)
-        locator_key = (relation_key.endpoint_token, pending.session_locator)
-        if self._pending_locator_owners.get(locator_key) == relation_key:
-            del self._pending_locator_owners[locator_key]
-        self._pending_sessions_promoted += 1
-        assembly_namespace = self._reused_or_fresh_assembly_namespace(
-            relation_key, pending.station_id
-        )
+            self._pending_sessions.pop(relation_key)
+            locator_key = (relation_key.endpoint_token, pending.session_locator)
+            if self._pending_locator_owners.get(locator_key) == relation_key:
+                del self._pending_locator_owners[locator_key]
+            self._pending_sessions_promoted += 1
 
-        replaced = self._remove_active_at_relation_if_present(relation_key)
-        if not replaced and len(self._sessions) >= self._max_sessions:
-            oldest_session_key = next(iter(self._sessions))
-            self._remove_session(oldest_session_key, "capacity")
+            replaced = self._remove_active_at_canonical_relation_if_present(
+                canonical_relation_key, now
+            )
+            if not replaced and len(self._sessions) >= self._max_sessions:
+                oldest_session_key = next(iter(self._sessions))
+                self._remove_session(oldest_session_key, "capacity", now)
 
-        session_key = _EndpointSessionKey(
-            relation_key.endpoint_token, pending.session_locator
-        )
-        session = LogicalSession(
-            _session_key=session_key,
-            station_id=pending.station_id,
-            created_at=now,
-            last_seen=now,
-            session_handle=self._fresh_session_handle(),
-            assembly_namespace=assembly_namespace,
-            # The confirmed epoch (both AES-GCM owners and the nonce set that
-            # already admitted the confirmation nonce) transfers unchanged
-            # from the pending candidate -- promotion does not derive new
-            # keys or reset replay state. The pending's already-reserved
-            # session_locator transfers unchanged too: promotion mints no
-            # second locator.
-            current_epoch=pending.current_epoch,
-            path_state=PathState(active_path=relation_key.peer_address),
-        )
-        self._sessions[session_key] = session
-        self._relation_index[
-            _canonical_active_relation_key(relation_key)
-        ] = session_key
-        self._sessions_created += 1
-        self._peak_sessions = max(
-            self._peak_sessions,
-            len(self._sessions),
-        )
-        return session
+            session_key = _EndpointSessionKey(
+                relation_key.endpoint_token, pending.session_locator
+            )
+            session = LogicalSession(
+                _session_key=session_key,
+                station_id=pending.station_id,
+                created_at=now,
+                last_seen=now,
+                session_handle=self._fresh_session_handle(),
+                assembly_namespace=assembly_namespace,
+                # The confirmed epoch (both AES-GCM owners and the nonce set that
+                # already admitted the confirmation nonce) transfers unchanged
+                # from the pending candidate -- promotion does not derive new
+                # keys or reset replay state. The pending's already-reserved
+                # session_locator transfers unchanged too: promotion mints no
+                # second locator.
+                current_epoch=pending.current_epoch,
+                path_state=PathState(active_path=relation_key.peer_address),
+            )
+            self._sessions[session_key] = session
+            self._relation_index[canonical_relation_key] = session_key
+            self._sessions_created += 1
+            self._peak_sessions = max(
+                self._peak_sessions,
+                len(self._sessions),
+            )
+            return session
 
     def data_nonce_seen(self, session, nonce, now):
-        if self._get_live_session_handle(session, now) is None:
-            return False
-        seen = session.current_epoch.seen_data_nonces.contains(nonce)
-        if seen:
-            self._data_nonce_replays += 1
-        return seen
+        with self._lock:
+            if self._get_live_session_handle(session, now) is None:
+                return False
+            seen = session.current_epoch.seen_data_nonces.contains(nonce)
+            if seen:
+                self._data_nonce_replays += 1
+            return seen
 
     def pending_data_nonce_seen(self, pending, nonce, now):
-        if self._get_live_pending_session_handle(pending, now) is None:
-            return False
-        return pending.current_epoch.seen_data_nonces.contains(nonce)
+        with self._lock:
+            if self._get_live_pending_session_handle(pending, now) is None:
+                return False
+            return pending.current_epoch.seen_data_nonces.contains(nonce)
 
     def _account_accepted_data_nonce(self):
         self._data_nonces_accepted += 1
@@ -1173,11 +1321,11 @@ class SecureState:
             self._current_data_nonces,
         )
 
-    def _remove_exact_session(self, session, reason):
+    def _remove_exact_session(self, session, reason, now):
         session_key = session._session_key
         if self._sessions.get(session_key) is not session:
             return False
-        self._remove_session(session_key, reason)
+        self._remove_session(session_key, reason, now)
         return True
 
     def _remove_exact_pending_session(self, pending, reason):
@@ -1188,46 +1336,52 @@ class SecureState:
         return True
 
     def admit_data_nonce(self, session, nonce, now):
-        if self._get_live_session_handle(session, now) is None:
-            return _DataNonceAdmission.STALE
-        admission = session.current_epoch.seen_data_nonces.admit(nonce)
-        if admission is _DataNonceAdmission.REPLAY:
-            self._data_nonce_replays += 1
-        elif admission is _DataNonceAdmission.EXHAUSTED:
-            if not self._remove_exact_session(session, "nonce_exhausted"):
+        with self._lock:
+            if self._get_live_session_handle(session, now) is None:
                 return _DataNonceAdmission.STALE
-        else:
-            self._account_accepted_data_nonce()
-        return admission
+            admission = session.current_epoch.seen_data_nonces.admit(nonce)
+            if admission is _DataNonceAdmission.REPLAY:
+                self._data_nonce_replays += 1
+            elif admission is _DataNonceAdmission.EXHAUSTED:
+                if not self._remove_exact_session(
+                    session, "nonce_exhausted", now
+                ):
+                    return _DataNonceAdmission.STALE
+            else:
+                self._account_accepted_data_nonce()
+            return admission
 
     def accept_data_nonce(self, session, nonce, now):
-        return (
-            self.admit_data_nonce(session, nonce, now)
-            is _DataNonceAdmission.ACCEPTED
-        )
+        with self._lock:
+            return (
+                self.admit_data_nonce(session, nonce, now)
+                is _DataNonceAdmission.ACCEPTED
+            )
 
     def admit_pending_data_nonce(self, pending, nonce, now):
-        if self._get_live_pending_session_handle(
-            pending, now
-        ) is None:
-            return _DataNonceAdmission.STALE
-        admission = pending.current_epoch.seen_data_nonces.admit(nonce)
-        if admission is _DataNonceAdmission.REPLAY:
-            self._data_nonce_replays += 1
-        elif admission is _DataNonceAdmission.EXHAUSTED:
-            if not self._remove_exact_pending_session(
-                pending, "nonce_exhausted"
-            ):
+        with self._lock:
+            if self._get_live_pending_session_handle(
+                pending, now
+            ) is None:
                 return _DataNonceAdmission.STALE
-        else:
-            self._account_accepted_data_nonce()
-        return admission
+            admission = pending.current_epoch.seen_data_nonces.admit(nonce)
+            if admission is _DataNonceAdmission.REPLAY:
+                self._data_nonce_replays += 1
+            elif admission is _DataNonceAdmission.EXHAUSTED:
+                if not self._remove_exact_pending_session(
+                    pending, "nonce_exhausted"
+                ):
+                    return _DataNonceAdmission.STALE
+            else:
+                self._account_accepted_data_nonce()
+            return admission
 
     def accept_pending_data_nonce(self, pending, nonce, now):
-        return (
-            self.admit_pending_data_nonce(pending, nonce, now)
-            is _DataNonceAdmission.ACCEPTED
-        )
+        with self._lock:
+            return (
+                self.admit_pending_data_nonce(pending, nonce, now)
+                is _DataNonceAdmission.ACCEPTED
+            )
 
 
 secure_state = SecureState()
@@ -1839,7 +1993,9 @@ async def _secure_server_loop(
                 # rekey (or, later, a real path migration), while a
                 # different authenticated station or a genuinely different
                 # LogicalSession must never share a namespace.
-                assembler_key = f"udpsec-assembly:{session.assembly_namespace}"
+                assembler_key = (
+                    f"udpsec-assembly:{session.assembly_namespace.hex()}"
+                )
                 frame = frame_from_text_payload(
                     kind="sec",
                     source_id=build_udpsec_source_id(station_id),

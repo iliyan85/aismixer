@@ -96,6 +96,11 @@ The installer places the runtime under `/opt/aismixer`, installs
 `/etc/aismixer`, preserves existing configuration and keys, and enables the
 service at boot. It intentionally does **not** start the service.
 
+The shipped `aismixer.service` sets no `User=`/`Group=`, so it runs with the
+privileges of whichever account starts it -- root by default. Operators
+wanting privilege isolation should create a dedicated service account
+themselves and add matching `User=`/`Group=` directives to the unit.
+
 #### ⚙️ Configure before the first start
 
 Review the installed configuration and trust/network policy first:
@@ -678,6 +683,11 @@ cd aismixer
 `/usr/local/bin/aismixerctl`, създава начални версии само на липсващите
 файлове в `/etc/aismixer`, запазва съществуващата конфигурация и ключове и
 включва услугата за стартиране при зареждане. Той умишлено **не стартира** услугата.
+
+Доставеният `aismixer.service` не задава `User=`/`Group=`, затова работи с
+правата на акаунта, който го стартира — по подразбиране root. Операторите,
+които искат изолация на правата, трябва сами да създадат отделен служебен
+акаунт и да добавят съответните директиви `User=`/`Group=` в юнита.
 
 #### ⚙️ Конфигуриране преди първото стартиране
 
@@ -1277,6 +1287,11 @@ Instalatorul plasează runtime-ul în `/opt/aismixer`, instalează
 `/usr/local/bin/aismixerctl`, creează numai fișierele lipsă din
 `/etc/aismixer`, păstrează configurația și cheile existente și activează
 serviciul pentru pornirea la boot. În mod intenționat, **nu** pornește serviciul.
+
+Unitatea `aismixer.service` livrată nu setează `User=`/`Group=`, deci rulează
+cu privilegiile contului care o pornește -- root, implicit. Operatorii care
+doresc izolarea privilegiilor trebuie să creeze ei înșiși un cont de serviciu
+dedicat și să adauge directivele `User=`/`Group=` corespunzătoare în unitate.
 
 #### ⚙️ Configurare înainte de prima pornire
 

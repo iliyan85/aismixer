@@ -35,6 +35,7 @@ run_as_root install -m 0644 "$SCRIPT_DIR/meta_cleaner.py" "$INSTALL_DIR/meta_cle
 run_as_root install -m 0644 "$REPO_ROOT/core/endpoint_display.py" "$CORE_DIR/endpoint_display.py"
 run_as_root install -m 0644 "$REPO_ROOT/core/key_material.py" "$CORE_DIR/key_material.py"
 run_as_root install -m 0644 "$REPO_ROOT/core/network_policy.py" "$CORE_DIR/network_policy.py"
+run_as_root install -m 0644 "$REPO_ROOT/core/sockaddr_identity.py" "$CORE_DIR/sockaddr_identity.py"
 run_as_root install -m 0644 "$REPO_ROOT/core/udpsec_crypto.py" "$CORE_DIR/udpsec_crypto.py"
 run_as_root install -m 0644 "$REPO_ROOT/core/udpsec_protocol.py" "$CORE_DIR/udpsec_protocol.py"
 run_as_root install -m 0755 "$REPO_ROOT/tools/aismixer_keys.py" "$TOOLS_DIR/aismixer_keys.py"

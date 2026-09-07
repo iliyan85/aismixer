@@ -363,29 +363,93 @@ below, and -- unlike an active session -- pending identity is still the
 exact endpoint-token/peer-address tuple from the handshake; see below.
 
 A `LogicalSession` carries two deliberately separate process-local
-identifiers that must not be conflated. `session_handle` identifies one
-concrete `LogicalSession` *object* incarnation: it is always freshly minted
-on construction, including when a same-relation authenticated replacement
-occurs, is never reused merely because the relation key matches, and is
-unaffected by touch/activity. `assembly_namespace` identifies secure
-multipart continuity lineage: it is normally also freshly minted, but a
-same-relation authenticated replacement carries it forward from the session
-it replaces *only* when that replacement's authenticated `station_id`
-exactly matches the station_id of the live session currently at that
-relation. Relation equality alone is never sufficient for this carry-
-forward -- a replacement authenticating as a different station always gets
-a fresh `assembly_namespace`, with no exception. Neither identifier survives
-a relation that is not currently live: expiry, close, capacity eviction,
+identifiers that must not be conflated. Both are opaque 16-byte values,
+reserved through one shared, process-wide, in-memory
+`core.session_identity_registry.SessionIdentityRegistry` instance
+(`aismixer_secure._SESSION_IDENTITY_REGISTRY`), not merely drawn independently
+from `os.urandom` and hoped not to collide: `reserve()` draws a fixed-width
+random candidate and, under the registry's own short internal lock, checks
+it against every currently live-or-recently-retired reservation before
+committing it, retrying a bounded number of times and failing closed
+(`SessionIdentityExhaustedError`) rather than ever returning an unchecked or
+weaker value. This is the same standard of guarantee `session_locator`
+generation already used, applied to a value two independent owners can also
+mint from. Every owner sharing one real Python import of `aismixer_secure`
+-- the shared production default and any additional `SecureState()`
+constructed by a multi-listener configuration or a test, including two
+owners running on two genuinely different OS threads -- shares this exact
+registry object (`sys.modules` import caching), so two owners can never
+simultaneously hold the same `session_handle` or `assembly_namespace`. A
+test harness that deliberately reloads `aismixer_secure.py` under a
+synthetic module name to simulate a second process gets its own completely
+independent registry, exactly like it gets its own independent
+`AUTHORIZED_KEYS` and `secure_state` -- this is a fully separate simulated
+process for every piece of module state, not a partial gap in identifier
+sharing alone. This matters because the assembler namespace derived from
+`assembly_namespace` (see below) can be shared across owners by whatever
+feeds their frames to a common downstream assembler; per-owner-only
+uniqueness would let two unrelated authenticated stations on different
+owners collide onto the same assembly group. `session_handle` identifies
+one concrete `LogicalSession` *object* incarnation: it is always freshly
+reserved on construction, including when a same-relation authenticated
+replacement occurs, is never reused merely because the relation key
+matches, and is unaffected by touch/activity; it is released back to the
+registry (entering a bounded retirement window, described below) the
+instant its exact `LogicalSession` incarnation is removed, for any reason.
+`assembly_namespace` identifies secure multipart continuity lineage: it is
+normally also freshly reserved, but a same-relation authenticated
+replacement carries it forward -- `claim()`ing an additional live reference
+on the SAME reservation rather than drawing a new one -- from the session it
+replaces *only* when that replacement's authenticated `station_id` exactly
+matches the station_id of the live session currently at that relation.
+Relation equality alone is never sufficient for this carry-forward -- a
+replacement authenticating as a different station always gets a fresh
+`assembly_namespace`, with no exception. Neither identifier survives a
+relation that is not currently live: expiry, close, capacity eviction,
 nonce exhaustion, or process restart all mean the next establishment at that
-relation gets both a fresh `session_handle` and a fresh `assembly_namespace`;
-there is no historical cache of removed relations, stations, or namespaces.
-This carry-forward is a transitional mechanism for the current stage, where
-a rekey still replaces the whole `LogicalSession` object; it is not the
-final rekey architecture. Once a later stage lets an authenticated refresh
-replace only `current_epoch` on an unchanged `LogicalSession`, both
-identifiers will naturally remain stable across rekey simply because the
-session object itself persists, and this reuse logic will no longer be
-needed.
+relation gets both a fresh `session_handle` and a fresh `assembly_namespace`.
+The registry itself is not an unlimited historical database: a released
+reservation is retired (occupied, but no longer counted live, so it cannot
+be re-drawn) for `RETIREMENT_SECONDS` (30 seconds -- a deliberate, documented
+30x margin over the only production `AIVDMAssembler` instantiation's default
+1-second group timeout, chosen because a downstream assembler group keyed by
+`assembly_namespace` can briefly outlive the `SecureState` session that
+minted it) and then purged, piggybacked on `SecureState`'s own existing
+monotonic cleanup pass rather than a dedicated thread or a per-packet scan.
+None of this is a claim of durable or cross-process uniqueness, or that a
+finite random space can never repeat in principle -- only that every draw is
+checked and retried under a real lock, and that this process's bookkeeping
+of what is currently live or recently retired is accurate. This carry-
+forward is a transitional mechanism for the current stage, where a rekey
+still replaces the whole `LogicalSession` object; it is not the final rekey
+architecture. Once a later stage lets an authenticated refresh replace only
+`current_epoch` on an unchanged `LogicalSession`, both identifiers will
+naturally remain stable across rekey simply because the session object
+itself persists, and this reuse logic will no longer be needed.
+
+`SecureState` itself is safe under the real shared-owner, multi-thread
+model its own test suite exercises: one reentrant lock
+(`threading.RLock()`, reentrant because several public methods call other
+public methods as an internal implementation detail -- `install_session`
+and `promote_pending_session` both call `cleanup_expired_sessions`;
+`accept_data_nonce` calls `admit_data_nonce`) protects every composite
+state transaction -- handshake replay admission, pending and active
+install/replace/remove, locator reservation, promotion, nonce admission,
+capacity eviction, and statistics snapshots -- as a single linearizable
+commit point. Internal `_`-prefixed helper methods do not acquire their own
+lock; they rely on their caller already holding it, and must never be
+called directly from outside a public method's locked section. The lock is
+held only for in-memory dict/set/counter work: it is never held across the
+identity registry's own calls needing to re-enter it (lock order is always
+`SecureState`'s lock first, the registry's own internal lock second, never
+the reverse), and never across ECDHE/AEAD/JSON, network I/O, or an `await`.
+This closes the specific defect an earlier corrective pass introduced: a
+naive single-owner-thread lock model that broke the real multi-listener
+tests below has been replaced by a lock scoped to each public method's own
+transaction rather than to the whole receive loop, which those same real
+concurrent-thread tests (and dedicated capacity/locator/nonce race tests
+using real threads and, for the aggregate and pending capacity cases, real
+loopback listeners) now verify directly.
 
 Each physical secure-listener socket incarnation owns one opaque endpoint
 token. The token has process-local object-identity semantics, remains stable
@@ -403,8 +467,29 @@ A DATA packet whose locator matches a live active session but whose source
 address does not structurally match that session's `active_path` is dropped
 before decryption is attempted, exactly as an unknown locator is; a locator
 is a lookup hint, never a bypass for path admission. Structural path
-equality compares `(ip, port)` for IPv4 and `(ip, port, scope_id)` for IPv6;
-IPv6 flow label (`flowinfo`) is not significant to path identity.
+equality -- one shared model (`core.sockaddr_identity`) used identically by
+the server's active-path/relation-index comparison and the client's pinned-
+remote-address check -- normalizes a raw address tuple to `(family, ip,
+port)` for IPv4 and `(family, ip, port, scope_id)` for IPv6, where `ip` is
+the canonical string form (so equivalent spellings, e.g. differing case or
+IPv6 zero-compression, compare equal); IPv6 flow label (`flowinfo`) is not
+significant to path identity. A bare IPv6 2-tuple (no scope information
+available) is compared as scope_id `0` explicitly -- never as a wildcard
+that matches any scope_id -- so it agrees with, and only with, a native
+4-tuple whose own scope_id is `0`. The canonical result is a distinct
+immutable type, not a plain tuple: a native IPv6 4-tuple and this
+canonical IPv6 form are both 4 elements long, so a plain-tuple result
+could otherwise be fed back in and silently misparsed as a different raw
+address; the distinct type makes normalization explicitly one-way, and
+handing a canonical value back in fails closed rather than being
+reinterpreted. A malformed or ambiguous address -- an unsupported tuple
+shape, a non-string IP, an IP string that does not parse, an out-of-range
+or non-integer port, a non-integer or negative flowinfo/scope_id, or an
+IPv6 zone-qualified address string (native OS sockaddrs convey scope only
+as the separate 4th tuple element, never embedded in the address string)
+-- fails closed rather than being treated as equivalent to a well-formed
+address. IPv4-mapped IPv6 literals remain IPv6 identity; they are never
+collapsed to IPv4.
 
 A bounded secondary relation index, keyed by endpoint token and the
 structurally-canonicalized active path, maps a relation to its current
@@ -754,10 +839,21 @@ record has exactly one removal reason. Reading statistics invokes neither
 clock, performs no cleanup, exposes no mutable state, and does not change an
 earlier snapshot.
 
-This section governs only process-local secure state and the encrypted graceful
-close described above. It does not otherwise redefine secure packet formats,
-cryptographic algorithms, the signed handshake transcript, session-key
-derivation, or `nmea_sproxy` protocol compatibility.
+This section's UDPSEC revision-2 changes are real, not merely local
+bookkeeping: DATA framing (`DATA_PREFIX`, the session locator, and the
+locator-aware AAD described above), the authenticated transcript inputs
+(protocol version and locator bound into the server auth digest and session
+transcript hash), and `nmea_sproxy` wire compatibility (no V1 fallback, no
+downgrade, no negotiation) are all part of this revision and are documented
+above and in the surrounding protocol/crypto modules, not left unspecified.
+What this section does NOT change is the underlying cryptographic
+algorithms (P-256 ECDSA/ECDHE, HKDF-SHA256, AES-256-GCM) or the lifecycle
+policies intentionally preserved from the prior revision (TTL, capacity,
+LRU, replay, and nonce-exhaustion semantics as documented above). Path
+migration and a true in-session `CryptoEpoch` refresh that preserves an
+unchanged `LogicalSession`/`session_locator` are explicitly not yet
+implemented; every rekey in this revision still replaces the whole
+`LogicalSession` and mints a fresh locator, exactly as documented above.
 
 ## 12. Routing snapshot boundary
 
@@ -1194,12 +1290,43 @@ read-only protocol methods:
 | Protocol method | Parameters and result |
 |---|---|
 | `runtime.statistics` | `params` must be absent. One aggregate pull returns `ingress_queues`, `processing_queue`, `processor`, `egress_queue`, and `egress_operations`. |
-| `runtime.statistics.inputs` | `params` may be absent, empty, or exactly `{ "input": <non-empty string> }`. One detailed input-traffic pull returns `inputs` in runtime declaration order, optionally filtered by exact input name; no match returns an empty list. |
+| `runtime.statistics.inputs` | `params` may be absent, empty, or exactly `{ "input": <non-empty string> }`. One detailed input-traffic pull returns `inputs` in runtime declaration order, optionally filtered by exact input `name`; no match returns an empty list. |
 | `runtime.statistics.outputs` | `params` may be absent, empty, or contain exactly one of non-negative integer `target_id` or non-empty string `name`. One detailed output-traffic pull returns `outputs` in numeric target order, optionally filtered by that exact value; no match returns an empty list. |
 
 These methods only read the injected statistics provider and cannot replace,
 disable, or otherwise mutate routing or data-plane state. Conversely, routing
 status and mutation methods do not pull statistics.
+
+Each `runtime.statistics.inputs` row carries two deliberately separate
+string fields: `name` is the stable, machine-facing selector identity --
+the exact value `{ "input": ... }` matches against -- and `display` is
+the separate, purely operator-facing rendering. `name` is
+address-independent by construction, not merely differently formatted
+from `display`: for an ingress input lacking a configured `id`, `name` is
+exactly `role-ingress:index` (the declaration position within its role's
+list, which AISMixer's own startup already requires to be unique), never
+a rendered endpoint of any form -- this project's earlier bracketed-IPv6
+selector convention (`[ip]:port`) has been removed outright, not relocated
+to another field, since it was project-owned and never required by
+UDPSEC, socket identity, or the OS. A configured `id` remains part of
+`name` (`role-ingress:index:id`), since an operator-chosen label is
+already address-independent. `display` is the configured `id` verbatim
+when one exists, otherwise this project's tcpdump-style endpoint
+convention (`ip.port` for IPv6, `ip:port` for IPv4). `display` is never
+matched against a filter and must never be parsed back into an identity.
+`aismixerctl`'s interactive table renders both -- `display` under an
+`INPUT` column, `name` under a `SELECTOR` column -- so an operator can see
+the value to pass back as a filter.
+
+`ROUTING_CONTROL_PROTOCOL_VERSION` is `2`. It was deliberately bumped from
+`1` because the `runtime.statistics.inputs` result schema and the unnamed-
+input selector convention both changed in a way this local control
+protocol does not treat as backward-compatible; a version-`1` request now
+fails closed with `ERROR_UNSUPPORTED_VERSION`, with no negotiation or
+downgrade. This version number is entirely local to AISMixer's optional
+control plane and is unrelated to `UDPSEC_PROTOCOL_VERSION` (currently
+`2` for a different reason -- UDPSEC's own wire revision); the two must
+never be conflated.
 
 `aismixerctl` presents these protocol methods as `show statistics`,
 `show statistics inputs [INPUT]`, and `show statistics outputs [OUTPUT]`.

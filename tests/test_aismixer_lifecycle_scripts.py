@@ -230,7 +230,12 @@ def test_control_deployment_docs_have_no_stale_runtime_or_cli_claims():
         "does not yet provision this directory",
         "installer/systemd integration is updated",
         "not assume that\n`aismixerctl` is installed globally",
-        "must already exist",
+        # Anchored to the runtime-directory topic, not a bare "must already
+        # exist": that generic fragment also matches unrelated, current,
+        # accurate text (README's routing-update section: "Target IDs must
+        # already exist in the running process"), which is not a claim
+        # about /run/aismixer provisioning at all.
+        "/run/aismixer must already exist",
         "Control socket directory provisioning is currently operator-managed",
         "Provisioning-ът на control socket директорията все още е задача",
     ]

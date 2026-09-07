@@ -1898,6 +1898,190 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         assert server_b.active_session_for(client_address) is session_b
 
 
+def test_real_concurrent_handshakes_respect_aggregate_session_capacity(
+    real_udpsec_endpoints,
+):
+    """Section 3 concurrency proof, positive evidence via real loopback
+    listeners: many real client sockets, on distinct OS threads, complete a
+    full real signed handshake against ONE real secure server (one real
+    asyncio receive loop) concurrently, all racing to install an active
+    session on a shared `SecureState` capped at `max_sessions=2`.
+
+    A TOCTOU race in `install_session`'s capacity check-then-evict-then-
+    insert sequence (unprotected by SecureState's own lock) could let two
+    threads' installs both observe room under the cap at once and both
+    insert, leaving more than 2 live sessions and a `peak_sessions` above
+    the configured cap. Exact accounting -- `sessions_created` counting
+    every attempt, `sessions_capacity_evicted` counting every eviction, and
+    `current_sessions`/`peak_sessions` never exceeding the cap -- is only
+    possible if each install's capacity check and insert are one atomic
+    transaction under the real lock."""
+    endpoints = real_udpsec_endpoints
+    state = endpoints.secure.SecureState(max_sessions=2)
+    client_count = 6
+
+    with _running_secure_server(
+        endpoints.secure,
+        endpoints.server_private_key,
+        socket.AF_INET,
+        "127.0.0.1",
+        state=state,
+    ) as server:
+        clients = [
+            _client_socket(socket.AF_INET, "127.0.0.1")
+            for _ in range(client_count)
+        ]
+        try:
+            barrier = threading.Barrier(client_count)
+            results = [None] * client_count
+            errors = [None] * client_count
+
+            def worker(index):
+                try:
+                    barrier.wait(timeout=NETWORK_TIMEOUT)
+                    results[index] = _perform_real_handshake(
+                        endpoints, clients[index], server.remote_addr
+                    )
+                except BaseException as exc:  # noqa: BLE001 - captured for assertion
+                    errors[index] = exc
+
+            threads = [
+                threading.Thread(target=worker, args=(index,))
+                for index in range(client_count)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(NETWORK_TIMEOUT * 3)
+
+            assert all(
+                thread_error is None for thread_error in errors
+            ), errors
+            assert all(result is not None for result in results)
+
+            stats = server.call_in_loop(state.stats)
+            assert stats.sessions_created == client_count
+            assert stats.sessions_capacity_evicted == client_count - 2
+            assert stats.current_sessions == 2
+            assert stats.peak_sessions == 2
+            assert len(state._sessions) == 2
+
+            # Cleanup and stats snapshotting remain safe and consistent
+            # immediately afterward -- no deadlock, no corrupted state left
+            # by the concurrent installs above.
+            cleaned = server.call_in_loop(
+                lambda: state.cleanup_expired_sessions(time.monotonic() + 3600)
+            )
+            assert len(cleaned) == 2
+            final_stats = server.call_in_loop(state.stats)
+            assert final_stats.current_sessions == 0
+            assert final_stats.sessions_expired == 2
+        finally:
+            for client in clients:
+                client.close()
+
+
+def test_real_concurrent_pending_handshakes_respect_pending_capacity(
+    real_udpsec_endpoints,
+):
+    """Pending-capacity equivalent of the aggregate-active-capacity race
+    above: many real client sockets send only their initial ClientHello
+    (never completing the confirmation round-trip) concurrently against one
+    real server whose shared `SecureState` caps `max_pending_sessions=2`.
+    `install_pending_session`'s own capacity check-then-evict-then-insert
+    sequence is exercised the same way, proving the same atomicity holds
+    for the pending store independently of the active-session store."""
+    endpoints = real_udpsec_endpoints
+    state = endpoints.secure.SecureState(max_pending_sessions=2)
+    client_count = 6
+
+    with _running_secure_server(
+        endpoints.secure,
+        endpoints.server_private_key,
+        socket.AF_INET,
+        "127.0.0.1",
+        state=state,
+    ) as server:
+        clients = [
+            _client_socket(socket.AF_INET, "127.0.0.1")
+            for _ in range(client_count)
+        ]
+        try:
+            barrier = threading.Barrier(client_count)
+            errors = [None] * client_count
+
+            def send_hello_only(index, client):
+                station_id = STATION_ID
+                timestamp = int(time.time())
+                client_random = os.urandom(32)
+                client_ephemeral_private_key = ec.generate_private_key(
+                    ec.SECP256R1()
+                )
+                client_ephemeral_public_key = (
+                    client_ephemeral_private_key.public_key().public_bytes(
+                        encoding=serialization.Encoding.X962,
+                        format=serialization.PublicFormat.CompressedPoint,
+                    )
+                )
+                digest = endpoints.proxy.build_client_auth_digest(
+                    protocol_version=UDPSEC_PROTOCOL_VERSION,
+                    station_id=station_id,
+                    timestamp=timestamp,
+                    client_random=client_random,
+                    client_ephemeral_public_key=client_ephemeral_public_key,
+                )
+                signature = endpoints.proxy.sign_transcript_digest(
+                    endpoints.station_private_key, digest
+                )
+                hello = ClientHello(
+                    protocol_version=UDPSEC_PROTOCOL_VERSION,
+                    station_id=station_id,
+                    timestamp=timestamp,
+                    client_random=client_random,
+                    client_ephemeral_public_key=client_ephemeral_public_key,
+                    client_signature=signature,
+                )
+                try:
+                    barrier.wait(timeout=NETWORK_TIMEOUT)
+                    client.sendto(
+                        build_client_hello_packet(hello), server.remote_addr
+                    )
+                    client.recvfrom(8192)
+                except BaseException as exc:  # noqa: BLE001
+                    errors[index] = exc
+
+            threads = [
+                threading.Thread(
+                    target=send_hello_only, args=(index, clients[index])
+                )
+                for index in range(client_count)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(NETWORK_TIMEOUT * 3)
+
+            assert all(
+                thread_error is None for thread_error in errors
+            ), errors
+
+            def snapshot():
+                return state.stats(), len(state._pending_sessions)
+
+            stats, pending_count = server.call_in_loop(snapshot)
+            assert stats.pending_sessions_created == client_count
+            assert (
+                stats.pending_sessions_capacity_evicted
+                == client_count - 2
+            )
+            assert stats.current_pending_sessions == 2
+            assert stats.peak_pending_sessions == 2
+            assert pending_count == 2
+        finally:
+            for client in clients:
+                client.close()
+
+
 def test_ipv6_remote_comparison_uses_ip_port_and_scope_from_four_tuple(
     real_udpsec_endpoints,
 ):
@@ -2825,18 +3009,23 @@ def test_session_state_retains_only_directional_cipher_contexts(
             forbidden_field_fragments
             & set(vars(retained))
         )
-        # session_locator is the one intentionally public, non-credential
-        # bytes value retained directly: it is server-minted, transcript-
-        # bound, and never proof of authentication -- everything else
-        # bytes-typed here would be raw key/secret material.
-        non_locator_values = {
+        # session_locator, session_handle, and assembly_namespace are the
+        # intentionally public, non-credential bytes values retained
+        # directly: session_locator is server-minted and transcript-bound,
+        # while session_handle/assembly_namespace are opaque identifiers
+        # reserved through the shared `_SESSION_IDENTITY_REGISTRY` (see
+        # `core.session_identity_registry`) -- none of the three is ever
+        # proof of authentication or usable as key material. Everything
+        # else bytes-typed here would be raw key/secret material.
+        non_identifier_fields = {"session_locator", "session_handle", "assembly_namespace"}
+        non_identifier_values = {
             name: value
             for name, value in vars(retained).items()
-            if name != "session_locator"
+            if name not in non_identifier_fields
         }
         assert not any(
             isinstance(value, bytes)
-            for value in non_locator_values.values()
+            for value in non_identifier_values.values()
         )
 
     key_material = SessionKeyMaterial(b"\x69" * 32, b"\x6a" * 32)

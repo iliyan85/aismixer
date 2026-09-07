@@ -16,6 +16,7 @@ DEPLOYED_PYTHON_FILES = {
     "core/endpoint_display.py": ROOT / "core" / "endpoint_display.py",
     "core/key_material.py": ROOT / "core" / "key_material.py",
     "core/network_policy.py": ROOT / "core" / "network_policy.py",
+    "core/sockaddr_identity.py": ROOT / "core" / "sockaddr_identity.py",
     "core/udpsec_crypto.py": ROOT / "core" / "udpsec_crypto.py",
     "core/udpsec_protocol.py": ROOT / "core" / "udpsec_protocol.py",
 }

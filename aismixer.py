@@ -79,15 +79,51 @@ def ts() -> str:
     return str(time.time())
 
 
-def _ingress_task_name(role, index, entry, ip, port):
+def _ingress_task_name(role, index, entry):
+    """Stable, machine-facing selector/task-name identity for one ingress
+    input.
+
+    This is the exact runtime-statistics/routing-control selector name for
+    that input's traffic metrics (see `InputTrafficMetrics`/
+    `_runtime_statistics_inputs_result`) as well as its asyncio task and
+    ingress-queue name. It is deliberately address-independent: an ingress
+    input lacking a configured ``id`` gets ``role-ingress:index`` alone
+    (role plus its declaration position, which the enumeration in `main()`
+    already guarantees is unique), never a rendered endpoint. This
+    project's own earlier bracketed-IPv6 convention (``[ip]:port``) has
+    been removed entirely -- it was project-owned, not required by UDPSEC,
+    socket identity, or the OS, and coupling the selector to address
+    spelling meant any future change to human-facing endpoint rendering
+    (`core.endpoint_display.format_endpoint`) could silently change the
+    selector too.
+
+    A configured ``id`` remains part of the selector (``role-ingress:
+    index:id``) since it is already an operator-chosen, address-
+    independent label, not an endpoint rendering.
+    """
     configured_id = entry.get("id")
-    label = (
-        configured_id
-        if isinstance(configured_id, str) and configured_id
-        else format_endpoint(ip, port)
-    )
-    safe_label = label.encode("unicode_escape").decode("ascii")[:80]
-    return f"{role}-ingress:{index}:{safe_label}"
+    if isinstance(configured_id, str) and configured_id:
+        safe_label = configured_id.encode("unicode_escape").decode("ascii")[:80]
+        return f"{role}-ingress:{index}:{safe_label}"
+    return f"{role}-ingress:{index}"
+
+
+def _ingress_display_label(entry, ip, port):
+    """Operator-facing display label for one ingress input: the configured
+    ``id`` when present (an operator's own chosen label needs no further
+    rendering), otherwise this project's tcpdump-style endpoint convention
+    (`core.endpoint_display.format_endpoint`).
+
+    Deliberately separate from `_ingress_task_name`'s address-independent
+    selector above: the selector must stay stable regardless of address
+    spelling, interface choice, or how endpoints are rendered for humans,
+    while this label exists specifically to render the endpoint for an
+    operator to read.
+    """
+    configured_id = entry.get("id")
+    if isinstance(configured_id, str) and configured_id:
+        return configured_id
+    return format_endpoint(ip, port)
 
 
 def load_config():
@@ -944,15 +980,17 @@ async def main(
                 "udpsec",
                 index,
                 entry,
-                ip,
-                port,
             )
             q = _ObservedQueue(
                 name=task_name,
                 maxsize=ingress_queue_maxsize,
             )
             input_queues.append(q)
-            traffic = InputTrafficMetrics(task_name, "udpsec")
+            traffic = InputTrafficMetrics(
+                task_name,
+                "udpsec",
+                display=_ingress_display_label(entry, ip, port),
+            )
             input_traffic.append(traffic)
             sec_id = entry.get("id")
             print(f"{ts()} Secure listening on {format_endpoint(ip, port)}")
@@ -983,15 +1021,17 @@ async def main(
                 "udp",
                 index,
                 entry,
-                ip,
-                port,
             )
             q = _ObservedQueue(
                 name=task_name,
                 maxsize=ingress_queue_maxsize,
             )
             input_queues.append(q)
-            traffic = InputTrafficMetrics(task_name, "udp")
+            traffic = InputTrafficMetrics(
+                task_name,
+                "udp",
+                display=_ingress_display_label(entry, ip, port),
+            )
             input_traffic.append(traffic)
             sock = create_udp_listener_socket(ip, reuse_address=True)
             udp_sockets.append(sock)

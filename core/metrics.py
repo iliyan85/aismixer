@@ -183,7 +183,20 @@ class EgressMetricsSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class InputTrafficMetricsSnapshot:
-    """Lifetime transport and admitted-payload counters for one input."""
+    """Lifetime transport and admitted-payload counters for one input.
+
+    `name` is the stable, machine-facing selector identity: it is what a
+    runtime-statistics/routing-control caller matches an exact filter
+    against, and it is address-independent (see
+    `aismixer._ingress_task_name`) -- an unnamed input's selector is its
+    role and declaration index alone, never a rendered endpoint, so it
+    cannot change merely because address spelling or the preferred human
+    display convention changes. `display` is the separate, purely
+    operator-facing rendering (the configured id, or this project's
+    tcpdump-style endpoint convention for an unnamed input); it is never
+    matched against a filter and must never be parsed back into an
+    identity.
+    """
 
     name: str
     kind: str
@@ -191,6 +204,7 @@ class InputTrafficMetricsSnapshot:
     transport_bytes: int
     accepted_frames: int
     payload_bytes: int
+    display: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str):
@@ -201,6 +215,10 @@ class InputTrafficMetricsSnapshot:
             raise TypeError("kind must be 'udp' or 'udpsec'.")
         if self.kind not in {"udp", "udpsec"}:
             raise ValueError("kind must be 'udp' or 'udpsec'.")
+        if not isinstance(self.display, str):
+            raise TypeError("display must be a non-empty string.")
+        if not self.display:
+            raise ValueError("display must be a non-empty string.")
 
         for field_name in (
             "transport_packets",

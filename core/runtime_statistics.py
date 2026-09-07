@@ -71,7 +71,14 @@ class RuntimeStatisticsSource(Protocol):
 
 
 class InputTrafficMetrics:
-    """Own process-local lifetime traffic counters for one runtime input."""
+    """Own process-local lifetime traffic counters for one runtime input.
+
+    `name` is the stable, machine-facing selector identity (never changed
+    for display-convention reasons -- see `InputTrafficMetricsSnapshot`).
+    `display` is the separate, purely operator-facing rendering; when not
+    given it defaults to `name` so existing call sites that only care
+    about the selector are unaffected.
+    """
 
     __slots__ = (
         "_name",
@@ -80,9 +87,10 @@ class InputTrafficMetrics:
         "_transport_bytes",
         "_accepted_frames",
         "_payload_bytes",
+        "_display",
     )
 
-    def __init__(self, name: str, kind: str) -> None:
+    def __init__(self, name: str, kind: str, display: str | None = None) -> None:
         initial = InputTrafficMetricsSnapshot(
             name=name,
             kind=kind,
@@ -90,6 +98,7 @@ class InputTrafficMetrics:
             transport_bytes=0,
             accepted_frames=0,
             payload_bytes=0,
+            display=name if display is None else display,
         )
         self._name = initial.name
         self._kind = initial.kind
@@ -97,6 +106,7 @@ class InputTrafficMetrics:
         self._transport_bytes = 0
         self._accepted_frames = 0
         self._payload_bytes = 0
+        self._display = initial.display
 
     def transport_received(self, data: bytes) -> None:
         """Account one raw datagram after its socket receive completes."""
@@ -120,6 +130,7 @@ class InputTrafficMetrics:
             transport_bytes=self._transport_bytes,
             accepted_frames=self._accepted_frames,
             payload_bytes=self._payload_bytes,
+            display=self._display,
         )
 
 

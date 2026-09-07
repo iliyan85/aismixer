@@ -43,6 +43,7 @@ _SHARED_CORE_MODULES = (
     "endpoint_display.py",
     "key_material.py",
     "network_policy.py",
+    "sockaddr_identity.py",
     "udpsec_crypto.py",
     "udpsec_protocol.py",
 )
@@ -72,6 +73,7 @@ from core.network_policy import (  # noqa: E402
     NetworkPolicyConfigError,
     compile_ingress_policy,
 )
+from core.sockaddr_identity import sockaddrs_match  # noqa: E402
 from core.udpsec_crypto import (  # noqa: E402
     SessionKeyMaterial,
     build_client_auth_digest,
@@ -660,26 +662,17 @@ def encrypt_secure_json_message(message, key, session_locator):
 
 def remote_addresses_match(addr, remote_addr):
     """Compare two socket address tuples by structured identity rather
-    than by display formatting. IPv4 endpoints (2-tuples) are compared by
-    (ip, port). IPv6 endpoints (4-tuples) are compared by
-    (ip, port, scope_id): flowinfo (index 2) is deliberately excluded so
-    it never distinguishes an otherwise-identical path, while scope_id
-    (index 3) is significant because it is required to disambiguate
-    link-local addresses. Global-unicast IPv6 endpoints keep scope_id 0
-    on both sides, so this is behavior-preserving for the non-scoped
-    case."""
-    if not (
-        isinstance(addr, tuple)
-        and isinstance(remote_addr, tuple)
-        and len(addr) >= 2
-        and len(remote_addr) >= 2
-    ):
-        return False
-    if addr[0] != remote_addr[0] or addr[1] != remote_addr[1]:
-        return False
-    if len(addr) >= 4 and len(remote_addr) >= 4:
-        return addr[3] == remote_addr[3]
-    return True
+    than by display formatting.
+
+    Delegates to the shared `core.sockaddr_identity` model (also used by
+    the server's `_structured_paths_match`) so both sides of the protocol
+    apply identical, strict semantics: IPv4 is ``(family, ip, port)``;
+    IPv6 is ``(family, ip, port, scope_id)`` with ``flowinfo`` excluded
+    and a missing scope defaulting to 0 (never a wildcard). A malformed or
+    ambiguous sockaddr raises `MalformedSockaddrError` rather than being
+    treated as equivalent to a valid address.
+    """
+    return sockaddrs_match(addr, remote_addr)
 
 
 def address_family_name(family):

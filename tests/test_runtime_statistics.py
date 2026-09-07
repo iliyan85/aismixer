@@ -132,6 +132,7 @@ def input_traffic_snapshot(name, kind="udp", **overrides):
         "transport_bytes": 0,
         "accepted_frames": 0,
         "payload_bytes": 0,
+        "display": name,
     }
     values.update(overrides)
     return InputTrafficMetricsSnapshot(**values)

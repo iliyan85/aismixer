@@ -4,6 +4,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -134,13 +135,91 @@ def write_public_key(path, private_key=None):
 
 
 _POSIX_SHELL = None
+_POSIX_SHELL_SKIP_REASON = None
+
+# `wsl.exe` invocations observably fail transiently under WSL service-level
+# contention (concurrent invocations, or the lightweight VM briefly busy)
+# in two specific, previously-confirmed ways: a spawn-time OSError with
+# WinError 6 ("the handle is invalid") inside CPython's own
+# handle-inheritance setup -- the subprocess is never actually created, so
+# nothing behavioral has been exercised yet -- and the lightweight VM
+# occasionally taking long enough to resume from an idle/suspended state
+# that an otherwise-generous timeout is exceeded (`TimeoutExpired`). A
+# bounded, short retry absorbs exactly those two conditions. It must never
+# retry (and so never mask) a completed process's actual non-zero return
+# code, nor any OTHER OSError subclass -- `FileNotFoundError`,
+# `PermissionError`, and similar all represent a genuine configuration
+# problem (missing executable, insufficient permission, ...), not
+# transient contention, and must fail immediately on the first attempt.
+_SUBPROCESS_SPAWN_RETRY_ATTEMPTS = 3
+_SUBPROCESS_SPAWN_RETRY_DELAY_SECONDS = 0.3
+_TRANSIENT_HANDLE_WINERROR = 6
+
+
+def _is_transient_spawn_error(exc):
+    """True only for the one specific, previously-observed transient spawn
+    failure this retry exists for (see module comment above). Deliberately
+    NOT true for `FileNotFoundError`, `PermissionError`, or any other
+    OSError subclass Python maps a specific errno to -- those carry their
+    own distinct `winerror` values on Windows and represent a genuine,
+    non-transient configuration problem that must be reported immediately,
+    not retried as if it might resolve itself."""
+    if isinstance(exc, (FileNotFoundError, PermissionError, NotADirectoryError)):
+        return False
+    return (
+        isinstance(exc, OSError)
+        and getattr(exc, "winerror", None) == _TRANSIENT_HANDLE_WINERROR
+    )
+
+
+def _run_with_spawn_retry(*args, **kwargs):
+    """Retry only `TimeoutExpired` and the one specific transient OSError
+    described above, both up to `_SUBPROCESS_SPAWN_RETRY_ATTEMPTS` times.
+    Every other exception propagates immediately on its first occurrence,
+    and a process that actually completed -- zero or non-zero exit -- is
+    returned as-is and never retried, so this can never mask a real
+    behavioral result as a transient failure."""
+    last_error = None
+    for attempt in range(_SUBPROCESS_SPAWN_RETRY_ATTEMPTS):
+        try:
+            return subprocess.run(*args, **kwargs)
+        except subprocess.TimeoutExpired as exc:
+            last_error = exc
+        except OSError as exc:
+            if not _is_transient_spawn_error(exc):
+                raise
+            last_error = exc
+        if attempt + 1 < _SUBPROCESS_SPAWN_RETRY_ATTEMPTS:
+            time.sleep(_SUBPROCESS_SPAWN_RETRY_DELAY_SECONDS)
+    raise last_error
 
 
 def posix_shell_command():
-    global _POSIX_SHELL
+    """Find (and cache, for the rest of this process) a working POSIX
+    `sh` invocation, distinguishing two honestly different outcomes when
+    none is usable:
+
+    - No candidate executable exists on this system at all (`shutil.which`
+      found neither `wsl.exe` nor `sh`): a genuinely missing prerequisite.
+    - A candidate executable WAS found, but every attempt to run it failed
+      (timeout, a non-transient OSError, or a completed non-zero exit): a
+      discovered-but-failing shell, which is an external-environment
+      blocker, not a missing prerequisite -- these must never be reported
+      with the same message, since conflating them would silently turn a
+      real infrastructure problem into what reads like an unremarkable,
+      expected skip.
+
+    Either way, callers still receive a `pytest.skip` (this project has no
+    real Windows-native init-script interpreter to fall back to, and must
+    not fabricate a result for an environment that cannot actually run
+    one) -- but the skip reason always says which case occurred, with
+    enough diagnostic detail (command, failure kind, elapsed time,
+    stderr) to tell a real regression from an absent prerequisite.
+    """
+    global _POSIX_SHELL, _POSIX_SHELL_SKIP_REASON
     if _POSIX_SHELL is not None:
         if not _POSIX_SHELL:
-            pytest.skip("a POSIX sh implementation is required for init-script tests")
+            pytest.skip(_POSIX_SHELL_SKIP_REASON)
         return _POSIX_SHELL
 
     candidates = []
@@ -152,29 +231,67 @@ def posix_shell_command():
     if shell:
         candidates.append((shell,))
 
+    if not candidates:
+        _POSIX_SHELL = ()
+        _POSIX_SHELL_SKIP_REASON = (
+            "no POSIX sh implementation found on this system (checked "
+            "wsl.exe and sh on PATH): missing prerequisite, not a failure "
+            "of a discovered shell"
+        )
+        pytest.skip(_POSIX_SHELL_SKIP_REASON)
+
+    failures = []
     for candidate in candidates:
+        started = time.monotonic()
         try:
-            probe = subprocess.run(
+            probe = _run_with_spawn_retry(
                 [*candidate, "-c", "exit 0"],
                 check=False,
                 capture_output=True,
                 timeout=10,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.monotonic() - started
+            failures.append(
+                f"{candidate!r} timed out after {elapsed:.1f}s across "
+                f"{_SUBPROCESS_SPAWN_RETRY_ATTEMPTS} attempt(s): {exc!r}"
+            )
+            continue
+        except OSError as exc:
+            failures.append(f"{candidate!r} raised {exc!r}")
             continue
         if probe.returncode == 0:
             _POSIX_SHELL = candidate
             return candidate
+        failures.append(
+            f"{candidate!r} exited {probe.returncode}: "
+            f"stderr={probe.stderr!r}"
+        )
 
     _POSIX_SHELL = ()
-    pytest.skip("a POSIX sh implementation is required for init-script tests")
+    _POSIX_SHELL_SKIP_REASON = (
+        "external-environment blocker: every discovered POSIX shell "
+        "candidate failed (this is distinct from no shell being present "
+        "at all): " + "; ".join(failures)
+    )
+    pytest.skip(_POSIX_SHELL_SKIP_REASON)
 
 
 def shell_path(path, command):
     path = Path(path).resolve()
     if os.name == "nt" and Path(command[0]).name.lower() == "wsl.exe":
-        translated = subprocess.run(
-            [command[0], "wslpath", "-a", str(path)],
+        # `wsl.exe` reconstructs its Linux-side command line by rejoining
+        # its own argv and re-parsing it, which silently drops single
+        # backslashes wherever they are not a recognized escape sequence
+        # (a Windows path like ``C:\Users\...`` arrives at `wslpath` as
+        # ``C:UsersiliyaProjectsaismixer``, argument shape intact but every
+        # backslash gone -- not a quoting failure Python's own argv
+        # marshaling can see or fix). `Path.as_posix()` sidesteps the
+        # whole ambiguity: Windows accepts forward slashes as an equally
+        # valid path separator, so passing the forward-slash form to
+        # `wslpath -a` never exercises that backslash-eating step at all.
+        translated = _run_with_spawn_retry(
+            [command[0], "wslpath", "-a", path.as_posix()],
             check=True,
             capture_output=True,
             text=True,
@@ -283,31 +400,41 @@ record status "$service_status"
 cat "$events_file"
 exit 0
 """
-    result = subprocess.run(
+    # Bytes in, bytes out -- not `text=True`. Piping a `str` (Python
+    # text-mode stdin) through `wsl.exe sh -s` corrupts the script before
+    # the Linux-side `sh` ever sees it (observed: "set -u" arrives as
+    # "set" with an illegal "-" option, and an extra phantom empty
+    # command on line 1), even though the exact same string content sent
+    # as raw bytes is received correctly. Native `/bin/sh` (the
+    # non-`wsl.exe` candidate) has no such issue, but bytes mode is
+    # unconditionally correct there too, so there is no need to branch on
+    # which candidate is in use.
+    result = _run_with_spawn_retry(
         [*command, "-s"],
-        input=script,
+        input=script.encode("utf-8"),
         cwd=ROOT,
         check=False,
         capture_output=True,
-        text=True,
         timeout=30,
     )
-    assert result.returncode == 0, result.stderr
+    stdout = result.stdout.decode("utf-8")
+    stderr = result.stderr.decode("utf-8")
+    assert result.returncode == 0, stderr
 
     parsed = tuple(
         tuple(line.split("\t"))
-        for line in result.stdout.splitlines()
+        for line in stdout.splitlines()
         if line.strip()
     )
     status_events = [event for event in parsed if event[0] == "status"]
-    assert status_events and len(status_events) == 1, result.stdout
+    assert status_events and len(status_events) == 1, stdout
     events = tuple(event for event in parsed if event[0] != "status")
     return InitHarnessResult(
         service_status=int(status_events[0][1]),
         fixture_root=fixture_root,
         events=events,
-        stdout=result.stdout,
-        stderr=result.stderr,
+        stdout=stdout,
+        stderr=stderr,
     )
 
 
@@ -397,6 +524,244 @@ def preflight_spy_calls(path):
     if not path.exists():
         return []
     return path.read_text(encoding="utf-8").splitlines()
+
+
+# --- Deterministic classification tests for the WSL/spawn-retry harness.
+# These do not touch the real environment at all: `subprocess.run` is
+# replaced with a scripted fake, so the classification logic itself
+# (timeout vs. missing-executable vs. transient-OSError vs. a completed
+# non-zero exit) is proven without depending on WSL actually being present
+# or actually misbehaving on the machine running the suite.
+
+
+_module = sys.modules[__name__]
+
+
+def test_run_with_spawn_retry_retries_transient_winerror6_then_succeeds(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(1)
+        if len(calls) < 3:
+            error = OSError("the handle is invalid")
+            error.winerror = 6
+            raise error
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    result = _run_with_spawn_retry(["irrelevant"])
+
+    assert result.returncode == 0
+    assert len(calls) == 3
+
+
+def test_run_with_spawn_retry_retries_timeout_then_succeeds(monkeypatch):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(1)
+        if len(calls) < 2:
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=10)
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    result = _run_with_spawn_retry(["irrelevant"], timeout=10)
+
+    assert result.returncode == 0
+    assert len(calls) == 2
+
+
+def test_run_with_spawn_retry_exhausts_and_reraises_persistent_timeout(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(1)
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=10)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_with_spawn_retry(["irrelevant"], timeout=10)
+
+    assert len(calls) == _SUBPROCESS_SPAWN_RETRY_ATTEMPTS
+
+
+def test_run_with_spawn_retry_does_not_retry_file_not_found_error(
+    monkeypatch,
+):
+    """A missing executable is a genuine configuration problem, not
+    transient contention -- it must fail on the very first attempt, never
+    be retried as if it might resolve itself."""
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(1)
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(FileNotFoundError):
+        _run_with_spawn_retry(["irrelevant"])
+
+    assert len(calls) == 1
+
+
+def test_run_with_spawn_retry_does_not_retry_permission_error(monkeypatch):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(1)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(PermissionError):
+        _run_with_spawn_retry(["irrelevant"])
+
+    assert len(calls) == 1
+
+
+def test_run_with_spawn_retry_does_not_retry_a_different_oserror_winerror(
+    monkeypatch,
+):
+    """Only the exact previously-observed WinError 6 is treated as
+    transient -- an OSError with any other winerror is a different,
+    unconfirmed failure mode and must not be silently retried under the
+    same justification."""
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(1)
+        error = OSError("some other failure")
+        error.winerror = 1223
+        raise error
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(OSError):
+        _run_with_spawn_retry(["irrelevant"])
+
+    assert len(calls) == 1
+
+
+def test_run_with_spawn_retry_never_retries_a_completed_nonzero_exit(
+    monkeypatch,
+):
+    """A process that actually ran and returned non-zero is a real
+    behavioral result, not a spawn failure -- it must be returned as-is on
+    the first attempt, never retried into a different outcome."""
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(1)
+        return subprocess.CompletedProcess(args[0], 7)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = _run_with_spawn_retry(["irrelevant"])
+
+    assert result.returncode == 7
+    assert len(calls) == 1
+
+
+def test_posix_shell_command_reports_missing_prerequisite_when_nothing_found(
+    monkeypatch,
+):
+    monkeypatch.setattr(_module, "_POSIX_SHELL", None)
+    monkeypatch.setattr(_module, "_POSIX_SHELL_SKIP_REASON", None)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    with pytest.raises(pytest.skip.Exception) as exc_info:
+        posix_shell_command()
+
+    message = str(exc_info.value)
+    assert "missing prerequisite" in message
+    assert "external-environment blocker" not in message
+
+
+def test_posix_shell_command_reports_environment_blocker_on_repeated_timeout(
+    monkeypatch,
+):
+    """A shell that IS found on this system but times out on every
+    attempt must be reported as a distinct environment-blocker case, never
+    with the same message a genuinely-missing shell gets."""
+    monkeypatch.setattr(_module, "_POSIX_SHELL", None)
+    monkeypatch.setattr(_module, "_POSIX_SHELL_SKIP_REASON", None)
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/usr/bin/sh" if name == "sh" else None
+    )
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=10)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(pytest.skip.Exception) as exc_info:
+        posix_shell_command()
+
+    message = str(exc_info.value)
+    assert "external-environment blocker" in message
+    assert "missing prerequisite" not in message
+    assert "timed out" in message
+
+
+def test_posix_shell_command_reports_environment_blocker_on_repeated_nonzero_exit(
+    monkeypatch,
+):
+    monkeypatch.setattr(_module, "_POSIX_SHELL", None)
+    monkeypatch.setattr(_module, "_POSIX_SHELL_SKIP_REASON", None)
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/usr/bin/sh" if name == "sh" else None
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args[0], 127, stdout=b"", stderr=b"sh: fatal error\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(pytest.skip.Exception) as exc_info:
+        posix_shell_command()
+
+    message = str(exc_info.value)
+    assert "external-environment blocker" in message
+    assert "exited 127" in message
+    assert "fatal error" in message
+
+
+def test_posix_shell_command_caches_result_across_calls(monkeypatch):
+    monkeypatch.setattr(_module, "_POSIX_SHELL", None)
+    monkeypatch.setattr(_module, "_POSIX_SHELL_SKIP_REASON", None)
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/usr/bin/sh" if name == "sh" else None
+    )
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(1)
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    first = posix_shell_command()
+    second = posix_shell_command()
+
+    assert first == second == ("/usr/bin/sh",)
+    assert len(calls) == 1
 
 
 def test_openwrt_recipe_uses_canonical_three_package_split():

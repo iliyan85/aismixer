@@ -351,7 +351,10 @@ sudo systemctl status nmea_sproxy@boat.service
 sudo journalctl -u nmea_sproxy@boat.service -f
 ```
 
-Names are operator labels, not protocol identities. Instances may coexist only
+Names are operator labels, not protocol identities: any label works, not a
+numbered or sequential scheme. `nmea_sproxy@yacht.service` (a second boat) and
+`nmea_sproxy@balchik_roof.service` (a fixed shore station) are equally valid
+alongside `nmea_sproxy@boat.service` above. Instances may coexist only
 with distinct UDP listeners or serial devices. systemd does not centrally
 preflight collisions; a conflict remains a runtime failure and may restart-loop.
 

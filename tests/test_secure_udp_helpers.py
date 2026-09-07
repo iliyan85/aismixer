@@ -67,16 +67,41 @@ def _normalize_path(path):
 def load_secure_module_with_fake_keys(
     monkeypatch,
     with_client_private_key=False,
+    extra_stations=None,
 ):
+    """Load a fresh, independently-imported `aismixer_secure` module with a
+    fake `authorized_keys.yaml`.
+
+    By default only ``boat_001`` is authorized, preserving every existing
+    call site's exact two-shape return (`module`, or `(module,
+    client_private_key)`). Pass `extra_stations` (an iterable of station-id
+    strings) to additionally authorize one freshly generated EC identity
+    per name -- needed for tests that must authenticate two genuinely
+    different stations (for example, proving independent SecureState
+    owners never cross-assemble unrelated stations' multipart traffic).
+    When `extra_stations` is given, the extra station's private key(s) are
+    returned as an additional `{name: private_key}` dict.
+    """
     client_private_key = ec.generate_private_key(ec.SECP256R1())
     client_public_bytes = client_private_key.public_key().public_bytes(
         encoding=serialization.Encoding.X962,
         format=serialization.PublicFormat.CompressedPoint,
     )
-    authorized_yaml = (
-        "authorized_clients:\n"
-        "  - name: boat_001\n"
-        f"    pubkey: {base64.b64encode(client_public_bytes).decode()}\n"
+    authorized_entries = [("boat_001", client_public_bytes)]
+    extra_private_keys = {}
+    for name in extra_stations or ():
+        extra_key = ec.generate_private_key(ec.SECP256R1())
+        extra_private_keys[name] = extra_key
+        extra_public_bytes = extra_key.public_key().public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.CompressedPoint,
+        )
+        authorized_entries.append((name, extra_public_bytes))
+
+    authorized_yaml = "authorized_clients:\n" + "".join(
+        f"  - name: {name}\n"
+        f"    pubkey: {base64.b64encode(public_bytes).decode()}\n"
+        for name, public_bytes in authorized_entries
     )
 
     real_open = open
@@ -95,6 +120,10 @@ def load_secure_module_with_fake_keys(
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        if extra_stations:
+            if with_client_private_key:
+                return module, client_private_key, extra_private_keys
+            return module, extra_private_keys
         if with_client_private_key:
             return module, client_private_key
         return module
@@ -1609,7 +1638,9 @@ def test_secure_server_enqueues_first_time_valid_data_packet(monkeypatch):
     assert frame.source_id == "udpsec:boat_001"
     assert frame.alias_for_s == "boat_001"
     assert frame.remote_ip == "127.0.0.1"
-    assert frame.assembler_key == f"udpsec-assembly:{session.assembly_namespace}"
+    assert frame.assembler_key == (
+        f"udpsec-assembly:{session.assembly_namespace.hex()}"
+    )
     assert frame.payload == b"!AIVDM,1,1,,A,payload,0*00"
     assert frame.text_mode is PayloadTextMode.UTF8_SURROGATEPASS
     assert (
@@ -6340,6 +6371,276 @@ def test_session_cleanup_removes_expired_lru_prefix_and_stops_at_live(monkeypatc
     assert state.stats().sessions_expired == 1
 
 
+def test_install_session_never_admits_two_threads_into_its_transaction_at_once(
+    monkeypatch,
+):
+    """Deterministic mutual-exclusion proof for Section 3, independent of
+    real network timing: proves by direct measurement (not by a blocked/
+    finished proxy signal, which an artificially-serializing test double
+    can satisfy even with the lock removed -- a double that unconditionally
+    parks every caller on the same gate blocks a second caller whether or
+    not any real lock exists) that `install_session()`'s capacity check-
+    evict-insert transaction never runs on two threads at once. Without
+    `SecureState`'s own lock spanning that whole sequence, a second thread
+    could observe stale `len(self._sessions)` before the first thread's
+    eviction-or-insert commits, letting both installs believe there is
+    room under the cap at once -- exactly the aggregate-capacity race
+    `test_real_concurrent_handshakes_respect_aggregate_session_capacity`
+    (tests/test_udpsec_security_validation.py) exercises over real
+    sockets. This test proves the same property without depending on
+    real-thread scheduling luck, and verifies the instrumentation itself
+    against a deliberately-unlocked control."""
+    import threading
+    import time
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    def run(use_broken_lock):
+        state = secure.SecureState(max_sessions=100)
+        if use_broken_lock:
+            class NullLock:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc_info):
+                    return False
+
+            state._lock = NullLock()
+
+        concurrent = 0
+        peak = [0]
+        counter_lock = threading.Lock()
+        original_locator_is_free = state._locator_is_free
+
+        def instrumented_locator_is_free(endpoint_token, candidate):
+            nonlocal concurrent
+            with counter_lock:
+                concurrent += 1
+                peak[0] = max(peak[0], concurrent)
+            time.sleep(0.03)
+            with counter_lock:
+                concurrent -= 1
+            return original_locator_is_free(endpoint_token, candidate)
+
+        state._locator_is_free = instrumented_locator_is_free
+
+        thread_count = 8
+        barrier = threading.Barrier(thread_count)
+
+        def worker(index):
+            barrier.wait(timeout=5.0)
+            state.install_session(
+                _relation_key(secure, (f"192.0.2.{index}", 50000 + index)),
+                f"station-{index}", _fresh_test_locator(), object(),
+                object(), now=0.0)
+
+        threads = [
+            threading.Thread(target=worker, args=(index,))
+            for index in range(thread_count)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+        return peak[0], state
+
+    peak_locked, locked_state = run(use_broken_lock=False)
+    assert peak_locked == 1
+    assert len(locked_state._sessions) == 8
+
+    peak_unlocked, _ = run(use_broken_lock=True)
+    assert peak_unlocked > 1, (
+        "the deliberately-unlocked control did not exhibit real concurrent "
+        "entry -- this instrumentation would not catch a missing lock"
+    )
+
+
+def test_concurrent_colliding_locator_installs_have_exactly_one_winner_per_endpoint(
+    monkeypatch,
+):
+    """Many real threads race to `install_session()` using the exact same
+    raw locator bytes on the SAME `endpoint_token`, each at a distinct
+    relation (so this exercises the locator-collision preflight, not the
+    same-relation-replacement path): exactly one must win and every other
+    must fail closed with `SessionLocatorCollisionError`, leaving no
+    partial or duplicate installation behind. A concurrent thread racing
+    with the exact same raw locator bytes on a DIFFERENT `endpoint_token`
+    must be completely unaffected -- collision scoping is per
+    `endpoint_token`, not global, even under real concurrent contention."""
+    import threading
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=100)
+    endpoint_a = secure._new_endpoint_token()
+    endpoint_b = secure._new_endpoint_token()
+    shared_locator = _fresh_test_locator()
+    thread_count_a = 8
+
+    barrier = threading.Barrier(thread_count_a + 1)
+    results = [None] * thread_count_a
+    errors = [None] * thread_count_a
+
+    def contend_on_endpoint_a(index):
+        barrier.wait(timeout=5.0)
+        try:
+            results[index] = state.install_session(
+                _relation_key(secure, (f"192.0.2.{index}", 50000 + index),
+                              endpoint_a),
+                f"station-{index}", shared_locator, object(), object(),
+                now=0.0)
+        except secure.SessionLocatorCollisionError as exc:
+            errors[index] = exc
+
+    b_result = {}
+
+    def contend_on_endpoint_b():
+        barrier.wait(timeout=5.0)
+        b_result["session"] = state.install_session(
+            _relation_key(secure, ("192.0.2.200", 50200), endpoint_b),
+            "station-b", shared_locator, object(), object(), now=0.0)
+
+    threads = [
+        threading.Thread(target=contend_on_endpoint_a, args=(index,))
+        for index in range(thread_count_a)
+    ] + [threading.Thread(target=contend_on_endpoint_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    winners = [result for result in results if result is not None]
+    collisions = [error for error in errors if error is not None]
+    assert len(winners) == 1
+    assert len(collisions) == thread_count_a - 1
+    assert all(
+        isinstance(error, secure.SessionLocatorCollisionError)
+        for error in collisions
+    )
+    assert b_result["session"] is not None
+    assert b_result["session"].session_handle != winners[0].session_handle
+
+    live_on_a = [
+        session for session in state._sessions.values()
+        if session._session_key.endpoint_token is endpoint_a
+    ]
+    live_on_b = [
+        session for session in state._sessions.values()
+        if session._session_key.endpoint_token is endpoint_b
+    ]
+    assert live_on_a == [winners[0]]
+    assert live_on_b == [b_result["session"]]
+    assert state.stats().sessions_created == 2
+
+
+def test_concurrent_duplicate_nonce_admission_has_exactly_one_acceptance(
+    monkeypatch,
+):
+    """Many real threads submit the EXACT SAME DATA nonce for one live
+    session at the same time, through the real production
+    `admit_data_nonce()` transaction (not a copy of the underlying bounded
+    set exercised in isolation). Exactly one must be admitted; every other
+    concurrent submission of the identical nonce must be rejected as a
+    replay, with exact, non-duplicated accounting -- proving the
+    replay-check-and-record step is one atomic transaction rather than
+    three separable reads/writes a second thread could interleave with."""
+    import threading
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    session, _, _ = _install_test_session(
+        secure, state, ("192.0.2.10", 50000), b"\x01" * 32, b"\x02" * 32,
+    )
+    nonce = b"\x09" * 12
+    thread_count = 10
+    barrier = threading.Barrier(thread_count)
+    admissions = [None] * thread_count
+
+    def worker(index):
+        barrier.wait(timeout=5.0)
+        admissions[index] = state.admit_data_nonce(session, nonce, now=0.0)
+
+    threads = [
+        threading.Thread(target=worker, args=(index,))
+        for index in range(thread_count)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    accepted = [
+        a for a in admissions if a is secure._DataNonceAdmission.ACCEPTED
+    ]
+    replayed = [
+        a for a in admissions if a is secure._DataNonceAdmission.REPLAY
+    ]
+    assert len(accepted) == 1
+    assert len(replayed) == thread_count - 1
+    stats = state.stats()
+    assert stats.data_nonces_accepted == 1
+    assert stats.data_nonce_replays == thread_count - 1
+    assert stats.current_data_nonces == 1
+    assert state.is_live_session_handle(session, now=0.0)
+
+
+def test_concurrent_nonce_exhaustion_removes_the_session_exactly_once(
+    monkeypatch,
+):
+    """Many real threads each submit a DISTINCT DATA nonce concurrently
+    against a session whose nonce capacity is already full (so every
+    submission is a genuine capacity-exhaustion event, not a replay of one
+    shared nonce). The real `admit_data_nonce()` transaction must remove
+    the exhausted session exactly once -- whichever thread's transaction
+    wins the race sees EXHAUSTED and performs the one real removal, and
+    every other thread's transaction, once it observes the session is no
+    longer live, must report STALE rather than re-removing an already-gone
+    session or resurrecting/duplicating any lifecycle accounting. No
+    thread may see or touch a session another thread already removed as
+    if it were still live."""
+    import threading
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(data_nonce_max_per_session=1)
+    session, _, _ = _install_test_session(
+        secure, state, ("192.0.2.10", 50000), b"\x01" * 32, b"\x02" * 32,
+    )
+    assert state.accept_data_nonce(session, b"\x00" * 12, now=0.0)
+
+    thread_count = 10
+    barrier = threading.Barrier(thread_count)
+    admissions = [None] * thread_count
+
+    def worker(index):
+        distinct_nonce = bytes([index + 1]) + b"\x00" * 11
+        barrier.wait(timeout=5.0)
+        admissions[index] = state.admit_data_nonce(
+            session, distinct_nonce, now=1.0
+        )
+
+    threads = [
+        threading.Thread(target=worker, args=(index,))
+        for index in range(thread_count)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    exhausted = [
+        a for a in admissions if a is secure._DataNonceAdmission.EXHAUSTED
+    ]
+    stale = [
+        a for a in admissions if a is secure._DataNonceAdmission.STALE
+    ]
+    assert len(exhausted) == 1
+    assert len(stale) == thread_count - 1
+    stats = state.stats()
+    assert stats.data_nonce_exhaustions == 1
+    assert stats.sessions_capacity_evicted == 0
+    assert len(state._sessions) == 0
+    assert not secure._SESSION_IDENTITY_REGISTRY.is_live(session.session_handle)
+
+
 def test_session_capacity_evicts_least_recently_seen(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState(max_sessions=2)
@@ -6379,6 +6680,53 @@ def test_session_capacity_evicts_least_recently_seen(monkeypatch):
     assert stats.sessions_expired == 0
     assert stats.current_sessions == 2
     assert stats.peak_sessions == 2
+
+
+def test_concurrent_close_session_calls_on_the_same_session_are_idempotent(
+    monkeypatch,
+):
+    """Many real threads call `close_session()` on the exact same live
+    session object at once. Exactly one call may actually perform the
+    removal and count it; every other concurrent call must see the
+    session already gone (via the same exact-object stale-handle check
+    used everywhere else) and report `False` without a second removal, a
+    doubled `sessions_closed` count, or a corrupted registry reservation."""
+    import threading
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    session, _, _ = _install_test_session(
+        secure, state, ("192.0.2.10", 50000), b"\x01" * 32, b"\x02" * 32,
+    )
+
+    thread_count = 10
+    barrier = threading.Barrier(thread_count)
+    results = [None] * thread_count
+
+    def worker(index):
+        barrier.wait(timeout=5.0)
+        results[index] = state.close_session(session, now=0.0)
+
+    threads = [
+        threading.Thread(target=worker, args=(index,))
+        for index in range(thread_count)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    assert results.count(True) == 1
+    assert results.count(False) == thread_count - 1
+    stats = state.stats()
+    assert stats.sessions_closed == 1
+    assert stats.current_sessions == 0
+    assert not secure._SESSION_IDENTITY_REGISTRY.is_live(
+        session.session_handle
+    )
+    assert secure._SESSION_IDENTITY_REGISTRY.is_retiring(
+        session.session_handle
+    )
 
 
 def test_equal_session_timestamps_use_deterministic_activity_order(monkeypatch):
@@ -9723,8 +10071,8 @@ def test_session_handle_is_stable_and_distinct_per_logical_session(
         secure, state, ("192.0.2.21", 50011), b"\x08" * 32, b"\x09" * 32
     )
 
-    assert isinstance(session_a.session_handle, int)
-    assert isinstance(session_b.session_handle, int)
+    assert isinstance(session_a.session_handle, bytes)
+    assert isinstance(session_b.session_handle, bytes)
     assert session_a.session_handle != session_b.session_handle
 
     handle_before_touch = session_a.session_handle
@@ -9868,6 +10216,171 @@ def test_correct_locator_but_wrong_path_is_silently_dropped_before_decrypt(
     assert stats.sessions_touched == 0
     assert stats.data_nonces_accepted == 0
     assert stats.current_data_nonces == 0
+
+
+class _SpyAESGCM:
+    """Wraps a real AESGCM object to observe whether decrypt is actually
+    invoked, while still performing genuine encryption/decryption so a
+    correct-path control packet processes normally through the same spy."""
+
+    def __init__(self, real):
+        self._real = real
+        self.decrypt_calls = 0
+
+    def decrypt(self, *args, **kwargs):
+        self.decrypt_calls += 1
+        return self._real.decrypt(*args, **kwargs)
+
+    def encrypt(self, *args, **kwargs):
+        return self._real.encrypt(*args, **kwargs)
+
+
+def _spy_on_state_method(monkeypatch, state, method_name):
+    """Wrap one bound SecureState method with a call-counting spy that
+    still delegates to the real implementation, so pre-decryption ordering
+    can be observed without changing exercised behavior."""
+    real_bound_method = getattr(state, method_name)
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_bound_method(*args, **kwargs)
+
+    monkeypatch.setattr(state, method_name, spy)
+    return calls
+
+
+def test_wrong_path_correct_locator_never_reaches_decrypt_or_replay_lookup(
+    monkeypatch,
+):
+    """Strengthens the state-only assertions above with OBSERVABLE spies
+    directly on the AEAD decrypt call and the replay lookup/admission
+    path, per the Codex audit's Finding E: proving the packet is dropped
+    before ANY of that machinery runs, not merely that its externally
+    visible side effects happen to be absent. A correct-path control
+    packet using the exact same spies proves they are attached to the
+    real exercised code path, not simply never invoked due to a broken
+    wrapper."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    original_addr = ("192.0.2.45", 50035)
+    different_addr = ("203.0.113.45", 60045)
+    client_to_server_key = b"\x25" * 32
+    server_to_client_key = b"\x26" * 32
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        original_addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+
+    spy_aesgcm = _SpyAESGCM(session.current_epoch.client_to_server_aesgcm)
+    session.current_epoch.client_to_server_aesgcm = spy_aesgcm
+    nonce_seen_calls = _spy_on_state_method(monkeypatch, state, "data_nonce_seen")
+    admit_calls = _spy_on_state_method(monkeypatch, state, "admit_data_nonce")
+    touch_calls = _spy_on_state_method(monkeypatch, state, "touch_session")
+
+    wrong_path_nonce = b"\x27" * 12
+    wrong_path_packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        wrong_path_nonce,
+        session._session_key.session_locator,
+        payload="!AIVDM,1,1,,A,wrong-path,0*00",
+    )
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(wrong_path_packet, different_addr)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    # No AEAD decrypt, no replay lookup, no admission, no session touch --
+    # not merely no visible side effect of any of those.
+    assert spy_aesgcm.decrypt_calls == 0
+    assert nonce_seen_calls == []
+    assert admit_calls == []
+    assert touch_calls == []
+    assert queue.items == []
+    assert fake_socket.sent == []
+    assert session.path_state.active_path == original_addr
+
+    # Control: the exact same session, same spies, same locator -- but
+    # from the session's own correct path -- must decrypt and admit
+    # normally, proving the spies above are wired into the real path and
+    # the wrong-path packet's silence is not an artifact of a broken test.
+    correct_path_nonce = b"\x28" * 12
+    correct_path_packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        correct_path_nonce,
+        session._session_key.session_locator,
+        payload="!AIVDM,1,1,,A,correct-path,0*00",
+    )
+    queue_2, _ = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(correct_path_packet, original_addr)],
+        state=state,
+        monotonic_clock=_FakeClock(2.0),
+    )
+
+    assert spy_aesgcm.decrypt_calls == 1
+    assert len(nonce_seen_calls) == 1
+    assert len(admit_calls) == 1
+    assert len(touch_calls) == 1
+    assert len(queue_2.items) == 1
+
+
+def test_unknown_locator_never_reaches_decrypt_regardless_of_correct_path(
+    monkeypatch,
+):
+    """An unrecognized locator must be silently dropped before any
+    decryption is attempted, even when it arrives from a live session's
+    own correct path address -- proving there is no fallback to tuple-
+    based lookup or trial decryption once the locator itself fails to
+    resolve to a live session."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    addr = ("192.0.2.46", 50036)
+    client_to_server_key = b"\x29" * 32
+    server_to_client_key = b"\x2a" * 32
+    session, _, _ = _install_test_session(
+        secure,
+        state,
+        addr,
+        client_to_server_key,
+        server_to_client_key,
+    )
+
+    spy_aesgcm = _SpyAESGCM(session.current_epoch.client_to_server_aesgcm)
+    session.current_epoch.client_to_server_aesgcm = spy_aesgcm
+    nonce_seen_calls = _spy_on_state_method(monkeypatch, state, "data_nonce_seen")
+
+    unknown_locator = _fresh_test_locator()
+    assert unknown_locator != session._session_key.session_locator
+    packet = _encrypted_data_packet(
+        secure,
+        client_to_server_key,
+        b"\x2b" * 12,
+        unknown_locator,
+        payload="!AIVDM,1,1,,A,unknown-locator,0*00",
+    )
+
+    queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, addr)],
+        state=state,
+        monotonic_clock=_FakeClock(1.0),
+    )
+
+    assert spy_aesgcm.decrypt_calls == 0
+    assert nonce_seen_calls == []
+    assert queue.items == []
+    assert fake_socket.sent == []
 
 
 def test_shutdown_close_resolves_through_path_state_active_path(monkeypatch):
@@ -10034,7 +10547,7 @@ def test_assembler_namespace_is_session_scoped_not_path_derived(monkeypatch):
     assert assembler_key_before == assembler_key_after
     assert (
         assembler_key_before
-        == f"udpsec-assembly:{session.assembly_namespace}"
+        == f"udpsec-assembly:{session.assembly_namespace.hex()}"
     )
     # Not a rendered remote tuple: neither the original nor the mutated
     # active_path's host/port ever appears in the assembler namespace.
@@ -10099,8 +10612,12 @@ def test_assembler_namespace_differs_across_sessions_with_same_station_id(
     key_one_ns = queue_one.items[0].assembler_key
     key_two_ns = queue_two.items[0].assembler_key
     assert key_one_ns != key_two_ns
-    assert key_one_ns == f"udpsec-assembly:{session_one.assembly_namespace}"
-    assert key_two_ns == f"udpsec-assembly:{session_two.assembly_namespace}"
+    assert key_one_ns == (
+        f"udpsec-assembly:{session_one.assembly_namespace.hex()}"
+    )
+    assert key_two_ns == (
+        f"udpsec-assembly:{session_two.assembly_namespace.hex()}"
+    )
 
 
 def _nmea_data_packet_with_aesgcm(
@@ -10253,6 +10770,496 @@ def test_multipart_assembler_namespace_survives_same_relation_replacement(
     assert outcome_2.sentences == (fragment_1_text, fragment_2_text)
 
 
+# Cross-owner identity (Codex audit Finding A): assembly_namespace and
+# session_handle are documented as process-wide identifiers, not merely
+# unique within one SecureState owner. Two independent owners feeding a
+# downstream assembler shared across them (as production code does: the
+# assembler is a module-level singleton, not owned per-listener) must never
+# mint the same value -- otherwise unrelated authenticated stations on
+# different owners could have their multipart fragments combined.
+
+
+def test_independent_secure_state_owners_never_mint_colliding_identifiers(
+    monkeypatch,
+):
+    """Direct, fast proof of the underlying allocator invariant: two
+    independently-constructed SecureState objects (as a multi-listener
+    configuration, or simply two isolated test/owner instances, would
+    create) never mint the same session_handle or assembly_namespace, so
+    the assembler keys they derive can never collide either."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    owner_a = secure.SecureState()
+    owner_b = secure.SecureState()
+
+    session_a = owner_a.install_session(
+        _relation_key(secure, ("192.0.2.150", 50040), secure._new_endpoint_token()),
+        "boat_a",
+        _fresh_test_locator(),
+        object(),
+        object(),
+        now=0.0,
+    )
+    session_b = owner_b.install_session(
+        _relation_key(secure, ("192.0.2.151", 50041), secure._new_endpoint_token()),
+        "boat_b",
+        _fresh_test_locator(),
+        object(),
+        object(),
+        now=0.0,
+    )
+
+    assert session_a.session_handle != session_b.session_handle
+    assert session_a.assembly_namespace != session_b.assembly_namespace
+    assembler_key_a = f"udpsec-assembly:{session_a.assembly_namespace.hex()}"
+    assembler_key_b = f"udpsec-assembly:{session_b.assembly_namespace.hex()}"
+    assert assembler_key_a != assembler_key_b
+
+
+def test_fresh_session_handle_draws_from_the_shared_identity_registry(
+    monkeypatch,
+):
+    """`_fresh_session_handle()` is a thin wrapper over
+    `_SESSION_IDENTITY_REGISTRY.reserve()`: fixed-size opaque bytes,
+    distinct on every call, and immediately visible to the registry as
+    live. An all-zero draw is not asserted to be impossible -- see
+    tests/test_session_identity_registry.py for why a finite random space
+    is a checked-and-retried probability, not a claim of mathematical
+    impossibility."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+
+    values = [state._fresh_session_handle() for _ in range(50)]
+
+    for value in values:
+        assert isinstance(value, bytes)
+        assert len(value) == len(values[0])
+        assert secure._SESSION_IDENTITY_REGISTRY.is_live(value)
+    assert len(set(values)) == len(values)
+
+
+def test_independently_loaded_module_copies_are_fully_separate(monkeypatch):
+    """A test harness that deliberately loads `aismixer_secure.py` a
+    second time under a synthetic module name (exactly what
+    `load_secure_module_with_fake_keys` does for per-test isolation) gets
+    its own independent module namespace -- `AUTHORIZED_KEYS`,
+    `secure_state`, `_SESSION_IDENTITY_REGISTRY`, and every other piece of
+    module state. This is the "separate simulated process" half of the
+    sharing contract: see
+    `test_two_secure_state_owners_from_one_import_share_the_identity_registry`
+    below for the complementary "genuine sharing within one process"
+    half."""
+    first_copy = load_secure_module_with_fake_keys(monkeypatch)
+    second_copy = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert first_copy is not second_copy
+    assert first_copy.AUTHORIZED_KEYS is not second_copy.AUTHORIZED_KEYS
+    assert first_copy.secure_state is not second_copy.secure_state
+    assert (
+        first_copy._SESSION_IDENTITY_REGISTRY
+        is not second_copy._SESSION_IDENTITY_REGISTRY
+    )
+
+    # Independence is behavioral, not just object identity: a handle
+    # reserved in one copy is not visible to the other at all.
+    handle = first_copy.SecureState()._fresh_session_handle()
+    assert first_copy._SESSION_IDENTITY_REGISTRY.is_live(handle)
+    assert not second_copy._SESSION_IDENTITY_REGISTRY.is_live(handle)
+
+
+def test_two_secure_state_owners_from_one_import_share_the_identity_registry(
+    monkeypatch,
+):
+    """Two independent `SecureState()` instances constructed through the
+    *same* loaded module (exactly like two physical listeners sharing one
+    `secure_state` in production) reserve from the exact same registry
+    object -- proving the sharing claim by observable behavior, not just
+    by reading the module-level assignment. A value reserved via one
+    owner's helper is immediately known to the other owner's registry
+    view, and a forced collision across owners is resolved by retrying,
+    never by both owners believing they hold the same value."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    owner_a = secure.SecureState()
+    owner_b = secure.SecureState()
+
+    handle_from_a = owner_a._fresh_session_handle()
+
+    assert secure._SESSION_IDENTITY_REGISTRY.is_live(handle_from_a)
+
+    draws = iter((handle_from_a, b"\x02" * len(handle_from_a)))
+    monkeypatch.setattr(secure.os, "urandom", lambda _length: next(draws))
+
+    handle_from_b = owner_b._fresh_session_handle()
+
+    assert handle_from_b != handle_from_a
+    assert secure._SESSION_IDENTITY_REGISTRY.is_live(handle_from_b)
+
+
+def test_fresh_session_handle_is_safe_across_real_concurrent_threads(
+    monkeypatch,
+):
+    """Baseline sanity check only: many real threads calling
+    `_fresh_session_handle()` at once, with real (unmocked) `os.urandom`,
+    produce no errors and no duplicates. This is necessary but not
+    sufficient evidence of atomicity -- 128-bit random draws essentially
+    never collide on their own regardless of locking, so this alone
+    cannot distinguish a correctly-locked registry from an unlocked one.
+    See `test_session_identity_registry_reserve_serializes_concurrent_callers`
+    in tests/test_session_identity_registry.py for the deterministic,
+    forced-collision proof of actual mutual exclusion."""
+    import threading
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    thread_count = 8
+    values_per_thread = 50
+    results = [None] * thread_count
+    errors = [None] * thread_count
+    barrier = threading.Barrier(thread_count)
+
+    state = secure.SecureState()
+
+    def worker(index):
+        try:
+            barrier.wait(timeout=5.0)
+            results[index] = [
+                state._fresh_session_handle()
+                for _ in range(values_per_thread)
+            ]
+        except BaseException as exc:  # noqa: BLE001 - captured for assertion
+            errors[index] = exc
+
+    threads = [
+        threading.Thread(target=worker, args=(index,))
+        for index in range(thread_count)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    assert all(thread_errors is None for thread_errors in errors), errors
+    assert all(thread_results is not None for thread_results in results)
+    all_values = [value for batch in results for value in batch]
+    assert len(all_values) == thread_count * values_per_thread
+    assert len(set(all_values)) == len(all_values)
+
+
+def test_capacity_eviction_releases_the_evicted_sessions_registry_reservations(
+    monkeypatch,
+):
+    """Both identifiers of a capacity-evicted session must leave the
+    "live" state (moving to "retiring", not vanishing outright, since a
+    downstream assembler group may still be draining) -- while a
+    surviving session's own identifiers are completely untouched."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=2)
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    first = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "first", _fresh_test_locator(), object(), object(), now=100.0)
+    second = state.install_session(
+        _relation_key(secure, ("192.0.2.11", 50001)),
+        "second", _fresh_test_locator(), object(), object(), now=110.0)
+    assert registry.is_live(first.session_handle)
+    assert registry.is_live(first.assembly_namespace)
+
+    third = state.install_session(
+        _relation_key(secure, ("192.0.2.12", 50002)),
+        "third", _fresh_test_locator(), object(), object(), now=130.0)
+
+    assert state.stats().sessions_capacity_evicted == 1
+    assert not registry.is_live(first.session_handle)
+    assert registry.is_retiring(first.session_handle)
+    assert not registry.is_live(first.assembly_namespace)
+    assert registry.is_retiring(first.assembly_namespace)
+    assert registry.is_live(second.session_handle)
+    assert registry.is_live(second.assembly_namespace)
+    assert registry.is_live(third.session_handle)
+    assert registry.is_live(third.assembly_namespace)
+
+
+def test_expiry_cleanup_releases_the_expired_sessions_registry_reservations(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=30.0)
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    expiring = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    survivor = state.install_session(
+        _relation_key(secure, ("192.0.2.11", 50001)),
+        "boat_002", _fresh_test_locator(), object(), object(), now=25.0)
+
+    state.cleanup_expired_sessions(now=31.0)
+
+    assert not registry.is_live(expiring.session_handle)
+    assert registry.is_retiring(expiring.session_handle)
+    assert not registry.is_live(expiring.assembly_namespace)
+    assert registry.is_live(survivor.session_handle)
+    assert registry.is_live(survivor.assembly_namespace)
+
+
+def test_close_session_releases_its_registry_reservations(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    session, _, _ = _install_test_session(
+        secure, state, ("192.0.2.10", 50000), b"\x01" * 32, b"\x02" * 32,
+    )
+    assert registry.is_live(session.session_handle)
+
+    assert state.close_session(session, now=1000.0)
+
+    assert not registry.is_live(session.session_handle)
+    assert registry.is_retiring(session.session_handle)
+    assert not registry.is_live(session.assembly_namespace)
+    assert registry.is_retiring(session.assembly_namespace)
+
+
+def test_same_station_replacement_releases_old_handle_but_keeps_namespace_live(
+    monkeypatch,
+):
+    """A same-relation, same-station replacement carries `assembly_namespace`
+    forward (claim()s an extra live reference on the SAME reservation) but
+    always mints a fresh `session_handle`: the old handle must leave the
+    live set while the namespace value stays live throughout, owned now by
+    the replacement rather than the replaced session."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    relation = _relation_key(secure, ("192.0.2.10", 50000))
+    original = state.install_session(
+        relation, "boat_001", _fresh_test_locator(), object(), object(),
+        now=0.0)
+
+    replacement = state.install_session(
+        relation, "boat_001", _fresh_test_locator(), object(), object(),
+        now=10.0)
+
+    assert replacement.assembly_namespace == original.assembly_namespace
+    assert replacement.session_handle != original.session_handle
+    assert not registry.is_live(original.session_handle)
+    assert registry.is_retiring(original.session_handle)
+    assert registry.is_live(replacement.assembly_namespace)
+    assert registry.is_live(replacement.session_handle)
+
+
+def test_different_station_replacement_releases_both_old_identifiers(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    relation = _relation_key(secure, ("192.0.2.10", 50000))
+    original = state.install_session(
+        relation, "boat_001", _fresh_test_locator(), object(), object(),
+        now=0.0)
+
+    replacement = state.install_session(
+        relation, "boat_099", _fresh_test_locator(), object(), object(),
+        now=10.0)
+
+    assert replacement.assembly_namespace != original.assembly_namespace
+    assert not registry.is_live(original.session_handle)
+    assert not registry.is_live(original.assembly_namespace)
+    assert registry.is_retiring(original.assembly_namespace)
+    assert registry.is_live(replacement.session_handle)
+    assert registry.is_live(replacement.assembly_namespace)
+
+
+def test_nonce_exhaustion_releases_only_the_exact_owning_sessions_identifiers(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(data_nonce_max_per_session=1, max_sessions=2)
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    exhausted = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    other = state.install_session(
+        _relation_key(secure, ("192.0.2.11", 50001)),
+        "boat_002", _fresh_test_locator(), object(), object(), now=0.0)
+    assert state.accept_data_nonce(exhausted, b"\x01" * 12, now=0.0)
+
+    assert state.admit_data_nonce(
+        exhausted, b"\x02" * 12, now=1.0
+    ) is secure._DataNonceAdmission.EXHAUSTED
+
+    assert not registry.is_live(exhausted.session_handle)
+    assert registry.is_retiring(exhausted.session_handle)
+    assert not registry.is_live(exhausted.assembly_namespace)
+    assert registry.is_live(other.session_handle)
+    assert registry.is_live(other.assembly_namespace)
+
+
+def test_pending_session_churn_never_touches_the_identity_registry(
+    monkeypatch,
+):
+    """Pending candidates never reserve `session_handle`/`assembly_namespace`
+    at all -- those are minted only at `install_session`/
+    `promote_pending_session` time -- so a pending session that fails
+    (collides, expires, or is capacity-evicted without ever promoting)
+    must leave the registry completely untouched: no orphaned
+    reservation, live or retiring."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(pending_session_ttl=30.0, max_pending_sessions=1)
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    live_before = registry.live_count()
+    retiring_before = registry.retiring_count()
+
+    state.install_pending_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    # Capacity-evicted before ever promoting.
+    state.install_pending_session(
+        _relation_key(secure, ("192.0.2.11", 50001)),
+        "boat_002", _fresh_test_locator(), object(), object(), now=0.0)
+    # Expired before ever promoting.
+    state.cleanup_expired_pending_sessions(now=31.0)
+
+    assert registry.live_count() == live_before
+    assert registry.retiring_count() == retiring_before
+
+
+def test_independent_owners_share_assembler_without_cross_station_combination(
+    monkeypatch,
+):
+    """Full encrypted-ingress reproduction of the Codex-reported defect:
+    two independent SecureState owners (distinct endpoint tokens, distinct
+    addresses, distinct locators/keys, distinct authenticated stations)
+    each complete a real signed handshake and send a real encrypted DATA
+    fragment through the production `_secure_server_loop` and frame
+    parser. Both owners' fragments declare the SAME nominal AIVDM group
+    (sequential id "9", channel "A", 2 total) -- exactly the shape that
+    would silently cross-assemble if their assembler_key values collided,
+    as they could before assembly_namespace became a process-wide
+    identifier. Both are fed into one shared, real AIVDMAssembler
+    instance, matching how production feeds every listener's frames
+    through one downstream assembler."""
+    secure, client_key_a, extra_keys = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+        extra_stations=["boat_beta"],
+    )
+    client_key_b = extra_keys["boat_beta"]
+
+    owner_a = secure.SecureState()
+    owner_b = secure.SecureState()
+    endpoint_a = secure._new_endpoint_token()
+    endpoint_b = secure._new_endpoint_token()
+    addr_a = ("192.0.2.160", 50050)
+    addr_b = ("192.0.2.161", 50051)
+    wall_clock = _FakeClock(1000.0)
+    monotonic_clock = _FakeClock(0.0)
+
+    def establish(state, endpoint_token, addr, client_private_key, station_id):
+        hello = _signed_handshake_packet(
+            secure, client_private_key, station_id, 1000
+        )
+        _run_secure_server_with_packets(
+            monkeypatch,
+            secure,
+            [(hello, addr)],
+            state=state,
+            endpoint_token=endpoint_token,
+            wall_clock=wall_clock,
+            monotonic_clock=monotonic_clock,
+        )
+        pending = state._pending_sessions[
+            _relation_key(secure, addr, endpoint_token)
+        ]
+        confirmation = _confirmation_packet_for(secure, pending, b"\x30" * 12)
+        _run_secure_server_with_packets(
+            monkeypatch,
+            secure,
+            [(confirmation, addr)],
+            state=state,
+            endpoint_token=endpoint_token,
+            wall_clock=wall_clock,
+            monotonic_clock=monotonic_clock,
+        )
+        return _active_session_at(secure, state, addr, endpoint_token)
+
+    session_a = establish(owner_a, endpoint_a, addr_a, client_key_a, "boat_001")
+    session_b = establish(owner_b, endpoint_b, addr_b, client_key_b, "boat_beta")
+
+    assert session_a.session_handle != session_b.session_handle
+    assert session_a.assembly_namespace != session_b.assembly_namespace
+
+    def send_fragment(state, endpoint_token, addr, session, nonce, text, source_id):
+        packet = _nmea_data_packet_with_aesgcm(
+            secure,
+            session.current_epoch.client_to_server_aesgcm,
+            nonce,
+            text,
+            session._session_key.session_locator,
+            source_id=source_id,
+        )
+        queue, _ = _run_secure_server_with_packets(
+            monkeypatch,
+            secure,
+            [(packet, addr)],
+            state=state,
+            endpoint_token=endpoint_token,
+            wall_clock=wall_clock,
+            monotonic_clock=monotonic_clock,
+        )
+        return queue.items[0].assembler_key
+
+    # Both owners declare the SAME nominal AIVDM group (2 total, channel
+    # A, sequential id 9) -- the exact shape that a colliding
+    # assembly_namespace would silently merge.
+    a_fragment_1 = "!AIVDM,2,1,9,A,owner-a-one,0*00"
+    a_fragment_2 = "!AIVDM,2,2,9,A,owner-a-two,0*00"
+    b_fragment_1 = "!AIVDM,2,1,9,A,owner-b-one,0*00"
+    b_fragment_2 = "!AIVDM,2,2,9,A,owner-b-two,0*00"
+
+    key_a_1 = send_fragment(
+        owner_a, endpoint_a, addr_a, session_a, b"\x31" * 12, a_fragment_1,
+        "boat_001",
+    )
+    key_b_2 = send_fragment(
+        owner_b, endpoint_b, addr_b, session_b, b"\x32" * 12, b_fragment_2,
+        "boat_beta",
+    )
+    assert key_a_1 != key_b_2
+
+    from assembler import AIVDMAssembler, AssemblyStatus
+
+    shared_assembler = AIVDMAssembler(timeout=30.0)
+
+    # Owner A's ordinal-1 fragment starts A's own group.
+    outcome_a1 = shared_assembler.feed_outcome(key_a_1, a_fragment_1)
+    assert outcome_a1.status is AssemblyStatus.PENDING
+
+    # Owner B's ordinal-2 fragment, despite declaring the identical
+    # nominal group (2/A/9), must NOT complete owner A's group: it must
+    # start its own independent, still-pending group under B's own key.
+    outcome_b2 = shared_assembler.feed_outcome(key_b_2, b_fragment_2)
+    assert outcome_b2.status is AssemblyStatus.PENDING
+
+    # Each owner's own remaining fragment completes its OWN generation,
+    # with only that owner's own sentences.
+    key_a_2 = send_fragment(
+        owner_a, endpoint_a, addr_a, session_a, b"\x33" * 12, a_fragment_2,
+        "boat_001",
+    )
+    key_b_1 = send_fragment(
+        owner_b, endpoint_b, addr_b, session_b, b"\x34" * 12, b_fragment_1,
+        "boat_beta",
+    )
+    assert key_a_2 == key_a_1
+    assert key_b_1 == key_b_2
+
+    outcome_a2 = shared_assembler.feed_outcome(key_a_2, a_fragment_2)
+    assert outcome_a2.status is AssemblyStatus.COMPLETE
+    assert outcome_a2.sentences == (a_fragment_1, a_fragment_2)
+
+    outcome_b1 = shared_assembler.feed_outcome(key_b_1, b_fragment_1)
+    assert outcome_b1.status is AssemblyStatus.COMPLETE
+    assert outcome_b1.sentences == (b_fragment_1, b_fragment_2)
+
+
 def test_same_relation_different_station_replacement_gets_fresh_namespace(
     monkeypatch,
 ):
@@ -10346,6 +11353,217 @@ def test_install_session_replacement_matches_promotion_semantics(
         different_station_replacement.assembly_namespace
         != same_station_replacement.assembly_namespace
     )
+
+
+# Deterministic exercise of the actual production locator generator
+# (Codex audit Finding E): monkeypatches only the randomness source, never
+# the generation/retry logic itself, and reads production's own ownership
+# indexes to confirm collision retry, bounded exhaustion, and cross-
+# endpoint independence.
+
+
+def test_generate_session_locator_retries_past_an_occupied_active_locator(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_token = secure._new_endpoint_token()
+    occupied = _fresh_test_locator()
+    free = _fresh_test_locator()
+    assert occupied != free
+    state.install_session(
+        _relation_key(secure, ("192.0.2.110", 50060), endpoint_token),
+        "boat_occupant",
+        occupied,
+        object(),
+        object(),
+        now=0.0,
+    )
+
+    draws = iter((occupied, free))
+    call_count = 0
+
+    def fake_urandom(_length):
+        nonlocal call_count
+        call_count += 1
+        return next(draws)
+
+    monkeypatch.setattr(secure.os, "urandom", fake_urandom)
+
+    result = state.generate_session_locator(endpoint_token)
+
+    assert result == free
+    assert call_count == 2
+
+
+def test_generate_session_locator_retries_past_an_occupied_pending_locator(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_token = secure._new_endpoint_token()
+    occupied = _fresh_test_locator()
+    free = _fresh_test_locator()
+    assert occupied != free
+    state.install_pending_session(
+        _relation_key(secure, ("192.0.2.111", 50061), endpoint_token),
+        "boat_pending",
+        occupied,
+        object(),
+        object(),
+        now=0.0,
+    )
+
+    draws = iter((occupied, free))
+    monkeypatch.setattr(secure.os, "urandom", lambda _length: next(draws))
+
+    result = state.generate_session_locator(endpoint_token)
+
+    assert result == free
+
+
+def test_generate_session_locator_bounded_retry_exhausts_at_exact_limit(
+    monkeypatch,
+):
+    """Exactly `SESSION_LOCATOR_GENERATION_ATTEMPTS` draws, no more, no
+    unbounded retry and no weaker fallback: exhaustion fails closed with
+    the intended dedicated error."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_token = secure._new_endpoint_token()
+    always_occupied = _fresh_test_locator()
+    state.install_session(
+        _relation_key(secure, ("192.0.2.112", 50062), endpoint_token),
+        "boat_occupant",
+        always_occupied,
+        object(),
+        object(),
+        now=0.0,
+    )
+
+    call_count = 0
+
+    def fake_urandom(_length):
+        nonlocal call_count
+        call_count += 1
+        return always_occupied
+
+    monkeypatch.setattr(secure.os, "urandom", fake_urandom)
+
+    with pytest.raises(secure.SessionLocatorExhaustedError):
+        state.generate_session_locator(endpoint_token)
+
+    assert call_count == secure.SESSION_LOCATOR_GENERATION_ATTEMPTS == 8
+
+
+def test_generate_session_locator_same_raw_bytes_free_on_other_endpoint(
+    monkeypatch,
+):
+    """The same raw locator bytes occupied on one endpoint_token are an
+    entirely independent, immediately-free identity on another -- proving
+    generation scopes collision checking per endpoint_token rather than
+    globally."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_a = secure._new_endpoint_token()
+    endpoint_b = secure._new_endpoint_token()
+    shared_bytes = _fresh_test_locator()
+    state.install_session(
+        _relation_key(secure, ("192.0.2.113", 50063), endpoint_a),
+        "boat_a",
+        shared_bytes,
+        object(),
+        object(),
+        now=0.0,
+    )
+
+    call_count = 0
+
+    def fake_urandom(_length):
+        nonlocal call_count
+        call_count += 1
+        return shared_bytes
+
+    monkeypatch.setattr(secure.os, "urandom", fake_urandom)
+
+    result = state.generate_session_locator(endpoint_b)
+
+    assert result == shared_bytes
+    assert call_count == 1
+
+
+def test_generate_session_locator_does_not_mutate_ownership_state(monkeypatch):
+    """Generation is purely observational: it only reads existing
+    ownership to pick a free value and never itself reserves anything --
+    reservation happens only when the caller actually installs a session
+    or pending candidate with the returned value."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_token = secure._new_endpoint_token()
+    state.install_session(
+        _relation_key(secure, ("192.0.2.114", 50064), endpoint_token),
+        "boat_a",
+        _fresh_test_locator(),
+        object(),
+        object(),
+        now=0.0,
+    )
+    sessions_before = dict(state._sessions)
+    pending_before = dict(state._pending_sessions)
+    owners_before = dict(state._pending_locator_owners)
+    relation_index_before = dict(state._relation_index)
+    stats_before = state.stats()
+
+    result = state.generate_session_locator(endpoint_token)
+
+    assert isinstance(result, bytes) and len(result) == secure.SESSION_LOCATOR_BYTES
+    assert state._sessions == sessions_before
+    assert state._pending_sessions == pending_before
+    assert state._pending_locator_owners == owners_before
+    assert state._relation_index == relation_index_before
+    assert state.stats() == stats_before
+
+
+def test_generate_session_locator_value_is_independent_of_station_or_address(
+    monkeypatch,
+):
+    """The locator generator's output must depend only on its randomness
+    source, never on station identity, network address, or ECDHE
+    material -- it is a process-local lookup hint, not a credential
+    derived from (and therefore entangled with) authenticated context.
+    Two completely different stations/addresses/endpoint_tokens forced to
+    draw the identical underlying random bytes must produce the identical
+    resulting locator, proving there is no hidden derivation from the
+    surrounding session context."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_alpha = secure._new_endpoint_token()
+    endpoint_beta = secure._new_endpoint_token()
+
+    state.install_session(
+        _relation_key(secure, ("192.0.2.120", 50070), endpoint_alpha),
+        "boat_alpha",
+        _fresh_test_locator(),
+        object(),
+        object(),
+        now=0.0,
+    )
+    state.install_session(
+        _relation_key(secure, ("2001:db8::99", 50071), endpoint_beta),
+        "boat_beta_completely_different_station",
+        _fresh_test_locator(),
+        object(),
+        object(),
+        now=0.0,
+    )
+
+    forced_draw = _fresh_test_locator()
+    monkeypatch.setattr(secure.os, "urandom", lambda _length: forced_draw)
+
+    locator_for_alpha = state.generate_session_locator(endpoint_alpha)
+    locator_for_beta = state.generate_session_locator(endpoint_beta)
+
+    assert locator_for_alpha == locator_for_beta == forced_draw
 
 
 # Locator uniqueness as a SecureState invariant, not merely a convention of
@@ -10797,7 +12015,7 @@ def test_promote_pending_session_collision_is_non_destructive(monkeypatch):
         created_at=0.5,
         last_seen=0.5,
         session_handle=state._fresh_session_handle(),
-        assembly_namespace=next(state._next_assembly_namespace),
+        assembly_namespace=secure._SESSION_IDENTITY_REGISTRY.reserve(),
         current_epoch=pending.current_epoch,
         path_state=secure.PathState(active_path=other_relation.peer_address),
     )
@@ -10834,6 +12052,118 @@ def test_promote_pending_session_collision_is_non_destructive(monkeypatch):
         stats_after.sessions_capacity_evicted
         == stats_before.sessions_capacity_evicted
     )
+
+
+def test_promote_pending_session_with_malformed_relation_key_is_non_destructive(
+    monkeypatch,
+):
+    """Codex audit Finding D follow-up: computing the fresh-or-reused
+    assembly namespace during promotion canonicalizes the pending's
+    relation_key, which can now raise `MalformedSockaddrError` for a
+    malformed peer address (stricter validation than before). This
+    canonicalization must happen BEFORE promotion pops the pending entry
+    or releases its locator reservation -- a white-box injected pending
+    candidate with a malformed relation address (bypassing the public
+    install_pending_session() API, which does not itself validate address
+    shape, exactly like real pending installation from a raw handshake
+    tuple does not) proves a validation failure here leaves the pending
+    session, its locator reservation, and every lifecycle statistic
+    exactly as they were."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_token = secure._new_endpoint_token()
+    malformed_address = ("not-an-ip-address", 50000)
+    relation_key = secure._EndpointPeerKey(endpoint_token, malformed_address)
+    locator = _fresh_test_locator()
+
+    pending = secure._PendingSecureSession(
+        _relation_key=relation_key,
+        _address=malformed_address,
+        station_id="boat_pending",
+        session_locator=locator,
+        created_at=0.0,
+        current_epoch=secure.CryptoEpoch(
+            client_to_server_aesgcm=object(),
+            server_to_client_aesgcm=object(),
+            seen_data_nonces=secure._BoundedNonceSet(
+                secure.DATA_NONCE_MAX_PER_SESSION
+            ),
+            created_at=0.0,
+        ),
+    )
+    # Constructed directly rather than via install_pending_session(): a
+    # real pending candidate reaches this exact same unvalidated shape
+    # from a raw handshake tuple, since pending identity is intentionally
+    # exact-tuple-bound and never itself canonicalized at install time.
+    state._pending_sessions[relation_key] = pending
+    state._pending_locator_owners[(endpoint_token, locator)] = relation_key
+    state._pending_sessions_created += 1
+
+    pending_before = dict(state._pending_sessions)
+    owners_before = dict(state._pending_locator_owners)
+    stats_before = state.stats()
+
+    with pytest.raises(secure.MalformedSockaddrError):
+        state.promote_pending_session(pending, 1.0)
+
+    assert state._pending_sessions == pending_before
+    assert state._pending_sessions[relation_key] is pending
+    assert state._pending_locator_owners == owners_before
+    assert state.stats() == stats_before
+
+
+def test_remove_session_with_malformed_active_path_is_non_destructive(
+    monkeypatch,
+):
+    """Companion to the promotion case above: `_remove_session` (used for
+    every active-session removal reason -- expiry, close, capacity,
+    replacement, nonce exhaustion) also canonicalizes `active_path`, which
+    can raise for a malformed value. A white-box injected active session
+    with a malformed `active_path` (bypassing install_session(), which
+    does validate this shape as a side effect of its own relation-index
+    write -- so this state cannot arise through the public API, but
+    `_remove_session` must not assume that and must still validate before
+    mutating) proves a validation failure leaves `_sessions` and every
+    other store untouched rather than a session already popped with
+    nothing else done."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    endpoint_token = secure._new_endpoint_token()
+    malformed_address = ("not-an-ip-address", 50000)
+    locator = _fresh_test_locator()
+    session_key = secure._EndpointSessionKey(endpoint_token, locator)
+
+    session = secure.LogicalSession(
+        _session_key=session_key,
+        station_id="boat_malformed",
+        created_at=0.0,
+        last_seen=0.0,
+        session_handle=state._fresh_session_handle(),
+        assembly_namespace=secure._SESSION_IDENTITY_REGISTRY.reserve(),
+        current_epoch=secure.CryptoEpoch(
+            client_to_server_aesgcm=object(),
+            server_to_client_aesgcm=object(),
+            seen_data_nonces=secure._BoundedNonceSet(
+                secure.DATA_NONCE_MAX_PER_SESSION
+            ),
+            created_at=0.0,
+        ),
+        path_state=secure.PathState(active_path=malformed_address),
+    )
+    state._sessions[session_key] = session
+    state._sessions_created += 1
+
+    sessions_before = dict(state._sessions)
+    relation_index_before = dict(state._relation_index)
+    stats_before = state.stats()
+
+    with pytest.raises(secure.MalformedSockaddrError):
+        state._remove_session(session_key, "closed", now=0.0)
+
+    assert state._sessions == sessions_before
+    assert state._sessions[session_key] is session
+    assert state._relation_index == relation_index_before
+    assert state.stats() == stats_before
 
 
 def test_same_raw_locator_on_different_endpoint_token_is_independent(

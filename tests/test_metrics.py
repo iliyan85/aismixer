@@ -55,8 +55,9 @@ INPUT_TRAFFIC_FIELDS = (
     "transport_bytes",
     "accepted_frames",
     "payload_bytes",
+    "display",
 )
-INPUT_TRAFFIC_NUMERIC_FIELDS = INPUT_TRAFFIC_FIELDS[2:]
+INPUT_TRAFFIC_NUMERIC_FIELDS = INPUT_TRAFFIC_FIELDS[2:6]
 OUTPUT_TRAFFIC_FIELDS = (
     "target_id",
     "name",
@@ -154,6 +155,7 @@ def input_traffic_snapshot(**overrides):
         "transport_bytes": 2400,
         "accepted_frames": 8,
         "payload_bytes": 600,
+        "display": "station-a",
     }
     values.update(overrides)
     return InputTrafficMetricsSnapshot(**values)
@@ -403,6 +405,7 @@ def test_input_traffic_snapshot_is_frozen_slotted_and_preserves_values():
         2400,
         8,
         600,
+        "station-a",
     )
 
 
@@ -436,6 +439,21 @@ def test_input_traffic_snapshot_accepts_supported_kinds_at_zero(kind):
 def test_input_traffic_snapshot_rejects_invalid_names(name, exception):
     with pytest.raises(exception, match="name"):
         input_traffic_snapshot(name=name)
+
+
+@pytest.mark.parametrize(
+    ("display", "exception"),
+    [
+        ("", ValueError),
+        (None, TypeError),
+        (1, TypeError),
+        (True, TypeError),
+        (b"display", TypeError),
+    ],
+)
+def test_input_traffic_snapshot_rejects_invalid_display(display, exception):
+    with pytest.raises(exception, match="display"):
+        input_traffic_snapshot(display=display)
 
 
 @pytest.mark.parametrize(

@@ -144,6 +144,7 @@ def input_traffic_result(inputs=None):
                 "transport_bytes": 24000,
                 "accepted_frames": 96,
                 "payload_bytes": 7200,
+                "display": "192.0.2.10:17778",
             },
             {
                 "name": "udpsec-ingress:1:station-b",
@@ -152,6 +153,7 @@ def input_traffic_result(inputs=None):
                 "transport_bytes": 12000,
                 "accepted_frames": 40,
                 "payload_bytes": 3000,
+                "display": "2001:db8::1.17779",
             },
         ]
     return {"inputs": list(inputs)}
@@ -1381,6 +1383,7 @@ def test_interactive_input_statistics_table_is_transport_and_payload_explicit(
     assert rc == aismixerctl.EXIT_OK
     for heading in (
         "INPUT",
+        "SELECTOR",
         "KIND",
         "TRANSPORT PACKETS",
         "TRANSPORT BYTES",
@@ -1388,6 +1391,13 @@ def test_interactive_input_statistics_table_is_transport_and_payload_explicit(
         "PAYLOAD BYTES",
     ):
         assert heading in stdout
+    # INPUT shows the operator-facing display label; SELECTOR shows the
+    # stable machine-facing name a --input filter actually matches -- the
+    # two are deliberately different columns, not the same value rendered
+    # twice, even though both distinguish these two rows from each other.
+    assert stdout.index("192.0.2.10:17778") < stdout.index(
+        "2001:db8::1.17779"
+    )
     assert stdout.index("udp-ingress:0:station-a") < stdout.index(
         "udpsec-ingress:1:station-b"
     )
