@@ -75,6 +75,34 @@ async def secure_server(*args, **kwargs):
     await implementation(*args, **kwargs)
 
 
+_secure_state_impl = None
+
+
+def _load_secure_state():
+    """Load UDPSEC's shared process-wide SecureState only for
+    configurations that require it -- same lazy-import discipline as
+    `_load_secure_server`."""
+
+    global _secure_state_impl
+    if _secure_state_impl is None:
+        from aismixer_secure import secure_state as implementation
+
+        _secure_state_impl = implementation
+    return _secure_state_impl
+
+
+async def secure_state_maintenance():
+    """Run the shared UDPSEC SecureState's periodic expiry/retirement-
+    purge housekeeping (F3), independent of any listener's own packet
+    traffic -- see `SecureState.run_periodic_maintenance` for why this
+    exists and what it does and does not affect. One task services every
+    secure listener sharing this process's default state, since they
+    already share its packet-triggered cleanup too; spawned at most once
+    regardless of how many secure inputs are configured."""
+
+    await _load_secure_state().run_periodic_maintenance()
+
+
 def ts() -> str:
     return str(time.time())
 
@@ -1008,6 +1036,19 @@ async def main(
                         server_private_key=udpsec_identity.private_key,
                         debug=DEBUG,
                     ),
+                )
+            )
+
+        if SEC_INPUTS:
+            # F3: one shared-state maintenance task regardless of how
+            # many secure inputs are configured -- every listener above
+            # shares this same process-default `secure_state`, so one
+            # task keeps its expiry/retirement-purge housekeeping running
+            # even while every configured listener is otherwise idle.
+            runtime_task_specs.append(
+                _RuntimeTaskSpec(
+                    name="udpsec-state-maintenance",
+                    coroutine_factory=secure_state_maintenance,
                 )
             )
 

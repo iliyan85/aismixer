@@ -25,6 +25,22 @@ from core.target_identity import EgressTargetId
 from dedup import Deduplicator
 
 
+# F4: how long a namespace-bearing frame (see `IngressFrame.admitted_at`)
+# may sit anywhere in the ingress/processing pipeline before this
+# processor refuses to feed it to the assembler at all. UDPSEC's shared
+# `SessionIdentityRegistry` retires a released `assembly_namespace` for
+# `core.session_identity_registry.RETIREMENT_SECONDS` before it can be
+# reserved by an unrelated station; that retirement window is only a
+# genuine safety margin if a frame can never reach the assembler after
+# this bound has passed, since none of this pipeline's ingress/processing
+# queues (see `aismixer.py`) impose a maximum residence time of their own
+# -- only a maximum depth, under ordinary blocking backpressure. This
+# value, together with `AIVDMAssembler`'s own default group timeout and a
+# margin for scheduling/GC jitter, is what `RETIREMENT_SECONDS` is
+# actually derived from -- see that constant's own comment.
+MAX_INGRESS_FRAME_AGE_SECONDS = 20.0
+
+
 @dataclass(frozen=True, slots=True)
 class _ProcessingConfig:
     station_id: str | None
@@ -56,6 +72,8 @@ class PythonDataPlaneProcessor:
         "_assembler",
         "_deduplicator",
         "_wall_clock",
+        "_monotonic_clock",
+        "_max_ingress_frame_age",
         "_gid_generator",
         "_source_state",
         "_multipart_s_ctx",
@@ -68,6 +86,7 @@ class PythonDataPlaneProcessor:
         "_outputless_calls",
         "_output_batches",
         "_output_messages",
+        "_stale_frames_dropped",
         "_reset_calls",
         "_reset_completed",
         "_reset_failed",
@@ -85,6 +104,8 @@ class PythonDataPlaneProcessor:
         assembler: AIVDMAssembler | None = None,
         deduplicator: Deduplicator | None = None,
         wall_clock: Callable[[], float] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+        max_ingress_frame_age: float = MAX_INGRESS_FRAME_AGE_SECONDS,
         gid_generator: Callable[[int], str] | None = None,
         source_state: SourceState | None = None,
     ) -> None:
@@ -106,6 +127,10 @@ class PythonDataPlaneProcessor:
             else deduplicator
         )
         self._wall_clock = time.time if wall_clock is None else wall_clock
+        self._monotonic_clock = (
+            time.monotonic if monotonic_clock is None else monotonic_clock
+        )
+        self._max_ingress_frame_age = max_ingress_frame_age
         self._gid_generator = (
             _generate_numeric_gid_fixed
             if gid_generator is None
@@ -124,10 +149,19 @@ class PythonDataPlaneProcessor:
         self._outputless_calls = 0
         self._output_batches = 0
         self._output_messages = 0
+        self._stale_frames_dropped = 0
         self._reset_calls = 0
         self._reset_completed = 0
         self._reset_failed = 0
         self._reset_in_flight = 0
+
+    @property
+    def stale_frames_dropped(self) -> int:
+        """Count of frames refused as too old to safely feed to the
+        assembler (see `MAX_INGRESS_FRAME_AGE_SECONDS`). Diagnostic only,
+        not part of the shared `ProcessorMetricsSnapshot` contract."""
+
+        return self._stale_frames_dropped
 
     def process(
         self,
@@ -161,6 +195,23 @@ class PythonDataPlaneProcessor:
         snapshot: ProcessingSnapshot,
     ) -> OutputBatch:
         """Run the existing Python processing algorithm."""
+
+        # F4: a frame whose assembler_key is tied to a process-wide
+        # identifier with a bounded reuse window (currently only UDPSEC's
+        # assembly_namespace -- see `IngressFrame.admitted_at`) must never
+        # reach the assembler after that window could plausibly have
+        # elapsed and let the identifier be reused for an unrelated
+        # station. None of the ingress/processing queues between UDPSEC
+        # admission and here impose a maximum residence time (only a
+        # maximum depth), so this is the actual enforcement point, not
+        # merely a documented assumption. A frame with no `admitted_at`
+        # (every non-UDPSEC source) has no such hazard and is never
+        # subject to this check.
+        if frame.admitted_at is not None:
+            age = self._monotonic_clock() - frame.admitted_at
+            if age > self._max_ingress_frame_age:
+                self._stale_frames_dropped += 1
+                return OutputBatch(outputs=())
 
         deduplication_mode = snapshot.deduplication_mode
         route_target_ids = snapshot.target_ids

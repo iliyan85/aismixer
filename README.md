@@ -516,7 +516,10 @@ is not systemd/procd service health. Statistics are fresh process-local
 snapshots, with aggregate and currently supported per-input/per-output views.
 
 Run an unfiltered statistics view first to discover filter values. An input
-filter is the exact displayed runtime input name. An output filter is an exact
+filter is the exact SELECTOR column value (an address-independent, stable
+machine identity such as `udp-ingress:0`), NOT the human-readable INPUT
+column -- the two are deliberately distinct: INPUT is for a person to read,
+SELECTOR is what `--input` actually matches. An output filter is an exact
 canonical name such as `udp:local_display` or a displayed decimal
 process-local target number. A filter with no match returns an empty view.
 

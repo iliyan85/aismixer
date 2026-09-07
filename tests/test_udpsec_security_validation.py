@@ -168,12 +168,14 @@ class _LoopbackSecureServer:
         *,
         graceful_close=False,
         state=None,
+        monotonic_clock=None,
     ):
         self.secure = secure
         self.server_private_key = server_private_key
         self.host = host
         self.port = port
         self.graceful_close = graceful_close
+        self.monotonic_clock = monotonic_clock
         self.socket = socket.socket(family, socket.SOCK_DGRAM)
         self.state = secure.SecureState() if state is None else state
         self.endpoint_token = secure._new_endpoint_token()
@@ -218,6 +220,7 @@ class _LoopbackSecureServer:
                 server_private_key=self.server_private_key,
                 owned_sessions=self.owned_sessions,
                 owned_pending_sessions=self.owned_pending_sessions,
+                monotonic_clock=self.monotonic_clock,
             )
         )
         # create_task() and call_soon() are FIFO on this loop. The listener
@@ -347,6 +350,7 @@ def _running_secure_server(
     *,
     graceful_close=False,
     state=None,
+    monotonic_clock=None,
 ):
     server = _LoopbackSecureServer(
         secure,
@@ -356,6 +360,7 @@ def _running_secure_server(
         port,
         graceful_close=graceful_close,
         state=state,
+        monotonic_clock=monotonic_clock,
     )
     try:
         yield server.start()
@@ -1898,24 +1903,142 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         assert server_b.active_session_for(client_address) is session_b
 
 
+class _GatedClock:
+    """Thread-safe monotonic-clock stand-in whose value the test sets
+    explicitly, read by two real listener threads sharing one
+    `SecureState`. Lets a test force a specific, otherwise-improbable
+    `now` ordering across two genuinely concurrent listeners without any
+    real-wall-clock timing dependency."""
+
+    def __init__(self, initial):
+        self._lock = threading.Lock()
+        self._value = initial
+
+    def set(self, value):
+        with self._lock:
+            self._value = value
+
+    def __call__(self):
+        with self._lock:
+            return self._value
+
+
+def test_real_two_listeners_racing_commit_order_does_not_defeat_expiry(
+    real_udpsec_endpoints,
+):
+    """F2, reproduced through the REAL `_secure_server_loop` (not only a
+    direct SecureState dictionary test): two real background-thread
+    secure listeners share one `SecureState`. Listener A's DATA-triggered
+    touch is made to COMMIT FIRST while reading the LARGER `now` (6);
+    listener B's commits SECOND while reading the SMALLER `now` (5) --
+    exactly the pathological OrderedDict order [6, 5] the audit reported.
+    At `session_ttl=10`, checking at `now=15` must still find B genuinely
+    expired despite B sitting behind A in commit/position order, and must
+    leave A (genuinely not yet expired) untouched."""
+    endpoints = real_udpsec_endpoints
+    shared_state = endpoints.secure.SecureState(session_ttl=10.0)
+    clock = _GatedClock(0.0)
+
+    with (
+        _running_secure_server(
+            endpoints.secure,
+            endpoints.server_private_key,
+            socket.AF_INET,
+            "127.0.0.1",
+            state=shared_state,
+            monotonic_clock=clock,
+        ) as server_a,
+        _running_secure_server(
+            endpoints.secure,
+            endpoints.server_private_key,
+            socket.AF_INET,
+            "127.0.0.1",
+            state=shared_state,
+            monotonic_clock=clock,
+        ) as server_b,
+        _client_socket(socket.AF_INET, "127.0.0.1") as client_a,
+        _client_socket(socket.AF_INET, "127.0.0.1") as client_b,
+    ):
+        material_a = _perform_real_handshake(
+            endpoints, client_a, server_a.remote_addr
+        )
+        material_b = _perform_real_handshake(
+            endpoints, client_b, server_b.remote_addr
+        )
+        session_a = server_a.active_session_for(client_a.getsockname())
+        session_b = server_b.active_session_for(client_b.getsockname())
+        assert session_a is not None and session_b is not None
+
+        # A commits first, reading the LARGER `now`.
+        clock.set(6.0)
+        endpoints.proxy.send_ping(
+            client_a,
+            server_a.remote_addr,
+            material_a.key_material.client_to_server_key,
+            material_a.session_locator,
+            STATION_ID,
+            41,
+        )
+        _receive_authenticated_pong(
+            endpoints.proxy, client_a, server_a.remote_addr, material_a, 41
+        )
+        assert session_a.last_seen == 6.0
+
+        # B commits second, reading the SMALLER `now` -- the exact
+        # pathology: B is chronologically older (more overdue for
+        # expiry) but was touched/moved-to-end AFTER A.
+        clock.set(5.0)
+        endpoints.proxy.send_ping(
+            client_b,
+            server_b.remote_addr,
+            material_b.key_material.client_to_server_key,
+            material_b.session_locator,
+            STATION_ID,
+            42,
+        )
+        _receive_authenticated_pong(
+            endpoints.proxy, client_b, server_b.remote_addr, material_b, 42
+        )
+        assert session_b.last_seen == 5.0
+        assert tuple(shared_state._sessions) == (
+            session_a._session_key,
+            session_b._session_key,
+        )
+
+        expired = shared_state.cleanup_expired_sessions(15.0)
+
+        assert session_b._session_key in expired
+        assert session_a._session_key not in expired
+        assert shared_state.is_live_session_handle(session_a, 15.0)
+        assert server_b.active_session_for(client_b.getsockname()) is None
+
+
 def test_real_concurrent_handshakes_respect_aggregate_session_capacity(
     real_udpsec_endpoints,
 ):
-    """Section 3 concurrency proof, positive evidence via real loopback
-    listeners: many real client sockets, on distinct OS threads, complete a
-    full real signed handshake against ONE real secure server (one real
-    asyncio receive loop) concurrently, all racing to install an active
-    session on a shared `SecureState` capped at `max_sessions=2`.
+    """Positive real-loopback evidence, real-client-concurrency variant:
+    many real client sockets, on distinct OS threads, complete a full real
+    signed handshake against ONE real secure server (one real asyncio
+    receive loop, hence one OS thread on the SERVER side) concurrently,
+    all racing to install an active session on a shared `SecureState`
+    capped at `max_sessions=2`.
 
-    A TOCTOU race in `install_session`'s capacity check-then-evict-then-
-    insert sequence (unprotected by SecureState's own lock) could let two
-    threads' installs both observe room under the cap at once and both
-    insert, leaving more than 2 live sessions and a `peak_sessions` above
-    the configured cap. Exact accounting -- `sessions_created` counting
-    every attempt, `sessions_capacity_evicted` counting every eviction, and
-    `current_sessions`/`peak_sessions` never exceeding the cap -- is only
-    possible if each install's capacity check and insert are one atomic
-    transaction under the real lock."""
+    IMPORTANT SCOPE NOTE: because the server side here is a single
+    asyncio event loop, `install_session` calls can never actually
+    interleave with each other at the Python level regardless of whether
+    `SecureState` holds any lock at all -- asyncio's own single-threaded
+    cooperative scheduling already serializes them, since `install_session`
+    contains no `await`. This test therefore does NOT by itself prove
+    `SecureState`'s lock is necessary; it proves the more modest but still
+    useful property that capacity accounting stays exact when many
+    concurrent CLIENT connections are funneled through one real server.
+    The genuine cross-thread SecureState-mutation proof requires two or
+    more real listeners (their own OS threads) sharing one state -- see
+    `test_real_two_listeners_racing_commit_order_does_not_defeat_expiry`
+    and the direct-thread tests in tests/test_secure_udp_helpers.py (e.g.
+    `test_install_session_never_admits_two_threads_into_its_transaction_at_once`)
+    for that.
+    """
     endpoints = real_udpsec_endpoints
     state = endpoints.secure.SecureState(max_sessions=2)
     client_count = 6
@@ -1984,13 +2107,16 @@ def test_real_concurrent_handshakes_respect_aggregate_session_capacity(
 def test_real_concurrent_pending_handshakes_respect_pending_capacity(
     real_udpsec_endpoints,
 ):
-    """Pending-capacity equivalent of the aggregate-active-capacity race
-    above: many real client sockets send only their initial ClientHello
-    (never completing the confirmation round-trip) concurrently against one
-    real server whose shared `SecureState` caps `max_pending_sessions=2`.
-    `install_pending_session`'s own capacity check-then-evict-then-insert
-    sequence is exercised the same way, proving the same atomicity holds
-    for the pending store independently of the active-session store."""
+    """Pending-capacity equivalent of the aggregate-active-capacity test
+    above, with the same scope note: many real client sockets send only
+    their initial ClientHello (never completing the confirmation round-
+    trip) concurrently against ONE real server (one asyncio event loop, so
+    `install_pending_session` calls cannot actually interleave with each
+    other regardless of locking) whose shared `SecureState` caps
+    `max_pending_sessions=2`. This proves pending-capacity accounting
+    stays exact under concurrent CLIENT load against one server -- not
+    that `SecureState`'s lock is required, which needs two or more real
+    listener threads (see the note on the active-capacity test above)."""
     endpoints = real_udpsec_endpoints
     state = endpoints.secure.SecureState(max_pending_sessions=2)
     client_count = 6

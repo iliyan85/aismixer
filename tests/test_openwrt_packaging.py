@@ -145,14 +145,28 @@ _POSIX_SHELL_SKIP_REASON = None
 # nothing behavioral has been exercised yet -- and the lightweight VM
 # occasionally taking long enough to resume from an idle/suspended state
 # that an otherwise-generous timeout is exceeded (`TimeoutExpired`). A
-# bounded, short retry absorbs exactly those two conditions. It must never
-# retry (and so never mask) a completed process's actual non-zero return
-# code, nor any OTHER OSError subclass -- `FileNotFoundError`,
-# `PermissionError`, and similar all represent a genuine configuration
-# problem (missing executable, insufficient permission, ...), not
-# transient contention, and must fail immediately on the first attempt.
-_SUBPROCESS_SPAWN_RETRY_ATTEMPTS = 3
-_SUBPROCESS_SPAWN_RETRY_DELAY_SECONDS = 0.3
+# bounded retry with exponential backoff absorbs exactly those two
+# conditions. It must never retry (and so never mask) a completed
+# process's actual non-zero return code, nor any OTHER OSError subclass --
+# `FileNotFoundError`, `PermissionError`, and similar all represent a
+# genuine configuration problem (missing executable, insufficient
+# permission, ...), not transient contention, and must fail immediately on
+# the first attempt.
+#
+# The attempt count and exponential backoff (not a fixed short delay) are
+# sized from a REAL reproduction actually observed on this machine while
+# validating this pass, not from speculation: running this file's full
+# suite repeatedly, one run hit 10 CONSECUTIVE test failures, each one
+# exhausting a smaller fixed-delay retry budget and still landing on
+# WinError 6 every single attempt, before the next full run recovered
+# cleanly. That is a multi-second contention burst, not a single blip --
+# a short fixed retry window cannot ride it out, but a longer exponential
+# one (up to `0.3 + 0.6 + 1.2 + 2.4 + 4.8 = 9.3s` of cumulative backoff
+# across 6 attempts) gives one call a real chance to survive it without
+# ever waiting anywhere close to that long in the ordinary case, where the
+# very first attempt succeeds.
+_SUBPROCESS_SPAWN_RETRY_ATTEMPTS = 6
+_SUBPROCESS_SPAWN_RETRY_BASE_DELAY_SECONDS = 0.3
 _TRANSIENT_HANDLE_WINERROR = 6
 
 
@@ -174,11 +188,11 @@ def _is_transient_spawn_error(exc):
 
 def _run_with_spawn_retry(*args, **kwargs):
     """Retry only `TimeoutExpired` and the one specific transient OSError
-    described above, both up to `_SUBPROCESS_SPAWN_RETRY_ATTEMPTS` times.
-    Every other exception propagates immediately on its first occurrence,
-    and a process that actually completed -- zero or non-zero exit -- is
-    returned as-is and never retried, so this can never mask a real
-    behavioral result as a transient failure."""
+    described above, both up to `_SUBPROCESS_SPAWN_RETRY_ATTEMPTS` times
+    with exponential backoff. Every other exception propagates immediately
+    on its first occurrence, and a process that actually completed -- zero
+    or non-zero exit -- is returned as-is and never retried, so this can
+    never mask a real behavioral result as a transient failure."""
     last_error = None
     for attempt in range(_SUBPROCESS_SPAWN_RETRY_ATTEMPTS):
         try:
@@ -190,7 +204,7 @@ def _run_with_spawn_retry(*args, **kwargs):
                 raise
             last_error = exc
         if attempt + 1 < _SUBPROCESS_SPAWN_RETRY_ATTEMPTS:
-            time.sleep(_SUBPROCESS_SPAWN_RETRY_DELAY_SECONDS)
+            time.sleep(_SUBPROCESS_SPAWN_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
     raise last_error
 
 
@@ -290,11 +304,16 @@ def shell_path(path, command):
         # whole ambiguity: Windows accepts forward slashes as an equally
         # valid path separator, so passing the forward-slash form to
         # `wslpath -a` never exercises that backslash-eating step at all.
+        # R4 bounded hardening: this call previously had no timeout at
+        # all, unlike the other two `_run_with_spawn_retry` call sites --
+        # a stuck `wsl.exe` would have hung this indefinitely rather than
+        # failing closed like the others do.
         translated = _run_with_spawn_retry(
             [command[0], "wslpath", "-a", path.as_posix()],
             check=True,
             capture_output=True,
             text=True,
+            timeout=10,
         )
         return translated.stdout.strip()
     return path.as_posix()
@@ -762,6 +781,25 @@ def test_posix_shell_command_caches_result_across_calls(monkeypatch):
 
     assert first == second == ("/usr/bin/sh",)
     assert len(calls) == 1
+
+
+def test_shell_path_wslpath_call_has_an_explicit_timeout(monkeypatch, tmp_path):
+    """R4 bounded hardening: the wslpath translation call must carry an
+    explicit timeout, like the other two `_run_with_spawn_retry` call
+    sites (the shell probe and the main harness invocation) already do --
+    a stuck `wsl.exe` must fail closed here too, not hang indefinitely."""
+    captured_kwargs = {}
+
+    def fake_run(args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, stdout="/mnt/c/fake\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(os, "name", "nt")
+
+    shell_path(tmp_path, ["C:\\Windows\\System32\\wsl.exe", "sh"])
+
+    assert captured_kwargs.get("timeout") == 10
 
 
 def test_openwrt_recipe_uses_canonical_three_package_split():

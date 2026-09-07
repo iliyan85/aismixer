@@ -201,29 +201,51 @@ def test_reserve_never_admits_two_threads_into_its_transaction_at_once():
     )
 
 
-def test_claim_cancels_pending_retirement_and_restores_live_status():
+def test_claim_adds_a_reference_to_an_already_live_value():
+    registry = SessionIdentityRegistry()
+    value = registry.reserve()
+
+    registry.claim(value)
+
+    assert registry.is_live(value)
+    # Two live references now: one release() must not be enough to retire
+    # it.
+    registry.release(value, now=0.0)
+    assert registry.is_live(value)
+    assert not registry.is_retiring(value)
+
+
+def test_claim_rejects_a_merely_retiring_value(monkeypatch):
+    """F5 hardening: claim() must never silently revive a retiring value.
+    The only legitimate caller
+    (`aismixer_secure._reused_or_fresh_assembly_namespace`) only ever
+    claims a value it has just confirmed is still live, so retirement
+    revival is not a real use case -- it is a bug/misuse signal and must
+    raise, not silently fabricate a reservation this registry never
+    checked for collisions at the point of revival."""
     registry = SessionIdentityRegistry()
     value = registry.reserve()
     registry.release(value, now=0.0)
     assert registry.is_retiring(value)
 
-    registry.claim(value)
+    with pytest.raises(ValueError):
+        registry.claim(value)
 
-    assert registry.is_live(value)
-    assert not registry.is_retiring(value)
+    # Rejection must not mutate state: still retiring, not live, not
+    # purged early.
+    assert registry.is_retiring(value)
+    assert not registry.is_live(value)
 
 
-def test_claim_on_an_unknown_value_admits_it_as_a_fresh_live_entry():
+def test_claim_rejects_an_entirely_unknown_value():
     registry = SessionIdentityRegistry()
     never_seen = b"\x44" * IDENTIFIER_WIDTH_BYTES
 
-    registry.claim(never_seen)
+    with pytest.raises(ValueError):
+        registry.claim(never_seen)
 
-    assert registry.is_live(never_seen)
-    # A single claim() is one reference: one release() must be enough to
-    # move it to retiring, not leave it live from a phantom extra count.
-    registry.release(never_seen, now=0.0)
-    assert registry.is_retiring(never_seen)
+    assert not registry.is_live(never_seen)
+    assert not registry.is_retiring(never_seen)
 
 
 def test_release_decrements_reference_count_before_retiring():
@@ -287,6 +309,101 @@ def test_purge_expired_removes_only_entries_past_their_retirement_window():
 
     assert purged_count == 1
     assert not registry.is_retiring(late)
+
+
+class _ItemsCountingDict(dict):
+    """Tracks how many times `.items()` is called on this exact dict, so a
+    test can prove a full-dict scan did or did not happen without relying
+    on timing."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.items_call_count = 0
+
+    def items(self):
+        self.items_call_count += 1
+        return super().items()
+
+
+def test_purge_expired_does_not_scan_every_retiring_entry_when_none_are_due():
+    """Regression for F3: the earlier implementation iterated
+    `_retiring_until.items()` in full on every call -- turning routine
+    per-packet cleanup (`purge_expired()` runs inside
+    `SecureState.cleanup_expired_sessions()`, which every accepted DATA
+    packet reaches) into O(retiring-set-size) work even when nothing is
+    due. With 1000 entries retiring but none yet due, `purge_expired()`
+    must do no full-dict scan at all."""
+    registry = SessionIdentityRegistry(retirement_seconds=30.0)
+    for _ in range(1000):
+        value = registry.reserve()
+        registry.release(value, now=0.0)
+    assert registry.retiring_count() == 1000
+
+    counting_dict = _ItemsCountingDict(registry._retiring_until)
+    registry._retiring_until = counting_dict
+
+    purged = registry.purge_expired(now=5.0)
+
+    assert purged == 0
+    assert counting_dict.items_call_count == 0
+    assert registry.retiring_count() == 1000
+
+
+def test_purge_expired_finds_due_entries_without_scanning_unexpired_ones():
+    """Same proof, but with a real mix of due and not-yet-due entries: the
+    due ones must still be found and purged, and the scan must still
+    never enumerate the full retiring set."""
+    registry = SessionIdentityRegistry(retirement_seconds=30.0)
+    due_values = []
+    for _ in range(10):
+        value = registry.reserve()
+        registry.release(value, now=0.0)
+        due_values.append(value)
+    not_due_values = []
+    for _ in range(1000):
+        value = registry.reserve()
+        registry.release(value, now=20.0)
+        not_due_values.append(value)
+
+    counting_dict = _ItemsCountingDict(registry._retiring_until)
+    registry._retiring_until = counting_dict
+
+    purged = registry.purge_expired(now=31.0)
+
+    assert purged == 10
+    assert counting_dict.items_call_count == 0
+    for value in due_values:
+        assert not registry.is_retiring(value)
+    for value in not_due_values:
+        assert registry.is_retiring(value)
+
+
+def test_purge_expired_ignores_a_heap_entry_stale_relative_to_retiring_until():
+    """Defensive lazy-deletion proof: `purge_expired()` validates each
+    popped heap entry against `_retiring_until` (the authoritative record)
+    before treating it as a real expiry, discarding anything that no
+    longer matches rather than assuming the heap and the dict always
+    agree. `claim()`'s F5 hardening (it now rejects a merely-retiring
+    value) means this cannot arise through this registry's own public API
+    today -- `reserve()` never draws an already-retiring value, and
+    `claim()` can no longer revive one -- but the check remains cheap,
+    correct safety-in-depth against a future internal change, exercised
+    here directly via white-box manipulation of the authoritative
+    record."""
+    registry = SessionIdentityRegistry(retirement_seconds=30.0)
+    value = registry.reserve()
+    registry.release(value, now=0.0)  # pushes (30.0, value) onto the heap
+
+    # Simulate the authoritative record having moved on to a later
+    # deadline without the stale (30.0, value) heap entry being removed --
+    # exactly the shape a stale heap entry has.
+    registry._retiring_until[value] = 80.0
+
+    purged = registry.purge_expired(now=31.0)
+
+    assert purged == 0
+    assert registry.is_retiring(value)
+    assert registry._retiring_until[value] == 80.0
 
 
 def test_memory_use_is_bounded_by_churn_and_retirement_not_unbounded_history():

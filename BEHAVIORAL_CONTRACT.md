@@ -410,22 +410,52 @@ nonce exhaustion, or process restart all mean the next establishment at that
 relation gets both a fresh `session_handle` and a fresh `assembly_namespace`.
 The registry itself is not an unlimited historical database: a released
 reservation is retired (occupied, but no longer counted live, so it cannot
-be re-drawn) for `RETIREMENT_SECONDS` (30 seconds -- a deliberate, documented
-30x margin over the only production `AIVDMAssembler` instantiation's default
-1-second group timeout, chosen because a downstream assembler group keyed by
-`assembly_namespace` can briefly outlive the `SecureState` session that
-minted it) and then purged, piggybacked on `SecureState`'s own existing
-monotonic cleanup pass rather than a dedicated thread or a per-packet scan.
-None of this is a claim of durable or cross-process uniqueness, or that a
-finite random space can never repeat in principle -- only that every draw is
-checked and retried under a real lock, and that this process's bookkeeping
-of what is currently live or recently retired is accurate. This carry-
-forward is a transitional mechanism for the current stage, where a rekey
-still replaces the whole `LogicalSession` object; it is not the final rekey
-architecture. Once a later stage lets an authenticated refresh replace only
+be re-drawn) for `RETIREMENT_SECONDS` (30 seconds) and then purged, via a
+bounded, lazy-deletion min-heap scan (see below) piggybacked on
+`SecureState`'s own existing monotonic cleanup pass rather than a dedicated
+thread or a full per-packet scan of every retiring entry. `RETIREMENT_SECONDS`
+is NOT simply a multiple of the assembler's own group timeout -- a downstream
+`AIVDMAssembler` group's timeout only starts once a frame actually reaches
+the assembler, not when UDPSEC admits it, and no ingress/processing queue
+between those two points imposes a maximum residence time (only a maximum
+depth). The actual enforcement point is
+`core.python_data_plane.MAX_INGRESS_FRAME_AGE_SECONDS` (20 seconds): any
+namespace-bearing frame (one whose `IngressFrame.admitted_at` is set --
+currently only UDPSEC's) older than that when the processor is about to
+feed it to the assembler is refused outright, never reaching the assembler
+in any form. `RETIREMENT_SECONDS` is the SUM of that enforced bound, the
+assembler's own default 1-second group timeout, and a margin for
+scheduling/GC jitter -- so no assembler group tied to a given namespace can
+still be alive once that namespace becomes eligible for reuse. None of this
+is a claim of durable or cross-process uniqueness, or that a finite random
+space can never repeat in principle -- only that every draw is checked and
+retried under a real lock, and that this process's bookkeeping of what is
+currently live or recently retired is accurate. This carry-forward is a
+transitional mechanism for the current stage, where a rekey still replaces
+the whole `LogicalSession` object; it is not the final rekey architecture.
+Once a later stage lets an authenticated refresh replace only
 `current_epoch` on an unchanged `LogicalSession`, both identifiers will
 naturally remain stable across rekey simply because the session object
 itself persists, and this reuse logic will no longer be needed.
+
+`claim()` only ever adds a reference to an ALREADY-live reservation -- it
+raises rather than silently reviving a merely-retiring value or admitting
+an unknown one as a fresh live entry, since the only legitimate caller
+always reads the value directly off a `LogicalSession` it has just
+confirmed is still live. `reserve()`/`claim()`/`release()` on
+`install_session`/`promote_pending_session` follow a strict prepare-then-
+commit discipline: `assembly_namespace` and `session_handle` are both
+acquired, and the full replacement `LogicalSession` object constructed,
+BEFORE any destructive mutation -- removing the previous session at that
+relation, evicting a capacity victim, or (for promotion) popping the
+pending candidate and releasing its locator reservation. If any
+acquisition or construction step fails, exactly what was newly acquired in
+that attempt is released once and every pre-existing store is left
+untouched; a still-valid previous session, its pending candidate's locator
+reservation, and any already-admitted confirmation-nonce accounting can
+never be destroyed by a failed replacement. Legitimate expiry cleanup (see
+below) may still remove genuinely expired state before an unrelated
+operation fails -- that is not a violation of this guarantee.
 
 `SecureState` itself is safe under the real shared-owner, multi-thread
 model its own test suite exercises: one reentrant lock
@@ -450,6 +480,50 @@ transaction rather than to the whole receive loop, which those same real
 concurrent-thread tests (and dedicated capacity/locator/nonce race tests
 using real threads and, for the aggregate and pending capacity cases, real
 loopback listeners) now verify directly.
+
+Active and pending expiry each have their own authoritative deadline index
+-- a lazy-deletion min-heap ordered strictly by deadline VALUE -- separate
+from `_sessions`'/`_pending_sessions`' `OrderedDict` position, which exists
+only for LRU/capacity-eviction ordering. The lock above serializes
+mutations, but does not make commit order track the `now` values callers
+happened to sample before acquiring it: two listener threads can commit in
+an order that does not match their own timestamps. A front-prefix scan of
+an `OrderedDict` silently assumes commit order tracks deadline order; where
+it does not, a genuinely expired entry can sit behind a newer one and never
+be found, letting expired active or pending state be treated as live. The
+heap has no such assumption -- popping always yields the true minimum
+deadline regardless of insertion order -- and each popped entry is
+revalidated against the live store's own current field before being acted
+on, so a stale entry (superseded by a later touch, for active sessions) is
+silently discarded and re-queued with its real current deadline rather than
+either resurrecting or wrongly expiring anything. `touch_session` clamps
+`last_seen` to never move backwards, so a stale, out-of-order `now` can
+never shorten a session's real remaining lifetime. `SecureState` also
+exposes `run_periodic_maintenance()`, an independent, opt-in coroutine an
+operator's runtime spawns once per shared owner (not per listener) to run
+this same expiry/retirement-purge housekeeping on a timer, so it still runs
+eventually even on an owner that currently receives no packets on any of
+its listeners; this is a memory-reclamation bound only, since every public
+entry point already re-validates liveness through this same authoritative
+path regardless of when that housekeeping last ran.
+
+A standalone `SecureState` owner has an explicit, complete teardown path:
+`close_owned_sessions()` gracefully closes (sends a close message for, then
+removes) every active session a listener installed or promoted, and the
+companion `close_owned_pending_sessions()` immediately discards that same
+listener's own still-pending candidates (freeing their locator reservation
+and pending-capacity slot) rather than leaving them to expire on their own
+TTL -- sending no wire message, since an unconfirmed candidate has no
+confirmed key material to notify with. Both are exact-object-checked
+(`close_session`/`close_pending_session`) so a handle already superseded by
+a later replacement is silently ignored, never discarding whatever
+legitimately occupies that relation now. Pending candidates hold no
+`_SESSION_IDENTITY_REGISTRY` reservation of their own to release
+(`session_handle`/`assembly_namespace` are minted only by `install_session`/
+`promote_pending_session`), so discarding one never touches the registry;
+tearing down one owner's sessions/pending candidates never affects any
+other owner sharing the same process-wide registry or the same
+`SecureState`.
 
 Each physical secure-listener socket incarnation owns one opaque endpoint
 token. The token has process-local object-identity semantics, remains stable

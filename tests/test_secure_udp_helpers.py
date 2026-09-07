@@ -7234,6 +7234,7 @@ def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
         "pending_sessions_promoted",
         "pending_sessions_expired",
         "pending_sessions_capacity_evicted",
+        "pending_sessions_closed",
         "data_nonces_accepted",
         "data_nonce_replays",
         "data_nonces_expired",
@@ -11119,6 +11120,528 @@ def test_pending_session_churn_never_touches_the_identity_registry(
 
     assert registry.live_count() == live_before
     assert registry.retiring_count() == retiring_before
+
+
+# --- F1 (UDPSEC V2 Corrective Closure R4): exception-safe install/promote.
+# `install_session()`/`promote_pending_session()` acquire an
+# `assembly_namespace` (reserve or claim) and a `session_handle` BEFORE
+# destructively removing the old owner at a relation, evicting a capacity
+# victim, or popping a pending candidate. These tests deterministically
+# force a failure at each fallible acquisition point (via controlled
+# `os.urandom` draws or direct fault injection, never a statistical
+# collision) and prove nothing valid was destroyed and nothing newly
+# acquired was leaked.
+
+
+def test_install_session_handle_exhaustion_preserves_old_session_same_station(
+    monkeypatch,
+):
+    """Same-relation, same-station replacement: `_reused_or_fresh_assembly_
+    namespace` claims the still-live old session's namespace (refcount 1
+    -> 2) before `_fresh_session_handle()` is even attempted. Forcing that
+    handle reservation to exhaust must release the claimed reference back
+    to exactly 1 (still held solely by the untouched old session) and must
+    not have removed that old session at all."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    relation = _relation_key(secure, ("192.0.2.10", 50000))
+    original = state.install_session(
+        relation, "boat_001", _fresh_test_locator(), object(), object(),
+        now=0.0)
+
+    always_occupied = original.session_handle
+    monkeypatch.setattr(
+        secure.os, "urandom", lambda _length: always_occupied
+    )
+
+    stats_before = state.stats()
+    with pytest.raises(secure.SessionIdentityExhaustedError):
+        state.install_session(
+            relation, "boat_001", _fresh_test_locator(), object(),
+            object(), now=1.0)
+
+    assert state._sessions[original._session_key] is original
+    assert state._active_session_at_relation(relation) is original
+    assert state.stats() == stats_before
+    assert registry.is_live(original.assembly_namespace)
+    # No leaked extra reference: closing the untouched original must fully
+    # release its namespace (retiring), not leave it live from a phantom
+    # extra claim the failed replacement forgot to release.
+    assert state.close_session(original, now=2.0)
+    assert not registry.is_live(original.assembly_namespace)
+    assert registry.is_retiring(original.assembly_namespace)
+
+
+def test_install_session_handle_exhaustion_preserves_old_session_different_station(
+    monkeypatch,
+):
+    """Same relation, but the replacement authenticates as a DIFFERENT
+    station: `_reused_or_fresh_assembly_namespace` reserves a FRESH
+    namespace (not a claim) before the handle reservation fails. That
+    freshly reserved namespace must be released (not leaked as a
+    permanently live reservation nobody owns), and the old session must
+    be completely untouched."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    relation = _relation_key(secure, ("192.0.2.10", 50000))
+    original = state.install_session(
+        relation, "boat_001", _fresh_test_locator(), object(), object(),
+        now=0.0)
+
+    fresh_namespace_draw = b"\x02" * 16
+    always_occupied = original.session_handle
+    draws = iter([fresh_namespace_draw])
+
+    def fake_urandom(_length):
+        try:
+            return next(draws)
+        except StopIteration:
+            return always_occupied
+
+    monkeypatch.setattr(secure.os, "urandom", fake_urandom)
+
+    stats_before = state.stats()
+    with pytest.raises(secure.SessionIdentityExhaustedError):
+        state.install_session(
+            relation, "boat_099", _fresh_test_locator(), object(),
+            object(), now=1.0)
+
+    assert state._sessions[original._session_key] is original
+    assert state.stats() == stats_before
+    assert not registry.is_live(fresh_namespace_draw)
+
+
+def test_install_session_handle_exhaustion_at_capacity_preserves_the_victim(
+    monkeypatch,
+):
+    """F1's capacity-eviction variant: with the store already full, a
+    handle-reservation failure for a genuinely new relation must not have
+    evicted the LRU capacity victim first -- eviction only happens in the
+    commit phase, strictly after every fallible acquisition already
+    succeeded."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(max_sessions=1)
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    victim = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+
+    fresh_namespace_draw = b"\x03" * 16
+    always_occupied = victim.session_handle
+    draws = iter([fresh_namespace_draw])
+
+    def fake_urandom(_length):
+        try:
+            return next(draws)
+        except StopIteration:
+            return always_occupied
+
+    monkeypatch.setattr(secure.os, "urandom", fake_urandom)
+
+    stats_before = state.stats()
+    with pytest.raises(secure.SessionIdentityExhaustedError):
+        state.install_session(
+            _relation_key(secure, ("192.0.2.11", 50001)),
+            "boat_002", _fresh_test_locator(), object(), object(),
+            now=1.0)
+
+    assert state._sessions[victim._session_key] is victim
+    assert state.stats() == stats_before
+    assert not registry.is_live(fresh_namespace_draw)
+
+
+def test_install_session_construction_failure_releases_all_newly_acquired(
+    monkeypatch,
+):
+    """Direct fault injection: `LogicalSession` construction has no real
+    data-dependent failure mode today, but `_prepare_candidate_session`
+    must still release BOTH a freshly-reserved handle and namespace if
+    construction itself raises for any reason."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+
+    def broken_logical_session(*args, **kwargs):
+        raise RuntimeError("injected construction failure")
+
+    monkeypatch.setattr(secure, "LogicalSession", broken_logical_session)
+
+    stats_before = state.stats()
+    with pytest.raises(RuntimeError, match="injected construction failure"):
+        state.install_session(
+            _relation_key(secure, ("192.0.2.10", 50000)),
+            "boat_001", _fresh_test_locator(), object(), object(),
+            now=0.0)
+
+    assert state.stats() == stats_before
+    assert len(state._sessions) == 0
+    assert registry.live_count() == 0
+    assert registry.retiring_count() == 2  # released handle + namespace
+
+
+def test_promote_pending_session_allocation_exhaustion_preserves_pending(
+    monkeypatch,
+):
+    """F1 for promotion: an allocation failure (namespace or handle) must
+    leave the pending candidate, its locator reservation, and its already-
+    admitted confirmation-nonce accounting completely untouched -- popping
+    the pending and releasing its locator only happens in the commit
+    phase, after every fallible acquisition already succeeded."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    relation = _relation_key(secure, ("192.0.2.10", 50000))
+    locator = _fresh_test_locator()
+    pending = state.install_pending_session(
+        relation, "boat_001", locator, object(), object(), now=0.0)
+    confirmation_nonce = b"\x00" * 12
+    assert state.accept_pending_data_nonce(
+        pending, confirmation_nonce, now=0.0
+    )
+
+    # A value already live in the registry forces every draw (namespace
+    # AND handle) to collide and exhaust deterministically.
+    poison = secure._SESSION_IDENTITY_REGISTRY.reserve()
+    monkeypatch.setattr(secure.os, "urandom", lambda _length: poison)
+
+    pending_before = state._pending_sessions[relation]
+    locator_owners_before = dict(state._pending_locator_owners)
+    stats_before = state.stats()
+
+    with pytest.raises(secure.SessionIdentityExhaustedError):
+        state.promote_pending_session(pending, now=1.0)
+
+    assert state._pending_sessions[relation] is pending_before
+    assert state._pending_locator_owners == locator_owners_before
+    assert state.stats() == stats_before
+    # The already-admitted confirmation nonce is still recorded on the
+    # untouched pending candidate's own ledger -- not orphaned.
+    assert state.pending_data_nonce_seen(
+        pending, confirmation_nonce, now=1.0
+    )
+
+
+def test_run_periodic_maintenance_cleans_up_idle_expired_state_without_packets(
+    monkeypatch,
+):
+    """F3: expiry and retirement-purge housekeeping must run eventually
+    even when no packet arrives on any listener to trigger it as a side
+    effect -- proven here with a short real interval and a controllable
+    monotonic clock, not a live production-length wait."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0)
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    clock = _FakeClock(11.0)  # already past the 10-second TTL
+
+    async def scenario():
+        task = asyncio.create_task(
+            state.run_periodic_maintenance(
+                interval=0.01, monotonic_clock=clock
+            )
+        )
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+    assert len(state._sessions) == 0
+    assert state.stats().sessions_expired == 1
+    assert not registry.is_live(session.session_handle)
+    assert registry.is_retiring(session.session_handle)
+
+
+def test_run_periodic_maintenance_stops_cleanly_on_cancellation(monkeypatch):
+    """One owner's maintenance task can be cancelled independently -- it
+    must exit via CancelledError without raising anything else or leaving
+    the state lock held."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+
+    async def scenario():
+        task = asyncio.create_task(state.run_periodic_maintenance(interval=60.0))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    # The lock is usable afterward -- cancellation while parked in
+    # `asyncio.sleep()` (never inside the lock) left nothing held.
+    assert state.stats().current_sessions == 0
+
+
+def test_two_real_threads_racing_commit_order_does_not_defeat_expiry(
+    monkeypatch,
+):
+    """F2's exact reported reproduction, at the SecureState level: two
+    real OS threads share one owner. Thread A's touch is made to COMMIT
+    FIRST while reading the LARGER `now` (6); thread B's commits SECOND
+    while reading the SMALLER `now` (5) -- exactly the pathological
+    OrderedDict order [6, 5] the audit reported. Without heap-
+    authoritative expiry, checking at `now=15` with `session_ttl=10`
+    would stop at the front entry (A, 15-6=9<10, not yet due) and never
+    even look at the entry behind it (B, 15-5=10>=10, genuinely due)."""
+    import threading
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0)
+    session_a = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_a", _fresh_test_locator(), object(), object(), now=0.0)
+    session_b = state.install_session(
+        _relation_key(secure, ("192.0.2.11", 50001)),
+        "boat_b", _fresh_test_locator(), object(), object(), now=0.0)
+
+    a_committed = threading.Event()
+
+    def thread_a():
+        state.touch_session(session_a, now=6.0)
+        a_committed.set()
+
+    def thread_b():
+        assert a_committed.wait(timeout=5.0)
+        state.touch_session(session_b, now=5.0)
+
+    ta = threading.Thread(target=thread_a)
+    tb = threading.Thread(target=thread_b)
+    tb.start()
+    ta.start()
+    ta.join(timeout=5.0)
+    tb.join(timeout=5.0)
+
+    assert session_a.last_seen == 6.0
+    assert session_b.last_seen == 5.0
+    assert tuple(state._sessions) == (
+        session_a._session_key,
+        session_b._session_key,
+    )
+
+    expired = state.cleanup_expired_sessions(now=15.0)
+
+    assert session_b._session_key in expired
+    assert session_a._session_key not in expired
+    assert state.is_live_session_handle(session_a, now=15.0)
+    assert state._active_session_at_relation(
+        _relation_key(secure, ("192.0.2.11", 50001))
+    ) is None
+
+
+def test_two_real_threads_racing_pending_commit_order_does_not_defeat_expiry(
+    monkeypatch,
+):
+    """Pending equivalent, including sequence-zero confirmation: pending
+    candidate B (created_at=5, genuinely overdue at now=15 under
+    pending_session_ttl=10) must not survive behind pending candidate A
+    (created_at=6, not yet due) merely because A's install committed
+    first."""
+    import threading
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(pending_session_ttl=10.0)
+    relation_a = _relation_key(secure, ("192.0.2.10", 50000))
+    relation_b = _relation_key(secure, ("192.0.2.11", 50001))
+    results = {}
+    a_committed = threading.Event()
+
+    def thread_a():
+        results["pending_a"] = state.install_pending_session(
+            relation_a, "boat_a", _fresh_test_locator(), object(),
+            object(), now=6.0)
+        a_committed.set()
+
+    def thread_b():
+        assert a_committed.wait(timeout=5.0)
+        results["pending_b"] = state.install_pending_session(
+            relation_b, "boat_b", _fresh_test_locator(), object(),
+            object(), now=5.0)
+
+    tb = threading.Thread(target=thread_b)
+    ta = threading.Thread(target=thread_a)
+    tb.start()
+    ta.start()
+    ta.join(timeout=5.0)
+    tb.join(timeout=5.0)
+
+    pending_a = results["pending_a"]
+    pending_b = results["pending_b"]
+    assert tuple(state._pending_sessions) == (relation_a, relation_b)
+
+    confirmation_nonce = b"\x00" * 12
+    # B is genuinely overdue at now=15 (15-5=10>=10): its confirmation
+    # nonce must not be admitted, and it must not be promotable.
+    assert not state.accept_pending_data_nonce(
+        pending_b, confirmation_nonce, now=15.0
+    )
+    assert state.promote_pending_session(pending_b, now=15.0) is None
+    assert state.get_pending_session(relation_b, now=15.0) is None
+
+    # A is genuinely not yet due (15-6=9<10) and remains fully valid.
+    assert state.accept_pending_data_nonce(
+        pending_a, confirmation_nonce, now=15.0
+    )
+    assert state.promote_pending_session(pending_a, now=15.0) is not None
+
+
+def test_stale_time_touch_cannot_move_last_seen_backwards_or_revive_expiry(
+    monkeypatch,
+):
+    """F2: a `now` sampled before this lock was acquired can arrive at
+    `touch_session` after a later, larger `now` already committed (the
+    same out-of-order-commit hazard as the two-thread tests above). The
+    resulting stale, smaller `now` must never move `last_seen` backwards
+    -- doing so would shorten the session's real remaining lifetime and
+    could let a stale heap re-push (see `_push_session_expiry`'s lazy
+    recompute) compute an artificially-early deadline."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0)
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+
+    assert state.touch_session(session, now=8.0)
+    assert session.last_seen == 8.0
+
+    # A stale, smaller `now` arrives after the later touch already
+    # committed -- must not move last_seen backwards to 3.0.
+    assert state.touch_session(session, now=3.0)
+    assert session.last_seen == 8.0
+
+    # Real deadline is 8.0 + 10.0 = 18.0, not 3.0 + 10.0 = 13.0: the
+    # session must still be live at now=15 and only actually expire once
+    # 18.0 is reached.
+    assert state.is_live_session_handle(session, now=15.0)
+    expired = state.cleanup_expired_sessions(now=15.0)
+    assert session._session_key not in expired
+
+    expired = state.cleanup_expired_sessions(now=18.0)
+    assert session._session_key in expired
+
+
+def test_f4_delayed_old_frame_after_namespace_reuse_does_not_cross_combine(
+    monkeypatch,
+):
+    """F4's exact previously-reported scenario, now closed: an old
+    authenticated frame is admitted, deliberately delayed (simulating
+    queue backpressure with no maximum residence time of its own), its
+    session closes, its `assembly_namespace` retirement window elapses
+    and is purged, a controlled allocator draw reuses that exact
+    identifier for an unrelated new station, and both the old (delayed)
+    and new fragments reach one real `AIVDMAssembler` through the real
+    `PythonDataPlaneProcessor`. The old frame's `admitted_at` timestamp is
+    from before the retirement window even started, so it is refused as
+    stale before ever reaching the assembler -- no cross-station
+    multipart completion can occur, regardless of how the registry's
+    retirement window alone might otherwise interact with pipeline
+    residence time."""
+    from assembler import AIVDMAssembler
+    from core.data_plane import DeduplicationMode, ProcessingSnapshot
+    from core.ingress_frame import IngressFrame
+    from core.python_data_plane import (
+        MAX_INGRESS_FRAME_AGE_SECONDS,
+        PythonDataPlaneProcessor,
+    )
+    from core.session_identity_registry import RETIREMENT_SECONDS
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+
+    session_a = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    reused_namespace = session_a.assembly_namespace
+    reused_assembler_key = f"udpsec-assembly:{reused_namespace.hex()}"
+
+    old_fragment_text = "!AIVDM,2,1,9,A,delayed-old,0*00"
+    old_frame = IngressFrame(
+        kind="sec",
+        source_id="udpsec:boat_001",
+        alias_for_s="boat_001",
+        remote_ip="192.0.2.10",
+        assembler_key=reused_assembler_key,
+        payload=old_fragment_text.encode("utf-8"),
+        admitted_at=0.0,
+    )
+
+    # Session A closes; its namespace enters retirement, then the window
+    # elapses and is purged via the existing monotonic cleanup pass.
+    assert state.close_session(session_a, now=1.0)
+    assert registry.is_retiring(reused_namespace)
+    purge_time = 1.0 + RETIREMENT_SECONDS + 1.0
+    state.cleanup_expired_sessions(now=purge_time)
+    assert not registry.is_retiring(reused_namespace)
+    assert not registry.is_live(reused_namespace)
+
+    # Controlled allocator draw: the exact same identifier is legitimately
+    # reserved again for a brand-new, unrelated station. Only the first
+    # draw (assembly_namespace) needs to be forced onto the reused value;
+    # the second draw (session_handle) must land on a genuinely free
+    # value, not collide with the namespace it was just handed.
+    draws = iter([reused_namespace])
+    fresh_handle = b"\x99" * len(reused_namespace)
+
+    def fake_urandom(_length):
+        try:
+            return next(draws)
+        except StopIteration:
+            return fresh_handle
+
+    monkeypatch.setattr(secure.os, "urandom", fake_urandom)
+    session_b = state.install_session(
+        _relation_key(secure, ("192.0.2.11", 50001)),
+        "boat_002", _fresh_test_locator(), object(), object(),
+        now=purge_time)
+    assert session_b.assembly_namespace == reused_namespace
+
+    new_fragment_text = "!AIVDM,2,2,9,A,fresh-new,0*00"
+    new_frame = IngressFrame(
+        kind="sec",
+        source_id="udpsec:boat_002",
+        alias_for_s="boat_002",
+        remote_ip="192.0.2.11",
+        assembler_key=reused_assembler_key,  # same key: namespace reused
+        payload=new_fragment_text.encode("utf-8"),
+        admitted_at=purge_time,
+    )
+
+    # Both frames finally reach one real processor+assembler. The OLD
+    # frame is delayed well past MAX_INGRESS_FRAME_AGE_SECONDS by the time
+    # it is actually processed here; the NEW frame is processed
+    # essentially immediately.
+    processing_time = purge_time + MAX_INGRESS_FRAME_AGE_SECONDS + 5.0
+    real_assembler = AIVDMAssembler(timeout=1.0)
+    processor = PythonDataPlaneProcessor(
+        assembler=real_assembler,
+        monotonic_clock=lambda: processing_time,
+    )
+    snapshot = ProcessingSnapshot(
+        routing_generation=0,
+        deduplication_mode=DeduplicationMode.GLOBAL,
+        target_ids=(),
+    )
+
+    old_outputs = processor.process(old_frame, snapshot).outputs
+    assert old_outputs == ()
+    assert processor.stale_frames_dropped == 1
+
+    new_outputs = processor.process(new_frame, snapshot).outputs
+    # B's own fragment 2/2 has no matching fragment 1/2 in the assembler
+    # (A's was correctly refused before it could seed a group) -- the
+    # assembler sees an orphaned continuation fragment, never a
+    # cross-station-completed message.
+    assert new_outputs == ()
+    assert real_assembler.stats().completed == 0
 
 
 def test_independent_owners_share_assembler_without_cross_station_combination(

@@ -168,6 +168,33 @@ def _install_owned_session(
     return session
 
 
+def _install_owned_pending_session(
+    state,
+    owned_pending_sessions,
+    endpoint_token,
+    address,
+    *,
+    station_id="boat_001",
+    client_key=b"\x01" * 32,
+    server_key=b"\x02" * 32,
+    session_locator=None,
+    now=1000.0,
+):
+    if session_locator is None:
+        session_locator = _fresh_test_locator()
+    relation_key = _relation_key(endpoint_token, address)
+    pending = state.install_pending_session(
+        relation_key,
+        station_id,
+        session_locator,
+        AESGCM(client_key),
+        AESGCM(server_key),
+        now=now,
+    )
+    owned_pending_sessions[relation_key] = pending
+    return pending
+
+
 def _run_packets(
     monkeypatch,
     packets,
@@ -557,6 +584,126 @@ def test_shared_state_listener_close_sends_only_exact_owned_session():
     assert state.stats().current_sessions == 1
 
 
+def test_close_pending_session_removes_exact_candidate_and_counts_closed():
+    endpoint_token = secure._new_endpoint_token()
+    address = ("127.0.0.1", 50200)
+    state = secure.SecureState()
+    relation_key = _relation_key(endpoint_token, address)
+    pending = state.install_pending_session(
+        relation_key,
+        "boat_001",
+        _fresh_test_locator(),
+        AESGCM(b"\x01" * 32),
+        AESGCM(b"\x02" * 32),
+        now=0.0,
+    )
+
+    assert state.close_pending_session(pending, now=1.0)
+
+    assert state.get_pending_session(relation_key, now=1.0) is None
+    stats = state.stats()
+    assert stats.pending_sessions_closed == 1
+    assert stats.pending_sessions_expired == 0
+    assert stats.current_pending_sessions == 0
+
+
+def test_close_pending_session_ignores_stale_replaced_handle():
+    """F5, exact-object-checked like `close_session`: a pending handle
+    already superseded by a later candidate at the same relation (a
+    fresh ClientHello replacing an unconfirmed one) must be silently
+    ignored, never discarding whatever now legitimately occupies that
+    relation."""
+    endpoint_token = secure._new_endpoint_token()
+    address = ("127.0.0.1", 50201)
+    state = secure.SecureState()
+    relation_key = _relation_key(endpoint_token, address)
+    stale_pending = state.install_pending_session(
+        relation_key,
+        "boat_001",
+        _fresh_test_locator(),
+        AESGCM(b"\x01" * 32),
+        AESGCM(b"\x02" * 32),
+        now=0.0,
+    )
+    replacement = state.install_pending_session(
+        relation_key,
+        "boat_001",
+        _fresh_test_locator(),
+        AESGCM(b"\x03" * 32),
+        AESGCM(b"\x04" * 32),
+        now=1.0,
+    )
+
+    assert not state.close_pending_session(stale_pending, now=2.0)
+
+    assert state.get_pending_session(relation_key, now=2.0) is replacement
+    assert state.stats().pending_sessions_closed == 0
+
+
+def test_close_owned_pending_sessions_discards_only_owned_candidates():
+    """F5: companion to `close_owned_sessions` for the pending store --
+    discards exactly the calling listener's own tracked candidates,
+    leaves an unrelated owner's pending candidate (and any active
+    session) sharing the same state completely untouched."""
+    first_endpoint_token = secure._new_endpoint_token()
+    second_endpoint_token = secure._new_endpoint_token()
+    address = ("127.0.0.1", 50202)
+    state = secure.SecureState()
+    first_owned_pending = weakref.WeakValueDictionary()
+    second_owned_pending = weakref.WeakValueDictionary()
+    first_pending = _install_owned_pending_session(
+        state, first_owned_pending, first_endpoint_token, address,
+        station_id="boat_first", client_key=b"\x11" * 32,
+        server_key=b"\x12" * 32,
+    )
+    second_pending = _install_owned_pending_session(
+        state, second_owned_pending, second_endpoint_token, address,
+        station_id="boat_second", client_key=b"\x21" * 32,
+        server_key=b"\x22" * 32,
+    )
+    unrelated_session = _install_owned_session(
+        state, weakref.WeakValueDictionary(), first_endpoint_token,
+        ("127.0.0.1", 50203), station_id="boat_active",
+    )
+
+    secure.close_owned_pending_sessions(
+        state, first_owned_pending, monotonic_clock=lambda: 1010.0,
+    )
+
+    assert state.get_pending_session(
+        first_pending._relation_key, 1010.0
+    ) is None
+    assert state.get_pending_session(
+        second_pending._relation_key, 1010.0
+    ) is second_pending
+    assert state.is_live_session_handle(unrelated_session, 1010.0)
+    stats = state.stats()
+    assert stats.pending_sessions_closed == 1
+    assert stats.current_pending_sessions == 1
+    assert stats.current_sessions == 1
+
+
+def test_close_owned_pending_sessions_sends_no_wire_message():
+    """Unlike an active session's graceful close, an unconfirmed pending
+    candidate has no confirmed key material to notify with -- discarding
+    it must not attempt to send anything."""
+    endpoint_token = secure._new_endpoint_token()
+    address = ("127.0.0.1", 50204)
+    state = secure.SecureState()
+    owned_pending = weakref.WeakValueDictionary()
+    _install_owned_pending_session(
+        state, owned_pending, endpoint_token, address,
+    )
+
+    # No socket is even passed to this function -- it cannot send
+    # anything by construction.
+    secure.close_owned_pending_sessions(
+        state, owned_pending, monotonic_clock=lambda: 1010.0,
+    )
+
+    assert state.stats().pending_sessions_closed == 1
+
+
 def test_secure_server_close_send_failure_is_best_effort_and_closes_socket(
     monkeypatch,
 ):
@@ -613,6 +760,56 @@ def test_secure_server_close_send_failure_is_best_effort_and_closes_socket(
     assert fake_socket.close_count == 1
     assert state.stats().sessions_closed == 2
     assert state.stats().current_sessions == 0
+
+
+def test_secure_server_shutdown_also_discards_owned_pending_sessions(
+    monkeypatch,
+):
+    """F5: full `secure_server()` shutdown must discard this listener's
+    own abandoned pending candidates too, not only its active sessions --
+    otherwise they would sit consuming pending-capacity and locator-
+    reservation slots for up to their ordinary TTL after the listener
+    that started them is already gone."""
+    address = ("127.0.0.1", 50130)
+    state = secure.SecureState()
+    fake_socket = _OrderedSocket()
+
+    monkeypatch.setattr(
+        secure,
+        "create_udp_listener_socket",
+        lambda _listen_ip, *, reuse_address: fake_socket,
+    )
+
+    async def install_pending_then_return(*_args, **kwargs):
+        _install_owned_pending_session(
+            kwargs["state"],
+            kwargs["owned_pending_sessions"],
+            kwargs["endpoint_token"],
+            address,
+        )
+
+    monkeypatch.setattr(
+        secure,
+        "_secure_server_loop",
+        install_pending_then_return,
+    )
+
+    asyncio.run(
+        secure.secure_server(
+            _Queue(),
+            "127.0.0.1",
+            9999,
+            state=state,
+            wall_clock=lambda: 1010.0,
+            monotonic_clock=lambda: 1010.0,
+            server_private_key=PREPARED_SERVER_PRIVATE_KEY,
+        )
+    )
+
+    assert fake_socket.close_count == 1
+    stats = state.stats()
+    assert stats.pending_sessions_closed == 1
+    assert stats.current_pending_sessions == 0
 
 
 def test_udpsec_handshake_ping_replay_and_rejected_data_are_transport_only(

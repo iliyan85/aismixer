@@ -53,6 +53,7 @@ def make_frame(
     alias_for_s=None,
     remote_ip=REMOTE_IP,
     assembler_key=ASSEMBLER_KEY,
+    admitted_at=None,
 ):
     return IngressFrame(
         kind="udp",
@@ -61,6 +62,7 @@ def make_frame(
         remote_ip=remote_ip,
         assembler_key=assembler_key,
         payload=payload.encode("utf-8"),
+        admitted_at=admitted_at,
     )
 
 
@@ -1469,3 +1471,119 @@ def test_multipart_crosses_generations_and_uses_completion_numeric_targets():
     )
     assert assembler.stats().completed == 1
     assert assembler.stats().resets == 0
+
+
+# --- F4 (UDPSEC V2 Corrective Closure R4): enforced maximum ingress frame
+# age, closing the gap where none of the ingress/processing queues between
+# UDPSEC admission and this processor impose a maximum residence time.
+
+
+def test_frame_with_no_admitted_at_is_never_age_checked():
+    """Only namespace-bearing (UDPSEC) frames set `admitted_at`; every
+    other source's frames must be processed normally regardless of how
+    far forward the clock has moved, since they carry no reuse hazard."""
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 10_000.0,
+        max_ingress_frame_age=1.0,
+    )
+
+    outputs = process_outputs(
+        processor, make_frame(SENTENCE, admitted_at=None), make_snapshot()
+    )
+
+    assert len(outputs) == 1
+    assert processor.stale_frames_dropped == 0
+
+
+def test_stale_ingress_frame_is_dropped_without_reaching_assembler():
+    """A frame older than the configured maximum age must be refused
+    outright -- not fed to the assembler in any form, single-sentence or
+    multipart -- and produces no output."""
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 100.0,
+        max_ingress_frame_age=20.0,
+    )
+    stats_before = assembler.stats()
+
+    outputs = process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=50.0),  # age = 100 - 50 = 50 > 20
+        make_snapshot(),
+    )
+
+    assert outputs == ()
+    assert processor.stale_frames_dropped == 1
+    # The assembler was never called at all -- not merely "produced no
+    # output" -- so every one of its own counters is untouched.
+    assert assembler.stats() == stats_before
+
+
+def test_fresh_ingress_frame_within_age_bound_is_processed_normally():
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 100.0,
+        max_ingress_frame_age=20.0,
+    )
+
+    outputs = process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=85.0),  # age = 100 - 85 = 15 < 20
+        make_snapshot(),
+    )
+
+    assert len(outputs) == 1
+    assert processor.stale_frames_dropped == 0
+
+
+def test_ingress_frame_exactly_at_the_age_boundary_is_accepted():
+    """Boundary semantics match the rest of this codebase's TTL checks:
+    exactly at the limit is still accepted, only strictly OVER it is
+    refused."""
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 100.0,
+        max_ingress_frame_age=20.0,
+    )
+
+    outputs = process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=80.0),  # age == 20.0 exactly
+        make_snapshot(),
+    )
+
+    assert len(outputs) == 1
+    assert processor.stale_frames_dropped == 0
+
+
+def test_stale_frame_drop_accounts_as_a_completed_outputless_call():
+    """A deliberate staleness drop is a normal completed call with zero
+    outputs -- not a failure -- matching how any other empty-output
+    completion is accounted."""
+    processor = make_processor(
+        monotonic_clock=lambda: 100.0,
+        max_ingress_frame_age=20.0,
+    )
+
+    process_batch(processor, make_frame(SENTENCE, admitted_at=0.0), make_snapshot())
+
+    metrics = processor.metrics_snapshot()
+    assert metrics.process_calls == 1
+    assert metrics.process_completed == 1
+    assert metrics.process_failed == 0
+    assert metrics.outputless_calls == 1
+    assert metrics.output_batches == 0
+    assert processor.stale_frames_dropped == 1
+
+
+def test_max_ingress_frame_age_defaults_to_module_constant():
+    processor = make_processor()
+    assert (
+        processor._max_ingress_frame_age
+        == python_data_plane_module.MAX_INGRESS_FRAME_AGE_SECONDS
+    )

@@ -1239,6 +1239,7 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         assert [spec.name for spec in specs] == [
             "udpsec-ingress:0:secure_one",
             "udpsec-ingress:1:secure_two",
+            "udpsec-state-maintenance",
             "udp-ingress:0:plain_one",
             "udp-ingress:1:plain_two",
             "ingress-fan-in",
@@ -1250,12 +1251,18 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         secure_factories = tuple(
             spec.coroutine_factory for spec in specs[:2]
         )
+        maintenance_factory = specs[2].coroutine_factory
         udp_factories = tuple(
-            spec.coroutine_factory for spec in specs[2:4]
+            spec.coroutine_factory for spec in specs[3:5]
         )
-        fan_in_factory = specs[4].coroutine_factory
-        processor_factory = specs[5].coroutine_factory
-        egress_factory = specs[6].coroutine_factory
+        fan_in_factory = specs[5].coroutine_factory
+        processor_factory = specs[6].coroutine_factory
+        egress_factory = specs[7].coroutine_factory
+
+        # F3: exactly one shared-state maintenance task regardless of how
+        # many secure inputs are configured (two, here) -- a bare
+        # zero-argument factory, not a per-listener partial.
+        assert maintenance_factory is aismixer.secure_state_maintenance
 
         assert all(
             factory.func is aismixer.secure_server
@@ -1287,6 +1294,10 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
             "plain_two",
         ]
 
+        # Ingress specs are no longer a contiguous prefix: the shared-state
+        # maintenance spec sits between the secure and plain UDP ingress
+        # specs (see the exact name list asserted above).
+        ingress_specs = specs[:2] + specs[3:5]
         input_queues = tuple(
             factory.args[0] for factory in secure_factories
         ) + tuple(factory.args[1] for factory in udp_factories)
@@ -1308,13 +1319,13 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
                 spec.name,
                 aismixer.DEFAULT_INGRESS_QUEUE_MAXSIZE,
             )
-            for spec in specs[:4]
+            for spec in ingress_specs
         )
         traffic_snapshots = tuple(
             owner.input_traffic_snapshot() for owner in input_traffic
         )
         assert tuple(snapshot.name for snapshot in traffic_snapshots) == tuple(
-            spec.name for spec in specs[:4]
+            spec.name for spec in ingress_specs
         )
         assert tuple(snapshot.kind for snapshot in traffic_snapshots) == (
             "udpsec",
@@ -1429,10 +1440,14 @@ def test_main_accepts_explicit_capacities_with_isolated_input_queues(
 
         specs = supervision_calls[0]
         secure_queue = specs[0].coroutine_factory.args[0]
-        udp_queue = specs[1].coroutine_factory.args[1]
-        fan_in_factory = specs[2].coroutine_factory
-        processor_factory = specs[3].coroutine_factory
-        egress_factory = specs[4].coroutine_factory
+        # specs[1] is the F3 shared-state maintenance task (a bare
+        # zero-argument factory, always inserted between the secure and
+        # plain UDP ingress specs when any secure input is configured).
+        assert specs[1].coroutine_factory is aismixer.secure_state_maintenance
+        udp_queue = specs[2].coroutine_factory.args[1]
+        fan_in_factory = specs[3].coroutine_factory
+        processor_factory = specs[4].coroutine_factory
+        egress_factory = specs[5].coroutine_factory
 
         assert secure_queue is not udp_queue
         assert isinstance(secure_queue, aismixer._ObservedQueue)

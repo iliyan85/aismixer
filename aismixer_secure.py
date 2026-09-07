@@ -2,6 +2,8 @@ import os
 import asyncio
 import base64
 import binascii
+import heapq
+import itertools
 import json
 import threading
 import time
@@ -69,6 +71,16 @@ HANDSHAKE_REPLAY_TTL_SECONDS = 60
 HANDSHAKE_REPLAY_MAX = 100000
 DATA_NONCE_MAX_PER_SESSION = 100000
 SESSION_LOCATOR_GENERATION_ATTEMPTS = 8
+# F3: how often `SecureState.run_periodic_maintenance()` (a small,
+# independent, opt-in background task -- see that method) runs expiry and
+# retirement-purge housekeeping. Not security-relevant on its own (an
+# expired owner is already correctly rejected by every lazy per-operation
+# check, in `_secure_server_loop` and elsewhere, regardless of when the
+# last sweep ran) -- this only bounds how long genuinely idle,
+# already-expired state and retired identifier reservations can sit
+# before their memory is reclaimed on a listener that receives no
+# packets at all.
+IDLE_MAINTENANCE_INTERVAL_SECONDS = 30.0
 
 _HANDSHAKE_REPLAY_LABEL = b"HANDSHAKE-REPLAY"
 
@@ -562,6 +574,7 @@ class SecureStateStats:
     pending_sessions_promoted: int
     pending_sessions_expired: int
     pending_sessions_capacity_evicted: int
+    pending_sessions_closed: int
 
     data_nonces_accepted: int
     data_nonce_replays: int
@@ -650,6 +663,38 @@ class SecureState:
         # directly against `self._sessions` (see `_locator_is_free`), since
         # that store is already locator-keyed.
         self._pending_locator_owners = {}
+        # Expiry authority is deliberately SEPARATE from `_sessions`'/
+        # `_pending_sessions`' OrderedDict position, which exists only for
+        # LRU/capacity-eviction ordering. `_sessions`/`_pending_sessions`
+        # are reordered (via `move_to_end` on touch, or plain insertion) at
+        # the moment each state transaction actually COMMITS under this
+        # lock -- but two transactions racing to commit do not necessarily
+        # commit in the same order as the `now` values they were called
+        # with (a thread can sample a LATER `now` yet still acquire this
+        # lock and commit BEFORE a thread that sampled an EARLIER `now`).
+        # An OrderedDict-front-prefix expiry scan silently assumes commit
+        # order tracks timestamp order; when it does not, a genuinely
+        # expired entry can sit behind a newer one at the front and never
+        # be found by that scan, letting expired active/pending state be
+        # treated as live. These two min-heaps are ordered strictly by
+        # deadline VALUE, not by insertion/commit order, so
+        # `cleanup_expired_sessions`/`cleanup_expired_pending_sessions`
+        # always find every genuinely due entry regardless of commit
+        # order. Entries are lazily validated against the live store when
+        # popped (see those methods) rather than proactively invalidated
+        # on every touch, which keeps each heap's size bounded by roughly
+        # the number of live entries rather than by total touch volume.
+        self._session_expiry_heap = []
+        self._pending_expiry_heap = []
+        # Heap entries are `(deadline, sequence, key)`. `_EndpointSessionKey`
+        # and `_EndpointPeerKey` support equality but not ordering, so two
+        # entries with an equal `deadline` (routine -- many sessions can
+        # share one `now` and `session_ttl`) would otherwise make `heapq`
+        # fall through to comparing the keys and raise `TypeError`. The
+        # monotonically increasing `sequence` is unique across every push
+        # to either heap, so it alone breaks every tie and the key is
+        # never actually compared.
+        self._expiry_heap_sequence = itertools.count()
         # `session_handle` identifies one LogicalSession object incarnation
         # and is always fresh. `assembly_namespace` identifies secure
         # multipart continuity lineage and may be carried forward across a
@@ -679,6 +724,7 @@ class SecureState:
         self._pending_sessions_promoted = 0
         self._pending_sessions_expired = 0
         self._pending_sessions_capacity_evicted = 0
+        self._pending_sessions_closed = 0
 
         self._data_nonces_accepted = 0
         self._data_nonce_replays = 0
@@ -717,6 +763,7 @@ class SecureState:
                 pending_sessions_capacity_evicted=(
                     self._pending_sessions_capacity_evicted
                 ),
+                pending_sessions_closed=self._pending_sessions_closed,
                 data_nonces_accepted=self._data_nonces_accepted,
                 data_nonce_replays=self._data_nonce_replays,
                 data_nonces_expired=self._data_nonces_expired,
@@ -820,19 +867,63 @@ class SecureState:
             self._pending_sessions_replaced += 1
         elif reason == "nonce_exhausted":
             self._data_nonce_exhaustions += 1
+        elif reason == "closed":
+            self._pending_sessions_closed += 1
         else:
             raise ValueError(
                 f"Unknown pending-session removal reason: {reason}"
             )
         return pending
 
+    def _push_session_expiry(self, session):
+        heapq.heappush(
+            self._session_expiry_heap,
+            (
+                session.last_seen + self._session_ttl,
+                next(self._expiry_heap_sequence),
+                session._session_key,
+            ),
+        )
+
+    def _push_pending_expiry(self, pending):
+        heapq.heappush(
+            self._pending_expiry_heap,
+            (
+                pending.created_at + self._pending_session_ttl,
+                next(self._expiry_heap_sequence),
+                pending._relation_key,
+            ),
+        )
+
     def cleanup_expired_sessions(self, now):
         with self._lock:
             expired = []
-            while self._sessions:
-                session_key, session = next(iter(self._sessions.items()))
-                if now - session.last_seen < self._session_ttl:
+            while self._session_expiry_heap:
+                deadline, _sequence, session_key = (
+                    self._session_expiry_heap[0]
+                )
+                if deadline > now:
                     break
+                heapq.heappop(self._session_expiry_heap)
+                session = self._sessions.get(session_key)
+                if session is None:
+                    continue  # removed already via another path
+                current_deadline = session.last_seen + self._session_ttl
+                if current_deadline > now:
+                    # This entry predates a later touch: the session's
+                    # real current deadline is not actually due yet. Push
+                    # one fresh entry reflecting that real deadline and
+                    # keep scanning -- another entry genuinely due now may
+                    # still be sitting behind this one in heap order.
+                    heapq.heappush(
+                        self._session_expiry_heap,
+                        (
+                            current_deadline,
+                            next(self._expiry_heap_sequence),
+                            session_key,
+                        ),
+                    )
+                    continue
                 self._remove_session(session_key, "expired", now)
                 expired.append(session_key)
             # Bounded registry housekeeping piggybacked on this already-
@@ -846,15 +937,70 @@ class SecureState:
     def cleanup_expired_pending_sessions(self, now):
         with self._lock:
             expired = []
-            while self._pending_sessions:
-                relation_key, pending = next(
-                    iter(self._pending_sessions.items())
+            while self._pending_expiry_heap:
+                deadline, _sequence, relation_key = (
+                    self._pending_expiry_heap[0]
                 )
-                if now < pending.created_at + self._pending_session_ttl:
+                if deadline > now:
                     break
+                heapq.heappop(self._pending_expiry_heap)
+                pending = self._pending_sessions.get(relation_key)
+                if pending is None:
+                    continue  # removed already via another path
+                current_deadline = (
+                    pending.created_at + self._pending_session_ttl
+                )
+                if current_deadline > now:
+                    heapq.heappush(
+                        self._pending_expiry_heap,
+                        (
+                            current_deadline,
+                            next(self._expiry_heap_sequence),
+                            relation_key,
+                        ),
+                    )
+                    continue
                 self._remove_pending_session(relation_key, "expired")
                 expired.append(relation_key)
             return expired
+
+    async def run_periodic_maintenance(
+        self,
+        interval=IDLE_MAINTENANCE_INTERVAL_SECONDS,
+        monotonic_clock=None,
+    ):
+        """F3: run this owner's expiry and retirement-purge housekeeping
+        on a timer, independent of any packet arriving to trigger it as a
+        side effect.
+
+        This is NOT security-relevant on its own: `_secure_server_loop`
+        and every other public entry point already call
+        `cleanup_expired_sessions`/`cleanup_expired_pending_sessions`
+        before treating any active/pending state as live, so an expired
+        owner is correctly rejected regardless of when this last ran. Its
+        only purpose is bounding how long already-expired state and
+        retired identifier reservations can sit un-reclaimed on a fully
+        idle owner (no packets on any listener sharing it) -- otherwise
+        that housekeeping never runs at all until the next packet.
+
+        Intended to be spawned as ONE independent supervised task per
+        `SecureState` owner (not per physical listener -- every listener
+        sharing one owner already benefits from a single task cleaning up
+        that shared owner's state), with a lifetime managed by the
+        caller exactly like any other supervised background task.
+        Cancelling it (or any one listener's own task) does not affect
+        any other owner's maintenance task, and this method does not
+        start, own, or need to know about any listener socket. Runs
+        until cancelled.
+        """
+        monotonic_now = (
+            time.monotonic if monotonic_clock is None else monotonic_clock
+        )
+        while True:
+            await asyncio.sleep(interval)
+            now = monotonic_now()
+            self.cleanup_expired_sessions(now)
+            self.cleanup_expired_pending_sessions(now)
 
     def _fresh_session_handle(self):
         """Always mint a new, process-wide-unique LogicalSession-incarnation
@@ -1002,6 +1148,59 @@ class SecureState:
                 f"{SESSION_LOCATOR_GENERATION_ATTEMPTS} attempts"
             )
 
+    def _prepare_candidate_session(
+        self,
+        session_key,
+        station_id,
+        canonical_relation_key,
+        current_epoch,
+        active_path,
+        now,
+    ):
+        """Acquire every fallible resource and fully construct a candidate
+        `LogicalSession`, BEFORE any destructive mutation to existing
+        state. Shared by `install_session` and `promote_pending_session`,
+        whose only difference at this point is where `current_epoch`
+        comes from (freshly built vs. transferred unchanged from a
+        confirmed pending candidate).
+
+        F1: an earlier version of this code could acquire/claim an
+        `assembly_namespace`, THEN destroy the previous session at this
+        relation (or evict a capacity victim), and only after that mint a
+        `session_handle` -- so a handle-reservation failure left the
+        namespace reservation orphaned and the previous session gone for
+        nothing. Here, nothing destructive happens until the caller
+        commits: on success, the returned `LogicalSession` fully owns a
+        freshly-acquired `session_handle` and an `assembly_namespace`
+        (freshly reserved, or one additional live reference claimed on a
+        still-live previous session's namespace); on failure, exactly
+        what THIS call newly acquired is released once and the exception
+        propagates, with no other store touched.
+        """
+        assembly_namespace = self._reused_or_fresh_assembly_namespace(
+            canonical_relation_key, station_id
+        )
+        try:
+            session_handle = self._fresh_session_handle()
+        except BaseException:
+            _SESSION_IDENTITY_REGISTRY.release(assembly_namespace, now)
+            raise
+        try:
+            return LogicalSession(
+                _session_key=session_key,
+                station_id=station_id,
+                created_at=now,
+                last_seen=now,
+                session_handle=session_handle,
+                assembly_namespace=assembly_namespace,
+                current_epoch=current_epoch,
+                path_state=PathState(active_path=active_path),
+            )
+        except BaseException:
+            _SESSION_IDENTITY_REGISTRY.release(session_handle, now)
+            _SESSION_IDENTITY_REGISTRY.release(assembly_namespace, now)
+            raise
+
     def install_session(
         self,
         relation_key,
@@ -1045,27 +1244,19 @@ class SecureState:
             canonical_relation_key = _canonical_active_relation_key(
                 relation_key
             )
-            assembly_namespace = self._reused_or_fresh_assembly_namespace(
-                canonical_relation_key, station_id
-            )
-            replaced = self._remove_active_at_canonical_relation_if_present(
-                canonical_relation_key, now
-            )
-            if not replaced and len(self._sessions) >= self._max_sessions:
-                oldest_session_key = next(iter(self._sessions))
-                self._remove_session(oldest_session_key, "capacity", now)
-
             session_key = _EndpointSessionKey(
                 relation_key.endpoint_token, session_locator
             )
-            session = LogicalSession(
-                _session_key=session_key,
-                station_id=station_id,
-                created_at=now,
-                last_seen=now,
-                session_handle=self._fresh_session_handle(),
-                assembly_namespace=assembly_namespace,
-                current_epoch=CryptoEpoch(
+
+            # PREPARE (F1): every fallible acquisition and the fully
+            # constructed candidate session happen here, before touching
+            # the old session at this relation (if any) or a capacity
+            # victim. See `_prepare_candidate_session`.
+            session = self._prepare_candidate_session(
+                session_key,
+                station_id,
+                canonical_relation_key,
+                CryptoEpoch(
                     client_to_server_aesgcm=client_to_server_aesgcm,
                     server_to_client_aesgcm=server_to_client_aesgcm,
                     seen_data_nonces=_BoundedNonceSet(
@@ -1073,10 +1264,23 @@ class SecureState:
                     ),
                     created_at=now,
                 ),
-                path_state=PathState(active_path=relation_key.peer_address),
+                relation_key.peer_address,
+                now,
             )
+
+            # COMMIT: the candidate is fully prepared, so only now remove
+            # the old owner at this relation (if any) or evict a capacity
+            # victim, and install the new session as one transaction.
+            replaced = self._remove_active_at_canonical_relation_if_present(
+                canonical_relation_key, now
+            )
+            if not replaced and len(self._sessions) >= self._max_sessions:
+                oldest_session_key = next(iter(self._sessions))
+                self._remove_session(oldest_session_key, "capacity", now)
+
             self._sessions[session_key] = session
             self._relation_index[canonical_relation_key] = session_key
+            self._push_session_expiry(session)
             self._sessions_created += 1
             self._peak_sessions = max(
                 self._peak_sessions,
@@ -1145,6 +1349,7 @@ class SecureState:
             self._pending_locator_owners[
                 (relation_key.endpoint_token, session_locator)
             ] = relation_key
+            self._push_pending_expiry(pending)
             self._pending_sessions_created += 1
             self._peak_pending_sessions = max(
                 self._peak_pending_sessions,
@@ -1187,7 +1392,17 @@ class SecureState:
         return pending
 
     def _touch_active_session(self, session, now):
-        session.last_seen = now
+        # Monotonic non-decreasing: two threads can race to touch the same
+        # session with `now` values sampled before either acquired this
+        # lock, so the one that actually commits second is not guaranteed
+        # to carry the larger `now`. Clamping here means a stale, out-of-
+        # order `now` can never move `last_seen` backwards and shorten
+        # this session's real remaining lifetime -- `cleanup_expired_*`'s
+        # lazy heap re-push (see `_push_session_expiry`) always recomputes
+        # the deadline from this authoritative field, so a backwards jump
+        # here would otherwise translate directly into a false-early
+        # expiry decision.
+        session.last_seen = max(session.last_seen, now)
         self._sessions.move_to_end(session._session_key)
         self._sessions_touched += 1
 
@@ -1208,6 +1423,22 @@ class SecureState:
                 return False
             self._remove_session(session._session_key, "closed", now)
             return True
+
+    def close_pending_session(self, pending, now):
+        """Discard the exact pending candidate `pending`, immediately
+        rather than waiting for its ordinary TTL. F5: companion to
+        `close_session` for the pending store -- exact-object-checked the
+        same way, so a stale/already-superseded pending handle is
+        correctly ignored rather than discarding whatever now legitimately
+        occupies that relation. Pending candidates hold no registry
+        identifier reservation of their own (`session_handle`/
+        `assembly_namespace` are minted only by `install_session`/
+        `promote_pending_session`), so there is nothing to release from
+        `_SESSION_IDENTITY_REGISTRY` here."""
+        with self._lock:
+            if self._get_live_pending_session_handle(pending, now) is None:
+                return False
+            return self._remove_exact_pending_session(pending, "closed")
 
     def promote_pending_session(self, pending, now):
         relation_key = pending._relation_key
@@ -1253,10 +1484,40 @@ class SecureState:
             canonical_relation_key = _canonical_active_relation_key(
                 relation_key
             )
-            assembly_namespace = self._reused_or_fresh_assembly_namespace(
-                canonical_relation_key, pending.station_id
+            session_key = _EndpointSessionKey(
+                relation_key.endpoint_token, pending.session_locator
             )
 
+            # PREPARE (F1): every fallible acquisition and the fully
+            # constructed candidate session happen here -- before popping
+            # the pending entry, releasing its locator reservation,
+            # touching the old active session at this relation (if any),
+            # or evicting a capacity victim. See
+            # `_prepare_candidate_session`. A failure here leaves the
+            # pending session, its locator reservation, its confirmation-
+            # nonce accounting, and every statistic below untouched: it
+            # has not been popped yet, so nothing has become ownerless.
+            session = self._prepare_candidate_session(
+                session_key,
+                pending.station_id,
+                canonical_relation_key,
+                # The confirmed epoch (both AES-GCM owners and the nonce
+                # set that already admitted the confirmation nonce)
+                # transfers unchanged from the pending candidate --
+                # promotion does not derive new keys or reset replay
+                # state. The pending's already-reserved session_locator
+                # transfers unchanged too: promotion mints no second
+                # locator.
+                pending.current_epoch,
+                relation_key.peer_address,
+                now,
+            )
+
+            # COMMIT: the candidate is fully prepared, so only now pop the
+            # pending entry, release its locator reservation, remove the
+            # old active owner at this relation (if any) or evict a
+            # capacity victim, and install the new session -- one
+            # uncontested transaction.
             self._pending_sessions.pop(relation_key)
             locator_key = (relation_key.endpoint_token, pending.session_locator)
             if self._pending_locator_owners.get(locator_key) == relation_key:
@@ -1270,27 +1531,9 @@ class SecureState:
                 oldest_session_key = next(iter(self._sessions))
                 self._remove_session(oldest_session_key, "capacity", now)
 
-            session_key = _EndpointSessionKey(
-                relation_key.endpoint_token, pending.session_locator
-            )
-            session = LogicalSession(
-                _session_key=session_key,
-                station_id=pending.station_id,
-                created_at=now,
-                last_seen=now,
-                session_handle=self._fresh_session_handle(),
-                assembly_namespace=assembly_namespace,
-                # The confirmed epoch (both AES-GCM owners and the nonce set that
-                # already admitted the confirmation nonce) transfers unchanged
-                # from the pending candidate -- promotion does not derive new
-                # keys or reset replay state. The pending's already-reserved
-                # session_locator transfers unchanged too: promotion mints no
-                # second locator.
-                current_epoch=pending.current_epoch,
-                path_state=PathState(active_path=relation_key.peer_address),
-            )
             self._sessions[session_key] = session
             self._relation_index[canonical_relation_key] = session_key
+            self._push_session_expiry(session)
             self._sessions_created += 1
             self._peak_sessions = max(
                 self._peak_sessions,
@@ -1487,6 +1730,43 @@ def close_owned_sessions(
                 session,
                 local_now,
             )
+
+
+def close_owned_pending_sessions(
+    state_owner,
+    owned_pending_sessions,
+    *,
+    monotonic_clock=None,
+):
+    """F5: discard exact pending candidates owned by one listener socket
+    immediately, rather than leaving them to expire on their own TTL.
+
+    Companion to `close_owned_sessions` for the pending store. Unlike
+    active sessions, an abandoned pending candidate holds no
+    `_SESSION_IDENTITY_REGISTRY` reservation of its own to release
+    (`session_handle`/`assembly_namespace` are minted only at
+    `install_session`/`promote_pending_session` time) -- so there is
+    nothing to leak here, but leaving a torn-down listener's own
+    candidates to expire naturally would needlessly hold pending-capacity
+    slots (and their locator reservations) that another owner sharing
+    this `SecureState` could otherwise use in the meantime. No handshake
+    message is sent: an unconfirmed candidate has no confirmed key
+    material to notify with, and UDPSEC's client-side retry/timeout
+    behavior on a silently-dropped pending handshake is already the
+    ordinary, unremarkable path.
+    """
+
+    if not owned_pending_sessions:
+        return
+
+    monotonic_now = (
+        time.monotonic
+        if monotonic_clock is None
+        else monotonic_clock
+    )
+    for relation_key, pending in list(owned_pending_sessions.items()):
+        local_now = monotonic_now()
+        state_owner.close_pending_session(pending, local_now)
 
 
 def _build_server_handshake(
@@ -2003,6 +2283,16 @@ async def _secure_server_loop(
                     remote_ip=remote_ip,
                     assembler_key=assembler_key,
                     payload=msg["payload"],
+                    # F4: this frame's assembler_key is derived from
+                    # assembly_namespace, which can legitimately be
+                    # reserved for an unrelated station once its
+                    # retirement window elapses. Recording admission time
+                    # here lets the processor (core.python_data_plane)
+                    # refuse to feed an over-age frame to the assembler,
+                    # closing the residence-time gap between UDPSEC
+                    # admission and the assembler group actually starting
+                    # its own timeout.
+                    admitted_at=local_now,
                 )
                 if frame is not None:
                     await queue.put(frame)
@@ -2073,4 +2363,11 @@ async def secure_server(
                 monotonic_clock=monotonic_clock,
             )
         finally:
-            sock.close()
+            try:
+                close_owned_pending_sessions(
+                    state_owner,
+                    owned_pending_sessions,
+                    monotonic_clock=monotonic_clock,
+                )
+            finally:
+                sock.close()

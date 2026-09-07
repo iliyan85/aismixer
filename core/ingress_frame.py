@@ -19,6 +19,17 @@ class IngressFrame:
     assembler_key: str
     payload: bytes
     text_mode: PayloadTextMode = PayloadTextMode.UTF8_IGNORE
+    # Monotonic timestamp of admission into the pipeline (NOT the
+    # transport's own arrival time, and NOT wall-clock), or `None` when
+    # the source does not need one. Currently populated only by UDPSEC
+    # (`aismixer_secure`), whose `assembler_key` is derived from a
+    # process-wide `assembly_namespace` identifier that can legitimately
+    # be reserved for an unrelated station once its own retirement window
+    # elapses (see `core.session_identity_registry`); plain UDP/serial
+    # assembler keys are address-derived and stable for that peer, so they
+    # have no analogous reuse hazard and never set this. See
+    # `core.python_data_plane` for where and why this is enforced.
+    admitted_at: Optional[float] = None
 
 
 def frame_from_text_payload(
@@ -29,6 +40,7 @@ def frame_from_text_payload(
     remote_ip: Optional[str],
     assembler_key: str,
     payload: object,
+    admitted_at: Optional[float] = None,
 ) -> Optional[IngressFrame]:
     if not isinstance(payload, str):
         return None
@@ -45,6 +57,7 @@ def frame_from_text_payload(
             errors="surrogatepass",
         ),
         text_mode=PayloadTextMode.UTF8_SURROGATEPASS,
+        admitted_at=admitted_at,
     )
 
 
