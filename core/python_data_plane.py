@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from secrets import randbelow
@@ -20,6 +21,7 @@ from core.metrics import ProcessorMetricsSnapshot
 from core.output_builder import build_output_bytes
 from core.parsed_sentence import parse_frame_sentences, parse_leading_s_value
 from core.s_policy import choose_s_value_from_candidates
+from core.session_identity_registry import RETIREMENT_SECONDS
 from core.state.s_cache import SourceState
 from core.target_identity import EgressTargetId
 from dedup import Deduplicator
@@ -37,8 +39,71 @@ from dedup import Deduplicator
 # -- only a maximum depth, under ordinary blocking backpressure. This
 # value, together with `AIVDMAssembler`'s own default group timeout and a
 # margin for scheduling/GC jitter, is what `RETIREMENT_SECONDS` is
-# actually derived from -- see that constant's own comment.
+# actually derived from -- see that constant's own comment, and
+# `_validate_retention_compatibility` below for the enforced relationship
+# between the three.
 MAX_INGRESS_FRAME_AGE_SECONDS = 20.0
+
+
+def _validate_retention_compatibility(max_ingress_frame_age, assembler):
+    """R5/F4: fail closed, at construction time, for any configured
+    combination of `max_ingress_frame_age` and the assembler's own group
+    `timeout` that would not actually be covered by
+    `core.session_identity_registry.RETIREMENT_SECONDS`.
+
+    The safety property this enforces: a namespace-bearing frame cannot
+    reach the assembler after `max_ingress_frame_age` from its own
+    admission (enforced in `_process_impl`), and once fed, an assembler
+    GROUP is only kept alive `assembler.timeout` seconds past its most
+    recently accepted fragment (`last_progress_at` is updated on every
+    unique fragment, not only the first -- see `assembler.py`). Every
+    fragment contributing to one group was itself admitted while its
+    owning session was still live, so the LATEST any fragment in a group
+    can have been admitted is the instant that session closed; the
+    group's own last possible expiry is therefore bounded by
+    `session_close_time + max_ingress_frame_age + assembler.timeout`.
+    For the namespace's retirement window (measured from that same
+    session-close instant) to be a genuine safety margin rather than a
+    number that merely looks generous, it must be no smaller than that
+    bound:
+
+        max_ingress_frame_age + assembler.timeout <= RETIREMENT_SECONDS
+
+    Only enforced when `assembler` actually exposes a numeric `timeout`
+    (the production `AIVDMAssembler` always does); an assembler stand-in
+    without one is trusted as-is rather than guessed at.
+    """
+    if not isinstance(max_ingress_frame_age, (int, float)) or isinstance(
+        max_ingress_frame_age, bool
+    ):
+        raise TypeError("max_ingress_frame_age must be a real number")
+    if not math.isfinite(max_ingress_frame_age):
+        raise ValueError("max_ingress_frame_age must be finite")
+    if max_ingress_frame_age <= 0:
+        raise ValueError("max_ingress_frame_age must be positive")
+
+    assembler_timeout = getattr(assembler, "timeout", None)
+    if assembler_timeout is None:
+        return
+    if not isinstance(assembler_timeout, (int, float)) or isinstance(
+        assembler_timeout, bool
+    ):
+        raise TypeError("assembler.timeout must be a real number")
+    if not math.isfinite(assembler_timeout) or assembler_timeout < 0:
+        raise ValueError("assembler.timeout must be finite and non-negative")
+
+    if max_ingress_frame_age + assembler_timeout > RETIREMENT_SECONDS:
+        raise ValueError(
+            "max_ingress_frame_age "
+            f"({max_ingress_frame_age}s) + assembler.timeout "
+            f"({assembler_timeout}s) exceeds RETIREMENT_SECONDS "
+            f"({RETIREMENT_SECONDS}s): this combination would let an "
+            "assembler group tied to a namespace still be legitimately "
+            "alive after that namespace becomes eligible for reuse by "
+            "an unrelated station. Lower max_ingress_frame_age, use an "
+            "assembler with a smaller timeout, or this configuration is "
+            "not supported without also increasing RETIREMENT_SECONDS."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +195,7 @@ class PythonDataPlaneProcessor:
         self._monotonic_clock = (
             time.monotonic if monotonic_clock is None else monotonic_clock
         )
+        _validate_retention_compatibility(max_ingress_frame_age, self._assembler)
         self._max_ingress_frame_age = max_ingress_frame_age
         self._gid_generator = (
             _generate_numeric_gid_fixed
@@ -207,9 +273,30 @@ class PythonDataPlaneProcessor:
         # merely a documented assumption. A frame with no `admitted_at`
         # (every non-UDPSEC source) has no such hazard and is never
         # subject to this check.
+        #
+        # This one observation, taken once, covers every sentence in this
+        # frame and every `feed_parsed_outcome()` call the loop below may
+        # make: `_process_impl` is a single synchronous call with no
+        # `await` or other yield point, so no further delay can elapse
+        # between sentences within it. This does not protect against an
+        # OS-level thread preemption or GC pause happening to land inside
+        # that call and lasting long enough to matter -- the same
+        # execution-model assumption every other latency-sensitive
+        # synchronous path in this codebase already relies on, not a new
+        # one introduced here -- so `RETIREMENT_SECONDS`'s margin is sized
+        # for realistic scheduling/GC jitter of one bounded parse-and-feed
+        # call, not for arbitrary suspension.
+        #
+        # `age` is validated, not merely computed: a non-finite value (a
+        # corrupted or mismatched-clock-domain `admitted_at`) or a
+        # NEGATIVE value (`admitted_at` appearing to be in the future
+        # relative to this processor's own clock -- impossible for a
+        # genuine same-clock-domain observation) both fail closed as
+        # stale, rather than one silently being treated as "very fresh"
+        # and bypassing this check entirely.
         if frame.admitted_at is not None:
             age = self._monotonic_clock() - frame.admitted_at
-            if age > self._max_ingress_frame_age:
+            if not math.isfinite(age) or age < 0 or age > self._max_ingress_frame_age:
                 self._stale_frames_dropped += 1
                 return OutputBatch(outputs=())
 

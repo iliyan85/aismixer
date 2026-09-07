@@ -11330,18 +11330,18 @@ def test_run_periodic_maintenance_cleans_up_idle_expired_state_without_packets(
     effect -- proven here with a short real interval and a controllable
     monotonic clock, not a live production-length wait."""
     secure = load_secure_module_with_fake_keys(monkeypatch)
-    state = secure.SecureState(session_ttl=10.0)
+    clock = _FakeClock(0.0)
+    state = secure.SecureState(session_ttl=10.0, clock=clock)
     registry = secure._SESSION_IDENTITY_REGISTRY
     session = state.install_session(
         _relation_key(secure, ("192.0.2.10", 50000)),
         "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
-    clock = _FakeClock(11.0)  # already past the 10-second TTL
+    clock.now = 11.0  # already past the 10-second TTL by the time
+    # maintenance ticks -- installed while the clock read 0.0 above.
 
     async def scenario():
         task = asyncio.create_task(
-            state.run_periodic_maintenance(
-                interval=0.01, monotonic_clock=clock
-            )
+            state.run_periodic_maintenance(interval=0.01)
         )
         try:
             await asyncio.sleep(0.05)
@@ -11526,6 +11526,372 @@ def test_stale_time_touch_cannot_move_last_seen_backwards_or_revive_expiry(
 
     expired = state.cleanup_expired_sessions(now=18.0)
     assert session._session_key in expired
+
+
+# --- R5/F2: authoritative monotonic time at state admission. The R4 heaps
+# correctly find every expired entry regardless of commit/insertion order,
+# but that alone does not protect against a caller supplying a STALE `now`
+# value for the admission decision itself (sampled before a delay, in a
+# different thread, or held on an old asynchronous reference) -- if that
+# stale value has not itself passed the deadline, R4's own heap logic
+# would (correctly, given that input) treat the object as still live. A
+# `SecureState` configured with `clock=` floors every supplied `now` at
+# that clock's own reading, so a stale value can no longer make an
+# object the clock knows is already past its deadline appear live.
+
+
+def test_stale_now_cannot_admit_data_nonce_past_the_authoritative_deadline(
+    monkeypatch,
+):
+    """Active owner last_seen=0, TTL=10: a caller samples time 5 (stale),
+    is delayed, then attempts admission once the authoritative clock
+    already reads 11 -- past the deadline. It must be rejected, even
+    though periodic maintenance has not run and even though 5 itself is
+    not past the (stale) deadline the caller believes it is checking
+    against."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    clock = _FakeClock(0.0)
+    state = secure.SecureState(session_ttl=10.0, clock=clock)
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+
+    clock.now = 11.0  # authoritative time has moved past the deadline
+    stale_now = 5.0  # the caller's own (stale) sample, still < deadline
+
+    assert state.admit_data_nonce(
+        session, b"\x01" * 12, stale_now
+    ) is secure._DataNonceAdmission.STALE
+    assert not state.is_live_session_handle(session, stale_now)
+    assert state._active_session_at_relation(
+        _relation_key(secure, ("192.0.2.10", 50000))
+    ) is None
+
+
+def test_stale_now_cannot_admit_or_promote_pending_past_authoritative_deadline(
+    monkeypatch,
+):
+    """Pending candidate created_at=0, TTL=10: stale time 5 cannot admit
+    the sequence-zero confirmation nonce or promote once the authoritative
+    clock already reads 11."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    clock = _FakeClock(0.0)
+    state = secure.SecureState(pending_session_ttl=10.0, clock=clock)
+    relation_key = _relation_key(secure, ("192.0.2.10", 50000))
+    pending = state.install_pending_session(
+        relation_key, "boat_001", _fresh_test_locator(), object(),
+        object(), now=0.0)
+
+    clock.now = 11.0
+    stale_now = 5.0
+
+    assert not state.accept_pending_data_nonce(
+        pending, b"\x00" * 12, stale_now
+    )
+    assert state.promote_pending_session(pending, stale_now) is None
+    assert state.get_pending_session(relation_key, stale_now) is None
+
+
+def test_stale_touch_cannot_revive_an_already_expired_owner(monkeypatch):
+    """Touch's `last_seen = max(last_seen, now)` clamp (R4) prevents
+    moving last_seen BACKWARDS, but that alone does not stop a stale `now`
+    from resurrecting a session the authoritative clock already knows is
+    past its deadline: `touch_session` must still fail once the
+    authoritative clock has moved past `last_seen + ttl`, regardless of
+    what (smaller, but still >= last_seen) `now` the caller supplies."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    clock = _FakeClock(0.0)
+    state = secure.SecureState(session_ttl=10.0, clock=clock)
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+
+    clock.now = 11.0
+    stale_now = 5.0  # >= last_seen (0), so the R4 clamp alone would allow it
+
+    assert not state.touch_session(session, stale_now)
+    assert session.last_seen == 0.0
+    assert state._active_session_at_relation(
+        _relation_key(secure, ("192.0.2.10", 50000))
+    ) is None
+
+
+def test_authoritative_clock_does_not_affect_a_caller_now_that_is_ahead(
+    monkeypatch,
+):
+    """The clock is a FLOOR, not a hard override: a caller-supplied `now`
+    already at or ahead of the configured clock's own (unmoved) reading
+    is used unchanged -- ordinary deterministic testing (advancing `now`
+    directly, without also advancing a configured clock) is unaffected."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    clock = _FakeClock(0.0)  # never advanced in this test
+    state = secure.SecureState(session_ttl=10.0, clock=clock)
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+
+    # now=9.0 is ahead of the unmoved clock (0.0); the caller's own value
+    # must win, exactly as if no clock were configured at all.
+    assert state.touch_session(session, now=9.0)
+    assert session.last_seen == 9.0
+    assert state.is_live_session_handle(session, now=9.0)
+
+    # Still not expired at now=18.0 (9.0 + ttl(10) = 19.0 > 18.0), even
+    # though that is also far ahead of the clock's own stale 0.0 reading.
+    assert state.is_live_session_handle(session, now=18.0)
+
+
+def test_two_real_threads_stale_now_cannot_revive_state_past_authoritative_clock(
+    monkeypatch,
+):
+    """R5/F2 with two real OS threads: one shared SecureState is
+    configured with an authoritative clock. Thread A advances that shared
+    clock past the session's deadline (simulating real elapsed time
+    passing); thread B, racing concurrently, attempts admission using a
+    STALE `now` sampled from BEFORE that advance -- reversed relative to
+    when the authoritative clock actually moved. The admission must still
+    be rejected: the shared authoritative clock, not whichever thread's
+    own stale sample happens to be used, governs the decision."""
+    import threading
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    clock = _FakeClock(0.0)
+    state = secure.SecureState(session_ttl=10.0, clock=clock)
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+
+    a_advanced_clock = threading.Event()
+    results = {}
+
+    def thread_a():
+        clock.now = 11.0  # real elapsed time moves past the deadline
+        a_advanced_clock.set()
+
+    def thread_b():
+        stale_now = 5.0  # sampled as if before thread A's advance
+        assert a_advanced_clock.wait(timeout=5.0)
+        results["admission"] = state.admit_data_nonce(
+            session, b"\x01" * 12, stale_now
+        )
+
+    ta = threading.Thread(target=thread_a)
+    tb = threading.Thread(target=thread_b)
+    ta.start()
+    tb.start()
+    ta.join(timeout=5.0)
+    tb.join(timeout=5.0)
+
+    assert results["admission"] is secure._DataNonceAdmission.STALE
+    assert state._active_session_at_relation(
+        _relation_key(secure, ("192.0.2.10", 50000))
+    ) is None
+
+
+def test_periodic_maintenance_uses_this_owners_authoritative_clock_domain(
+    monkeypatch,
+):
+    """Maintenance must never use a clock reading behind this owner's own
+    authoritative floor: even if maintenance itself observed a smaller
+    value at some point, the `_authoritative_now()` floor inside
+    `cleanup_expired_sessions` still applies, so a later state transition
+    at this owner can never be overridden by an older maintenance
+    observation. Exercised by configuring an ADVANCING clock: maintenance
+    reads it once per tick, always current at the moment it ticks."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    clock = _FakeClock(0.0)
+    state = secure.SecureState(session_ttl=10.0, clock=clock)
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+
+    async def scenario():
+        task = asyncio.create_task(
+            state.run_periodic_maintenance(interval=0.01)
+        )
+        try:
+            await asyncio.sleep(0.03)
+            # Still not due: maintenance's own tick(s) so far observed
+            # the clock before it advanced past the deadline.
+            assert state._active_session_at_relation(
+                _relation_key(secure, ("192.0.2.10", 50000))
+            ) is session
+            clock.now = 11.0
+            await asyncio.sleep(0.03)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+    assert len(state._sessions) == 0
+    assert state.stats().sessions_expired == 1
+
+
+# --- R5/F5: complete independent-owner teardown via SecureState.close().
+# A DIFFERENT, WIDER operation than close_owned_sessions()/
+# close_owned_pending_sessions() (R4), which discard only what ONE
+# listener tracks -- close() discards EVERYTHING this exact owner holds
+# and ends its lifecycle.
+
+
+def test_close_discards_all_active_and_pending_state(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    pending = state.install_pending_session(
+        _relation_key(secure, ("192.0.2.11", 50001)),
+        "boat_002", _fresh_test_locator(), object(), object(), now=0.0)
+
+    state.close(now=1.0)
+
+    assert len(state._sessions) == 0
+    assert len(state._pending_sessions) == 0
+    assert len(state._relation_index) == 0
+    assert len(state._pending_locator_owners) == 0
+    stats = state.stats()
+    assert stats.sessions_closed == 1
+    assert stats.pending_sessions_closed == 1
+    assert stats.current_sessions == 0
+    assert stats.current_pending_sessions == 0
+    assert not state.is_live_session_handle(session, now=1.0)
+    assert state.get_pending_session(pending._relation_key, now=1.0) is None
+
+
+def test_close_releases_exactly_this_owners_registry_reservations(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    handle, namespace = session.session_handle, session.assembly_namespace
+    assert registry.is_live(handle)
+    assert registry.is_live(namespace)
+
+    state.close(now=1.0)
+
+    assert not registry.is_live(handle)
+    assert registry.is_retiring(handle)
+    assert not registry.is_live(namespace)
+    assert registry.is_retiring(namespace)
+
+
+def test_close_does_not_affect_a_second_owner_sharing_the_registry(
+    monkeypatch,
+):
+    """A second `SecureState()` constructed through the SAME loaded
+    module shares the process-wide identity registry (see
+    `_SESSION_IDENTITY_REGISTRY`'s own sharing model) -- closing one
+    owner must not touch the other owner's live sessions, its own
+    registry reservations, or its own stores at all."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    owner_a = secure.SecureState()
+    owner_b = secure.SecureState()
+    session_a = owner_a.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_a", _fresh_test_locator(), object(), object(), now=0.0)
+    session_b = owner_b.install_session(
+        _relation_key(secure, ("192.0.2.11", 50001)),
+        "boat_b", _fresh_test_locator(), object(), object(), now=0.0)
+
+    owner_a.close(now=1.0)
+
+    assert len(owner_a._sessions) == 0
+    assert not registry.is_live(session_a.session_handle)
+    # Owner B is completely unaffected: its store, its exact session
+    # object, and its own registry reservations are all still live.
+    assert owner_b._sessions[session_b._session_key] is session_b
+    assert registry.is_live(session_b.session_handle)
+    assert registry.is_live(session_b.assembly_namespace)
+    assert owner_b.is_live_session_handle(session_b, now=1.0)
+
+
+def test_close_is_idempotent_and_stale_exact_session_close_does_not_double_release(
+    monkeypatch,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    handle = session.session_handle
+
+    state.close(now=1.0)
+    stats_after_first_close = state.stats()
+
+    # Calling close() again is a no-op, not an error and not a re-count.
+    state.close(now=2.0)
+    assert state.stats() == stats_after_first_close
+
+    # A listener's own exact-object close (e.g. from a racing
+    # close_owned_sessions() shutdown path) against a session close()
+    # already removed must be a safe no-op too -- exact-object liveness
+    # checking already covers this, with no double release.
+    assert not state.close_session(session, now=3.0)
+    assert state.stats() == stats_after_first_close
+    assert registry.is_retiring(handle)
+    assert not registry.is_live(handle)
+
+
+def test_install_after_close_raises_and_does_not_create_state(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    state.close(now=0.0)
+
+    with pytest.raises(secure.SecureStateClosedError):
+        state.install_session(
+            _relation_key(secure, ("192.0.2.10", 50000)),
+            "boat_001", _fresh_test_locator(), object(), object(), now=1.0)
+    with pytest.raises(secure.SecureStateClosedError):
+        state.install_pending_session(
+            _relation_key(secure, ("192.0.2.11", 50001)),
+            "boat_002", _fresh_test_locator(), object(), object(), now=1.0)
+
+    assert len(state._sessions) == 0
+    assert len(state._pending_sessions) == 0
+
+
+def test_close_then_periodic_maintenance_tick_does_not_resurrect_or_crash(
+    monkeypatch,
+):
+    """A maintenance task still running (or ticking one more time before
+    its owner cancels it) against an already-closed, now-empty owner must
+    be a harmless no-op -- no crash, and certainly no resurrected
+    session."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    state.install_session(
+        _relation_key(secure, ("192.0.2.10", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    state.close(now=1.0)
+
+    async def scenario():
+        task = asyncio.create_task(
+            state.run_periodic_maintenance(interval=0.01)
+        )
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+    assert len(state._sessions) == 0
+    assert state.stats().current_sessions == 0
 
 
 def test_f4_delayed_old_frame_after_namespace_reuse_does_not_cross_combine(

@@ -1166,6 +1166,15 @@ async def main(
         if control_server_started:
             await control_server.close()
         forwarder.close()
+        if SEC_INPUTS:
+            # R5/F5: final owner-level teardown of the shared UDPSEC
+            # state, once every listener sharing it has already stopped
+            # (each secure listener already closed its own exact
+            # sessions/pending candidates in `secure_server()`'s own
+            # shutdown `finally` block, as part of `_supervise_named_tasks`
+            # returning above) -- safe here specifically because nothing
+            # else can still be using this owner past this point.
+            _load_secure_state().close(time.monotonic())
 
 def _raise_keyboard_interrupt_for_sigterm(_signum, _frame):
     raise KeyboardInterrupt

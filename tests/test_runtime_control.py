@@ -658,6 +658,24 @@ class _MainTestIdentity:
     private_key = object()
 
 
+class _MainTestSecureStateStub:
+    """R5/F5: a stand-in for `aismixer_secure.secure_state`'s `close()`
+    teardown, called from `main()`'s own final shutdown when `SEC_INPUTS`
+    is non-empty. Without this, a test whose `supervisor` returns
+    immediately (never genuinely running `secure_server()`) would
+    otherwise trigger a REAL, uncached-per-test import of `aismixer_secure`
+    and permanently close the actual process-wide `secure_state` singleton
+    for the rest of this pytest process -- a test-isolation hazard, not a
+    behavior most tests using this helper are even exercising. Records
+    each call for the one test that does exercise it."""
+
+    def __init__(self):
+        self.close_calls = []
+
+    def close(self, now):
+        self.close_calls.append(now)
+
+
 def _configure_main_lifecycle_test(
     monkeypatch,
     *,
@@ -697,6 +715,11 @@ def _configure_main_lifecycle_test(
         lambda active_sec_inputs: (
             _MainTestIdentity() if active_sec_inputs else None
         ),
+    )
+    monkeypatch.setattr(
+        aismixer,
+        "_load_secure_state",
+        lambda: _MainTestSecureStateStub(),
     )
     if supervisor is not None:
         monkeypatch.setattr(
@@ -1025,6 +1048,71 @@ def test_udpsec_main_generates_and_injects_prepared_identity(
             == loaded_private_key.public_key().public_numbers()
             == loaded_public_key.public_numbers()
         )
+
+    asyncio.run(scenario())
+
+
+def test_main_closes_the_shared_secure_state_owner_on_final_shutdown_when_udpsec_configured(
+    monkeypatch,
+):
+    """R5/F5: once every listener sharing the process-default UDPSEC
+    `SecureState` has stopped (`_supervise_named_tasks` has returned),
+    `main()`'s own final `finally` block must tear down that shared
+    owner exactly once -- but only when UDPSEC was actually configured,
+    never forcing the otherwise-lazy `aismixer_secure` import for a
+    plain-UDP-only deployment."""
+
+    async def scenario():
+        async def supervisor(_task_specs):
+            return None
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10112,
+                },
+            ),
+            supervisor=supervisor,
+        )
+        stub = _MainTestSecureStateStub()
+        monkeypatch.setattr(aismixer, "_load_secure_state", lambda: stub)
+        monkeypatch.setattr(
+            aismixer,
+            "_load_secure_server",
+            lambda: (lambda *_a, **_kw: None),
+        )
+
+        await aismixer.main()
+
+        assert len(stub.close_calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_main_never_loads_secure_state_when_udpsec_is_not_configured(
+    monkeypatch,
+):
+    """A plain-UDP-only deployment (no `sec_inputs`) must not force the
+    otherwise-lazy UDPSEC import merely for final shutdown."""
+
+    async def scenario():
+        async def supervisor(_task_specs):
+            return None
+
+        _configure_main_lifecycle_test(monkeypatch, supervisor=supervisor)
+
+        def fail_if_loaded():
+            raise AssertionError(
+                "plain-UDP-only deployment must not load UDPSEC's "
+                "SecureState merely for final shutdown"
+            )
+
+        monkeypatch.setattr(aismixer, "_load_secure_state", fail_if_loaded)
+
+        await aismixer.main()
 
     asyncio.run(scenario())
 

@@ -413,6 +413,16 @@ class SessionLocatorCollisionError(RuntimeError):
     """
 
 
+class SecureStateClosedError(RuntimeError):
+    """R5/F5: raised by `install_session`/`install_pending_session` once
+    this owner's `close()` has run.
+
+    A closed owner must not silently accept new sessions or recreate
+    state -- there is no reopen contract; construct a fresh
+    `SecureState()` for a new owner.
+    """
+
+
 @dataclass
 class CryptoEpoch:
     """One authenticated ECDHE handshake's key material and replay ledger.
@@ -603,7 +613,40 @@ class SecureState:
         data_nonce_max_per_session=DATA_NONCE_MAX_PER_SESSION,
         pending_session_ttl=PENDING_SESSION_TTL_SECONDS,
         max_pending_sessions=PENDING_SESSION_MAX,
+        clock=None,
     ):
+        # R5/F2: an OPTIONAL authoritative monotonic clock this owner
+        # trusts as a floor under every caller-supplied `now`. `None`
+        # (the default) preserves the exact prior behavior -- every
+        # existing caller and test that never configures this continues
+        # to have its own supplied `now` taken as-is, with zero behavior
+        # change. When configured (production's module-level
+        # `secure_state` below passes `time.monotonic`), a stale `now`
+        # sampled before a delay (a different thread, a slow prior
+        # crypto/parsing step, or simply an old async task holding a
+        # stale session reference) can no longer make an already-expired
+        # owner appear live: every method that takes `now` runs it
+        # through `_authoritative_now()` first, which floors it at this
+        # clock's current reading. `now` itself is never discarded --
+        # a caller supplying a value AHEAD of this clock (routine
+        # deterministic testing, or a legitimately fresher observation)
+        # is respected unchanged; only a value BEHIND it is corrected.
+        # A `SecureState` sharing `_SESSION_IDENTITY_REGISTRY` with other
+        # owners must use a clock domain compatible with theirs -- the
+        # registry's own retirement bookkeeping is keyed by whatever
+        # `now` each owner's removals pass it, so two owners configured
+        # with incompatible clocks (e.g. one real, one a fake test clock
+        # far in the past or future) would corrupt each other's
+        # retirement windows. Every owner sharing the process-wide
+        # default registry in production shares the same real
+        # `time.monotonic`; a test constructing an isolated owner with a
+        # fake clock must not also feed values into the shared registry
+        # through a DIFFERENT owner using a real or differently-scaled
+        # clock.
+        self._clock = clock
+        # R5/F5: set exactly once, by `close()`, this owner's own explicit
+        # end-of-life marker -- see that method.
+        self._closed = False
         self._session_ttl = _validate_positive_ttl(
             "session_ttl", session_ttl)
         self._max_sessions = _validate_positive_int(
@@ -741,6 +784,20 @@ class SecureState:
         self._peak_pending_sessions = 0
         self._peak_data_nonces = 0
 
+    def _authoritative_now(self, now):
+        """Floor a caller-supplied `now` at this owner's configured
+        authoritative clock, if any (see `__init__`). Called once, at the
+        top of every public method that takes `now`, so every downstream
+        use within that call -- expiry comparison, `last_seen`/
+        `created_at` recording, heap deadline computation, registry
+        release timestamps -- is consistent within that one transaction.
+        Returns `now` unchanged when no clock is configured (the default),
+        or when `now` is already at or ahead of the clock's own reading.
+        """
+        if self._clock is None:
+            return now
+        return max(now, self._clock())
+
     def stats(self) -> SecureStateStats:
         with self._lock:
             return SecureStateStats(
@@ -786,6 +843,7 @@ class SecureState:
 
     def accept_handshake_replay(self, key, now):
         with self._lock:
+            now = self._authoritative_now(now)
             admission = self._handshake_replays.accept(key, now)
             self._handshake_replay_expired += admission.expired
             self._handshake_replay_capacity_evicted += (
@@ -897,6 +955,7 @@ class SecureState:
 
     def cleanup_expired_sessions(self, now):
         with self._lock:
+            now = self._authoritative_now(now)
             expired = []
             while self._session_expiry_heap:
                 deadline, _sequence, session_key = (
@@ -936,6 +995,7 @@ class SecureState:
 
     def cleanup_expired_pending_sessions(self, now):
         with self._lock:
+            now = self._authoritative_now(now)
             expired = []
             while self._pending_expiry_heap:
                 deadline, _sequence, relation_key = (
@@ -967,7 +1027,6 @@ class SecureState:
     async def run_periodic_maintenance(
         self,
         interval=IDLE_MAINTENANCE_INTERVAL_SECONDS,
-        monotonic_clock=None,
     ):
         """F3: run this owner's expiry and retirement-purge housekeeping
         on a timer, independent of any packet arriving to trigger it as a
@@ -983,6 +1042,16 @@ class SecureState:
         idle owner (no packets on any listener sharing it) -- otherwise
         that housekeeping never runs at all until the next packet.
 
+        R5/F2: samples THIS owner's own configured authoritative clock
+        (falling back to real `time.monotonic` if none is configured) --
+        deliberately not an independently injectable parameter, so
+        maintenance can never observe a different, incoherent clock
+        domain than every other decision this owner makes via
+        `_authoritative_now()`. A test wanting deterministic maintenance
+        behavior configures `SecureState(clock=...)` at construction, the
+        same way it would to test any other authoritative-clock behavior
+        on this owner.
+
         Intended to be spawned as ONE independent supervised task per
         `SecureState` owner (not per physical listener -- every listener
         sharing one owner already benefits from a single task cleaning up
@@ -993,9 +1062,7 @@ class SecureState:
         start, own, or need to know about any listener socket. Runs
         until cancelled.
         """
-        monotonic_now = (
-            time.monotonic if monotonic_clock is None else monotonic_clock
-        )
+        monotonic_now = time.monotonic if self._clock is None else self._clock
         while True:
             await asyncio.sleep(interval)
             now = monotonic_now()
@@ -1213,6 +1280,11 @@ class SecureState:
         relation_key = _require_endpoint_peer_key(relation_key)
         session_locator = _require_session_locator(session_locator)
         with self._lock:
+            if self._closed:
+                raise SecureStateClosedError(
+                    "cannot install a session on a closed SecureState owner"
+                )
+            now = self._authoritative_now(now)
             self.cleanup_expired_sessions(now)
 
             # Preflight, before any destructive mutation: a locator already
@@ -1300,6 +1372,12 @@ class SecureState:
         relation_key = _require_endpoint_peer_key(relation_key)
         session_locator = _require_session_locator(session_locator)
         with self._lock:
+            if self._closed:
+                raise SecureStateClosedError(
+                    "cannot install a pending session on a closed "
+                    "SecureState owner"
+                )
+            now = self._authoritative_now(now)
             self.cleanup_expired_pending_sessions(now)
 
             # Preflight, before any destructive mutation (own-relation
@@ -1408,6 +1486,7 @@ class SecureState:
 
     def touch_session(self, session, now):
         with self._lock:
+            now = self._authoritative_now(now)
             if self._get_live_session_handle(session, now) is None:
                 return False
             self._touch_active_session(session, now)
@@ -1415,10 +1494,12 @@ class SecureState:
 
     def is_live_session_handle(self, session, now):
         with self._lock:
+            now = self._authoritative_now(now)
             return self._get_live_session_handle(session, now) is not None
 
     def close_session(self, session, now):
         with self._lock:
+            now = self._authoritative_now(now)
             if self._get_live_session_handle(session, now) is None:
                 return False
             self._remove_session(session._session_key, "closed", now)
@@ -1436,13 +1517,63 @@ class SecureState:
         `promote_pending_session`), so there is nothing to release from
         `_SESSION_IDENTITY_REGISTRY` here."""
         with self._lock:
+            now = self._authoritative_now(now)
             if self._get_live_pending_session_handle(pending, now) is None:
                 return False
             return self._remove_exact_pending_session(pending, "closed")
 
+    def close(self, now):
+        """R5/F5: explicit, deterministic OWNER-level teardown -- discard
+        every active session and pending candidate THIS OWNER holds
+        (releasing exactly this owner's `session_handle`/
+        `assembly_namespace` reservations from the shared process-wide
+        registry along the way, via the normal per-session/per-pending
+        removal paths), and mark this owner closed.
+
+        This is a wider, different operation from `close_owned_sessions`/
+        `close_owned_pending_sessions`: those discard only the exact
+        sessions/candidates ONE physical listener installed or promoted
+        (its own `owned_sessions`/`owned_pending_sessions`), so one
+        listener can stop without disturbing a SHARED owner other
+        listeners still use. `close()` discards EVERYTHING this owner
+        holds and ends this owner's own lifecycle -- call it only when
+        this exact `SecureState` instance itself (not merely one listener
+        sharing it) is being retired. It never touches any other
+        `SecureState` owner, and never clears the shared identity
+        registry -- other owners' live and retiring reservations are
+        completely unaffected.
+
+        Idempotent: closing an already-closed owner is a no-op, not an
+        error. After this returns, `install_session()`/
+        `install_pending_session()` on this owner raise `RuntimeError`
+        rather than silently creating new state -- there is no reopen
+        contract; construct a fresh `SecureState()` for a new owner.
+        Existing exact-object-identity checks throughout this class
+        already make every OTHER public method (touch, close, nonce
+        admission, promotion) a safe no-op against state this call has
+        already removed, so listener-level cleanup racing with (or
+        running after) this call cannot double-release anything.
+
+        Does not rely on `__del__`/garbage collection: this is the
+        primary, explicit cleanup path, safe to call from any owner
+        lifecycle a caller manages (a test, or a runtime's own final
+        shutdown once every listener sharing this owner has already
+        stopped).
+        """
+        with self._lock:
+            if self._closed:
+                return
+            now = self._authoritative_now(now)
+            for session_key in list(self._sessions.keys()):
+                self._remove_session(session_key, "closed", now)
+            for relation_key in list(self._pending_sessions.keys()):
+                self._remove_pending_session(relation_key, "closed")
+            self._closed = True
+
     def promote_pending_session(self, pending, now):
         relation_key = pending._relation_key
         with self._lock:
+            now = self._authoritative_now(now)
             if self._get_live_pending_session_handle(pending, now) is None:
                 return None
 
@@ -1543,6 +1674,7 @@ class SecureState:
 
     def data_nonce_seen(self, session, nonce, now):
         with self._lock:
+            now = self._authoritative_now(now)
             if self._get_live_session_handle(session, now) is None:
                 return False
             seen = session.current_epoch.seen_data_nonces.contains(nonce)
@@ -1552,6 +1684,7 @@ class SecureState:
 
     def pending_data_nonce_seen(self, pending, nonce, now):
         with self._lock:
+            now = self._authoritative_now(now)
             if self._get_live_pending_session_handle(pending, now) is None:
                 return False
             return pending.current_epoch.seen_data_nonces.contains(nonce)
@@ -1580,6 +1713,7 @@ class SecureState:
 
     def admit_data_nonce(self, session, nonce, now):
         with self._lock:
+            now = self._authoritative_now(now)
             if self._get_live_session_handle(session, now) is None:
                 return _DataNonceAdmission.STALE
             admission = session.current_epoch.seen_data_nonces.admit(nonce)
@@ -1596,6 +1730,7 @@ class SecureState:
 
     def accept_data_nonce(self, session, nonce, now):
         with self._lock:
+            now = self._authoritative_now(now)
             return (
                 self.admit_data_nonce(session, nonce, now)
                 is _DataNonceAdmission.ACCEPTED
@@ -1603,6 +1738,7 @@ class SecureState:
 
     def admit_pending_data_nonce(self, pending, nonce, now):
         with self._lock:
+            now = self._authoritative_now(now)
             if self._get_live_pending_session_handle(
                 pending, now
             ) is None:
@@ -1621,13 +1757,21 @@ class SecureState:
 
     def accept_pending_data_nonce(self, pending, nonce, now):
         with self._lock:
+            now = self._authoritative_now(now)
             return (
                 self.admit_pending_data_nonce(pending, nonce, now)
                 is _DataNonceAdmission.ACCEPTED
             )
 
 
-secure_state = SecureState()
+# R5/F2: the process-wide production default is explicitly configured
+# with the real authoritative clock (see `SecureState.__init__`'s `clock`
+# parameter) -- a stale `now` sampled by any listener sharing this owner
+# (before a delay, in a different thread, or held on an old asynchronous
+# reference) can never make an already-expired session or pending
+# candidate appear live. A `SecureState` a test constructs directly
+# defaults to `clock=None` and is unaffected.
+secure_state = SecureState(clock=time.monotonic)
 
 
 def _update_replay_digest(digest, field):

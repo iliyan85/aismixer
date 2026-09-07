@@ -2013,6 +2013,64 @@ def test_real_two_listeners_racing_commit_order_does_not_defeat_expiry(
         assert server_b.active_session_for(client_b.getsockname()) is None
 
 
+def test_real_secure_server_loop_stale_local_now_cannot_admit_past_authoritative_clock(
+    real_udpsec_endpoints,
+):
+    """R5/F2 through the REAL `_secure_server_loop`, not a direct
+    SecureState call: the receive loop's own `local_now` sampling (its
+    injected `monotonic_clock`) is deliberately held stale (5.0) while the
+    shared SecureState's OWN, independently configured authoritative
+    clock has already advanced to 11.0 -- past this session's TTL(10)
+    deadline. A real encrypted ping processed under these conditions must
+    be rejected: no pong arrives, and the session is gone from the shared
+    state, proving the authoritative floor applies even when a real
+    production receive loop (real crypto, real frame parsing) supplies
+    the stale value, not only a direct unit-level call."""
+    endpoints = real_udpsec_endpoints
+    authoritative_clock = _GatedClock(0.0)
+    shared_state = endpoints.secure.SecureState(
+        session_ttl=10.0, clock=authoritative_clock
+    )
+    loop_clock = _GatedClock(0.0)
+
+    with (
+        _running_secure_server(
+            endpoints.secure,
+            endpoints.server_private_key,
+            socket.AF_INET,
+            "127.0.0.1",
+            state=shared_state,
+            monotonic_clock=loop_clock,
+        ) as server,
+        _client_socket(socket.AF_INET, "127.0.0.1") as client,
+    ):
+        material = _perform_real_handshake(
+            endpoints, client, server.remote_addr
+        )
+        session = server.active_session_for(client.getsockname())
+        assert session is not None
+        assert session.last_seen == 0.0
+
+        # Real elapsed time moves the authoritative clock past the
+        # deadline, but the receive loop's own local_now sampling for the
+        # next packet stays stale, well behind it.
+        authoritative_clock.set(11.0)
+        loop_clock.set(5.0)
+
+        endpoints.proxy.send_ping(
+            client,
+            server.remote_addr,
+            material.key_material.client_to_server_key,
+            material.session_locator,
+            STATION_ID,
+            41,
+        )
+        with pytest.raises(socket.timeout):
+            client.recvfrom(8192)
+
+        assert server.active_session_for(client.getsockname()) is None
+
+
 def test_real_concurrent_handshakes_respect_aggregate_session_capacity(
     real_udpsec_endpoints,
 ):

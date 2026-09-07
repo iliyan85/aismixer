@@ -426,11 +426,35 @@ feed it to the assembler is refused outright, never reaching the assembler
 in any form. `RETIREMENT_SECONDS` is the SUM of that enforced bound, the
 assembler's own default 1-second group timeout, and a margin for
 scheduling/GC jitter -- so no assembler group tied to a given namespace can
-still be alive once that namespace becomes eligible for reuse. None of this
-is a claim of durable or cross-process uniqueness, or that a finite random
-space can never repeat in principle -- only that every draw is checked and
-retried under a real lock, and that this process's bookkeeping of what is
-currently live or recently retired is accurate. This carry-forward is a
+still be alive once that namespace becomes eligible for reuse. This
+accounts for an assembler group's LATEST possible progress, not only its
+first fragment (`AIVDMAssembler` resets a group's own timeout on every
+uniquely-accepted fragment, not just the first): every fragment
+contributing to one group was itself admitted while its owning session was
+still live, so the latest any fragment can have been admitted is the
+instant that session closed, bounding the group's own last possible
+expiry at `session_close_time + max_ingress_frame_age + assembler.timeout`
+-- which is exactly the relationship `PythonDataPlaneProcessor` validates
+at construction (`max_ingress_frame_age + assembler.timeout <=
+RETIREMENT_SECONDS`), rejecting an incompatible configured combination
+(a longer assembler timeout, a longer permitted frame age, non-finite or
+non-positive values) with a clear error rather than silently claiming the
+same guarantee as the default. The age check itself, and the computed
+`age` it is based on, are validated too: a non-finite or negative age (a
+corrupted `admitted_at`, or one appearing to be in the future relative to
+the processor's own clock -- impossible for a genuine same-clock-domain
+observation) fails closed as stale rather than bypassing the check. This
+one age observation, taken once per frame before parsing, covers every
+sentence in that frame and every assembler-feed call its processing may
+make, since `_process_impl` is one synchronous call with no `await` or
+other yield point -- it does not protect against an OS-level thread
+preemption or GC pause happening to land inside that call and lasting
+long enough to matter, the same execution-model assumption every other
+latency-sensitive synchronous path in this codebase already relies on.
+None of this is a claim of durable or cross-process uniqueness, or that a
+finite random space can never repeat in principle -- only that every draw is
+checked and retried under a real lock, and that this process's bookkeeping
+of what is currently live or recently retired is accurate. This carry-forward is a
 transitional mechanism for the current stage, where a rekey still replaces
 the whole `LogicalSession` object; it is not the final rekey architecture.
 Once a later stage lets an authenticated refresh replace only
@@ -498,32 +522,80 @@ on, so a stale entry (superseded by a later touch, for active sessions) is
 silently discarded and re-queued with its real current deadline rather than
 either resurrecting or wrongly expiring anything. `touch_session` clamps
 `last_seen` to never move backwards, so a stale, out-of-order `now` can
-never shorten a session's real remaining lifetime. `SecureState` also
-exposes `run_periodic_maintenance()`, an independent, opt-in coroutine an
+never shorten a session's real remaining lifetime.
+
+The heap fix above corrects a commit-order defect, but not a distinct one:
+correct heap ordering still trusts whatever `now` a caller actually
+supplies for the admission decision, and a `now` sampled before a delay (a
+different thread, a slow prior parsing/crypto step, or an old asynchronous
+task holding a stale session reference) can itself be wrong relative to
+real elapsed time, independent of commit order. `SecureState` accepts an
+optional authoritative `clock` at construction (`__init__`'s `clock`
+parameter, `None` by default, preserving every existing caller's exact
+prior behavior); when configured, every public method that takes `now`
+floors it at that clock's own current reading before using it for
+anything -- expiry comparison, `last_seen`/`created_at` recording, heap
+deadline computation, registry release timestamps -- so a stale, too-small
+`now` can no longer make an object the clock already knows is past its
+deadline appear live, while a `now` already at or ahead of the clock is
+used unchanged (ordinary deterministic testing is unaffected). Production's
+module-level `secure_state` singleton is the one owner explicitly
+configured this way, with real `time.monotonic`; a `SecureState` a test
+constructs directly defaults to no clock and is unaffected unless it opts
+in. `run_periodic_maintenance()` -- an independent, opt-in coroutine an
 operator's runtime spawns once per shared owner (not per listener) to run
 this same expiry/retirement-purge housekeeping on a timer, so it still runs
 eventually even on an owner that currently receives no packets on any of
-its listeners; this is a memory-reclamation bound only, since every public
-entry point already re-validates liveness through this same authoritative
-path regardless of when that housekeeping last ran.
+its listeners -- samples this SAME configured clock (falling back to real
+`time.monotonic` if none is configured), never an independently injectable
+one, so maintenance can never observe a different, incoherent clock domain
+than every other decision this owner makes. None of this is security-
+relevant on its own, since every public entry point already re-validates
+liveness through this same authoritative path regardless of when
+maintenance last ran; it only bounds memory reclamation on an idle owner. A
+`SecureState` sharing the process-wide identity registry with other owners
+must use a clock domain compatible with theirs, since the registry's own
+retirement bookkeeping is keyed by whatever `now` each owner's removals
+pass it -- every owner sharing the process-wide default registry in
+production shares the same real `time.monotonic`.
 
-A standalone `SecureState` owner has an explicit, complete teardown path:
-`close_owned_sessions()` gracefully closes (sends a close message for, then
-removes) every active session a listener installed or promoted, and the
-companion `close_owned_pending_sessions()` immediately discards that same
-listener's own still-pending candidates (freeing their locator reservation
-and pending-capacity slot) rather than leaving them to expire on their own
-TTL -- sending no wire message, since an unconfirmed candidate has no
-confirmed key material to notify with. Both are exact-object-checked
-(`close_session`/`close_pending_session`) so a handle already superseded by
-a later replacement is silently ignored, never discarding whatever
-legitimately occupies that relation now. Pending candidates hold no
-`_SESSION_IDENTITY_REGISTRY` reservation of their own to release
-(`session_handle`/`assembly_namespace` are minted only by `install_session`/
-`promote_pending_session`), so discarding one never touches the registry;
-tearing down one owner's sessions/pending candidates never affects any
-other owner sharing the same process-wide registry or the same
-`SecureState`.
+A standalone `SecureState` owner has two distinct, explicit teardown paths
+at two different scopes. `close_owned_sessions()` gracefully closes (sends
+a close message for, then removes) every active session ONE LISTENER
+installed or promoted, and the companion `close_owned_pending_sessions()`
+immediately discards that same listener's own still-pending candidates
+(freeing their locator reservation and pending-capacity slot) rather than
+leaving them to expire on their own TTL -- sending no wire message, since
+an unconfirmed candidate has no confirmed key material to notify with.
+Both are exact-object-checked (`close_session`/`close_pending_session`) so
+a handle already superseded by a later replacement is silently ignored,
+never discarding whatever legitimately occupies that relation now. Pending
+candidates hold no `_SESSION_IDENTITY_REGISTRY` reservation of their own to
+release (`session_handle`/`assembly_namespace` are minted only by
+`install_session`/`promote_pending_session`), so discarding one never
+touches the registry; tearing down one listener's own sessions/pending
+candidates never affects any other owner, or any OTHER listener sharing
+the same owner, sharing the same process-wide registry.
+
+`close()` is the wider, OWNER-level operation: it discards EVERYTHING one
+exact `SecureState` instance holds -- every active session and pending
+candidate regardless of which listener installed it, releasing exactly
+that owner's own registry reservations -- and marks the owner closed.
+Idempotent (closing an already-closed owner is a no-op); `install_session`/
+`install_pending_session` raise `SecureStateClosedError` afterward rather
+than silently creating new state, since there is no reopen contract (a
+fresh `SecureState()` is the supported way to get a new owner). It never
+touches any other owner or clears the shared registry, and does not rely on
+`__del__`/garbage collection. This is a genuinely different operation from
+`close_owned_sessions()`/`close_owned_pending_sessions()`, which exist
+specifically so ONE listener can stop without disturbing a state SEVERAL
+listeners still share -- `close()` ends the owner's own lifecycle and must
+only be called once nothing else is still using that exact instance. The
+default daemon runtime calls it exactly once, on the process-wide
+`secure_state` singleton, in `aismixer.py`'s own final shutdown -- strictly
+after every listener sharing it has already stopped and run its own
+listener-level cleanup -- and only when UDPSEC was actually configured, so
+a plain-UDP-only deployment never forces the otherwise-lazy import.
 
 Each physical secure-listener socket incarnation owns one opaque endpoint
 token. The token has process-local object-identity semantics, remains stable
