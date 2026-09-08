@@ -1542,6 +1542,42 @@ class SecureState:
             now = self._authoritative_now(now)
             return self._get_live_session_handle(session, now) is not None
 
+    def acquire_namespace_lease(self, session, now):
+        """R7: atomically verify `session` is still the exact live
+        incarnation at its own key, and if so, acquire an independent
+        `core.session_identity_registry.SessionIdentityRegistry.lease` on
+        its `assembly_namespace` -- both steps under this one lock
+        acquisition, with no caller-visible gap between them.
+
+        A caller that separately calls `touch_session()`/
+        `is_live_session_handle()` and only LATER calls the registry's
+        own `lease()` directly leaves a window, however small, between
+        those two separate lock sections: another thread sharing this
+        exact owner could remove `session` (and, in principle, have its
+        exact `assembly_namespace` bytes retire and be reissued to an
+        unrelated incarnation) in between. `lease()` alone cannot detect
+        that -- it only knows whether the raw bytes are currently live,
+        not whether they still belong to the lineage that authorized this
+        call. Re-verifying liveness immediately before acquiring the
+        lease, in the same locked transaction, closes that window
+        entirely rather than merely narrowing it: if `session` is no
+        longer live, this returns `None` without ever touching the
+        registry, exactly like `touch_session`/`is_live_session_handle`'s
+        own exact-object-identity semantics -- there is nothing left to
+        protect, so this data message is dropped like any other lost race
+        against session removal.
+
+        Preserves the existing lock order (`SecureState`'s own lock
+        first, the identity registry's own internal lock second, never
+        the reverse): this method does no AEAD, parsing, socket I/O, or
+        `await` while holding either lock.
+        """
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return None
+            return _SESSION_IDENTITY_REGISTRY.lease(session.assembly_namespace)
+
     def close_session(self, session, now):
         with self._lock:
             now = self._authoritative_now(now)
@@ -2480,9 +2516,7 @@ async def _secure_server_loop(
                     f"udpsec-assembly:{session.assembly_namespace.hex()}"
                 )
                 # R6/F4: an explicit, frame-scoped hold on this exact
-                # assembly_namespace reservation, taken out now -- while
-                # `session` is known live, because `touch_session` above
-                # just confirmed it, with no `await` in between -- so
+                # assembly_namespace reservation, taken out now -- so
                 # THIS frame's own right to eventually reach the
                 # assembler survives even an arbitrary pause anywhere
                 # downstream, independent of the owning session's own
@@ -2493,20 +2527,27 @@ async def _secure_server_loop(
                 # `core.python_data_plane` for why this -- not the age
                 # check below -- is what actually closes the race a
                 # one-time age observation cannot.
-                try:
-                    namespace_lease = _SESSION_IDENTITY_REGISTRY.lease(
-                        session.assembly_namespace
-                    )
-                except ValueError:
-                    # The session's own reference on this namespace was
-                    # released concurrently, between `touch_session`
-                    # above and here -- only possible if another thread
-                    # sharing this exact SecureState removed this exact
-                    # session in that instant. There is no live
-                    # reservation left to protect, so this data message
-                    # is dropped exactly like any other lost race against
-                    # session removal, rather than raising out of this
-                    # handler.
+                #
+                # R7: acquired through `SecureState.acquire_namespace_
+                # lease()`, not a raw registry call -- that method
+                # re-verifies `session` is still the exact live
+                # incarnation and acquires the lease in ONE locked
+                # transaction, so no gap exists (unlike separately
+                # trusting `touch_session`'s EARLIER liveness proof) for
+                # a stale caller to attach to an unrelated incarnation
+                # that happens to reuse the same raw bytes after this
+                # exact session's own reservation already retired.
+                namespace_lease = state_owner.acquire_namespace_lease(
+                    session, local_now
+                )
+                if namespace_lease is None:
+                    # The session is no longer live (removed concurrently
+                    # by another thread sharing this exact SecureState,
+                    # between `touch_session` above and here) -- there is
+                    # no live reservation left to protect, so this data
+                    # message is dropped exactly like any other lost race
+                    # against session removal, rather than raising out of
+                    # this handler.
                     continue
                 frame = frame_from_text_payload(
                     kind="sec",
@@ -2528,8 +2569,12 @@ async def _secure_server_loop(
                 if frame is None:
                     # Unreachable in practice (payload was already
                     # validated as a str above), but defensively release
-                    # rather than leak if it ever is.
-                    namespace_lease.release(local_now)
+                    # rather than leak if it ever is. R7: a FRESH reading
+                    # from this listener's own monotonic clock, taken now
+                    # -- not the admission-time `local_now` -- so
+                    # retirement is anchored to the actual release
+                    # instant (see the identical reasoning below).
+                    namespace_lease.release(monotonic_now())
                 else:
                     try:
                         await queue.put(frame)
@@ -2539,7 +2584,20 @@ async def _secure_server_loop(
                         # cancelled while awaiting capacity) -- ownership
                         # of the lease never transferred anywhere else,
                         # so it must be released here, not leaked.
-                        namespace_lease.release(local_now)
+                        #
+                        # R7: release using a FRESH `monotonic_now()`
+                        # reading taken HERE, not the stale `local_now`
+                        # sampled back at receive time, before this
+                        # `await` -- which can have waited arbitrarily
+                        # long for queue capacity. Retirement must begin
+                        # from a current, compatible monotonic
+                        # observation at the actual release transition;
+                        # a cached admission timestamp would backdate the
+                        # retirement deadline and could let this
+                        # namespace become eligible for reuse before an
+                        # assembler group this exact frame never even
+                        # reached has had a chance to naturally expire.
+                        namespace_lease.release(monotonic_now())
                         raise
                     if input_traffic is not None:
                         input_traffic.frame_accepted(frame.payload)

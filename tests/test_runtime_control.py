@@ -1218,6 +1218,68 @@ def test_main_still_closes_secure_state_owner_when_forwarder_close_raises(
     asyncio.run(scenario())
 
 
+class _RaisingCloseSocket(_MainTestSocket):
+    def __init__(self, close_exc):
+        super().__init__()
+        self._close_exc = close_exc
+
+    def close(self):
+        super().close()
+        raise self._close_exc
+
+
+def test_main_closes_every_udp_socket_even_when_an_earlier_one_raises(
+    monkeypatch,
+):
+    """R7/Section 6: a `for sock in udp_sockets: sock.close()` loop that
+    aborts on the first failure would leave every LATER socket in it
+    unclosed. Every socket must have its own close attempted regardless
+    of an earlier failure, and the first failure (not silently masked)
+    must still propagate once every socket has had its chance -- and
+    must still leave later cleanup steps (control server, forwarder,
+    owner teardown) to run via the existing nested try/finally chain."""
+
+    async def scenario():
+        async def supervisor(_task_specs):
+            return None
+
+        first_socket = _RaisingCloseSocket(OSError("first socket close failed"))
+        second_socket = _MainTestSocket()
+        third_socket = _MainTestSocket()
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            udp_inputs=(
+                {
+                    "id": "plain_one",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10117,
+                },
+                {
+                    "id": "plain_two",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10118,
+                },
+                {
+                    "id": "plain_three",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10119,
+                },
+            ),
+            sockets=(first_socket, second_socket, third_socket),
+            supervisor=supervisor,
+        )
+
+        with pytest.raises(OSError, match="first socket close failed"):
+            await aismixer.main()
+
+        assert first_socket.close_count == 1
+        assert second_socket.close_count == 1
+        assert third_socket.close_count == 1
+
+    asyncio.run(scenario())
+
+
 class _RecordingReleaseLease:
     def __init__(self, sink):
         self._sink = sink

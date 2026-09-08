@@ -12631,16 +12631,16 @@ def test_r6_secure_server_loop_releases_lease_when_queue_admission_fails(
 def test_r6_secure_server_loop_drops_data_message_when_session_dies_before_lease(
     monkeypatch,
 ):
-    """The other admission-time release path: `lease()` itself raises
-    `ValueError` because the session's own reference was released
-    concurrently between `touch_session` and the lease attempt (only
-    reachable with a second real listener sharing this exact
+    """The other admission-time release path: `acquire_namespace_lease()`
+    returns `None` because the session's own reference was released
+    concurrently between `touch_session` and the lease-acquisition call
+    (only reachable with a second real listener sharing this exact
     `SecureState` -- modeled here directly by closing the session from
-    under the loop via a `SecureState` subclass whose `touch_session`
-    also closes it, so the real `_secure_server_loop` code path -- not a
-    hand-rolled substitute -- exercises the `except ValueError` branch).
-    The data message must be dropped, not raise out of the handler, and
-    nothing is left half-admitted."""
+    under the loop via a monkeypatched `touch_session` that also closes
+    it, so the real `_secure_server_loop` code path -- not a hand-rolled
+    substitute -- exercises the None-return branch). The data message
+    must be dropped, not raise out of the handler, and nothing is left
+    half-admitted."""
     secure, client_identity_private_key = load_secure_module_with_fake_keys(
         monkeypatch, with_client_private_key=True
     )
@@ -12701,6 +12701,350 @@ def test_r6_secure_server_loop_drops_data_message_when_session_dies_before_lease
     assert fake_queue.items == []  # dropped, never reached the pipeline
     assert not registry.is_live(namespace)
     assert registry.is_retiring(namespace)
+
+
+def test_r7_cancelled_put_releases_lease_using_current_time_not_stale_receive_time(
+    monkeypatch,
+):
+    """R7/Correction A: the exact independently-reproduced defect. A
+    frame's admission-time `local_now` is sampled once, at receive. If
+    `await queue.put(frame)` then genuinely blocks (real queue
+    backpressure) and this task is cancelled while still waiting, the
+    lease release on that path must use a FRESH monotonic reading taken
+    at the actual cancellation/release instant -- not the stale
+    receive-time `local_now` -- or the computed retirement deadline is
+    backdated. A REAL, bounded `asyncio.Queue` (pre-filled to capacity)
+    is used so the block is genuine, not simulated."""
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    addr = ("127.0.0.1", 50401)
+    station_id = "boat_001"
+    client_to_server_key = b"\x07" * 32
+    server_to_client_key = b"\x08" * 32
+    state = secure.SecureState()
+    session, _, _ = _install_test_session(
+        secure, state, addr, client_to_server_key, server_to_client_key,
+    )
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    namespace = session.assembly_namespace
+
+    packet = _encrypted_data_packet(
+        secure, client_to_server_key, b"\x00" * 12,
+        session._session_key.session_locator,
+        source_id=station_id,
+    )
+    fake_socket = _FakeSecureSocket()
+    fake_loop = _FakeSecureLoop([(packet, addr)])
+    monkeypatch.setattr(secure, "asyncio", _FakeAsyncioModule(fake_loop))
+    receive_time_clock = _FakeClock(1000.0)
+    owned_sessions = dict(state._sessions)
+    owned_pending_sessions = dict(state._pending_sessions)
+
+    async def scenario():
+        real_queue = asyncio.Queue(maxsize=1)
+        await real_queue.put("occupies-the-only-slot")
+
+        task = asyncio.create_task(
+            secure._secure_server_loop(
+                fake_socket,
+                real_queue,
+                "127.0.0.1",
+                9999,
+                endpoint_token=_test_endpoint_token(secure),
+                state=state,
+                wall_clock=_FakeClock(1010.0),
+                monotonic_clock=receive_time_clock,
+                server_private_key=_PREPARED_SERVER_PRIVATE_KEY,
+                owned_sessions=owned_sessions,
+                owned_pending_sessions=owned_pending_sessions,
+            )
+        )
+        # Let the loop run synchronously (receive, decrypt, touch,
+        # acquire the lease, build the frame) up to its first genuine
+        # suspension point: `await real_queue.put(frame)`, blocked
+        # because the queue is already full.
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if task.done():
+                break
+        assert not task.done(), "producer never reached the blocking put()"
+        assert registry.is_live(namespace)
+
+        # The owning session's own reference is released now (t=0.5 in
+        # the audit's own timeline) -- well before the producer's
+        # eventual cancellation -- leaving the frame's own lease as the
+        # ONLY remaining live reference.
+        assert state.close_session(session, now=0.5)
+        assert registry.is_live(namespace)  # the lease alone keeps it so
+
+        # A real, substantial amount of time passes while genuinely
+        # blocked in put() -- modeled by advancing this listener's own
+        # injected monotonic clock, exactly as real elapsed wall time
+        # would.
+        receive_time_clock.now = 2000.0
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    # The lease's release -- the FINAL live reference -- must be
+    # anchored to the fresh 2000.0 reading taken at cancellation, not
+    # the stale 1000.0 receive-time value: retirement must end at
+    # 2000.0 + RETIREMENT_SECONDS, not 1000.0 + RETIREMENT_SECONDS.
+    from core.session_identity_registry import RETIREMENT_SECONDS
+
+    assert not registry.is_live(namespace)
+    assert registry.is_retiring(namespace)
+    assert registry._retiring_until[namespace] == 2000.0 + RETIREMENT_SECONDS
+
+    # A forced reuse attempt at the OLD (buggy) deadline must still be
+    # refused; the registry considers the value occupied until the
+    # CORRECT, later deadline.
+    from core.session_identity_registry import SessionIdentityExhaustedError
+
+    monkeypatch.setattr(secure.os, "urandom", lambda _length: namespace)
+    old_buggy_purge_time = 1000.0 + RETIREMENT_SECONDS + 1.0
+    registry.purge_expired(old_buggy_purge_time)
+    assert registry.is_retiring(namespace)
+    with pytest.raises(SessionIdentityExhaustedError):
+        registry.reserve()
+
+    correct_purge_time = 2000.0 + RETIREMENT_SECONDS + 1.0
+    registry.purge_expired(correct_purge_time)
+    assert not registry.is_retiring(namespace)
+    result = registry.reserve()
+    assert result == namespace
+
+
+def test_r7_acquire_namespace_lease_succeeds_for_a_live_session(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.80", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+
+    lease = state.acquire_namespace_lease(session, now=1.0)
+
+    assert lease is not None
+    assert registry.is_live(session.assembly_namespace)
+    lease.release(now=2.0)
+    # Session's own reference alone still keeps it live.
+    assert registry.is_live(session.assembly_namespace)
+
+
+def test_r7_acquire_namespace_lease_returns_none_for_a_removed_session_without_touching_the_registry(
+    monkeypatch,
+):
+    """A session already closed/expired/replaced must be refused, and
+    refusing must not itself acquire or otherwise mutate any registry
+    reservation -- exactly like `touch_session`/`is_live_session_handle`
+    leaving state untouched on a stale-handle no-op."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.81", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    namespace = session.assembly_namespace
+    assert state.close_session(session, now=1.0)
+    assert registry.is_retiring(namespace)
+    live_count_before = registry.live_count()
+    retiring_count_before = registry.retiring_count()
+
+    result = state.acquire_namespace_lease(session, now=2.0)
+
+    assert result is None
+    assert registry.live_count() == live_count_before
+    assert registry.retiring_count() == retiring_count_before
+    assert registry.is_retiring(namespace)  # unchanged, not revived
+
+
+def test_r7_acquire_namespace_lease_rejects_a_stale_incarnation_at_a_reused_key(
+    monkeypatch,
+):
+    """A session removed and superseded (same relation/session_key, a
+    genuinely different object) must be refused too -- exact-object
+    identity, not mere key presence, exactly like every other
+    `_get_live_session_handle`-gated method."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    relation = _relation_key(secure, ("192.0.2.82", 50000))
+    locator = _fresh_test_locator()
+    session_a = state.install_session(
+        relation, "boat_001", locator, object(), object(), now=0.0)
+    assert state.close_session(session_a, now=1.0)
+    session_b = state.install_session(
+        relation, "boat_001", locator, object(), object(), now=2.0)
+    assert session_b is not session_a
+    assert session_b._session_key == session_a._session_key
+
+    result = state.acquire_namespace_lease(session_a, now=3.0)
+
+    assert result is None
+
+
+def test_r7_old_two_step_pattern_is_vulnerable_but_atomic_method_is_not(
+    monkeypatch,
+):
+    """R7/Correction C: directly contrasts the OLD vulnerable pattern
+    (`touch_session`/`is_live_session_handle` confirming liveness
+    SEPARATELY, with a later, independent raw `registry.lease()` call)
+    against the NEW `acquire_namespace_lease()` -- both put through the
+    exact same injected "pause": session_a is closed and its exact
+    namespace bytes are forced to be reissued to an unrelated station
+    between the two steps. The old pattern has a real seam here (two
+    separate `SecureState` lock acquisitions with caller code, and
+    therefore another thread, able to run in between); the new method
+    does not (one lock acquisition, no `await`, nothing else can run
+    inside it)."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    session_a = state.install_session(
+        _relation_key(secure, ("192.0.2.83", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    namespace = session_a.assembly_namespace
+
+    def inject_synthetic_pause_and_reissue():
+        from core.session_identity_registry import RETIREMENT_SECONDS
+
+        state.close_session(session_a, now=1.0)
+        # The audit's own synthetic pause spans the FULL retirement
+        # window (the reproduction resumed at t=31 against a session
+        # closed at t=0.5) -- purge it outright so `namespace` is
+        # genuinely free, not merely retiring, before the forced draw.
+        pause_end = 1.0 + RETIREMENT_SECONDS + 1.0
+        state.cleanup_expired_sessions(now=pause_end)
+        # Only the FIRST draw (assembly_namespace) needs to be forced
+        # onto the reused value; the second draw (session_handle) must
+        # land on a genuinely free value, matching the established
+        # pattern used elsewhere for this exact same reason.
+        draws = iter([namespace])
+        fresh_handle = b"\xbb" * len(namespace)
+        monkeypatch.setattr(
+            secure.os, "urandom", lambda _length: next(draws, fresh_handle)
+        )
+        return state.install_session(
+            _relation_key(secure, ("192.0.2.84", 50001)),
+            "boat_002", _fresh_test_locator(), object(), object(),
+            now=pause_end)
+
+    # OLD pattern: liveness confirmed, THEN (during the audit's own
+    # synthetic pause) the race happens, THEN a raw lease() call.
+    assert state.is_live_session_handle(session_a, now=0.5)
+    session_b = inject_synthetic_pause_and_reissue()
+    assert session_b.assembly_namespace == namespace
+    confused_lease = registry.lease(namespace)  # the demonstrated defect
+    assert confused_lease is not None
+    confused_lease.release(now=2.0)
+    assert state.close_session(session_b, now=2.0)
+    monkeypatch.undo()  # restore real os.urandom before the next scenario
+
+    # NEW atomic method: an equivalent session/pause/reissue setup, but
+    # using acquire_namespace_lease() as the ONLY liveness+acquisition
+    # step -- there is no separate earlier "confirmed live" call for a
+    # pause to be inserted after, so the race that fooled the old
+    # pattern above cannot even be expressed against this one.
+    from core.session_identity_registry import RETIREMENT_SECONDS
+
+    session_c = state.install_session(
+        _relation_key(secure, ("192.0.2.85", 50002)),
+        "boat_003", _fresh_test_locator(), object(), object(), now=3.0)
+    namespace_c = session_c.assembly_namespace
+    assert state.close_session(session_c, now=4.0)
+    pause_end_c = 4.0 + RETIREMENT_SECONDS + 1.0
+    state.cleanup_expired_sessions(now=pause_end_c)
+    draws_c = iter([namespace_c])
+    fresh_handle_c = b"\xcc" * len(namespace_c)
+    monkeypatch.setattr(
+        secure.os, "urandom", lambda _length: next(draws_c, fresh_handle_c)
+    )
+    session_d = state.install_session(
+        _relation_key(secure, ("192.0.2.86", 50003)),
+        "boat_004", _fresh_test_locator(), object(), object(),
+        now=pause_end_c)
+    assert session_d.assembly_namespace == namespace_c
+
+    # session_c is definitively gone; acquire_namespace_lease() checks
+    # AND acquires in one step, so it correctly refuses rather than
+    # attaching to session_d's now-unrelated reservation.
+    result = state.acquire_namespace_lease(session_c, now=5.0)
+    assert result is None
+
+
+def test_r7_concurrent_acquisition_and_close_race_never_produces_a_confused_outcome(
+    monkeypatch,
+):
+    """Real two-thread stress test: one real OS thread repeatedly calls
+    `acquire_namespace_lease()` against a session while a second real OS
+    thread concurrently closes that same exact session, under a barrier
+    maximizing contention, across many trials. `acquire_namespace_lease`
+    checks liveness and acquires the lease in ONE locked transaction, so
+    exactly one of two orderings must be observed every single time:
+    either the lease is granted and the namespace is (and remains,
+    holding the lease) live, or the lease is refused (`None`) because
+    the close won the race -- never a lease granted against a namespace
+    that turns out already gone, and never a namespace left live with no
+    accounting for why."""
+    import threading
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    trial_count = 25
+    confusions = []
+
+    for trial in range(trial_count):
+        base = float(trial * 100)
+        session = state.install_session(
+            _relation_key(secure, (f"192.0.2.{100 + trial}", 50000)),
+            "boat_a", _fresh_test_locator(), object(), object(), now=base)
+        namespace = session.assembly_namespace
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def acquirer():
+            barrier.wait(timeout=5.0)
+            results["lease"] = state.acquire_namespace_lease(
+                session, now=base + 0.1
+            )
+
+        def closer():
+            barrier.wait(timeout=5.0)
+            results["closed"] = state.close_session(session, now=base + 0.1)
+
+        t_acquire = threading.Thread(target=acquirer)
+        t_close = threading.Thread(target=closer)
+        t_acquire.start()
+        t_close.start()
+        t_acquire.join(timeout=5.0)
+        t_close.join(timeout=5.0)
+
+        lease = results.get("lease")
+        if lease is not None:
+            # The acquirer's atomic check-and-acquire ran while the
+            # session was still live: the lease itself is now the sole
+            # remaining reference (close_session, whenever it actually
+            # ran, released the session's own reference already).
+            if not registry.is_live(namespace):
+                confusions.append((trial, "lease granted but not live"))
+            lease.release(now=base + 1.0)
+        else:
+            # The close won the race: the session (and its namespace's
+            # only reference) is already gone.
+            if session._session_key in state._sessions:
+                confusions.append((trial, "refused but session still live"))
+        # Either ordering must leave the namespace fully released and
+        # eligible for eventual legitimate reuse -- no orphaned live
+        # reference from either thread.
+        state.cleanup_expired_sessions(now=base + 10_000.0)
+        if registry.is_live(namespace) or registry.is_retiring(namespace):
+            confusions.append((trial, "namespace never fully released"))
+
+    assert confusions == []
 
 
 def test_independent_owners_share_assembler_without_cross_station_combination(

@@ -608,6 +608,7 @@ async def ingress_fan_in_loop(
     *,
     routing_state=None,
     legacy_target_ids,
+    monotonic_clock=None,
 ):
     """Bind accepted ingress items while owning every private reader task.
 
@@ -621,6 +622,7 @@ async def ingress_fan_in_loop(
             "legacy_target_ids must be a non-string iterable"
         )
     legacy_target_ids = tuple(legacy_target_ids)
+    monotonic_now = time.monotonic if monotonic_clock is None else monotonic_clock
 
     async def reader(q):
         while True:
@@ -628,14 +630,34 @@ async def ingress_fan_in_loop(
             frame = coerce_ingress_frame(item)
             if frame is None:
                 continue
-            await processing_queue.admit(
-                partial(
-                    _bind_processing_work_item,
-                    frame,
-                    routing_state=routing_state,
-                    legacy_target_ids=legacy_target_ids,
+            # R7: this reader is the sole holder of `frame` (and any
+            # namespace lease it carries -- see `IngressFrame.
+            # admission_lease`) from here until `admit()` actually
+            # transfers it into the processing queue. `admit()` either
+            # completes normally (ownership has transferred: ordinary
+            # queue depth accounting and, eventually, `processor_stage_
+            # loop`/`PythonDataPlaneProcessor.process()` own releasing
+            # it) or raises for ANY reason -- capacity never freed before
+            # this task was cancelled, `work_item_factory` failing, or a
+            # cancellation landing during the atomic bind-and-enqueue
+            # step itself -- in which case ownership never transferred
+            # anywhere else, and this reader must release the lease
+            # itself rather than silently dropping it. A fresh clock
+            # reading is taken now, not a cached admission-time value, so
+            # the release reflects the actual instant this frame's
+            # journey ended, however long it waited for capacity first.
+            try:
+                await processing_queue.admit(
+                    partial(
+                        _bind_processing_work_item,
+                        frame,
+                        routing_state=routing_state,
+                        legacy_target_ids=legacy_target_ids,
+                    )
                 )
-            )
+            except BaseException:
+                frame.release_admission_lease(monotonic_now())
+                raise
 
     if not input_queues:
         await asyncio.get_running_loop().create_future()
@@ -1188,8 +1210,22 @@ async def main(
         # its own exception (if any) propagate once every later step has
         # had its chance to run too.
         try:
+            # R7: attempt every socket's close even if an earlier one
+            # raises -- a plain `for sock in udp_sockets: sock.close()`
+            # would abort the loop on the first failure and leave every
+            # later socket in it unclosed. The first failure (if any) is
+            # still raised once every socket has had its own close
+            # attempted, so a genuine close error is never silently
+            # masked.
+            first_socket_close_error = None
             for sock in udp_sockets:
-                sock.close()
+                try:
+                    sock.close()
+                except BaseException as exc:
+                    if first_socket_close_error is None:
+                        first_socket_close_error = exc
+            if first_socket_close_error is not None:
+                raise first_socket_close_error
         finally:
             try:
                 if control_server_started:

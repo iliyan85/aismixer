@@ -423,30 +423,80 @@ delay that already elapsed BEFORE that observation; it cannot protect
 against an arbitrary pause (real OS thread preemption or a GC pause, not
 merely the absence of `await`) landing AFTER the check passes but BEFORE
 the frame actually reaches the assembler. The authoritative safety
-mechanism is now an explicit, frame-scoped hold: `_secure_server_loop`
-takes out a `core.session_identity_registry.SessionIdentityRegistry.lease`
-on a namespace-bearing frame's `assembly_namespace` at admission time --
-while `touch_session` has just proven the owning session live, with no
-`await` in between -- and attaches it as `IngressFrame.admission_lease`.
-This is an ADDITIONAL live reference on the same registry reservation the
-owning session already holds (reference-counted, exactly like a same-
-station replacement's `claim()`), independent of that session's own
-lifetime: for as long as the lease is outstanding, `reserve()` cannot draw
-that value for anyone else, no matter how long the frame takes to actually
-reach the assembler or how long the owning session has already been gone.
-`PythonDataPlaneProcessor.process()` holds this lease for the frame's
-entire `_process_impl` call and releases it exactly once, in its own
-`finally`, regardless of outcome (normal completion, an early stale-age
-drop, or a raised exception) -- so a frame that is mid-`process()` when
-its owning session's OWN reference is released still keeps the namespace
-alive until `process()` itself returns. A frame whose lease attempt fails
-(the owning session's own reference was released concurrently, between
-`touch_session` and the lease call -- reachable only with a second real
-listener sharing the same `SecureState`) is dropped like any other lost
-race, never queued. Every other admission-time loss (queue-put failure or
-task cancellation before the frame entered the pipeline, an abandoned
-`None` from `frame_from_text_payload`) releases the lease right there
-instead. `aismixer.py`'s final shutdown additionally drains any residual
+mechanism is an explicit, frame-scoped hold: `_secure_server_loop`
+attaches a `core.session_identity_registry.SessionIdentityRegistry.lease`
+on a namespace-bearing frame's `assembly_namespace` to it as
+`IngressFrame.admission_lease`. This is an ADDITIONAL live reference on
+the same registry reservation the owning session already holds
+(reference-counted, exactly like a same-station replacement's `claim()`),
+independent of that session's own lifetime: for as long as the lease is
+outstanding, `reserve()` cannot draw that value for anyone else, no matter
+how long the frame takes to actually reach the assembler or how long the
+owning session has already been gone. `PythonDataPlaneProcessor.process()`
+holds this lease for the frame's entire `_process_impl` call and releases
+it exactly once, in its own `finally`, regardless of outcome (normal
+completion, an early stale-age drop, or a raised exception), using a
+FRESH clock reading taken at that release instant -- so a frame that is
+mid-`process()` when its owning session's OWN reference is released still
+keeps the namespace alive until `process()` itself returns, and the
+namespace's own eventual retirement is timed from when this frame's use
+of it actually ended, not from admission time.
+
+R7/Correction A: every OTHER release call site along this frame's journey
+-- `_secure_server_loop`'s own release on a queue-put failure or a task
+cancellation while awaiting queue capacity (potentially after an
+arbitrarily long wait), and `ingress_fan_in_loop`'s reader releasing on an
+admission failure or cancellation while blocked waiting for processing
+capacity (see below) -- likewise samples a FRESH reading from that
+component's own injected monotonic clock at the actual release instant,
+never a cached admission/receive-time value. A stale cached timestamp
+used at release would backdate the computed retirement deadline and could
+let the namespace become eligible for reuse before an assembler group fed
+by this exact frame (or, in the queue-wait case, by an earlier frame that
+legitimately reached the assembler under the same namespace) has actually
+had a chance to expire.
+
+R7/Correction B: ownership of a dequeued ingress frame (and any lease it
+carries) belongs to `ingress_fan_in_loop`'s reader from the moment it
+dequeues the item until `processing_queue.admit()` actually transfers it
+into the processing queue. If `admit()` fails or the reader is cancelled
+before that transfer completes -- whether while still waiting for
+capacity, or during the atomic bind-and-enqueue step itself --
+ownership never passed anywhere else, and the reader releases the lease
+itself before the failure/cancellation propagates; once `admit()`
+succeeds, the reader releases nothing further, since the processing
+queue's eventual consumer (`processor_stage_loop`/`PythonDataPlaneProcessor
+.process()`) now owns that responsibility. Without this, a frame accepted
+by UDPSEC but never consumed before its reader task is cancelled (a
+supported, low-severity but genuine scenario -- not merely a theoretical
+one) would leave its lease permanently outstanding: a real, if bounded,
+registry-reference leak that neither garbage collection nor another
+owner's own cleanup would ever reclaim on its own.
+
+R7/Correction C: `SecureState.acquire_namespace_lease(session, now)` is
+the sole, atomic way `_secure_server_loop` acquires this hold -- it
+re-verifies, under this owner's own lock, that `session` is STILL the
+exact live incarnation at its own key immediately before acquiring the
+lease, in ONE locked transaction with no gap between the two steps.
+Separately confirming liveness (via `touch_session`/
+`is_live_session_handle`) and only later asking the shared registry for a
+lease against the raw `assembly_namespace` bytes leaves a window, however
+small, between those two separate lock acquisitions -- another thread
+sharing this exact owner could remove `session` in between, and if its
+exact namespace bytes ever retired and were reissued to an unrelated
+incarnation before the second call ran, that raw two-step pattern would
+attach the frame's protection to the WRONG lineage without any error,
+since a bare `lease()` call only knows whether the raw bytes are
+currently live, never whether they still belong to the caller that
+originally authorized them. `acquire_namespace_lease` closes this
+possibility entirely rather than merely narrowing it: a session no longer
+live returns `None` without ever touching the registry, exactly like
+every other `_get_live_session_handle`-gated method's exact-object-
+identity semantics.
+
+Every other admission-time loss (an abandoned `None` from
+`frame_from_text_payload`) releases the lease right there instead.
+`aismixer.py`'s final shutdown additionally drains any residual
 ingress/processing backlog and releases whatever leases those abandoned
 frames still held, since none of this pipeline's queues are drained by
 ordinary task cancellation alone. A frame with no `admitted_at` (every
@@ -673,7 +723,12 @@ cleanup: a UDP socket, the control server, or the forwarder failing to
 close cleanly does not prevent a later step (including the final owner
 `close()`) from running, and does not silently mask the failure either --
 each step's own exception, if any, still propagates once every later step
-has had its chance to run. That same final shutdown also drains any
+has had its chance to run. Within the UDP-socket step itself, every
+socket's own `close()` is attempted individually (the first failure, if
+any, is what ultimately propagates) rather than a single `for sock in
+udp_sockets: sock.close()` that would abort on the first failure and
+leave every later socket in that same loop unclosed. That same final
+shutdown also drains any
 residual UDPSEC ingress/processing backlog and releases whatever namespace
 lease each abandoned frame still held (see Blocker B above), immediately
 before calling `close()`, so a frame that was accepted but never consumed
