@@ -62,16 +62,16 @@ SERVER_EPHEMERAL_PUBLIC_KEY_B64 = (
 )
 SERVER_SIGNATURE_B64 = b"MAYCAQICAQM="
 SESSION_LOCATOR_B64 = b"QEFCQ0RFRkdISUpLTE1OTw=="
-PROTOCOL_VERSION_ASCII = b"3"
+PROTOCOL_VERSION_ASCII = b"2"
 
 CLIENT_PACKET = (
-    b"NMEA-H|3|boat_001|18446744073709551615|"
+    b"NMEA-H|2|boat_001|18446744073709551615|"
     b"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=|"
     b"A2sX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKW|"
     b"MAYCAQECAQE="
 )
 SERVER_PACKET = (
-    b"OK|3|QEFCQ0RFRkdISUpLTE1OTw==|"
+    b"OK|2|QEFCQ0RFRkdISUpLTE1OTw==|"
     b"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=|"
     b"A3zyexiNA09+ilI4AwS1GsPAiWnid/IbNaYLSPxHZpl4|"
     b"MAYCAQICAQM="
@@ -235,13 +235,13 @@ def test_protocol_api_and_wire_prefixes_are_public():
         "epoch_selector_for_generation",
     } <= set(udpsec_protocol.__all__)
     assert CLIENT_HELLO_PREFIX == b"NMEA-H"
-    assert DATA_PREFIX == b"NMEA-D3"
+    assert DATA_PREFIX == b"NMEA-D2"
     assert SESSION_CLOSE_REASON_SHUTDOWN == "shutdown"
     assert SESSION_CLOSE_TYPE == "close"
     assert SESSION_CONFIRMATION_SEQUENCE == 0
     assert SESSION_LOCATOR_BYTES == 16
     assert SERVER_HELLO_PREFIX == b"OK"
-    assert UDPSEC_PROTOCOL_VERSION == 3
+    assert UDPSEC_PROTOCOL_VERSION == 2
 
 
 @pytest.mark.parametrize(
@@ -1322,14 +1322,14 @@ def test_builders_emit_canonical_base64_for_every_binary_field(
 
 
 # ---------------------------------------------------------------------------
-# UDPSEC protocol revision 3: explicit protocol_version field.
+# UDPSEC protocol version 2: explicit protocol_version field.
 # ---------------------------------------------------------------------------
 
 
-def test_client_hello_and_server_hello_default_to_protocol_version_3():
+def test_client_hello_and_server_hello_default_to_protocol_version_2():
     assert _client_hello().protocol_version == UDPSEC_PROTOCOL_VERSION
     assert _server_hello().protocol_version == UDPSEC_PROTOCOL_VERSION
-    assert UDPSEC_PROTOCOL_VERSION == 3
+    assert UDPSEC_PROTOCOL_VERSION == 2
 
 
 @pytest.mark.parametrize(
@@ -1348,7 +1348,7 @@ def test_protocol_version_rejects_non_integer_types_and_bool(factory, version):
     (_client_hello, _server_hello),
     ids=("client", "server"),
 )
-@pytest.mark.parametrize("version", (0, 1, 2, 4, -1, 255))
+@pytest.mark.parametrize("version", (0, 1, 3, 4, -1, 255))
 def test_protocol_version_rejects_any_value_other_than_current(
     factory,
     version,
@@ -1367,7 +1367,7 @@ def test_protocol_version_rejects_any_value_other_than_current(
         pytest.param(parse_server_hello_packet, SERVER_PACKET, id="server"),
     ),
 )
-@pytest.mark.parametrize("encoded", (b"1", b"2", b"4", b"0", b"255"))
+@pytest.mark.parametrize("encoded", (b"1", b"3", b"4", b"0", b"255"))
 def test_parsers_reject_any_wire_version_other_than_current(
     parser,
     packet,
@@ -1447,7 +1447,7 @@ def test_old_v1_server_hello_shape_without_version_or_locator_is_rejected():
 
 
 # ---------------------------------------------------------------------------
-# UDPSEC protocol revision 3: server-minted session locator.
+# UDPSEC protocol version 2: server-minted session locator.
 # ---------------------------------------------------------------------------
 
 
@@ -1500,8 +1500,8 @@ def test_locator_is_never_reused_as_random_or_transcript_material():
 
 
 # ---------------------------------------------------------------------------
-# UDPSEC protocol revision 3: DATA framing
-# (NMEA-D3 | locator | epoch_selector | nonce | ct) with the full epoch
+# UDPSEC V2 epoch-aware DATA framing
+# (NMEA-D2 | locator | epoch_selector | nonce | ct) with the full epoch
 # generation bound into the AEAD associated data.
 # ---------------------------------------------------------------------------
 
@@ -1513,9 +1513,8 @@ DATA_EPOCH_GENERATION = 0
 _HEADER_LEN = len(DATA_PREFIX) + SESSION_LOCATOR_BYTES + 1
 
 
-def test_data_prefix_is_version_distinct_from_earlier_revisions():
-    assert DATA_PREFIX == b"NMEA-D3"
-    assert DATA_PREFIX != b"NMEA-D2"
+def test_data_prefix_is_the_v2_prefix_and_distinct_from_v1():
+    assert DATA_PREFIX == b"NMEA-D2"
     assert DATA_PREFIX != b"NMEA-D"
 
 
@@ -1601,11 +1600,43 @@ def test_build_data_packet_rejects_wrong_length_nonce():
         )
 
 
-def test_parse_data_packet_rejects_old_v2_prefix():
-    old_v2_packet = b"NMEA-D2" + DATA_LOCATOR + DATA_NONCE + DATA_CIPHERTEXT
+def test_pre_refresh_v2_data_without_selector_is_not_accepted():
+    """The epoch-aware V2 DATA frame is not wire-compatible with pre-refresh
+    V2 binaries, and there is no legacy/compat parser: a historical
+    no-selector `NMEA-D2 || locator || nonce || ct` frame either fails the
+    length check outright or -- when long enough to parse at all -- has its
+    bytes reinterpreted under the current layout and fails AEAD
+    authentication. It is never admitted through a fallback path."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+    # Too short to be a current frame -> structural rejection.
+    short_old = b"NMEA-D2" + DATA_LOCATOR + DATA_NONCE + b"x" * 16
     with pytest.raises(ValueError):
-        parse_data_packet(old_v2_packet)
+        parse_data_packet(short_old)
+
+    # A genuinely-encrypted old-format frame (old locator-only AAD, no
+    # selector byte). It is long enough to parse, but the current parser
+    # reads a selector out of the old nonce bytes and the current AEAD
+    # construction (generation-bound AAD, shifted nonce/ciphertext) cannot
+    # authenticate it under the correct key.
+    key = AESGCM.generate_key(bit_length=256)
+    aesgcm = AESGCM(key)
+    nonce = bytes(range(12))
+    old_aad = b"NMEA-D2" + DATA_LOCATOR
+    ciphertext = aesgcm.encrypt(nonce, b'{"type":"ping"}', old_aad)
+    old_frame = b"NMEA-D2" + DATA_LOCATOR + nonce + ciphertext
+
+    locator_out, selector_out, nonce_out, ciphertext_out = parse_data_packet(
+        old_frame
+    )
+    assert locator_out == DATA_LOCATOR
+    assert (nonce_out, ciphertext_out) != (nonce, ciphertext)
+    with pytest.raises(Exception):
+        aesgcm.decrypt(
+            nonce_out,
+            ciphertext_out,
+            build_data_aad(locator_out, selector_out),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1714,7 +1745,7 @@ def test_captured_ciphertext_replayed_under_a_different_epoch_selector_fails():
     )
     assert tampered_selector == 5
 
-    # A revision-3 receiver now selects the generation-5 epoch key and builds
+    # An epoch-aware V2 receiver now selects the generation-5 epoch key and builds
     # AAD for generation 5: both differ from what the ciphertext was produced
     # under, so authentication fails.
     with pytest.raises(Exception):

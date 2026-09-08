@@ -85,7 +85,7 @@ HANDSHAKE_REPLAY_MAX = 100000
 DATA_NONCE_MAX_PER_SESSION = 100000
 SESSION_LOCATOR_GENERATION_ATTEMPTS = 8
 
-# UDPSEC revision 3 in-session epoch refresh (see BEHAVIORAL_CONTRACT.md
+# UDPSEC V2 in-session epoch refresh (see BEHAVIORAL_CONTRACT.md
 # section 11). A confirmed `LogicalSession` owns at most one candidate
 # (pending) epoch and, for a short fixed monotonic window immediately after
 # a commit, at most one retiring epoch. These bounds are deliberately small:
@@ -638,7 +638,7 @@ class LogicalSession:
     assembly_namespace: bytes
     current_epoch: CryptoEpoch
     path_state: PathState
-    # UDPSEC revision 3 in-session epoch refresh state. `pending_epoch` is the
+    # UDPSEC V2 in-session epoch refresh state. `pending_epoch` is the
     # at-most-one authenticated candidate epoch (see `_PendingEpoch`);
     # `retiring_epoch` is the at-most-one immediately-previous epoch kept
     # briefly after a commit, and `retiring_deadline` is its exact monotonic
@@ -836,7 +836,7 @@ class SecureState:
         # the number of live entries rather than by total touch volume.
         self._session_expiry_heap = []
         self._pending_expiry_heap = []
-        # UDPSEC revision 3: a third lazy-deletion min-heap for epoch
+        # UDPSEC V2 epoch refresh: a third lazy-deletion min-heap for epoch
         # transition deadlines -- pending-epoch TTLs and retiring-epoch
         # cutoffs. Entries are
         # `(deadline, sequence, session_key, session, kind, epoch_object)`
@@ -2094,7 +2094,7 @@ class SecureState:
             )
 
     #
-    # UDPSEC revision 3: in-session authenticated epoch refresh.
+    # UDPSEC V2: in-session authenticated epoch refresh.
     #
     # All of the following operate on the EXACT `CryptoEpoch` OBJECT the
     # caller authenticated a packet under -- never `session.current_epoch`
@@ -2491,7 +2491,8 @@ def build_handshake_replay_key(
 def encrypt_secure_json_message(
     aesgcm, session_locator, epoch_generation, message
 ):
-    """Encrypt one JSON DATA-channel message as one canonical V3 packet.
+    """Encrypt one JSON DATA-channel message as one canonical epoch-aware
+    V2 packet.
 
     Every direction/message kind (NMEA, ordinary ping/pong, confirmation
     ping/pong, graceful close, and the epoch-refresh control messages) must
@@ -3179,7 +3180,7 @@ async def _secure_server_loop(
 
                 station_id = session.station_id
 
-                # UDPSEC revision 3: resolve the plaintext epoch selector to
+                # UDPSEC V2 epoch refresh: resolve the plaintext epoch selector to
                 # exactly one live CryptoEpoch on this session. No trial
                 # decryption across epochs -- one exact-generation match
                 # among {retiring, current, pending}, or a drop.

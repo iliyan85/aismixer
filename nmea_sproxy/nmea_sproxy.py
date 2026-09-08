@@ -133,7 +133,7 @@ SESSION_ACTION_SEND_PING = "send_ping"
 SESSION_ACTION_START_EPOCH_REFRESH = "start_epoch_refresh"
 HANDSHAKE_FAILURE = "handshake_failure"
 
-# UDPSEC revision 3 client-side in-session epoch refresh (see
+# UDPSEC V2 client-side in-session epoch refresh (see
 # BEHAVIORAL_CONTRACT.md section 11). All finite, validated bounds:
 #   - the whole REFRESH_INIT -> REFRESH_REPLY -> REFRESH_CONFIRM ->
 #     REFRESH_ACK transaction is abandoned (E1 stays current) if not

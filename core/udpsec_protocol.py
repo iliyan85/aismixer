@@ -1,17 +1,22 @@
 """Canonical wire values, codecs, and control validation for UDPSEC.
 
-UDPSEC protocol revision 3. There is no capability negotiation and no
-downgrade: exactly one protocol version is ever accepted, and any other
-value fails closed at parse time. Backward compatibility with revisions 1
-and 2 is not provided -- both `aismixer` and `nmea_sproxy` are upgraded
-together. Revision 3 adds a true in-session authenticated cryptographic
-epoch refresh: the same established `LogicalSession` and `session_locator`
-can carry more than one directional traffic-key epoch during a bounded,
-authenticated transition. A DATA packet therefore carries a one-byte
-plaintext epoch selector (a lookup hint among the at most three epoch
-states a locator can name during a transition), and the full 32-bit epoch
-generation is bound into the AEAD associated data so the selector alone can
-never authorize decryption under the wrong key.
+UDPSEC protocol version 2 (`UDPSEC_PROTOCOL_VERSION = 2`). There is no
+capability negotiation and no downgrade: exactly one protocol version is
+ever accepted, and any other value fails closed at parse time. Revision 1
+wire compatibility does not exist.
+
+The V2 DATA wire format is epoch-aware: the frame carries a one-byte
+plaintext epoch selector and the full 32-bit epoch generation is bound
+into the AEAD associated data, so the same established `LogicalSession`
+and `session_locator` can carry more than one directional traffic-key
+epoch during a bounded, authenticated in-session refresh. This is an
+evolution of the V2 wire format, not a new protocol version: it is NOT
+compatible with pre-refresh V2 binaries (a DATA frame without the epoch
+selector, or with the old locator-only associated data, fails current
+authentication and admission -- there is no legacy parser, negotiation,
+version fallback, or silent downgrade), so `aismixer` and `nmea_sproxy`
+must be upgraded together. The selector is a lookup hint only; the
+generation is the authenticated value.
 
 ClientHello and ServerHello packets use pipe-delimited ASCII framing with
 strict UTF-8 for the station identifier, canonical unsigned decimal for the
@@ -43,7 +48,7 @@ from dataclasses import dataclass, field
 
 CLIENT_HELLO_PREFIX = b"NMEA-H"
 SERVER_HELLO_PREFIX = b"OK"
-DATA_PREFIX = b"NMEA-D3"
+DATA_PREFIX = b"NMEA-D2"
 SESSION_CONFIRMATION_SEQUENCE = 0
 SESSION_CLOSE_TYPE = "close"
 SESSION_CLOSE_REASON_SHUTDOWN = "shutdown"
@@ -55,7 +60,7 @@ REFRESH_ACK_TYPE = "refresh_ack"
 REFRESH_TRANSACTION_ID_BYTES = 32
 REFRESH_RANDOM_BYTES = 32
 
-UDPSEC_PROTOCOL_VERSION = 3
+UDPSEC_PROTOCOL_VERSION = 2
 SESSION_LOCATOR_BYTES = 16
 EPOCH_SELECTOR_BYTES = 1
 # The establishment epoch of every session; each successful refresh installs
@@ -336,7 +341,7 @@ def is_session_close_message(message: object, station_id: str) -> bool:
 
 
 #
-# Epoch refresh control messages (UDPSEC revision 3)
+# Epoch refresh control messages (UDPSEC V2 in-session epoch refresh)
 #
 # The four refresh messages are carried inside the existing encrypted DATA
 # channel as strict, closed-schema JSON objects. INIT/REPLY travel under the
@@ -930,8 +935,8 @@ def epoch_selector_for_generation(epoch_generation: int) -> int:
 
 
 def build_data_aad(session_locator: bytes, epoch_generation: int) -> bytes:
-    """Build the locator- and epoch-aware AEAD associated data for one V3
-    DATA packet.
+    """Build the locator- and epoch-aware AEAD associated data for one
+    epoch-aware V2 DATA packet.
 
     Every encrypted DATA-channel message in both directions (NMEA, ordinary
     ping/pong, confirmation ping/pong, graceful close, and the four epoch
@@ -954,8 +959,8 @@ def build_data_packet(
     nonce: bytes,
     ciphertext: bytes,
 ) -> bytes:
-    """Encode one V3 DATA packet: prefix, locator, one-byte epoch selector,
-    nonce, then ciphertext.
+    """Encode one epoch-aware V2 DATA packet: prefix, locator, one-byte
+    epoch selector, nonce, then ciphertext.
 
     `epoch_generation` is the full generation of the epoch the ciphertext
     was produced under; only its low byte is written to the wire (see
@@ -980,13 +985,17 @@ def build_data_packet(
 
 
 def parse_data_packet(packet: object) -> tuple[bytes, int, bytes, bytes]:
-    """Parse one V3 DATA packet into
+    """Parse one epoch-aware V2 DATA packet into
     (session_locator, epoch_selector, nonce, ciphertext).
 
     `epoch_selector` is the raw one-byte lookup hint as an ``int`` in
     ``0..255``. Structural parsing only: this performs no AEAD work and does
     not know whether the locator is recognized, which epoch the selector
-    actually names, or whether the ciphertext is authentic.
+    actually names, or whether the ciphertext is authentic. A pre-refresh
+    V2 DATA frame (no selector byte) is not accepted through any legacy
+    path: if it is long enough to parse at all its bytes are reinterpreted
+    under the current layout and fail AEAD authentication, and a shorter
+    one fails the length check here.
     """
 
     if not isinstance(packet, bytes):

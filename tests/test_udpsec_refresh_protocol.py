@@ -1,4 +1,4 @@
-"""UDPSEC revision 3 epoch-refresh wire codecs and transcript digests.
+"""UDPSEC V2 epoch-refresh wire codecs and transcript digests.
 
 Structural/codec coverage for `core.udpsec_protocol`'s four refresh control
 messages and `core.udpsec_crypto`'s refresh transcript digests + key
@@ -62,6 +62,13 @@ def test_epoch_selector_is_low_byte(generation, selector):
 def test_epoch_selector_rejects_invalid_generation(bad):
     with pytest.raises((TypeError, ValueError)):
         p.epoch_selector_for_generation(bad)
+
+
+def test_epoch_refresh_is_a_v2_wire_format_evolution():
+    # The in-session epoch refresh does NOT bump the protocol version: it
+    # is an evolution of the V2 DATA wire format.
+    assert p.UDPSEC_PROTOCOL_VERSION == 2
+    assert p.DATA_PREFIX == b"NMEA-D2"
 
 
 def test_data_aad_binds_full_generation_not_only_selector():
@@ -272,7 +279,11 @@ def test_refresh_init_digest_binds_every_field(field):
     base = udpsec_crypto.build_refresh_init_digest(**common)
     altered = dict(common)
     if field == "protocol_version":
-        pytest.skip("only one protocol version is accepted")
+        # Only version 2 is ever accepted on the wire, but the digest helper
+        # still frames the protocol-version field, so a signature can never
+        # be reinterpreted as authenticating a different version.
+        assert common["protocol_version"] == 2
+        altered["protocol_version"] = 3
     elif field in ("parent_generation", "next_generation"):
         altered["parent_generation"] = common["parent_generation"] + 10
         altered["next_generation"] = altered["parent_generation"] + 1

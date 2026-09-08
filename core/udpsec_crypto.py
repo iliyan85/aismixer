@@ -36,12 +36,13 @@ CLIENT_AUTH_LABEL = b"CLIENT-AUTH"
 SERVER_AUTH_LABEL = b"SERVER-AUTH"
 SESSION_TRANSCRIPT_LABEL = b"SESSION-TRANSCRIPT"
 
-# UDPSEC revision 3 in-session epoch refresh. A DELIBERATELY DISTINCT domain
-# from `DOMAIN_CONTEXT`: an establishment (ClientHello/ServerHello) transcript
+# UDPSEC V2 in-session epoch refresh. A DELIBERATELY DISTINCT domain from
+# `DOMAIN_CONTEXT`: an establishment (ClientHello/ServerHello) transcript
 # digest and a refresh transcript digest can never collide, so a captured
 # establishment signature cannot be replayed as a refresh message and vice
 # versa. The refresh key schedule is likewise domain-separated from the
-# establishment key schedule.
+# establishment key schedule. The wire label below is a stable transcript
+# constant and is not a protocol version identifier.
 REFRESH_DOMAIN_CONTEXT = b"AISMIXER-UDPSEC-EPOCH-REFRESH"
 REFRESH_INIT_LABEL = b"REFRESH-INIT"
 REFRESH_REPLY_LABEL = b"REFRESH-REPLY"

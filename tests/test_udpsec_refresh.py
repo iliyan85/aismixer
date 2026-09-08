@@ -1,4 +1,4 @@
-"""UDPSEC revision 3 in-session authenticated epoch refresh -- acceptance.
+"""UDPSEC V2 in-session authenticated epoch refresh -- acceptance.
 
 Deterministic coverage of the identity/continuity invariants, the
 INIT/REPLY/CONFIRM/ACK state machine, commit points, lost-ACK recovery,

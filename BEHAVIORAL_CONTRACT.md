@@ -320,18 +320,24 @@ default is module-wide, while an isolated state owner and clocks may be
 injected into a secure listener. This state is in-memory and process-local; it
 is neither durable nor shared across processes.
 
-UDPSEC is protocol revision 3 (`UDPSEC_PROTOCOL_VERSION = 3`). There is no
+UDPSEC is protocol version 2 (`UDPSEC_PROTOCOL_VERSION = 2`). There is no
 negotiation or downgrade: a ClientHello or ServerHello whose declared version
-is not exactly `3` fails closed, and the version is itself part of the
+is not exactly `2` fails closed, and the version is itself part of the
 authenticated handshake transcript (the client digest, the server auth
-digest, and the session transcript hash all bind it). Revision 1 and 2 wire
-compatibility does not exist; both `aismixer` and `nmea_sproxy` are upgraded
-together. Revision 3 adds a true in-session authenticated cryptographic
-epoch refresh (see the dedicated subsection below): the same established
-`LogicalSession` and `session_locator` can carry more than one directional
-traffic-key epoch during a bounded, authenticated transition, so every DATA
-packet now also carries a one-byte plaintext epoch selector and the full
-32-bit epoch generation is bound into the AEAD associated data.
+digest, and the session transcript hash all bind it). Revision 1 wire
+compatibility does not exist.
+
+The V2 DATA wire format is epoch-aware: this is an evolution of the V2 wire
+format, not a new protocol version. The DATA frame carries a one-byte
+plaintext epoch selector and the full 32-bit epoch generation is bound into
+the AEAD associated data, which lets the same established `LogicalSession`
+and `session_locator` carry more than one directional traffic-key epoch
+during a bounded, authenticated in-session refresh (see the dedicated
+subsection below). This is NOT wire-compatible with pre-refresh V2 binaries:
+a DATA frame without the epoch selector, or with the old locator-only
+associated data, fails current authentication and admission -- there is no
+legacy parser, negotiation, version fallback, or silent downgrade -- so
+`aismixer` and `nmea_sproxy` must be upgraded together.
 
 An established relation is internally represented as three separate
 ownership layers: a `LogicalSession` (authenticated station identity, its
@@ -360,8 +366,8 @@ session-lifetime lookup hint, never a credential: it is never derived from
 station identity, network address, or ECDHE material, and by itself it
 cannot bypass AEAD authentication, `allow_from`, active-path checks, replay
 admission, or listener scoping. Every DATA packet (NMEA payload, ping, pong,
-graceful close, and the four epoch refresh control messages alike) uses V3
-framing: `DATA_PREFIX` (`b"NMEA-D3"`) followed by the 16-byte
+graceful close, and the four epoch refresh control messages alike) uses the
+epoch-aware V2 framing: `DATA_PREFIX` (`b"NMEA-D2"`) followed by the 16-byte
 `session_locator`, a one-byte epoch selector, a 12-byte nonce, and the
 AES-GCM ciphertext plus tag; associated data is
 `build_data_aad(session_locator, epoch_generation) = DATA_PREFIX ||
@@ -562,9 +568,9 @@ None of this is a claim of durable or cross-process uniqueness, or that a
 finite random space can never repeat in principle -- only that every draw is
 checked and retried under a real lock, and that this process's bookkeeping
 of what is currently live or recently retired is accurate. An in-session
-authenticated epoch refresh (revision 3) preserves both identifiers
-trivially, because it replaces only `current_epoch` on the unchanged
-`LogicalSession` object and never draws or claims a namespace at all.
+authenticated epoch refresh preserves both identifiers trivially, because
+it replaces only `current_epoch` on the unchanged `LogicalSession` object
+and never draws or claims a namespace at all.
 This carry-forward mechanism now applies ONLY to genuine
 whole-`LogicalSession` replacement -- a fresh establishment handshake for
 terminal recovery or a genuinely new session -- where a same-relation,
@@ -1009,8 +1015,8 @@ state (the old active server session stays usable while confirmation is
 pending, failed confirmation does not destroy it, and successful
 confirmation atomically promotes the candidate as specified below).
 Configured planned refresh (`session_refresh_interval > 0`) instead runs
-the revision-3 in-session authenticated epoch refresh described in the
-epoch-refresh subsection above: it does not restart forwarding, does not
+the in-session authenticated epoch refresh described in the epoch-refresh
+subsection above: it does not restart forwarding, does not
 invoke ClientHello/ServerHello on success, and leaves the same server
 `LogicalSession` in place. The first proactive-rekey attempt and each
 planned-refresh transaction start are immediate; peer graceful close,
@@ -1308,16 +1314,18 @@ booleans rejected). No mandatory permanent session-age cap is introduced:
 an epoch's usable lifetime is the logical-session lifetime unless planned
 refresh or nonce pressure triggers earlier.
 
-This section's UDPSEC revision-3 changes are real, not merely local
-bookkeeping: the DATA framing (`DATA_PREFIX b"NMEA-D3"`, the one-byte
-epoch selector, and the generation-bound AAD), the four authenticated
-refresh transcripts and their domain-separated key schedule, and
-`nmea_sproxy` wire compatibility (no V1/V2 fallback, no downgrade, no
-negotiation) are all part of this revision and are documented above and
-in the surrounding protocol/crypto modules, not left unspecified. What
-this section does NOT change is the underlying cryptographic algorithms
-(P-256 ECDSA/ECDHE, HKDF-SHA256, AES-256-GCM) or the lifecycle policies
-intentionally preserved from the prior revision (TTL, capacity, LRU,
+This section's UDPSEC in-session epoch refresh is a real evolution of the
+V2 wire format, not merely local bookkeeping: the DATA framing
+(`DATA_PREFIX b"NMEA-D2"`, the one-byte epoch selector, and the
+generation-bound AAD), the four authenticated refresh transcripts and
+their domain-separated key schedule, and `nmea_sproxy` wire compatibility
+(no legacy parser, no fallback, no downgrade, no negotiation; both
+endpoints upgraded together) are all part of this format and are
+documented above and in the surrounding protocol/crypto modules, not left
+unspecified. The protocol version number stays `2`. What this section
+does NOT change is the underlying cryptographic algorithms (P-256
+ECDSA/ECDHE, HKDF-SHA256, AES-256-GCM) or the lifecycle policies
+intentionally preserved from before the refresh work (TTL, capacity, LRU,
 replay, and nonce-exhaustion semantics as documented above). Path
 migration and NAT rebinding are still explicitly not implemented; a
 refresh authorizes no path change, DATA from a tuple other than
