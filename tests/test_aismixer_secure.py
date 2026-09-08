@@ -123,20 +123,24 @@ def _install_session(
     )
 
 
-def _secure_data_packet(session_locator, key, nonce, message):
+def _secure_data_packet(session_locator, key, nonce, message, epoch_generation=0):
     plaintext = json.dumps(message).encode()
     ciphertext = AESGCM(key).encrypt(
-        nonce, plaintext, secure.build_data_aad(session_locator)
+        nonce,
+        plaintext,
+        secure.build_data_aad(session_locator, epoch_generation),
     )
-    return secure.build_data_packet(session_locator, nonce, ciphertext)
+    return secure.build_data_packet(
+        session_locator, epoch_generation, nonce, ciphertext
+    )
 
 
-def _decrypt_server_message(packet, server_to_client_key):
-    locator, nonce, ciphertext = secure.parse_data_packet(packet)
+def _decrypt_server_message(packet, server_to_client_key, epoch_generation=0):
+    locator, _selector, nonce, ciphertext = secure.parse_data_packet(packet)
     plaintext = AESGCM(server_to_client_key).decrypt(
         nonce,
         ciphertext,
-        secure.build_data_aad(locator),
+        secure.build_data_aad(locator, epoch_generation),
     )
     return json.loads(plaintext.decode())
 

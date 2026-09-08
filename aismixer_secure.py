@@ -33,9 +33,13 @@ from core.udp_listener import create_udp_listener_socket
 from core.udpsec_crypto import (
     DOMAIN_CONTEXT,
     build_client_auth_digest,
+    build_refresh_init_digest,
+    build_refresh_reply_digest,
+    build_refresh_transcript_hash,
     build_server_auth_digest,
     build_session_transcript_hash,
     derive_ephemeral_shared_secret,
+    derive_refresh_epoch_key_material,
     derive_session_key_material,
     generate_ephemeral_private_key,
     parse_ephemeral_public_key,
@@ -46,6 +50,10 @@ from core.udpsec_crypto import (
 from core.udpsec_protocol import (
     CLIENT_HELLO_PREFIX,
     DATA_PREFIX,
+    ESTABLISHMENT_EPOCH_GENERATION,
+    MAX_EPOCH_GENERATION,
+    REFRESH_CONFIRM_TYPE,
+    REFRESH_INIT_TYPE,
     SESSION_CLOSE_TYPE,
     SESSION_CONFIRMATION_SEQUENCE,
     SESSION_LOCATOR_BYTES,
@@ -54,12 +62,17 @@ from core.udpsec_protocol import (
     build_data_aad,
     build_data_packet,
     build_pong_message,
+    build_refresh_ack_message,
+    build_refresh_reply_message,
     build_session_close_message,
     build_server_hello_packet,
+    epoch_selector_for_generation,
     is_ping_message,
     is_session_close_message,
     parse_client_hello_packet,
     parse_data_packet,
+    parse_refresh_confirm_message,
+    parse_refresh_init_message,
 )
 
 
@@ -71,6 +84,26 @@ HANDSHAKE_REPLAY_TTL_SECONDS = 60
 HANDSHAKE_REPLAY_MAX = 100000
 DATA_NONCE_MAX_PER_SESSION = 100000
 SESSION_LOCATOR_GENERATION_ATTEMPTS = 8
+
+# UDPSEC revision 3 in-session epoch refresh (see BEHAVIORAL_CONTRACT.md
+# section 11). A confirmed `LogicalSession` owns at most one candidate
+# (pending) epoch and, for a short fixed monotonic window immediately after
+# a commit, at most one retiring epoch. These bounds are deliberately small:
+# there is no chain of pending refreshes and no unbounded key history.
+#
+# `PENDING_EPOCH_TTL_SECONDS` bounds how long a candidate epoch may sit
+# unconfirmed before the server discards it (the client abandons the
+# transaction on its own, shorter, deadline). A retry that reuses the same
+# transaction id is idempotent and never extends this deadline.
+PENDING_EPOCH_TTL_SECONDS = 30
+# `RETIRING_EPOCH_OVERLAP_SECONDS` is the exact monotonic cutoff during
+# which the immediately-previous epoch still authenticates INCOMING DATA of
+# type nmea/ping/close only -- never a refresh, path change, or
+# current-epoch replacement. Its full replay ledger is retained for the
+# whole window and discarded deterministically at the cutoff (lazy
+# per-packet plus `run_periodic_maintenance`). The boundary is exact:
+# `age >= cutoff` retires it, matching every other UDPSEC TTL.
+RETIRING_EPOCH_OVERLAP_SECONDS = 5
 # F3: how often `SecureState.run_periodic_maintenance()` (a small,
 # independent, opt-in background task -- see that method) runs expiry and
 # retirement-purge housekeeping. Not security-relevant on its own (an
@@ -273,6 +306,21 @@ class _DataNonceAdmission(Enum):
     STALE = "stale"
 
 
+class _PendingEpochInstall(Enum):
+    """Outcome of `SecureState.install_pending_epoch`."""
+
+    INSTALLED = "installed"
+    # Idempotent retransmit of the same transaction: resend the cached reply.
+    DUPLICATE = "duplicate"
+    # A different unresolved transition already holds this session -- no chain.
+    REJECTED_BUSY = "rejected_busy"
+    # The session/parent-epoch identity check failed (concurrent commit,
+    # stale parent generation, session gone).
+    STALE = "stale"
+    REPLAY = "replay"
+    EXHAUSTED = "exhausted"
+
+
 class _BoundedNonceSet:
     """Retain DATA nonces until their owning traffic-key epoch ends."""
 
@@ -425,20 +473,57 @@ class SecureStateClosedError(RuntimeError):
 
 @dataclass
 class CryptoEpoch:
-    """One authenticated ECDHE handshake's key material and replay ledger.
+    """One authenticated ECDHE exchange's directional key material and its
+    own private replay ledger.
 
-    A crypto epoch is replaceable as a unit: a successful authenticated
-    re-handshake (rekey) installs a fresh ``CryptoEpoch``. In this stage that
-    replacement still happens by replacing the whole owning `LogicalSession`
-    (see `promote_pending_session`), but the crypto state is now represented
-    as an explicit, independently referenceable object so a later stage can
-    swap only the epoch on an unchanged `LogicalSession` instead.
+    A crypto epoch is replaceable as a unit on an UNCHANGED `LogicalSession`:
+    an authenticated in-session refresh (REFRESH_INIT -> REFRESH_REPLY ->
+    REFRESH_CONFIRM -> REFRESH_ACK) derives a fresh ``CryptoEpoch`` from
+    fresh ephemeral ECDHE and installs it as `LogicalSession.current_epoch`
+    without touching the session object, its `session_locator`,
+    `session_handle`, `assembly_namespace`, `path_state`, or `created_at`.
+
+    `generation` is a per-`LogicalSession` monotonic counter: the
+    establishment epoch is generation 0 and each successful refresh installs
+    generation + 1. Its low byte is the plaintext DATA epoch selector; the
+    full 32-bit value is bound into every DATA packet's AEAD associated data
+    (`build_data_aad`) and into the refresh transcript. `transaction_id` is
+    `None` for the establishment epoch and the confirmed refresh transaction
+    for every refresh-derived epoch (used for idempotent lost-ACK recovery).
+    `created_at` is set at establishment/promotion and reset only on an
+    actual refresh commit -- never on pending-epoch creation or retries.
     """
 
     client_to_server_aesgcm: AESGCM
     server_to_client_aesgcm: AESGCM
     seen_data_nonces: _BoundedNonceSet
     created_at: float
+    generation: int = ESTABLISHMENT_EPOCH_GENERATION
+    transaction_id: object = None
+
+
+@dataclass
+class _PendingEpoch:
+    """The single authenticated candidate epoch a `LogicalSession` may own
+    during a bounded refresh transition.
+
+    Bound to the exact `LogicalSession` object and the exact parent
+    `current_epoch` generation it was derived against -- both re-checked
+    under the `SecureState` lock at commit. Carries only the transaction
+    identity, generations, the fully-built candidate `CryptoEpoch` (its own
+    fresh nonce ledger, already holding the admitted confirmation nonce once
+    confirmed), timestamps, and the cached REFRESH_REPLY packet for
+    idempotent retransmission. Holds no `_SESSION_IDENTITY_REGISTRY`
+    reservation of its own.
+    """
+
+    transaction_id: bytes
+    generation: int
+    parent_generation: int
+    epoch: CryptoEpoch
+    created_at: float
+    deadline: float
+    reply_packet: bytes
 
 
 def _structured_paths_match(a, b):
@@ -553,6 +638,15 @@ class LogicalSession:
     assembly_namespace: bytes
     current_epoch: CryptoEpoch
     path_state: PathState
+    # UDPSEC revision 3 in-session epoch refresh state. `pending_epoch` is the
+    # at-most-one authenticated candidate epoch (see `_PendingEpoch`);
+    # `retiring_epoch` is the at-most-one immediately-previous epoch kept
+    # briefly after a commit, and `retiring_deadline` is its exact monotonic
+    # receive-eligibility cutoff. None of these change session identity,
+    # lifetime origin, path, or registry reservations.
+    pending_epoch: object = None
+    retiring_epoch: object = None
+    retiring_deadline: object = None
 
 
 @dataclass
@@ -593,6 +687,11 @@ class SecureStateStats:
     data_nonce_exhaustions: int
     data_nonces_session_discarded: int
 
+    epoch_refreshes_committed: int
+    pending_epochs_created: int
+    pending_epochs_discarded: int
+    retiring_epochs_retired: int
+
     current_handshake_replays: int
     peak_handshake_replays: int
     current_sessions: int
@@ -601,6 +700,8 @@ class SecureStateStats:
     peak_pending_sessions: int
     current_data_nonces: int
     peak_data_nonces: int
+    current_pending_epochs: int
+    current_retiring_epochs: int
 
 
 class SecureState:
@@ -613,6 +714,8 @@ class SecureState:
         data_nonce_max_per_session=DATA_NONCE_MAX_PER_SESSION,
         pending_session_ttl=PENDING_SESSION_TTL_SECONDS,
         max_pending_sessions=PENDING_SESSION_MAX,
+        pending_epoch_ttl=PENDING_EPOCH_TTL_SECONDS,
+        retiring_epoch_overlap=RETIRING_EPOCH_OVERLAP_SECONDS,
         clock=None,
     ):
         # R5/F2: an OPTIONAL authoritative monotonic clock this owner
@@ -661,6 +764,10 @@ class SecureState:
             "handshake_replay_max", handshake_replay_max)
         self._data_nonce_max_per_session = _validate_positive_int(
             "data_nonce_max_per_session", data_nonce_max_per_session)
+        self._pending_epoch_ttl = _validate_positive_ttl(
+            "pending_epoch_ttl", pending_epoch_ttl)
+        self._retiring_epoch_overlap = _validate_positive_ttl(
+            "retiring_epoch_overlap", retiring_epoch_overlap)
 
         # One reentrant lock protects every composite state transaction
         # below (replay admission, pending/active install/replace/remove,
@@ -729,6 +836,19 @@ class SecureState:
         # the number of live entries rather than by total touch volume.
         self._session_expiry_heap = []
         self._pending_expiry_heap = []
+        # UDPSEC revision 3: a third lazy-deletion min-heap for epoch
+        # transition deadlines -- pending-epoch TTLs and retiring-epoch
+        # cutoffs. Entries are
+        # `(deadline, sequence, session_key, session, kind, epoch_object)`
+        # where `kind` is "pending" or "retiring". Validated by OBJECT
+        # IDENTITY against whatever transition state the session currently
+        # holds when popped, exactly like the two heaps above -- a
+        # superseded entry (a committed/discarded pending epoch, a
+        # replaced retiring epoch) is discarded outright. This keeps a
+        # session's own per-packet path O(1): it never scans other
+        # sessions' transitions, and `run_periodic_maintenance` drains
+        # this heap on an otherwise-idle owner.
+        self._epoch_transition_heap = []
         # Heap entries are `(deadline, sequence, key)`. `_EndpointSessionKey`
         # and `_EndpointPeerKey` support equality but not ordering, so two
         # entries with an equal `deadline` (routine -- many sessions can
@@ -777,6 +897,11 @@ class SecureState:
         self._data_nonces_capacity_evicted = 0
         self._data_nonce_exhaustions = 0
         self._data_nonces_session_discarded = 0
+
+        self._epoch_refreshes_committed = 0
+        self._pending_epochs_created = 0
+        self._pending_epochs_discarded = 0
+        self._retiring_epochs_retired = 0
 
         self._current_data_nonces = 0
         self._peak_handshake_replays = 0
@@ -831,6 +956,10 @@ class SecureState:
                 data_nonces_session_discarded=(
                     self._data_nonces_session_discarded
                 ),
+                epoch_refreshes_committed=self._epoch_refreshes_committed,
+                pending_epochs_created=self._pending_epochs_created,
+                pending_epochs_discarded=self._pending_epochs_discarded,
+                retiring_epochs_retired=self._retiring_epochs_retired,
                 current_handshake_replays=len(self._handshake_replays),
                 peak_handshake_replays=self._peak_handshake_replays,
                 current_sessions=len(self._sessions),
@@ -839,6 +968,16 @@ class SecureState:
                 peak_pending_sessions=self._peak_pending_sessions,
                 current_data_nonces=self._current_data_nonces,
                 peak_data_nonces=self._peak_data_nonces,
+                current_pending_epochs=sum(
+                    1
+                    for session in self._sessions.values()
+                    if session.pending_epoch is not None
+                ),
+                current_retiring_epochs=sum(
+                    1
+                    for session in self._sessions.values()
+                    if session.retiring_epoch is not None
+                ),
             )
 
     def accept_handshake_replay(self, key, now):
@@ -870,10 +1009,28 @@ class SecureState:
             )
             return True
 
-    def _discard_session_nonces(self, session):
-        discarded_nonces = session.current_epoch.seen_data_nonces.discard_all()
+    def _live_session_epochs(self, session):
+        """Yield every `CryptoEpoch` a session/pending-session currently
+        owns: `current_epoch`, and (for a `LogicalSession` mid-transition)
+        the candidate epoch and the retiring epoch. Order is irrelevant --
+        callers only sum or discard across all of them."""
+        yield session.current_epoch
+        pending_epoch = getattr(session, "pending_epoch", None)
+        if pending_epoch is not None:
+            yield pending_epoch.epoch
+        retiring_epoch = getattr(session, "retiring_epoch", None)
+        if retiring_epoch is not None:
+            yield retiring_epoch
+
+    def _discard_one_epoch_nonces(self, epoch):
+        discarded_nonces = epoch.seen_data_nonces.discard_all()
         self._current_data_nonces -= discarded_nonces
         self._data_nonces_session_discarded += discarded_nonces
+        return discarded_nonces
+
+    def _discard_session_nonces(self, session):
+        for epoch in self._live_session_epochs(session):
+            self._discard_one_epoch_nonces(epoch)
 
     def _remove_session(self, session_key, reason, now):
         # Canonicalize before popping: `_canonical_active_relation_key` can
@@ -1069,6 +1226,82 @@ class SecureState:
                 expired.append(relation_key)
             return expired
 
+    def _push_epoch_transition(self, session, kind, epoch_object, deadline):
+        heapq.heappush(
+            self._epoch_transition_heap,
+            (
+                deadline,
+                next(self._expiry_heap_sequence),
+                session._session_key,
+                session,
+                kind,
+                epoch_object,
+            ),
+        )
+
+    def _expire_session_epoch_transitions(self, session, now):
+        """Lazily retire this exact session's own expired transition state
+        (an unconfirmed candidate past its TTL, a retiring epoch past its
+        cutoff). Caller must hold the lock and have already confirmed
+        `session` is the live incarnation. O(1) -- only this session's own
+        two optional slots, never a scan of other sessions."""
+        pending_epoch = session.pending_epoch
+        if pending_epoch is not None and pending_epoch.deadline <= now:
+            self._discard_one_epoch_nonces(pending_epoch.epoch)
+            session.pending_epoch = None
+            self._pending_epochs_discarded += 1
+        retiring_epoch = session.retiring_epoch
+        if (
+            retiring_epoch is not None
+            and session.retiring_deadline is not None
+            and session.retiring_deadline <= now
+        ):
+            self._discard_one_epoch_nonces(retiring_epoch)
+            session.retiring_epoch = None
+            session.retiring_deadline = None
+            self._retiring_epochs_retired += 1
+
+    def cleanup_expired_epoch_transitions(self, now):
+        """Drain the epoch-transition deadline heap: discard every candidate
+        epoch past its TTL and every retiring epoch past its cutoff, in time
+        proportional to how many are actually due. Popped entries are
+        validated by OBJECT IDENTITY against the session's current
+        transition state, so a committed/discarded/replaced transition's
+        stale entry is dropped outright."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            while self._epoch_transition_heap:
+                deadline, _sequence, session_key, pushed_session, kind, epoch = (
+                    self._epoch_transition_heap[0]
+                )
+                if deadline > now:
+                    break
+                heapq.heappop(self._epoch_transition_heap)
+                session = self._sessions.get(session_key)
+                if session is not pushed_session:
+                    continue
+                if kind == "pending":
+                    pending_epoch = session.pending_epoch
+                    if pending_epoch is None or pending_epoch.epoch is not epoch:
+                        continue  # committed or already discarded
+                    if pending_epoch.deadline > now:
+                        continue  # never extended, so unreachable in practice
+                    self._discard_one_epoch_nonces(epoch)
+                    session.pending_epoch = None
+                    self._pending_epochs_discarded += 1
+                else:  # "retiring"
+                    if session.retiring_epoch is not epoch:
+                        continue  # replaced by a newer commit or already gone
+                    if (
+                        session.retiring_deadline is not None
+                        and session.retiring_deadline > now
+                    ):
+                        continue
+                    self._discard_one_epoch_nonces(epoch)
+                    session.retiring_epoch = None
+                    session.retiring_deadline = None
+                    self._retiring_epochs_retired += 1
+
     async def run_periodic_maintenance(
         self,
         interval=IDLE_MAINTENANCE_INTERVAL_SECONDS,
@@ -1113,6 +1346,7 @@ class SecureState:
             now = monotonic_now()
             self.cleanup_expired_sessions(now)
             self.cleanup_expired_pending_sessions(now)
+            self.cleanup_expired_epoch_transitions(now)
 
     def _fresh_session_handle(self):
         """Always mint a new, process-wide-unique LogicalSession-incarnation
@@ -1663,6 +1897,7 @@ class SecureState:
             self._handshake_replays.discard_all()
             self._session_expiry_heap.clear()
             self._pending_expiry_heap.clear()
+            self._epoch_transition_heap.clear()
             self._closed = True
 
     def promote_pending_session(self, pending, now):
@@ -1858,6 +2093,355 @@ class SecureState:
                 is _DataNonceAdmission.ACCEPTED
             )
 
+    #
+    # UDPSEC revision 3: in-session authenticated epoch refresh.
+    #
+    # All of the following operate on the EXACT `CryptoEpoch` OBJECT the
+    # caller authenticated a packet under -- never `session.current_epoch`
+    # re-read -- so a receive thread that decrypted under epoch G and then
+    # lost a concurrent commit race admits its nonce into epoch G's own
+    # (now retiring) ledger, or gets STALE, but never into epoch G+1's
+    # ledger. The expensive ECDHE/derive/signature work happens in
+    # `_secure_server_loop` OUTSIDE this lock; only cheap in-memory
+    # validation, object attachment, and the atomic swap happen here.
+    #
+
+    def _session_epoch_role(self, session, epoch):
+        """Return 'current' / 'pending' / 'retiring' if `epoch` is exactly
+        that live role object on `session` right now, else None. Identity
+        comparison only -- two epochs are never interchangeable by value."""
+        if session.current_epoch is epoch:
+            return "current"
+        pending = session.pending_epoch
+        if pending is not None and pending.epoch is epoch:
+            return "pending"
+        if session.retiring_epoch is epoch:
+            return "retiring"
+        return None
+
+    def build_refresh_candidate_epoch(
+        self,
+        client_to_server_key,
+        server_to_client_key,
+        generation,
+        transaction_id,
+    ):
+        """Construct a fully-owned candidate `CryptoEpoch` (fresh private
+        replay ledger) from already-derived directional keys. No lock and
+        no registry interaction -- a candidate epoch holds no
+        `session_handle`/`assembly_namespace` reservation of its own."""
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            raise TypeError("epoch generation must be an integer")
+        if not 0 <= generation <= MAX_EPOCH_GENERATION:
+            raise ValueError("epoch generation out of range")
+        return CryptoEpoch(
+            client_to_server_aesgcm=AESGCM(client_to_server_key),
+            server_to_client_aesgcm=AESGCM(server_to_client_key),
+            seen_data_nonces=_BoundedNonceSet(
+                self._data_nonce_max_per_session
+            ),
+            created_at=0.0,
+            generation=generation,
+            transaction_id=transaction_id,
+        )
+
+    def select_data_epoch(self, session, epoch_selector, now):
+        """Resolve the one-byte plaintext DATA selector to exactly one live
+        `CryptoEpoch` on `session`, returning `(epoch, role)` or
+        `(None, None)`.
+
+        `role` is 'current', 'pending', or 'retiring'. Consecutive
+        generations have distinct low bytes and at most three epochs are
+        ever simultaneously live, so this is an exact match, never a trial.
+        A retiring epoch past its exact monotonic cutoff is discarded here
+        and never returned. The caller still applies the per-role message
+        gate (a 'pending' epoch carries only REFRESH_CONFIRM; a 'retiring'
+        epoch carries only nmea/ping/close)."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return (None, None)
+            self._expire_session_epoch_transitions(session, now)
+            if not isinstance(epoch_selector, int) or not (
+                0 <= epoch_selector <= 0xFF
+            ):
+                return (None, None)
+            current = session.current_epoch
+            if epoch_selector_for_generation(current.generation) == (
+                epoch_selector
+            ):
+                return (current, "current")
+            pending = session.pending_epoch
+            if pending is not None and epoch_selector_for_generation(
+                pending.generation
+            ) == epoch_selector:
+                return (pending.epoch, "pending")
+            retiring = session.retiring_epoch
+            if retiring is not None and epoch_selector_for_generation(
+                retiring.generation
+            ) == epoch_selector:
+                return (retiring, "retiring")
+            return (None, None)
+
+    def epoch_data_nonce_seen(self, session, epoch, nonce, now):
+        """Pre-decrypt replay membership check against the EXACT epoch's
+        own ledger."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return False
+            self._expire_session_epoch_transitions(session, now)
+            if self._session_epoch_role(session, epoch) is None:
+                return False
+            seen = epoch.seen_data_nonces.contains(nonce)
+            if seen:
+                self._data_nonce_replays += 1
+            return seen
+
+    def admit_epoch_data_nonce(self, session, epoch, nonce, now):
+        """Authoritative post-validation nonce admission into the EXACT
+        epoch the caller decrypted under. STALE if that epoch is no longer
+        a live role on `session`. EXHAUSTED on the current epoch is
+        terminal for the whole session (as before); EXHAUSTED on a
+        pending or retiring epoch discards only that epoch."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return _DataNonceAdmission.STALE
+            self._expire_session_epoch_transitions(session, now)
+            role = self._session_epoch_role(session, epoch)
+            if role is None:
+                return _DataNonceAdmission.STALE
+            admission = epoch.seen_data_nonces.admit(nonce)
+            if admission is _DataNonceAdmission.REPLAY:
+                self._data_nonce_replays += 1
+            elif admission is _DataNonceAdmission.EXHAUSTED:
+                if role == "current":
+                    if not self._remove_exact_session(
+                        session, "nonce_exhausted", now
+                    ):
+                        return _DataNonceAdmission.STALE
+                elif role == "pending":
+                    self._discard_one_epoch_nonces(epoch)
+                    session.pending_epoch = None
+                    self._pending_epochs_discarded += 1
+                    self._data_nonce_exhaustions += 1
+                else:  # retiring
+                    self._discard_one_epoch_nonces(epoch)
+                    session.retiring_epoch = None
+                    session.retiring_deadline = None
+                    self._retiring_epochs_retired += 1
+                    self._data_nonce_exhaustions += 1
+            else:
+                self._account_accepted_data_nonce()
+            return admission
+
+    def install_pending_epoch(
+        self,
+        session,
+        parent_epoch,
+        transaction_id,
+        generation,
+        candidate_epoch,
+        reply_packet,
+        init_nonce,
+        now,
+    ):
+        """Attach the single authenticated candidate epoch to `session`
+        after the caller has verified the REFRESH_INIT signature and
+        derived `candidate_epoch` OUTSIDE this lock. Returns
+        `(_PendingEpochInstall.<outcome>, pending_epoch_or_None)`.
+
+        `parent_epoch` is the exact `CryptoEpoch` object the INIT was
+        decrypted under: it must still be `session.current_epoch` (identity)
+        and its generation must be exactly `generation - 1`. A different
+        unresolved transaction already pending, or an unresolved retiring
+        epoch, rejects the new refresh (no chain, no overlap of
+        incompatible transitions). A retransmit of the SAME transaction is
+        idempotent: its fresh replay nonce is admitted, but no new keys are
+        derived and no second candidate is created."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return (_PendingEpochInstall.STALE, None)
+            self._expire_session_epoch_transitions(session, now)
+            if session.current_epoch is not parent_epoch:
+                return (_PendingEpochInstall.STALE, None)
+            if session.current_epoch.generation != generation - 1:
+                return (_PendingEpochInstall.STALE, None)
+
+            existing = session.pending_epoch
+            same_transaction = (
+                existing is not None
+                and existing.transaction_id == transaction_id
+            )
+            if existing is not None and not same_transaction:
+                return (_PendingEpochInstall.REJECTED_BUSY, None)
+            if existing is None and session.retiring_epoch is not None:
+                return (_PendingEpochInstall.REJECTED_BUSY, None)
+
+            admission = parent_epoch.seen_data_nonces.admit(init_nonce)
+            if admission is _DataNonceAdmission.REPLAY:
+                self._data_nonce_replays += 1
+                return (_PendingEpochInstall.REPLAY, None)
+            if admission is _DataNonceAdmission.EXHAUSTED:
+                if not self._remove_exact_session(
+                    session, "nonce_exhausted", now
+                ):
+                    return (_PendingEpochInstall.STALE, None)
+                return (_PendingEpochInstall.EXHAUSTED, None)
+            self._account_accepted_data_nonce()
+
+            if same_transaction:
+                # Idempotent retransmit: keep the existing candidate and its
+                # generation/keys exactly; the caller resends the cached
+                # REFRESH_REPLY. The candidate's deadline is NOT extended.
+                self._touch_active_session(session, now)
+                return (_PendingEpochInstall.DUPLICATE, existing)
+
+            pending = _PendingEpoch(
+                transaction_id=transaction_id,
+                generation=generation,
+                parent_generation=generation - 1,
+                epoch=candidate_epoch,
+                created_at=now,
+                deadline=now + self._pending_epoch_ttl,
+                reply_packet=reply_packet,
+            )
+            session.pending_epoch = pending
+            self._push_epoch_transition(
+                session, "pending", candidate_epoch, pending.deadline
+            )
+            self._pending_epochs_created += 1
+            self._touch_active_session(session, now)
+            return (_PendingEpochInstall.INSTALLED, pending)
+
+    def admit_refresh_confirm(
+        self, session, epoch, transaction_id, next_generation, confirm_nonce, now
+    ):
+        """Admit a validated REFRESH_CONFIRM's nonce into the exact epoch it
+        was decrypted under and, if it matches the live candidate, commit
+        the epoch swap atomically. Returns
+        `(ack_epoch_or_None, newly_committed: bool)`.
+
+        The commit is a pure in-memory swap (all fallible work already
+        happened at INIT time): `retiring_epoch <- current_epoch` with an
+        exact monotonic cutoff, `current_epoch <- candidate` (its
+        `created_at` set to now, `transaction_id` recorded),
+        `pending_epoch <- None`. `sessions_created`/`sessions_replaced` and
+        the session's identity/registry reservations are untouched.
+
+        A CONFIRM that arrives after the commit (a lost ACK) selects the
+        now-current epoch, matches its recorded transaction, has its nonce
+        admitted, and gets the ACK re-sent WITHOUT a second commit."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return (None, False)
+            self._expire_session_epoch_transitions(session, now)
+            role = self._session_epoch_role(session, epoch)
+            if role == "pending":
+                pending = session.pending_epoch
+                if (
+                    pending.transaction_id != transaction_id
+                    or pending.generation != next_generation
+                ):
+                    return (None, False)
+                admission = epoch.seen_data_nonces.admit(confirm_nonce)
+                if admission is _DataNonceAdmission.REPLAY:
+                    self._data_nonce_replays += 1
+                    return (None, False)
+                if admission is _DataNonceAdmission.EXHAUSTED:
+                    self._discard_one_epoch_nonces(epoch)
+                    session.pending_epoch = None
+                    self._pending_epochs_discarded += 1
+                    self._data_nonce_exhaustions += 1
+                    return (None, False)
+                self._account_accepted_data_nonce()
+                # COMMIT
+                previous = session.current_epoch
+                if session.retiring_epoch is not None:
+                    self._discard_one_epoch_nonces(session.retiring_epoch)
+                    self._retiring_epochs_retired += 1
+                session.retiring_epoch = previous
+                session.retiring_deadline = (
+                    now + self._retiring_epoch_overlap
+                )
+                self._push_epoch_transition(
+                    session,
+                    "retiring",
+                    previous,
+                    session.retiring_deadline,
+                )
+                epoch.created_at = now
+                epoch.transaction_id = transaction_id
+                session.current_epoch = epoch
+                session.pending_epoch = None
+                self._epoch_refreshes_committed += 1
+                self._touch_active_session(session, now)
+                return (epoch, True)
+            if role == "current":
+                current = session.current_epoch
+                if (
+                    current.transaction_id != transaction_id
+                    or current.generation != next_generation
+                ):
+                    return (None, False)
+                admission = current.seen_data_nonces.admit(confirm_nonce)
+                if admission is _DataNonceAdmission.REPLAY:
+                    # A byte-for-byte replayed CONFIRM after the commit: the
+                    # legitimate client still needs the ACK it lost, so
+                    # re-send it, but a replay never advances liveness.
+                    self._data_nonce_replays += 1
+                    return (current, False)
+                if admission is _DataNonceAdmission.EXHAUSTED:
+                    if not self._remove_exact_session(
+                        session, "nonce_exhausted", now
+                    ):
+                        return (None, False)
+                    return (None, False)
+                # A fresh-nonce CONFIRM retransmit is genuine authenticated
+                # peer activity.
+                self._account_accepted_data_nonce()
+                self._touch_active_session(session, now)
+                return (current, False)
+            return (None, False)
+
+    def discard_pending_epoch(self, session, pending_epoch, now):
+        """Discard a specific candidate epoch by object identity (a failed
+        transaction, an owner/listener teardown). Safe no-op against a
+        stale handle. Never touches the current or retiring epoch."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return False
+            pending = session.pending_epoch
+            if pending is None or pending is not pending_epoch:
+                return False
+            self._discard_one_epoch_nonces(pending.epoch)
+            session.pending_epoch = None
+            self._pending_epochs_discarded += 1
+            return True
+
+    def refresh_epoch_generations(self, session, now):
+        """Diagnostic/test helper: the live epoch generations on `session`
+        as `{'current': int, 'pending': int|None, 'retiring': int|None}`."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return None
+            self._expire_session_epoch_transitions(session, now)
+            pending = session.pending_epoch
+            return {
+                "current": session.current_epoch.generation,
+                "pending": None if pending is None else pending.generation,
+                "retiring": (
+                    None
+                    if session.retiring_epoch is None
+                    else session.retiring_epoch.generation
+                ),
+            }
+
 
 # R5/F2: the process-wide production default is explicitly configured
 # with the real authoritative clock (see `SecureState.__init__`'s `clock`
@@ -1904,21 +2488,28 @@ def build_handshake_replay_key(
     return digest.finalize()
 
 
-def encrypt_secure_json_message(aesgcm, session_locator, message):
-    """Encrypt one JSON DATA-channel message as one canonical V2 packet.
+def encrypt_secure_json_message(
+    aesgcm, session_locator, epoch_generation, message
+):
+    """Encrypt one JSON DATA-channel message as one canonical V3 packet.
 
     Every direction/message kind (NMEA, ordinary ping/pong, confirmation
-    ping/pong, graceful close) must use this exact construction so that
-    changing the plaintext locator on a captured ciphertext invalidates
-    AEAD authentication under the correct key.
+    ping/pong, graceful close, and the epoch-refresh control messages) must
+    use this exact construction so that changing the plaintext locator OR
+    the plaintext epoch selector on a captured ciphertext invalidates AEAD
+    authentication under the correct key. `epoch_generation` is the full
+    generation of the epoch `aesgcm` belongs to; it is bound into the AEAD
+    associated data and its low byte is the wire selector.
     """
 
     nonce = os.urandom(12)
     plaintext = json.dumps(message, separators=(",", ":")).encode()
     ciphertext = aesgcm.encrypt(
-        nonce, plaintext, build_data_aad(session_locator)
+        nonce, plaintext, build_data_aad(session_locator, epoch_generation)
     )
-    return build_data_packet(session_locator, nonce, ciphertext)
+    return build_data_packet(
+        session_locator, epoch_generation, nonce, ciphertext
+    )
 
 
 def close_owned_sessions(
@@ -1954,6 +2545,7 @@ def close_owned_sessions(
                 encrypt_secure_json_message(
                     session.current_epoch.server_to_client_aesgcm,
                     session_key.session_locator,
+                    session.current_epoch.generation,
                     message,
                 ),
                 addr,
@@ -2085,6 +2677,203 @@ def _build_server_handshake(
         AESGCM(key_material.client_to_server_key),
         AESGCM(key_material.server_to_client_key),
     )
+
+
+def _process_refresh_init(
+    state_owner,
+    session,
+    current_epoch,
+    msg,
+    init_nonce,
+    packet_locator,
+    server_private_key,
+    wall_now,
+    now,
+):
+    """Handle one decrypted, source-matched REFRESH_INIT for an established
+    session. Returns the REFRESH_REPLY DATA packet to send, or None.
+
+    Every fallible/expensive step -- structural validation, the client
+    refresh-signature check, fresh server ephemeral ECDHE, transcript
+    hashing, HKDF -- happens here, entirely OUTSIDE the SecureState lock.
+    Only the final `install_pending_epoch` re-validates the session and
+    parent-epoch identity under the lock and attaches the candidate.
+    """
+    try:
+        refresh_init = parse_refresh_init_message(msg)
+    except (ValueError, TypeError):
+        return None
+    if refresh_init.station_id != session.station_id:
+        return None
+    if refresh_init.parent_generation != current_epoch.generation:
+        return None
+
+    identity_public_key = AUTHORIZED_KEYS.get(session.station_id)
+    if identity_public_key is None:
+        return None
+
+    init_digest = build_refresh_init_digest(
+        protocol_version=UDPSEC_PROTOCOL_VERSION,
+        station_id=session.station_id,
+        session_locator=packet_locator,
+        parent_generation=refresh_init.parent_generation,
+        next_generation=refresh_init.next_generation,
+        transaction_id=refresh_init.transaction_id,
+        client_epoch_random=refresh_init.client_epoch_random,
+        client_epoch_public_key=refresh_init.client_epoch_public_key,
+    )
+    if not verify_transcript_signature(
+        identity_public_key,
+        refresh_init.refresh_signature,
+        init_digest,
+    ):
+        return None
+
+    try:
+        client_epoch_public_key = parse_ephemeral_public_key(
+            refresh_init.client_epoch_public_key
+        )
+    except ValueError:
+        return None
+
+    server_epoch_private_key = generate_ephemeral_private_key()
+    server_epoch_public_bytes = serialize_ephemeral_public_key(
+        server_epoch_private_key.public_key()
+    )
+    server_epoch_random = os.urandom(32)
+    reply_digest = build_refresh_reply_digest(
+        protocol_version=UDPSEC_PROTOCOL_VERSION,
+        station_id=session.station_id,
+        session_locator=packet_locator,
+        parent_generation=refresh_init.parent_generation,
+        next_generation=refresh_init.next_generation,
+        transaction_id=refresh_init.transaction_id,
+        client_epoch_random=refresh_init.client_epoch_random,
+        client_epoch_public_key=refresh_init.client_epoch_public_key,
+        client_refresh_signature=refresh_init.refresh_signature,
+        server_epoch_random=server_epoch_random,
+        server_epoch_public_key=server_epoch_public_bytes,
+    )
+    server_refresh_signature = sign_transcript_digest(
+        _require_prepared_server_private_key(server_private_key),
+        reply_digest,
+    )
+    refresh_transcript_hash = build_refresh_transcript_hash(
+        protocol_version=UDPSEC_PROTOCOL_VERSION,
+        station_id=session.station_id,
+        session_locator=packet_locator,
+        parent_generation=refresh_init.parent_generation,
+        next_generation=refresh_init.next_generation,
+        transaction_id=refresh_init.transaction_id,
+        client_epoch_random=refresh_init.client_epoch_random,
+        client_epoch_public_key=refresh_init.client_epoch_public_key,
+        client_refresh_signature=refresh_init.refresh_signature,
+        server_epoch_random=server_epoch_random,
+        server_epoch_public_key=server_epoch_public_bytes,
+        server_refresh_signature=server_refresh_signature,
+    )
+    shared_secret = derive_ephemeral_shared_secret(
+        server_epoch_private_key,
+        client_epoch_public_key,
+    )
+    # The candidate epoch's ephemeral private key has served its one
+    # purpose; drop the local reference promptly (no claim of physical
+    # zeroization in Python).
+    server_epoch_private_key = None
+    key_material = derive_refresh_epoch_key_material(
+        shared_secret,
+        refresh_transcript_hash,
+    )
+    candidate_epoch = state_owner.build_refresh_candidate_epoch(
+        key_material.client_to_server_key,
+        key_material.server_to_client_key,
+        refresh_init.next_generation,
+        refresh_init.transaction_id,
+    )
+    reply_message = build_refresh_reply_message(
+        station_id=session.station_id,
+        transaction_id=refresh_init.transaction_id,
+        parent_generation=refresh_init.parent_generation,
+        next_generation=refresh_init.next_generation,
+        epoch_random=server_epoch_random,
+        epoch_public_key=server_epoch_public_bytes,
+        refresh_signature=server_refresh_signature,
+        timestamp=int(wall_now()),
+    )
+    reply_packet = encrypt_secure_json_message(
+        current_epoch.server_to_client_aesgcm,
+        packet_locator,
+        current_epoch.generation,
+        reply_message,
+    )
+
+    outcome, pending = state_owner.install_pending_epoch(
+        session,
+        current_epoch,
+        refresh_init.transaction_id,
+        refresh_init.next_generation,
+        candidate_epoch,
+        reply_packet,
+        init_nonce,
+        now,
+    )
+    if outcome is _PendingEpochInstall.INSTALLED:
+        return reply_packet
+    if outcome is _PendingEpochInstall.DUPLICATE:
+        return pending.reply_packet
+    return None
+
+
+def _process_refresh_confirm(
+    state_owner,
+    session,
+    epoch,
+    msg,
+    confirm_nonce,
+    packet_locator,
+    wall_now,
+    now,
+):
+    """Handle one decrypted, source-matched REFRESH_CONFIRM. Returns
+    `(ack_packet_or_None, newly_committed: bool)`.
+
+    `SecureState.admit_refresh_confirm` performs the nonce admission and
+    the atomic epoch swap under the lock; this function only parses the
+    message and, on success, builds the authenticated REFRESH_ACK under
+    whichever epoch the ACK must be sent under (the newly-current epoch on
+    a fresh commit, or the already-current epoch on a lost-ACK retransmit).
+    """
+    try:
+        refresh_confirm = parse_refresh_confirm_message(msg)
+    except (ValueError, TypeError):
+        return (None, False)
+    if refresh_confirm.station_id != session.station_id:
+        return (None, False)
+
+    ack_epoch, newly_committed = state_owner.admit_refresh_confirm(
+        session,
+        epoch,
+        refresh_confirm.transaction_id,
+        refresh_confirm.next_generation,
+        confirm_nonce,
+        now,
+    )
+    if ack_epoch is None:
+        return (None, False)
+
+    ack_message = build_refresh_ack_message(
+        station_id=session.station_id,
+        transaction_id=refresh_confirm.transaction_id,
+        next_generation=refresh_confirm.next_generation,
+        timestamp=int(wall_now()),
+    )
+    ack_packet = encrypt_secure_json_message(
+        ack_epoch.server_to_client_aesgcm,
+        packet_locator,
+        ack_epoch.generation,
+        ack_message,
+    )
+    return (ack_packet, newly_committed)
 
 
 async def _secure_server_loop(
@@ -2233,9 +3022,12 @@ async def _secure_server_loop(
         elif data.startswith(DATA_PREFIX):
             try:
                 try:
-                    packet_locator, nonce, ciphertext = parse_data_packet(
-                        data
-                    )
+                    (
+                        packet_locator,
+                        epoch_selector,
+                        nonce,
+                        ciphertext,
+                    ) = parse_data_packet(data)
                 except ValueError:
                     continue
 
@@ -2271,7 +3063,10 @@ async def _secure_server_loop(
                             pending.current_epoch.client_to_server_aesgcm.decrypt(
                                 nonce,
                                 ciphertext,
-                                build_data_aad(packet_locator),
+                                build_data_aad(
+                                    packet_locator,
+                                    ESTABLISHMENT_EPOCH_GENERATION,
+                                ),
                             )
                         )
                     except InvalidTag:
@@ -2347,6 +3142,7 @@ async def _secure_server_loop(
                         encrypt_secure_json_message(
                             session.current_epoch.server_to_client_aesgcm,
                             session._session_key.session_locator,
+                            session.current_epoch.generation,
                             response,
                         ),
                         addr,
@@ -2371,31 +3167,41 @@ async def _secure_server_loop(
                     # station identity exists.
                     continue
 
-                # No migration in this stage: a locator match from any path
-                # other than the session's currently validated active_path
-                # is dropped before any cryptographic work, exactly like an
-                # unknown locator. A later stage will turn this into
-                # authenticated candidate-path evaluation.
+                # No migration in this revision: a locator match from any
+                # path other than the session's currently validated
+                # active_path is dropped before any cryptographic work,
+                # exactly like an unknown locator. An in-session epoch
+                # refresh authorizes no path change.
                 if not _structured_paths_match(
                     addr, session.path_state.active_path
                 ):
                     continue
 
                 station_id = session.station_id
-                client_to_server_aesgcm = (
-                    session.current_epoch.client_to_server_aesgcm
+
+                # UDPSEC revision 3: resolve the plaintext epoch selector to
+                # exactly one live CryptoEpoch on this session. No trial
+                # decryption across epochs -- one exact-generation match
+                # among {retiring, current, pending}, or a drop.
+                epoch, epoch_role = state_owner.select_data_epoch(
+                    session, epoch_selector, local_now
                 )
-                if state_owner.data_nonce_seen(session, nonce, local_now):
+                if epoch is None:
+                    continue
+
+                if state_owner.epoch_data_nonce_seen(
+                    session, epoch, nonce, local_now
+                ):
                     print(
                         "[!] Duplicate secure data nonce from "
                         f"{format_endpoint_tuple(addr)}"
                     )
                     continue
 
-                plaintext = client_to_server_aesgcm.decrypt(
+                plaintext = epoch.client_to_server_aesgcm.decrypt(
                     nonce,
                     ciphertext,
-                    build_data_aad(packet_locator),
+                    build_data_aad(packet_locator, epoch.generation),
                 )
 
                 msg = json.loads(plaintext.decode())
@@ -2407,6 +3213,66 @@ async def _secure_server_loop(
                     continue
 
                 message_type = msg.get("type")
+
+                # Per-role message gate: a pending candidate epoch carries
+                # only a REFRESH_CONFIRM; a retiring epoch carries only
+                # nmea/ping/close (never a refresh, path change, or
+                # current-epoch replacement).
+                if (
+                    epoch_role == "pending"
+                    and message_type != REFRESH_CONFIRM_TYPE
+                ):
+                    continue
+                if epoch_role == "retiring" and message_type not in (
+                    "nmea",
+                    "ping",
+                    SESSION_CLOSE_TYPE,
+                ):
+                    continue
+
+                if message_type == REFRESH_INIT_TYPE:
+                    if epoch_role != "current":
+                        continue
+                    reply_packet = _process_refresh_init(
+                        state_owner,
+                        session,
+                        epoch,
+                        msg,
+                        nonce,
+                        packet_locator,
+                        active_server_private_key,
+                        wall_now,
+                        local_now,
+                    )
+                    if reply_packet is not None:
+                        sock.sendto(
+                            reply_packet, session.path_state.active_path
+                        )
+                    continue
+
+                if message_type == REFRESH_CONFIRM_TYPE:
+                    ack_packet, newly_committed = _process_refresh_confirm(
+                        state_owner,
+                        session,
+                        epoch,
+                        msg,
+                        nonce,
+                        packet_locator,
+                        wall_now,
+                        local_now,
+                    )
+                    if ack_packet is not None:
+                        sock.sendto(
+                            ack_packet, session.path_state.active_path
+                        )
+                        if newly_committed:
+                            print(
+                                "[+] Committed in-session epoch refresh "
+                                f"for {station_id} @ "
+                                f"{format_endpoint_tuple(addr)}"
+                            )
+                    continue
+
                 if message_type == "ping":
                     if not is_ping_message(msg, station_id):
                         print(
@@ -2442,8 +3308,8 @@ async def _secure_server_loop(
                     )
                     continue
 
-                admission = state_owner.admit_data_nonce(
-                    session, nonce, local_now
+                admission = state_owner.admit_epoch_data_nonce(
+                    session, epoch, nonce, local_now
                 )
                 if admission is _DataNonceAdmission.REPLAY:
                     print(
@@ -2452,11 +3318,14 @@ async def _secure_server_loop(
                     )
                     continue
                 if admission is _DataNonceAdmission.EXHAUSTED:
+                    # Only current-epoch exhaustion is terminal for the
+                    # session; a pending/retiring epoch's exhaustion just
+                    # discards that epoch and leaves the session intact.
                     if (
                         owned_sessions is not None
-                        and owned_sessions.get(
-                            session._session_key
-                        ) is session
+                        and not state_owner.is_live_session_handle(
+                            session, local_now
+                        )
                     ):
                         owned_sessions.pop(session._session_key, None)
                     print(
@@ -2486,16 +3355,17 @@ async def _secure_server_loop(
                         int(wall_now()),
                     )
                     # Established-session traffic addresses the session's
-                    # authoritative outbound path, not necessarily the tuple
-                    # this particular packet happened to arrive from. In this
-                    # stage there is no migration yet, so `active_path` is
-                    # always the same value `addr` already has -- but this is
-                    # now the one place later path-validation work needs to
-                    # change.
+                    # authoritative outbound path. The pong is sent under the
+                    # SAME epoch the ping arrived on (including a retiring
+                    # epoch during the client's own commit uncertainty), so
+                    # the client can always decrypt the reply it is waiting
+                    # for. There is no migration in this revision, so
+                    # `active_path` is always the tuple `addr` already has.
                     sock.sendto(
                         encrypt_secure_json_message(
-                            session.current_epoch.server_to_client_aesgcm,
+                            epoch.server_to_client_aesgcm,
                             session._session_key.session_locator,
+                            epoch.generation,
                             response,
                         ),
                         session.path_state.active_path,

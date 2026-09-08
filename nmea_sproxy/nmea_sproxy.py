@@ -77,9 +77,13 @@ from core.sockaddr_identity import sockaddrs_match  # noqa: E402
 from core.udpsec_crypto import (  # noqa: E402
     SessionKeyMaterial,
     build_client_auth_digest,
+    build_refresh_init_digest,
+    build_refresh_reply_digest,
+    build_refresh_transcript_hash,
     build_server_auth_digest,
     build_session_transcript_hash,
     derive_ephemeral_shared_secret,
+    derive_refresh_epoch_key_material,
     derive_session_key_material,
     generate_ephemeral_private_key,
     parse_ephemeral_public_key,
@@ -90,6 +94,10 @@ from core.udpsec_crypto import (  # noqa: E402
 from core.udpsec_protocol import (  # noqa: E402
     ClientHello,
     DATA_PREFIX,
+    ESTABLISHMENT_EPOCH_GENERATION,
+    MAX_EPOCH_GENERATION,
+    REFRESH_ACK_TYPE,
+    REFRESH_REPLY_TYPE,
     SESSION_CONFIRMATION_SEQUENCE,
     SESSION_LOCATOR_BYTES,
     UDPSEC_PROTOCOL_VERSION,
@@ -97,10 +105,15 @@ from core.udpsec_protocol import (  # noqa: E402
     build_data_aad,
     build_data_packet,
     build_ping_message,
+    build_refresh_confirm_message,
+    build_refresh_init_message,
     build_session_close_message,
+    epoch_selector_for_generation,
     is_matching_pong_message,
     is_session_close_message,
     parse_data_packet,
+    parse_refresh_ack_message,
+    parse_refresh_reply_message,
     parse_server_hello_packet,
 )
 
@@ -109,13 +122,31 @@ from core.udpsec_protocol import (  # noqa: E402
 SERVER_PACKET_IGNORED = "ignored"
 SERVER_PACKET_AUTHENTICATED = "authenticated"
 SERVER_PACKET_PEER_CLOSE = "peer_close"
+SERVER_PACKET_REFRESH_PROGRESS = "refresh_progress"
+SERVER_PACKET_REFRESH_COMMITTED = "refresh_committed"
 SESSION_END_PLANNED_REFRESH = "planned_refresh"
 SESSION_END_PROACTIVE_REKEY = "proactive_rekey"
 SESSION_END_PEER_GRACEFUL_CLOSE = "peer_graceful_close"
 SESSION_END_PEER_TIMEOUT = "peer_timeout"
 SESSION_END_SOCKET_ERROR = "socket_error"
 SESSION_ACTION_SEND_PING = "send_ping"
+SESSION_ACTION_START_EPOCH_REFRESH = "start_epoch_refresh"
 HANDSHAKE_FAILURE = "handshake_failure"
+
+# UDPSEC revision 3 client-side in-session epoch refresh (see
+# BEHAVIORAL_CONTRACT.md section 11). All finite, validated bounds:
+#   - the whole REFRESH_INIT -> REFRESH_REPLY -> REFRESH_CONFIRM ->
+#     REFRESH_ACK transaction is abandoned (E1 stays current) if not
+#     committed within REFRESH_TRANSACTION_TIMEOUT_SECONDS;
+#   - INIT/CONFIRM are retransmitted every REFRESH_RETRANSMIT_SECONDS, at
+#     most REFRESH_MAX_ATTEMPTS times per phase;
+#   - after a commit the client keeps the retiring epoch's server->client
+#     key for REFRESH_RETIRING_WINDOW_SECONDS only, purely to still decrypt
+#     a pong for a keepalive ping it sent under E1 just before committing.
+REFRESH_TRANSACTION_TIMEOUT_SECONDS = 15.0
+REFRESH_RETRANSMIT_SECONDS = 2.0
+REFRESH_MAX_ATTEMPTS = 6
+REFRESH_RETIRING_WINDOW_SECONDS = 5.0
 CONFIG_ENV_VAR = "NMEA_SPROXY_CONFIG"
 DEFAULT_PROCESS_TITLE = "nmea_sproxy"
 SYSTEM_CONFIG_PATH = "/etc/nmea_sproxy/config.yaml"
@@ -629,6 +660,338 @@ class ConfirmedUdpsecSession:
     key_material: SessionKeyMaterial
 
 
+class _ClientEpochSet:
+    """The client's mutable view of which traffic-key epoch to send under
+    on one confirmed UDPSEC relation, plus the at-most-one candidate epoch
+    during a refresh and the briefly-retained retiring epoch just after a
+    commit. The `session_locator` never changes across an in-session
+    refresh -- only the directional keys and the generation do."""
+
+    __slots__ = (
+        "session_locator",
+        "generation",
+        "client_to_server_key",
+        "server_to_client_key",
+        "_retiring_generation",
+        "_retiring_server_to_client_key",
+        "_retiring_until",
+        "_pending",
+    )
+
+    def __init__(self, session_locator, key_material):
+        self.session_locator = session_locator
+        self.generation = ESTABLISHMENT_EPOCH_GENERATION
+        self.client_to_server_key = key_material.client_to_server_key
+        self.server_to_client_key = key_material.server_to_client_key
+        self._retiring_generation = None
+        self._retiring_server_to_client_key = None
+        self._retiring_until = None
+        self._pending = None  # (generation, c2s_key, s2c_key)
+
+    def set_pending(self, generation, c2s_key, s2c_key):
+        self._pending = (generation, c2s_key, s2c_key)
+
+    def clear_pending(self):
+        self._pending = None
+
+    @property
+    def pending_generation(self):
+        return None if self._pending is None else self._pending[0]
+
+    def commit_pending(self, now):
+        if self._pending is None:
+            return False
+        generation, c2s_key, s2c_key = self._pending
+        self._retiring_generation = self.generation
+        self._retiring_server_to_client_key = self.server_to_client_key
+        self._retiring_until = now + REFRESH_RETIRING_WINDOW_SECONDS
+        self.generation = generation
+        self.client_to_server_key = c2s_key
+        self.server_to_client_key = s2c_key
+        self._pending = None
+        return True
+
+    def expire_retiring(self, now):
+        if self._retiring_until is not None and now >= self._retiring_until:
+            self._retiring_generation = None
+            self._retiring_server_to_client_key = None
+            self._retiring_until = None
+
+    def inbound_epoch(self, epoch_selector, now):
+        """Resolve a plaintext DATA selector to the
+        (server->client key, generation) the client should decrypt under,
+        or None. Current epoch, the pending candidate (a REFRESH_ACK), or
+        -- briefly after a commit -- the retiring epoch (a straggler pong
+        for a keepalive ping sent under E1 just before committing)."""
+        self.expire_retiring(now)
+        if epoch_selector == epoch_selector_for_generation(self.generation):
+            return (self.server_to_client_key, self.generation)
+        if self._pending is not None and epoch_selector == (
+            epoch_selector_for_generation(self._pending[0])
+        ):
+            return (self._pending[2], self._pending[0])
+        if self._retiring_generation is not None and epoch_selector == (
+            epoch_selector_for_generation(self._retiring_generation)
+        ):
+            return (
+                self._retiring_server_to_client_key,
+                self._retiring_generation,
+            )
+        return None
+
+
+class _ClientEpochRefresh:
+    """Client-owned state machine for one in-session authenticated epoch
+    refresh transaction (REFRESH_INIT -> REFRESH_REPLY -> REFRESH_CONFIRM
+    -> REFRESH_ACK). Owns only the transient choreography state; the
+    forwarding relation, input adapter, output socket, ForwardingStats,
+    and session locator all stay put in `forward_loop()`."""
+
+    IDLE = "idle"
+    INIT_SENT = "init_sent"
+    CONFIRM_SENT = "confirm_sent"
+
+    def __init__(
+        self, station_private_key, station_id, session_locator
+    ):
+        self._station_private_key = station_private_key
+        self._station_id = station_id
+        self._session_locator = session_locator
+        self.phase = self.IDLE
+        self._txn = None
+        self._parent_gen = None
+        self._next_gen = None
+        self._client_epoch_private_key = None
+        self._client_epoch_random = None
+        self._client_epoch_public_bytes = None
+        self._init_signature = None
+        self._init_packet = None
+        self._confirm_packet = None
+        self._deadline = None
+        self._next_send_at = None
+        self._attempts = 0
+
+    @property
+    def active(self):
+        return self.phase in (self.INIT_SENT, self.CONFIRM_SENT)
+
+    def _reset(self):
+        self.phase = self.IDLE
+        self._txn = None
+        self._parent_gen = None
+        self._next_gen = None
+        self._client_epoch_private_key = None
+        self._client_epoch_random = None
+        self._client_epoch_public_bytes = None
+        self._init_signature = None
+        self._init_packet = None
+        self._confirm_packet = None
+        self._deadline = None
+        self._next_send_at = None
+        self._attempts = 0
+
+    @staticmethod
+    def _send(sock, remote_addr, packet):
+        try:
+            sock.sendto(packet, remote_addr)
+        except OSError as exc:
+            print(f"❌ Epoch refresh send error: {exc}")
+
+    def start(self, epochs, sock, remote_addr, now):
+        if self.active:
+            return
+        parent_gen = epochs.generation
+        next_gen = parent_gen + 1
+        if next_gen > MAX_EPOCH_GENERATION:
+            return  # fail closed rather than wrap the epoch generation
+        self._txn = os.urandom(32)
+        self._parent_gen = parent_gen
+        self._next_gen = next_gen
+        self._client_epoch_private_key = generate_ephemeral_private_key()
+        self._client_epoch_public_bytes = serialize_ephemeral_public_key(
+            self._client_epoch_private_key.public_key()
+        )
+        self._client_epoch_random = os.urandom(32)
+        init_digest = build_refresh_init_digest(
+            protocol_version=UDPSEC_PROTOCOL_VERSION,
+            station_id=self._station_id,
+            session_locator=self._session_locator,
+            parent_generation=parent_gen,
+            next_generation=next_gen,
+            transaction_id=self._txn,
+            client_epoch_random=self._client_epoch_random,
+            client_epoch_public_key=self._client_epoch_public_bytes,
+        )
+        self._init_signature = sign_transcript_digest(
+            self._station_private_key, init_digest
+        )
+        init_message = build_refresh_init_message(
+            station_id=self._station_id,
+            transaction_id=self._txn,
+            parent_generation=parent_gen,
+            next_generation=next_gen,
+            epoch_random=self._client_epoch_random,
+            epoch_public_key=self._client_epoch_public_bytes,
+            refresh_signature=self._init_signature,
+            timestamp=int(time.time()),
+        )
+        self._init_packet = encrypt_secure_json_message(
+            init_message,
+            epochs.client_to_server_key,
+            self._session_locator,
+            parent_gen,
+        )
+        self.phase = self.INIT_SENT
+        self._attempts = 1
+        self._deadline = now + REFRESH_TRANSACTION_TIMEOUT_SECONDS
+        self._next_send_at = now + REFRESH_RETRANSMIT_SECONDS
+        print("Starting in-session authenticated epoch refresh.")
+        self._send(sock, remote_addr, self._init_packet)
+
+    def tick(self, epochs, sock, remote_addr, now):
+        """Retransmit / abandon. Returns True if the transaction was
+        abandoned this tick (E1 stays current)."""
+        if not self.active:
+            return False
+        if now >= self._deadline:
+            print(
+                "Secure epoch refresh timed out; keeping the current epoch."
+            )
+            epochs.clear_pending()
+            self._reset()
+            return True
+        if now >= self._next_send_at:
+            if self._attempts >= REFRESH_MAX_ATTEMPTS:
+                self._next_send_at = self._deadline
+                return False
+            self._attempts += 1
+            self._next_send_at = now + REFRESH_RETRANSMIT_SECONDS
+            packet = (
+                self._confirm_packet
+                if self.phase == self.CONFIRM_SENT
+                else self._init_packet
+            )
+            if packet is not None:
+                self._send(sock, remote_addr, packet)
+        return False
+
+    def next_deadline(self, now):
+        if not self.active:
+            return None
+        upper = min(
+            d for d in (self._deadline, self._next_send_at) if d is not None
+        )
+        return max(now, upper)
+
+    def on_reply(
+        self,
+        reply,
+        epochs,
+        server_identity_public_key,
+        sock,
+        remote_addr,
+        now,
+    ):
+        if self.phase not in (self.INIT_SENT, self.CONFIRM_SENT):
+            return False
+        if reply.transaction_id != self._txn:
+            return False
+        if (
+            reply.parent_generation != self._parent_gen
+            or reply.next_generation != self._next_gen
+        ):
+            return False
+        if self.phase == self.CONFIRM_SENT:
+            # Idempotent: E2 already derived and CONFIRM already sent. A
+            # duplicate REPLY only means our CONFIRM may have been lost --
+            # resend it.
+            if self._confirm_packet is not None:
+                self._send(sock, remote_addr, self._confirm_packet)
+            return True
+
+        reply_digest = build_refresh_reply_digest(
+            protocol_version=UDPSEC_PROTOCOL_VERSION,
+            station_id=self._station_id,
+            session_locator=self._session_locator,
+            parent_generation=self._parent_gen,
+            next_generation=self._next_gen,
+            transaction_id=self._txn,
+            client_epoch_random=self._client_epoch_random,
+            client_epoch_public_key=self._client_epoch_public_bytes,
+            client_refresh_signature=self._init_signature,
+            server_epoch_random=reply.server_epoch_random,
+            server_epoch_public_key=reply.server_epoch_public_key,
+        )
+        if not verify_transcript_signature(
+            server_identity_public_key,
+            reply.refresh_signature,
+            reply_digest,
+        ):
+            return False
+        try:
+            server_epoch_public_key = parse_ephemeral_public_key(
+                reply.server_epoch_public_key
+            )
+        except ValueError:
+            return False
+        transcript_hash = build_refresh_transcript_hash(
+            protocol_version=UDPSEC_PROTOCOL_VERSION,
+            station_id=self._station_id,
+            session_locator=self._session_locator,
+            parent_generation=self._parent_gen,
+            next_generation=self._next_gen,
+            transaction_id=self._txn,
+            client_epoch_random=self._client_epoch_random,
+            client_epoch_public_key=self._client_epoch_public_bytes,
+            client_refresh_signature=self._init_signature,
+            server_epoch_random=reply.server_epoch_random,
+            server_epoch_public_key=reply.server_epoch_public_key,
+            server_refresh_signature=reply.refresh_signature,
+        )
+        shared_secret = derive_ephemeral_shared_secret(
+            self._client_epoch_private_key,
+            server_epoch_public_key,
+        )
+        self._client_epoch_private_key = None
+        key_material = derive_refresh_epoch_key_material(
+            shared_secret, transcript_hash
+        )
+        epochs.set_pending(
+            self._next_gen,
+            key_material.client_to_server_key,
+            key_material.server_to_client_key,
+        )
+        confirm_message = build_refresh_confirm_message(
+            station_id=self._station_id,
+            transaction_id=self._txn,
+            next_generation=self._next_gen,
+            timestamp=int(time.time()),
+        )
+        self._confirm_packet = encrypt_secure_json_message(
+            confirm_message,
+            key_material.client_to_server_key,
+            self._session_locator,
+            self._next_gen,
+        )
+        self.phase = self.CONFIRM_SENT
+        self._attempts = 1
+        self._next_send_at = now + REFRESH_RETRANSMIT_SECONDS
+        self._send(sock, remote_addr, self._confirm_packet)
+        return True
+
+    def on_ack(self, ack, epochs, now):
+        if self.phase != self.CONFIRM_SENT:
+            return False
+        if (
+            ack.transaction_id != self._txn
+            or ack.next_generation != self._next_gen
+        ):
+            return False
+        committed = epochs.commit_pending(now)
+        self._reset()
+        return committed
+
+
 def encrypt_message_aes_gcm(plaintext, key, aad):
     iv = os.urandom(12)
     encryptor = Cipher(
@@ -640,24 +1003,39 @@ def encrypt_message_aes_gcm(plaintext, key, aad):
     return iv, ciphertext + encryptor.tag
 
 
-def decrypt_secure_json_message(data, key, session_locator):
-    packet_locator, nonce, ciphertext = parse_data_packet(data)
+def decrypt_secure_json_message(
+    data, key, session_locator, epoch_generation=ESTABLISHMENT_EPOCH_GENERATION
+):
+    packet_locator, epoch_selector, nonce, ciphertext = parse_data_packet(data)
     if packet_locator != session_locator:
         raise ValueError(
             "secure packet locator does not match the current session"
         )
+    if epoch_selector != epoch_selector_for_generation(epoch_generation):
+        raise ValueError(
+            "secure packet epoch selector does not match the expected epoch"
+        )
     plaintext = AESGCM(key).decrypt(
-        nonce, ciphertext, build_data_aad(session_locator)
+        nonce,
+        ciphertext,
+        build_data_aad(session_locator, epoch_generation),
     )
     return json.loads(plaintext.decode())
 
 
-def encrypt_secure_json_message(message, key, session_locator):
+def encrypt_secure_json_message(
+    message,
+    key,
+    session_locator,
+    epoch_generation=ESTABLISHMENT_EPOCH_GENERATION,
+):
     plaintext = json.dumps(message, separators=(",", ":")).encode()
     nonce, ciphertext = encrypt_message_aes_gcm(
-        plaintext, key, build_data_aad(session_locator)
+        plaintext, key, build_data_aad(session_locator, epoch_generation)
     )
-    return build_data_packet(session_locator, nonce, ciphertext)
+    return build_data_packet(
+        session_locator, epoch_generation, nonce, ciphertext
+    )
 
 
 def remote_addresses_match(addr, remote_addr):
@@ -749,19 +1127,26 @@ def handle_server_packet(
     session_locator,
     station_id,
     expected_ping_seq,
+    epoch_generation=ESTABLISHMENT_EPOCH_GENERATION,
 ):
     """Accept a server DATA packet only when both the sender matches the
     pinned/configured server endpoint AND the packet's locator matches the
     current confirmed session -- and only then attempt AEAD/message
     validation. Locator equality alone is never treated as liveness
-    evidence or as a substitute for the pinned-address check."""
+    evidence or as a substitute for the pinned-address check.
+
+    `epoch_generation` selects which traffic-key epoch this datagram is
+    expected to have been produced under (see `_ClientEpochSet`): the
+    plaintext epoch selector and the AEAD associated data must both agree
+    with it. During the brief window after an in-session refresh commit the
+    caller may retry against the retiring epoch."""
 
     if not remote_addresses_match(addr, remote_addr):
         return SERVER_PACKET_IGNORED
 
     try:
         message = decrypt_secure_json_message(
-            data, server_to_client_key, session_locator
+            data, server_to_client_key, session_locator, epoch_generation
         )
     except Exception:
         return SERVER_PACKET_IGNORED
@@ -777,6 +1162,82 @@ def handle_server_packet(
     ):
         return SERVER_PACKET_AUTHENTICATED
     return SERVER_PACKET_IGNORED
+
+
+def _try_handle_refresh_message(
+    data,
+    addr,
+    remote_addr,
+    epochs,
+    refresh,
+    station_id,
+    server_identity_public_key,
+    sock,
+    now,
+):
+    """Route one server DATA datagram to the epoch-refresh state machine if
+    it is a REFRESH_REPLY or REFRESH_ACK for the active transaction.
+
+    Returns ``SERVER_PACKET_REFRESH_COMMITTED`` (the epoch swap just
+    finalized -- the caller reanchors the planned-refresh cadence),
+    ``SERVER_PACKET_REFRESH_PROGRESS`` (authenticated peer evidence that
+    advanced the machine or a benign duplicate), or ``None`` (not a refresh
+    message for us -- the caller falls through to `handle_server_packet`).
+    A forged/replayed/mismatched refresh message advances nothing and
+    returns ``None``."""
+    if refresh is None:
+        return None
+    if not remote_addresses_match(addr, remote_addr):
+        return None
+    try:
+        packet_locator, epoch_selector, _nonce, _ciphertext = parse_data_packet(
+            data
+        )
+    except (TypeError, ValueError):
+        return None
+    if packet_locator != epochs.session_locator:
+        return None
+    resolved = epochs.inbound_epoch(epoch_selector, now)
+    if resolved is None:
+        return None
+    key, generation = resolved
+    try:
+        message = decrypt_secure_json_message(
+            data, key, epochs.session_locator, generation
+        )
+    except Exception:
+        return None
+    if not isinstance(message, dict):
+        return None
+    kind = message.get("type")
+    if kind == REFRESH_REPLY_TYPE:
+        try:
+            reply = parse_refresh_reply_message(message)
+        except (TypeError, ValueError):
+            return None
+        if reply.station_id != station_id:
+            return None
+        if refresh.on_reply(
+            reply,
+            epochs,
+            server_identity_public_key,
+            sock,
+            remote_addr,
+            now,
+        ):
+            return SERVER_PACKET_REFRESH_PROGRESS
+        return None
+    if kind == REFRESH_ACK_TYPE:
+        try:
+            ack = parse_refresh_ack_message(message)
+        except (TypeError, ValueError):
+            return None
+        if ack.station_id != station_id:
+            return None
+        if refresh.on_ack(ack, epochs, now):
+            return SERVER_PACKET_REFRESH_COMMITTED
+        return None
+    return None
 
 
 def session_expiration_reason(
@@ -946,6 +1407,7 @@ def send_udpsec_nmea_sentence(
     client_to_server_key,
     session_locator,
     remote_addr,
+    epoch_generation=ESTABLISHMENT_EPOCH_GENERATION,
 ):
     json_obj = {
         "type": "nmea",
@@ -955,7 +1417,7 @@ def send_udpsec_nmea_sentence(
     }
     out_sock.sendto(
         encrypt_secure_json_message(
-            json_obj, client_to_server_key, session_locator
+            json_obj, client_to_server_key, session_locator, epoch_generation
         ),
         remote_addr,
     )
@@ -976,12 +1438,18 @@ def forward_pending_input(input_adapter, send_sentence, stats=None):
 
 
 def send_ping(
-    sock, remote_addr, client_to_server_key, session_locator, station_id, seq
+    sock,
+    remote_addr,
+    client_to_server_key,
+    session_locator,
+    station_id,
+    seq,
+    epoch_generation=ESTABLISHMENT_EPOCH_GENERATION,
 ):
     message = build_ping_message(station_id, seq, int(time.time()))
     sock.sendto(
         encrypt_secure_json_message(
-            message, client_to_server_key, session_locator
+            message, client_to_server_key, session_locator, epoch_generation
         ),
         remote_addr,
     )
@@ -993,6 +1461,7 @@ def send_session_close(
     client_to_server_key,
     session_locator,
     station_id,
+    epoch_generation=ESTABLISHMENT_EPOCH_GENERATION,
 ):
     message = build_session_close_message(
         station_id,
@@ -1000,7 +1469,7 @@ def send_session_close(
     )
     sock.sendto(
         encrypt_secure_json_message(
-            message, client_to_server_key, session_locator
+            message, client_to_server_key, session_locator, epoch_generation
         ),
         remote_addr,
     )
@@ -1211,17 +1680,39 @@ def forward_loop(
     remote_addr,
     ingress_policy=None,
     stats=None,
+    *,
+    station_private_key=None,
+    server_identity_public_key=None,
+    epoch_state_ref=None,
 ):
     """Run one authenticated forwarding session.
 
     ``stats`` should be the caller-owned ForwardingStats for the running
     relation so cumulative counters survive reconnect/rekey across
     successive calls; a fresh instance is created only when none is given.
+
+    When both ``station_private_key`` and ``server_identity_public_key`` are
+    given, a planned ``session_refresh_interval`` triggers a true in-session
+    authenticated epoch refresh (REFRESH_INIT -> REFRESH_REPLY ->
+    REFRESH_CONFIRM -> REFRESH_ACK): the session locator, input adapter,
+    forwarding relation, ForwardingStats and liveness/ping state all stay
+    put, and only the traffic-key epoch changes. Without them, a planned
+    refresh falls back to ending the loop with ``SESSION_END_PLANNED_REFRESH``
+    for a fresh establishment handshake, exactly as before.
     """
     input_adapter = _coerce_input_adapter(local_input, ingress_policy)
     session_locator = confirmed_session.session_locator
-    client_to_server_key = confirmed_session.key_material.client_to_server_key
-    server_to_client_key = confirmed_session.key_material.server_to_client_key
+    epochs = _ClientEpochSet(session_locator, confirmed_session.key_material)
+    if epoch_state_ref is not None:
+        # Publish the live epoch view so a best-effort graceful close on
+        # process shutdown uses the currently authoritative send epoch, not
+        # the establishment keys captured in `confirmed_session`.
+        epoch_state_ref[:] = [epochs]
+    refresh = None
+    if station_private_key is not None and server_identity_public_key is not None:
+        refresh = _ClientEpochRefresh(
+            station_private_key, config["station_id"], session_locator
+        )
     session_started_at = time.monotonic()
     last_authenticated_peer = session_started_at
     last_ping_at = session_started_at
@@ -1232,13 +1723,15 @@ def forward_loop(
         clean_line,
         out_sock,
         config,
-        client_to_server_key,
+        epochs.client_to_server_key,
         session_locator,
         remote_addr,
+        epochs.generation,
     )
 
     def apply_due_deadline(now):
         nonlocal expected_ping_seq, last_ping_at, next_ping_seq
+        nonlocal session_started_at
 
         action = session_deadline_action(
             now,
@@ -1253,10 +1746,11 @@ def forward_loop(
                 send_ping(
                     out_sock,
                     remote_addr,
-                    client_to_server_key,
+                    epochs.client_to_server_key,
                     session_locator,
                     config["station_id"],
                     next_ping_seq,
+                    epochs.generation,
                 )
             except Exception as e:
                 print(f"❌ Secure ping error: {e}")
@@ -1272,17 +1766,31 @@ def forward_loop(
             )
             return action
         if action == SESSION_END_PLANNED_REFRESH:
-            print("Secure session planned refresh due.")
-            return action
+            if refresh is None:
+                print("Secure session planned refresh due.")
+                return action
+            # True in-session epoch refresh: do NOT end the loop. Reanchor
+            # the planned-refresh cadence now (a retry/abandon backs off by
+            # one interval; a commit reanchors again) and start the
+            # transaction if one is not already in flight.
+            session_started_at = now
+            if not refresh.active:
+                refresh.start(epochs, out_sock, remote_addr, now)
+            return None
         if action is not None:
             print(f"Secure session invalidated: {action}")
         return action
+
+    def drive_refresh(now):
+        if refresh is not None:
+            refresh.tick(epochs, out_sock, remote_addr, now)
 
     while True:
         now = time.monotonic()
         deadline_reason = apply_due_deadline(now)
         if deadline_reason is not None:
             return deadline_reason
+        drive_refresh(now)
 
         if stats.is_heartbeat_due(now):
             print_forwarding_heartbeat(
@@ -1313,6 +1821,7 @@ def forward_loop(
         deadline_reason = apply_due_deadline(now)
         if deadline_reason is not None:
             return deadline_reason
+        drive_refresh(now)
         poll_timeout = session_poll_timeout(
             now,
             session_started_at,
@@ -1325,6 +1834,10 @@ def forward_loop(
         # Bound the wait so the heartbeat cadence is explicit rather than
         # merely incidental to keepalive/session wakeups.
         poll_timeout = min(poll_timeout, stats.heartbeat_remaining(now))
+        if refresh is not None:
+            refresh_deadline = refresh.next_deadline(now)
+            if refresh_deadline is not None:
+                poll_timeout = min(poll_timeout, max(0.0, refresh_deadline - now))
 
         try:
             readable, _, _ = select.select(
@@ -1338,6 +1851,7 @@ def forward_loop(
         deadline_reason = apply_due_deadline(now)
         if deadline_reason is not None:
             return deadline_reason
+        drive_refresh(now)
 
         if out_sock in readable:
             try:
@@ -1346,19 +1860,55 @@ def forward_loop(
                 print(f"❌ Secure peer receive error: {e}")
                 return SESSION_END_SOCKET_ERROR
 
-            result = handle_server_packet(
+            now = time.monotonic()
+            refresh_result = _try_handle_refresh_message(
                 response,
                 addr,
                 remote_addr,
-                server_to_client_key,
-                session_locator,
+                epochs,
+                refresh,
                 config["station_id"],
-                expected_ping_seq,
+                server_identity_public_key,
+                out_sock,
+                now,
             )
+            if refresh_result == SERVER_PACKET_REFRESH_COMMITTED:
+                print(
+                    "Secure epoch refresh committed; continuing on the new "
+                    "epoch without a new session."
+                )
+                last_authenticated_peer = now
+                # Reanchor the planned-refresh cadence from the commit.
+                session_started_at = now
+                result = SERVER_PACKET_IGNORED
+            elif refresh_result == SERVER_PACKET_REFRESH_PROGRESS:
+                last_authenticated_peer = now
+                result = SERVER_PACKET_IGNORED
+            else:
+                try:
+                    _pl, selector, _n, _c = parse_data_packet(response)
+                    resolved = epochs.inbound_epoch(selector, now)
+                except (TypeError, ValueError):
+                    resolved = None
+                if resolved is None:
+                    result = SERVER_PACKET_IGNORED
+                else:
+                    reply_key, reply_generation = resolved
+                    result = handle_server_packet(
+                        response,
+                        addr,
+                        remote_addr,
+                        reply_key,
+                        session_locator,
+                        config["station_id"],
+                        expected_ping_seq,
+                        reply_generation,
+                    )
             now = time.monotonic()
             deadline_reason = apply_due_deadline(now)
             if deadline_reason is not None:
                 return deadline_reason
+            drive_refresh(now)
             if result == SERVER_PACKET_AUTHENTICATED:
                 last_authenticated_peer = now
                 expected_ping_seq = None
@@ -1603,6 +2153,11 @@ def main(argv=None):
         )
 
     active_confirmed_session = None
+    # A live one-element view of the current forwarding loop's epoch state,
+    # so the best-effort graceful close below uses the currently
+    # authoritative send epoch (which an in-session refresh may have
+    # advanced past the establishment keys in `active_confirmed_session`).
+    active_epoch_ref = []
     # One ForwardingStats instance is owned for the whole process/relation
     # lifetime here, so cumulative counters survive UDPSEC reconnect/rekey
     # and plain-UDP output-socket recreation across successive forwarding
@@ -1630,6 +2185,7 @@ def main(argv=None):
             )
             if confirmed_session:
                 active_confirmed_session = confirmed_session
+                active_epoch_ref.clear()
                 reason = forward_loop(
                     local_input,
                     out_sock,
@@ -1638,9 +2194,13 @@ def main(argv=None):
                     remote_addr,
                     ingress_policy,
                     stats,
+                    station_private_key=station_identity_private_key,
+                    server_identity_public_key=server_identity_public_key,
+                    epoch_state_ref=active_epoch_ref,
                 )
                 if reason == SESSION_END_PEER_GRACEFUL_CLOSE:
                     active_confirmed_session = None
+                    active_epoch_ref.clear()
             else:
                 reason = HANDSHAKE_FAILURE
 
@@ -1657,13 +2217,25 @@ def main(argv=None):
                 output_config["type"] == UDPSEC_OUTPUT_TYPE
                 and active_confirmed_session is not None
             ):
+                if active_epoch_ref:
+                    _close_epochs = active_epoch_ref[0]
+                    _close_key = _close_epochs.client_to_server_key
+                    _close_locator = _close_epochs.session_locator
+                    _close_generation = _close_epochs.generation
+                else:
+                    _close_key = (
+                        active_confirmed_session.key_material.client_to_server_key
+                    )
+                    _close_locator = active_confirmed_session.session_locator
+                    _close_generation = ESTABLISHMENT_EPOCH_GENERATION
                 try:
                     send_session_close(
                         out_sock,
                         remote_addr,
-                        active_confirmed_session.key_material.client_to_server_key,
-                        active_confirmed_session.session_locator,
+                        _close_key,
+                        _close_locator,
                         config["station_id"],
+                        _close_generation,
                     )
                 except Exception as exc:
                     print(

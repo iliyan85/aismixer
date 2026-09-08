@@ -563,6 +563,7 @@ def _encrypted_data_packet(
     session_locator,
     source_id="boat_001",
     payload="!AIVDM,1,1,,A,payload,0*00",
+    epoch_generation=0,
 ):
     plaintext = secure.json.dumps({
         "type": "nmea",
@@ -573,9 +574,11 @@ def _encrypted_data_packet(
     ciphertext = secure.AESGCM(client_to_server_key).encrypt(
         nonce,
         plaintext,
-        secure.build_data_aad(session_locator),
+        secure.build_data_aad(session_locator, epoch_generation),
     )
-    return secure.build_data_packet(session_locator, nonce, ciphertext)
+    return secure.build_data_packet(
+        session_locator, epoch_generation, nonce, ciphertext
+    )
 
 
 def _encrypted_control_packet(
@@ -584,14 +587,17 @@ def _encrypted_control_packet(
     nonce,
     message,
     session_locator,
+    epoch_generation=0,
 ):
     plaintext = secure.json.dumps(message).encode()
     ciphertext = secure.AESGCM(client_to_server_key).encrypt(
         nonce,
         plaintext,
-        secure.build_data_aad(session_locator),
+        secure.build_data_aad(session_locator, epoch_generation),
     )
-    return secure.build_data_packet(session_locator, nonce, ciphertext)
+    return secure.build_data_packet(
+        session_locator, epoch_generation, nonce, ciphertext
+    )
 
 
 def _run_secure_server_with_packets(
@@ -849,7 +855,7 @@ def test_secure_server_rejects_verified_duplicate_handshake_replay(monkeypatch):
 
     nonce = b"\x01" * 12
     plaintext = b"direction check"
-    data_aad = secure.build_data_aad(pending.session_locator)
+    data_aad = secure.build_data_aad(pending.session_locator, 0)
     ciphertext = secure.AESGCM(
         client_key_material.client_to_server_key
     ).encrypt(nonce, plaintext, data_aad)
@@ -1289,7 +1295,7 @@ def test_secure_server_silently_drops_data_without_session(monkeypatch):
     secure = load_secure_module_with_fake_keys(monkeypatch)
     addr = ("127.0.0.1", 50123)
     packet = secure.build_data_packet(
-        _fresh_test_locator(), b"\x00" * 12, b"\x00" * 16
+        _fresh_test_locator(), 0, b"\x00" * 12, b"\x00" * 16
     )
     signing_calls = []
 
@@ -1405,7 +1411,7 @@ def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
     assert fake_queue.items == []
     assert len(fake_socket.sent) == 1
     response, response_addr = fake_socket.sent[0]
-    response_locator, response_nonce, ciphertext = secure.parse_data_packet(
+    response_locator, _selector, response_nonce, ciphertext = secure.parse_data_packet(
         response
     )
     assert response_locator == session._session_key.session_locator
@@ -1413,14 +1419,14 @@ def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
         secure.AESGCM(server_to_client_key).decrypt(
             response_nonce,
             ciphertext,
-            secure.build_data_aad(response_locator),
+            secure.build_data_aad(response_locator, 0),
         ).decode()
     )
     with pytest.raises(InvalidTag):
         secure.AESGCM(client_to_server_key).decrypt(
             response_nonce,
             ciphertext,
-            secure.build_data_aad(response_locator),
+            secure.build_data_aad(response_locator, 0),
         )
     assert response_addr == addr
     assert pong == {
@@ -2004,7 +2010,7 @@ def test_secure_server_failed_decrypt_does_not_record_data_nonce(monkeypatch):
         server_to_client_key,
     )
     packet = secure.build_data_packet(
-        session._session_key.session_locator, nonce, b"\x00" * 16
+        session._session_key.session_locator, 0, nonce, b"\x00" * 16
     )
 
     fake_queue, _ = _run_secure_server_with_packets(
@@ -2687,10 +2693,10 @@ def test_secure_server_invalid_json_does_not_record_nonce_or_touch(monkeypatch):
     ciphertext = secure.AESGCM(client_to_server_key).encrypt(
         nonce,
         b"not-json",
-        secure.build_data_aad(session._session_key.session_locator),
+        secure.build_data_aad(session._session_key.session_locator, 0),
     )
     packet = secure.build_data_packet(
-        session._session_key.session_locator, nonce, ciphertext
+        session._session_key.session_locator, 0, nonce, ciphertext
     )
 
     fake_queue, fake_socket = _run_secure_server_with_packets(
@@ -3032,13 +3038,13 @@ def test_proxy_encrypt_message_aes_gcm_uses_12_byte_nonce_and_locator_aad():
     plaintext = b'{"type":"nmea","payload":"!AIVDM,1,1,,A,payload,0*00"}'
 
     nonce, ciphertext_and_tag = proxy.encrypt_message_aes_gcm(
-        plaintext, key, proxy.build_data_aad(locator)
+        plaintext, key, proxy.build_data_aad(locator, 0)
     )
 
     assert len(nonce) == 12
     assert (
         AESGCM(key).decrypt(
-            nonce, ciphertext_and_tag, proxy.build_data_aad(locator)
+            nonce, ciphertext_and_tag, proxy.build_data_aad(locator, 0)
         )
         == plaintext
     )
@@ -4029,7 +4035,7 @@ class _TestConfirmingServer:
         assert isinstance(message.get("timestamp"), int)
         self.confirmation_packet = confirmation_packet
         self.confirmation_message = message
-        _, self.confirmation_nonce, _ = self.proxy.parse_data_packet(
+        _, _, self.confirmation_nonce, _ = self.proxy.parse_data_packet(
             confirmation_packet
         )
         return message
@@ -4647,8 +4653,8 @@ def test_runtime_end_to_end_ecdhe_and_directional_encryption(monkeypatch):
         len(pong_packet[len(proxy.DATA_PREFIX) + proxy.SESSION_LOCATOR_BYTES:][:12])
         == 12
     )
-    ping_locator, _, _ = proxy.parse_data_packet(ping_packet)
-    pong_locator, _, _ = proxy.parse_data_packet(pong_packet)
+    ping_locator, _, _, _ = proxy.parse_data_packet(ping_packet)
+    pong_locator, _, _, _ = proxy.parse_data_packet(pong_packet)
     assert ping_locator == session_locator
     assert pong_locator == session_locator
 
@@ -4805,10 +4811,10 @@ def test_proxy_handshake_ignores_invalid_confirmation_before_valid(
             encrypted = AESGCM(key).encrypt(
                 nonce,
                 b"not-json",
-                proxy.build_data_aad(confirming_server.session_locator),
+                proxy.build_data_aad(confirming_server.session_locator, 0),
             )
             packet = proxy.build_data_packet(
-                confirming_server.session_locator, nonce, encrypted
+                confirming_server.session_locator, 0, nonce, encrypted
             )
         elif mutation == "non-dict-json":
             packet = confirming_server.encrypt_server_packet(
@@ -5940,9 +5946,11 @@ def test_secure_data_packet_parser_accepts_minimum_structural_packet(monkeypatch
     nonce = b"\x01" * 12
     ciphertext_and_tag = b"\x02" * 16
 
-    parsed_locator, parsed_nonce, parsed_ciphertext = secure.parse_data_packet(
-        secure.DATA_PREFIX + locator + nonce + ciphertext_and_tag
+    parsed_locator, _selector, parsed_nonce, parsed_ciphertext = secure.parse_data_packet(
+        secure.DATA_PREFIX + locator + b"" + nonce + ciphertext_and_tag
     )
+
+    assert _selector == 5
 
     assert parsed_locator == locator
     assert parsed_nonce == nonce
@@ -5957,12 +5965,12 @@ def test_secure_data_packet_parser_output_decrypts_valid_proxy_packet(monkeypatc
     message = {"type": "nmea", "payload": "!AIVDM,1,1,,A,payload,0*00"}
     encrypted = proxy.encrypt_secure_json_message(message, key, locator)
 
-    parsed_locator, nonce, ciphertext = secure.parse_data_packet(encrypted)
+    parsed_locator, _selector, nonce, ciphertext = secure.parse_data_packet(encrypted)
 
     assert parsed_locator == locator
     assert (
         AESGCM(key).decrypt(
-            nonce, ciphertext, secure.build_data_aad(parsed_locator)
+            nonce, ciphertext, secure.build_data_aad(parsed_locator, 0)
         )
         == secure.json.dumps(message, separators=(",", ":")).encode()
     )
@@ -7241,6 +7249,10 @@ def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
         "data_nonces_capacity_evicted",
         "data_nonce_exhaustions",
         "data_nonces_session_discarded",
+        "epoch_refreshes_committed",
+        "pending_epochs_created",
+        "pending_epochs_discarded",
+        "retiring_epochs_retired",
         "current_handshake_replays",
         "peak_handshake_replays",
         "current_sessions",
@@ -7249,6 +7261,8 @@ def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
         "peak_pending_sessions",
         "current_data_nonces",
         "peak_data_nonces",
+        "current_pending_epochs",
+        "current_retiring_epochs",
     }
     assert all(value == 0 for value in vars(initial).values())
     with pytest.raises(FrozenInstanceError):
@@ -7769,11 +7783,11 @@ def _d66_confirmation_packet(
 
 
 def _d66_decrypt_json(secure, packet, key):
-    locator, nonce, ciphertext = secure.parse_data_packet(packet)
+    locator, _selector, nonce, ciphertext = secure.parse_data_packet(packet)
     plaintext = secure.AESGCM(key).decrypt(
         nonce,
         ciphertext,
-        secure.build_data_aad(locator),
+        secure.build_data_aad(locator, 0),
     )
     return secure.json.loads(plaintext.decode())
 
@@ -7888,6 +7902,8 @@ def test_d66_pending_representation_and_creation_stats(monkeypatch):
         "server_to_client_aesgcm",
         "seen_data_nonces",
         "created_at",
+        "generation",
+        "transaction_id",
     }
     assert pending._address == addr
     assert pending.station_id == "boat_001"
@@ -8225,7 +8241,7 @@ def test_d66_authenticated_hello_is_pending_until_exact_expiry(
     )
     nonce = b"\x31" * 12
     plaintext = b"directional pending key check"
-    data_aad = secure.build_data_aad(pending.session_locator)
+    data_aad = secure.build_data_aad(pending.session_locator, 0)
     ciphertext = secure.AESGCM(
         key_material.client_to_server_key
     ).encrypt(nonce, plaintext, data_aad)
@@ -8702,10 +8718,10 @@ def test_d66_invalid_pending_packets_do_not_promote_or_consume_nonce(
         ciphertext = secure.AESGCM(client_to_server_key).encrypt(
             nonce,
             b"{not-json",
-            secure.build_data_aad(pending.session_locator),
+            secure.build_data_aad(pending.session_locator, 0),
         )
         packet = secure.build_data_packet(
-            pending.session_locator, nonce, ciphertext
+            pending.session_locator, 0, nonce, ciphertext
         )
     elif case == "non-dict-json":
         packet = _encrypted_control_packet(
@@ -10278,8 +10294,12 @@ def test_wrong_path_correct_locator_never_reaches_decrypt_or_replay_lookup(
 
     spy_aesgcm = _SpyAESGCM(session.current_epoch.client_to_server_aesgcm)
     session.current_epoch.client_to_server_aesgcm = spy_aesgcm
-    nonce_seen_calls = _spy_on_state_method(monkeypatch, state, "data_nonce_seen")
-    admit_calls = _spy_on_state_method(monkeypatch, state, "admit_data_nonce")
+    nonce_seen_calls = _spy_on_state_method(
+        monkeypatch, state, "epoch_data_nonce_seen"
+    )
+    admit_calls = _spy_on_state_method(
+        monkeypatch, state, "admit_epoch_data_nonce"
+    )
     touch_calls = _spy_on_state_method(monkeypatch, state, "touch_session")
 
     wrong_path_nonce = b"\x27" * 12
@@ -10487,9 +10507,9 @@ def _confirmation_packet_for(secure, pending, nonce):
     }
     plaintext = secure.json.dumps(message).encode()
     ciphertext = pending.current_epoch.client_to_server_aesgcm.encrypt(
-        nonce, plaintext, secure.build_data_aad(pending.session_locator)
+        nonce, plaintext, secure.build_data_aad(pending.session_locator, 0)
     )
-    return secure.build_data_packet(pending.session_locator, nonce, ciphertext)
+    return secure.build_data_packet(pending.session_locator, 0, nonce, ciphertext)
 
 
 # Secure-ingress assembler namespace.
@@ -10634,9 +10654,9 @@ def _nmea_data_packet_with_aesgcm(
         "source_id": source_id,
     }).encode()
     ciphertext = aesgcm.encrypt(
-        nonce, plaintext, secure.build_data_aad(session_locator)
+        nonce, plaintext, secure.build_data_aad(session_locator, 0)
     )
-    return secure.build_data_packet(session_locator, nonce, ciphertext)
+    return secure.build_data_packet(session_locator, 0, nonce, ciphertext)
 
 
 def test_multipart_assembler_namespace_survives_same_relation_replacement(

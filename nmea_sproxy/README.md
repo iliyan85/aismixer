@@ -298,9 +298,12 @@ encrypted. Close is unacknowledged. Keepalive ping/pong traffic provides
 liveness and helps retain NAT, CGNAT, and mobile-network UDP mappings.
 
 An unresolved liveness failure starts a fresh signed handshake. Optional
-`session_refresh_interval` uses the same authenticated refresh path; zero
-disables planned refresh. Session and replay state are in-memory and
-non-durable, so process restart establishes a fresh session.
+`session_refresh_interval` instead runs a true in-session authenticated
+epoch refresh (REFRESH_INIT/REPLY/CONFIRM/ACK with fresh ephemeral ECDHE):
+the traffic keys roll over on the same session without a new handshake,
+locator, or forwarding-loop restart. Zero disables planned refresh.
+Session and replay state are in-memory and non-durable, so process restart
+establishes a fresh session.
 
 A receiver remembers every admitted DATA nonce for the full usable directional
 traffic-key epoch. Those nonce records have no independent TTL and are not
