@@ -168,12 +168,14 @@ class _LoopbackSecureServer:
         *,
         graceful_close=False,
         state=None,
+        monotonic_clock=None,
     ):
         self.secure = secure
         self.server_private_key = server_private_key
         self.host = host
         self.port = port
         self.graceful_close = graceful_close
+        self.monotonic_clock = monotonic_clock
         self.socket = socket.socket(family, socket.SOCK_DGRAM)
         self.state = secure.SecureState() if state is None else state
         self.endpoint_token = secure._new_endpoint_token()
@@ -218,6 +220,7 @@ class _LoopbackSecureServer:
                 server_private_key=self.server_private_key,
                 owned_sessions=self.owned_sessions,
                 owned_pending_sessions=self.owned_pending_sessions,
+                monotonic_clock=self.monotonic_clock,
             )
         )
         # create_task() and call_soon() are FIFO on this loop. The listener
@@ -347,6 +350,7 @@ def _running_secure_server(
     *,
     graceful_close=False,
     state=None,
+    monotonic_clock=None,
 ):
     server = _LoopbackSecureServer(
         secure,
@@ -356,6 +360,7 @@ def _running_secure_server(
         port,
         graceful_close=graceful_close,
         state=state,
+        monotonic_clock=monotonic_clock,
     )
     try:
         yield server.start()
@@ -1898,6 +1903,459 @@ def test_real_same_peer_is_isolated_across_physical_listeners(
         assert server_b.active_session_for(client_address) is session_b
 
 
+class _GatedClock:
+    """Thread-safe monotonic-clock stand-in whose value the test sets
+    explicitly, read by two real listener threads sharing one
+    `SecureState`. Lets a test force a specific, otherwise-improbable
+    `now` ordering across two genuinely concurrent listeners without any
+    real-wall-clock timing dependency."""
+
+    def __init__(self, initial):
+        self._lock = threading.Lock()
+        self._value = initial
+
+    def set(self, value):
+        with self._lock:
+            self._value = value
+
+    def __call__(self):
+        with self._lock:
+            return self._value
+
+
+def test_real_two_listeners_racing_commit_order_does_not_defeat_expiry(
+    real_udpsec_endpoints,
+):
+    """F2, reproduced through the REAL `_secure_server_loop` (not only a
+    direct SecureState dictionary test): two real background-thread
+    secure listeners share one `SecureState`. Listener A's DATA-triggered
+    touch is made to COMMIT FIRST while reading the LARGER `now` (6);
+    listener B's commits SECOND while reading the SMALLER `now` (5) --
+    exactly the pathological OrderedDict order [6, 5] the audit reported.
+    At `session_ttl=10`, checking at `now=15` must still find B genuinely
+    expired despite B sitting behind A in commit/position order, and must
+    leave A (genuinely not yet expired) untouched."""
+    endpoints = real_udpsec_endpoints
+    shared_state = endpoints.secure.SecureState(session_ttl=10.0)
+    clock = _GatedClock(0.0)
+
+    with (
+        _running_secure_server(
+            endpoints.secure,
+            endpoints.server_private_key,
+            socket.AF_INET,
+            "127.0.0.1",
+            state=shared_state,
+            monotonic_clock=clock,
+        ) as server_a,
+        _running_secure_server(
+            endpoints.secure,
+            endpoints.server_private_key,
+            socket.AF_INET,
+            "127.0.0.1",
+            state=shared_state,
+            monotonic_clock=clock,
+        ) as server_b,
+        _client_socket(socket.AF_INET, "127.0.0.1") as client_a,
+        _client_socket(socket.AF_INET, "127.0.0.1") as client_b,
+    ):
+        material_a = _perform_real_handshake(
+            endpoints, client_a, server_a.remote_addr
+        )
+        material_b = _perform_real_handshake(
+            endpoints, client_b, server_b.remote_addr
+        )
+        session_a = server_a.active_session_for(client_a.getsockname())
+        session_b = server_b.active_session_for(client_b.getsockname())
+        assert session_a is not None and session_b is not None
+
+        # A commits first, reading the LARGER `now`.
+        clock.set(6.0)
+        endpoints.proxy.send_ping(
+            client_a,
+            server_a.remote_addr,
+            material_a.key_material.client_to_server_key,
+            material_a.session_locator,
+            STATION_ID,
+            41,
+        )
+        _receive_authenticated_pong(
+            endpoints.proxy, client_a, server_a.remote_addr, material_a, 41
+        )
+        assert session_a.last_seen == 6.0
+
+        # B commits second, reading the SMALLER `now` -- the exact
+        # pathology: B is chronologically older (more overdue for
+        # expiry) but was touched/moved-to-end AFTER A.
+        clock.set(5.0)
+        endpoints.proxy.send_ping(
+            client_b,
+            server_b.remote_addr,
+            material_b.key_material.client_to_server_key,
+            material_b.session_locator,
+            STATION_ID,
+            42,
+        )
+        _receive_authenticated_pong(
+            endpoints.proxy, client_b, server_b.remote_addr, material_b, 42
+        )
+        assert session_b.last_seen == 5.0
+        assert tuple(shared_state._sessions) == (
+            session_a._session_key,
+            session_b._session_key,
+        )
+
+        expired = shared_state.cleanup_expired_sessions(15.0)
+
+        assert session_b._session_key in expired
+        assert session_a._session_key not in expired
+        assert shared_state.is_live_session_handle(session_a, 15.0)
+        assert server_b.active_session_for(client_b.getsockname()) is None
+
+
+def test_real_secure_server_loop_stale_local_now_cannot_admit_past_authoritative_clock(
+    real_udpsec_endpoints,
+):
+    """R5/F2 through the REAL `_secure_server_loop`, not a direct
+    SecureState call: the receive loop's own `local_now` sampling (its
+    injected `monotonic_clock`) is deliberately held stale (5.0) while the
+    shared SecureState's OWN, independently configured authoritative
+    clock has already advanced to 11.0 -- past this session's TTL(10)
+    deadline. A real encrypted ping processed under these conditions must
+    be rejected: no pong arrives, and the session is gone from the shared
+    state, proving the authoritative floor applies even when a real
+    production receive loop (real crypto, real frame parsing) supplies
+    the stale value, not only a direct unit-level call."""
+    endpoints = real_udpsec_endpoints
+    authoritative_clock = _GatedClock(0.0)
+    shared_state = endpoints.secure.SecureState(
+        session_ttl=10.0, clock=authoritative_clock
+    )
+    loop_clock = _GatedClock(0.0)
+
+    with (
+        _running_secure_server(
+            endpoints.secure,
+            endpoints.server_private_key,
+            socket.AF_INET,
+            "127.0.0.1",
+            state=shared_state,
+            monotonic_clock=loop_clock,
+        ) as server,
+        _client_socket(socket.AF_INET, "127.0.0.1") as client,
+    ):
+        material = _perform_real_handshake(
+            endpoints, client, server.remote_addr
+        )
+        session = server.active_session_for(client.getsockname())
+        assert session is not None
+        assert session.last_seen == 0.0
+
+        # Real elapsed time moves the authoritative clock past the
+        # deadline, but the receive loop's own local_now sampling for the
+        # next packet stays stale, well behind it.
+        authoritative_clock.set(11.0)
+        loop_clock.set(5.0)
+
+        endpoints.proxy.send_ping(
+            client,
+            server.remote_addr,
+            material.key_material.client_to_server_key,
+            material.session_locator,
+            STATION_ID,
+            41,
+        )
+        with pytest.raises(socket.timeout):
+            client.recvfrom(8192)
+
+        assert server.active_session_for(client.getsockname()) is None
+
+
+def test_real_concurrent_handshakes_respect_aggregate_session_capacity(
+    real_udpsec_endpoints,
+):
+    """Positive real-loopback evidence, real-client-concurrency variant:
+    many real client sockets, on distinct OS threads, complete a full real
+    signed handshake against ONE real secure server (one real asyncio
+    receive loop, hence one OS thread on the SERVER side) concurrently,
+    all racing to install an active session on a shared `SecureState`
+    capped at `max_sessions=2`.
+
+    IMPORTANT SCOPE NOTE: because the server side here is a single
+    asyncio event loop, `install_session` calls can never actually
+    interleave with each other at the Python level regardless of whether
+    `SecureState` holds any lock at all -- asyncio's own single-threaded
+    cooperative scheduling already serializes them, since `install_session`
+    contains no `await`. This test therefore does NOT by itself prove
+    `SecureState`'s lock is necessary; it proves the more modest but still
+    useful property that capacity accounting stays exact when many
+    concurrent CLIENT connections are funneled through one real server.
+    The genuine cross-thread SecureState-mutation proof requires two or
+    more real listeners (their own OS threads) sharing one state -- see
+    `test_real_two_listeners_racing_commit_order_does_not_defeat_expiry`
+    and the direct-thread tests in tests/test_secure_udp_helpers.py (e.g.
+    `test_install_session_never_admits_two_threads_into_its_transaction_at_once`)
+    for that.
+    """
+    endpoints = real_udpsec_endpoints
+    state = endpoints.secure.SecureState(max_sessions=2)
+    client_count = 6
+
+    with _running_secure_server(
+        endpoints.secure,
+        endpoints.server_private_key,
+        socket.AF_INET,
+        "127.0.0.1",
+        state=state,
+    ) as server:
+        clients = [
+            _client_socket(socket.AF_INET, "127.0.0.1")
+            for _ in range(client_count)
+        ]
+        try:
+            barrier = threading.Barrier(client_count)
+            results = [None] * client_count
+            errors = [None] * client_count
+
+            def worker(index):
+                try:
+                    barrier.wait(timeout=NETWORK_TIMEOUT)
+                    results[index] = _perform_real_handshake(
+                        endpoints, clients[index], server.remote_addr
+                    )
+                except BaseException as exc:  # noqa: BLE001 - captured for assertion
+                    errors[index] = exc
+
+            threads = [
+                threading.Thread(target=worker, args=(index,))
+                for index in range(client_count)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(NETWORK_TIMEOUT * 3)
+
+            assert all(
+                thread_error is None for thread_error in errors
+            ), errors
+            assert all(result is not None for result in results)
+
+            stats = server.call_in_loop(state.stats)
+            assert stats.sessions_created == client_count
+            assert stats.sessions_capacity_evicted == client_count - 2
+            assert stats.current_sessions == 2
+            assert stats.peak_sessions == 2
+            assert len(state._sessions) == 2
+
+            # Cleanup and stats snapshotting remain safe and consistent
+            # immediately afterward -- no deadlock, no corrupted state left
+            # by the concurrent installs above.
+            cleaned = server.call_in_loop(
+                lambda: state.cleanup_expired_sessions(time.monotonic() + 3600)
+            )
+            assert len(cleaned) == 2
+            final_stats = server.call_in_loop(state.stats)
+            assert final_stats.current_sessions == 0
+            assert final_stats.sessions_expired == 2
+        finally:
+            for client in clients:
+                client.close()
+
+
+def test_real_concurrent_pending_handshakes_respect_pending_capacity(
+    real_udpsec_endpoints,
+):
+    """Pending-capacity equivalent of the aggregate-active-capacity test
+    above, with the same scope note: many real client sockets send only
+    their initial ClientHello (never completing the confirmation round-
+    trip) concurrently against ONE real server (one asyncio event loop, so
+    `install_pending_session` calls cannot actually interleave with each
+    other regardless of locking) whose shared `SecureState` caps
+    `max_pending_sessions=2`. This proves pending-capacity accounting
+    stays exact under concurrent CLIENT load against one server -- not
+    that `SecureState`'s lock is required, which needs two or more real
+    listener threads (see the note on the active-capacity test above)."""
+    endpoints = real_udpsec_endpoints
+    state = endpoints.secure.SecureState(max_pending_sessions=2)
+    client_count = 6
+
+    with _running_secure_server(
+        endpoints.secure,
+        endpoints.server_private_key,
+        socket.AF_INET,
+        "127.0.0.1",
+        state=state,
+    ) as server:
+        clients = [
+            _client_socket(socket.AF_INET, "127.0.0.1")
+            for _ in range(client_count)
+        ]
+        try:
+            barrier = threading.Barrier(client_count)
+            errors = [None] * client_count
+
+            def send_hello_only(index, client):
+                station_id = STATION_ID
+                timestamp = int(time.time())
+                client_random = os.urandom(32)
+                client_ephemeral_private_key = ec.generate_private_key(
+                    ec.SECP256R1()
+                )
+                client_ephemeral_public_key = (
+                    client_ephemeral_private_key.public_key().public_bytes(
+                        encoding=serialization.Encoding.X962,
+                        format=serialization.PublicFormat.CompressedPoint,
+                    )
+                )
+                digest = endpoints.proxy.build_client_auth_digest(
+                    protocol_version=UDPSEC_PROTOCOL_VERSION,
+                    station_id=station_id,
+                    timestamp=timestamp,
+                    client_random=client_random,
+                    client_ephemeral_public_key=client_ephemeral_public_key,
+                )
+                signature = endpoints.proxy.sign_transcript_digest(
+                    endpoints.station_private_key, digest
+                )
+                hello = ClientHello(
+                    protocol_version=UDPSEC_PROTOCOL_VERSION,
+                    station_id=station_id,
+                    timestamp=timestamp,
+                    client_random=client_random,
+                    client_ephemeral_public_key=client_ephemeral_public_key,
+                    client_signature=signature,
+                )
+                try:
+                    barrier.wait(timeout=NETWORK_TIMEOUT)
+                    client.sendto(
+                        build_client_hello_packet(hello), server.remote_addr
+                    )
+                    client.recvfrom(8192)
+                except BaseException as exc:  # noqa: BLE001
+                    errors[index] = exc
+
+            threads = [
+                threading.Thread(
+                    target=send_hello_only, args=(index, clients[index])
+                )
+                for index in range(client_count)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(NETWORK_TIMEOUT * 3)
+
+            assert all(
+                thread_error is None for thread_error in errors
+            ), errors
+
+            def snapshot():
+                return state.stats(), len(state._pending_sessions)
+
+            stats, pending_count = server.call_in_loop(snapshot)
+            assert stats.pending_sessions_created == client_count
+            assert (
+                stats.pending_sessions_capacity_evicted
+                == client_count - 2
+            )
+            assert stats.current_pending_sessions == 2
+            assert stats.peak_pending_sessions == 2
+            assert pending_count == 2
+        finally:
+            for client in clients:
+                client.close()
+
+
+def test_r6_sustained_pending_replacement_churn_via_real_secure_receive_path(
+    real_udpsec_endpoints,
+):
+    """Blocker A (R6), reproduced through the real, production
+    `_secure_server_loop` receive path with real signed ClientHello
+    packets from one physical client address -- not direct `SecureState`
+    manipulation. Matches the audit's own real-path reproduction (100
+    ClientHellos, one live pending candidate, 100 heap entries): before
+    this fix, a same-relation pending replacement's stale heap entry
+    (keyed only by relation, not by the specific candidate incarnation)
+    would be found "still occupied" by whatever candidate currently held
+    that relation and recompute/reschedule THAT candidate's deadline
+    rather than being discarded -- so the heap grew by one entry per
+    ClientHello despite only one pending candidate ever being live."""
+    endpoints = real_udpsec_endpoints
+    state = endpoints.secure.SecureState(
+        pending_session_ttl=3.0, max_pending_sessions=1
+    )
+    replacement_count = 100
+    # A real socket round-trip is far faster than a 3-second TTL, so a
+    # real wall clock would never actually reach cleanup due-ness within
+    # this test -- a shared gated clock lets each ClientHello advance
+    # time by exactly one second, deterministically reproducing the
+    # audit's own "replacement every second" pacing.
+    clock = _GatedClock(0.0)
+
+    with _running_secure_server(
+        endpoints.secure,
+        endpoints.server_private_key,
+        socket.AF_INET,
+        "127.0.0.1",
+        state=state,
+        monotonic_clock=clock,
+    ) as server:
+        client = _client_socket(socket.AF_INET, "127.0.0.1")
+        try:
+            for step in range(replacement_count):
+                clock.set(float(step))
+                client_random = os.urandom(32)
+                client_ephemeral_private_key = ec.generate_private_key(
+                    ec.SECP256R1()
+                )
+                client_ephemeral_public_key = (
+                    client_ephemeral_private_key.public_key().public_bytes(
+                        encoding=serialization.Encoding.X962,
+                        format=serialization.PublicFormat.CompressedPoint,
+                    )
+                )
+                digest = endpoints.proxy.build_client_auth_digest(
+                    protocol_version=UDPSEC_PROTOCOL_VERSION,
+                    station_id=STATION_ID,
+                    timestamp=int(time.time()),
+                    client_random=client_random,
+                    client_ephemeral_public_key=client_ephemeral_public_key,
+                )
+                signature = endpoints.proxy.sign_transcript_digest(
+                    endpoints.station_private_key, digest
+                )
+                hello = ClientHello(
+                    protocol_version=UDPSEC_PROTOCOL_VERSION,
+                    station_id=STATION_ID,
+                    timestamp=int(time.time()),
+                    client_random=client_random,
+                    client_ephemeral_public_key=client_ephemeral_public_key,
+                    client_signature=signature,
+                )
+                client.sendto(
+                    build_client_hello_packet(hello), server.remote_addr
+                )
+                client.recvfrom(8192)
+
+            def snapshot():
+                return (
+                    state.stats(),
+                    len(state._pending_sessions),
+                    len(state._pending_expiry_heap),
+                )
+
+            stats, pending_count, heap_size = server.call_in_loop(snapshot)
+            assert stats.pending_sessions_created == replacement_count
+            assert pending_count == 1
+            assert heap_size <= 5, (
+                f"pending expiry heap retained {heap_size} entries after "
+                f"{replacement_count} real ClientHello replacements from "
+                "one address"
+            )
+        finally:
+            client.close()
+
+
 def test_ipv6_remote_comparison_uses_ip_port_and_scope_from_four_tuple(
     real_udpsec_endpoints,
 ):
@@ -2825,18 +3283,23 @@ def test_session_state_retains_only_directional_cipher_contexts(
             forbidden_field_fragments
             & set(vars(retained))
         )
-        # session_locator is the one intentionally public, non-credential
-        # bytes value retained directly: it is server-minted, transcript-
-        # bound, and never proof of authentication -- everything else
-        # bytes-typed here would be raw key/secret material.
-        non_locator_values = {
+        # session_locator, session_handle, and assembly_namespace are the
+        # intentionally public, non-credential bytes values retained
+        # directly: session_locator is server-minted and transcript-bound,
+        # while session_handle/assembly_namespace are opaque identifiers
+        # reserved through the shared `_SESSION_IDENTITY_REGISTRY` (see
+        # `core.session_identity_registry`) -- none of the three is ever
+        # proof of authentication or usable as key material. Everything
+        # else bytes-typed here would be raw key/secret material.
+        non_identifier_fields = {"session_locator", "session_handle", "assembly_namespace"}
+        non_identifier_values = {
             name: value
             for name, value in vars(retained).items()
-            if name != "session_locator"
+            if name not in non_identifier_fields
         }
         assert not any(
             isinstance(value, bytes)
-            for value in non_locator_values.values()
+            for value in non_identifier_values.values()
         )
 
     key_material = SessionKeyMaterial(b"\x69" * 32, b"\x6a" * 32)

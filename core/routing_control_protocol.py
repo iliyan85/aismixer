@@ -31,7 +31,15 @@ from core.routing_state import StaleRoutingGenerationError
 from core.runtime_statistics import RuntimeStatisticsSource
 
 
-ROUTING_CONTROL_PROTOCOL_VERSION = 1
+ROUTING_CONTROL_PROTOCOL_VERSION = 2
+# Bumped from 1: `runtime.statistics.inputs` result rows deliberately gained
+# a required `display` field (see `InputTrafficMetricsSnapshot`) and the
+# unnamed-input selector convention changed at the same time (see
+# `aismixer._ingress_task_name`). This is a local control-plane protocol
+# version, unrelated to UDPSEC's own wire revision (`UDPSEC_PROTOCOL_VERSION`
+# in `core.udpsec_protocol`) -- the two must never be conflated. There is no
+# negotiation or downgrade: a version-1 request now fails closed with
+# `ERROR_UNSUPPORTED_VERSION`, exactly like any other unrecognized version.
 
 ERROR_MALFORMED_JSON = "malformed_json"
 ERROR_INVALID_REQUEST = "invalid_request"
@@ -596,6 +604,7 @@ def _input_traffic_metrics_result(
         "transport_bytes": snapshot.transport_bytes,
         "accepted_frames": snapshot.accepted_frames,
         "payload_bytes": snapshot.payload_bytes,
+        "display": snapshot.display,
     }
 
 

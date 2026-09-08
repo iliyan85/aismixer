@@ -233,7 +233,7 @@ def assert_error(response, code, request_id="req-1"):
 
 def test_runtime_statistics_request_has_exact_no_params_shape():
     assert runtime_statistics_request("stats-1") == {
-        "version": 1,
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
         "request_id": "stats-1",
         "method": "runtime.statistics",
     }
@@ -278,7 +278,7 @@ def test_runtime_statistics_serializes_exact_all_zero_result_and_calls_once():
 
     assert statistics.snapshot_calls == 1
     assert response == {
-        "version": 1,
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
         "request_id": "stats-zero",
         "ok": True,
         "result": {
@@ -408,7 +408,7 @@ def test_runtime_statistics_serializes_populated_snapshot_in_ingress_order():
 
     assert statistics.snapshot_calls == 1
     assert response == {
-        "version": 1,
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
         "request_id": "stats-full",
         "ok": True,
         "result": {
@@ -493,6 +493,7 @@ def test_runtime_statistics_inputs_serializes_ordered_snapshots_and_calls_once()
                 transport_bytes=24000,
                 accepted_frames=96,
                 payload_bytes=7200,
+                display="192.0.2.10:17778",
             ),
             InputTrafficMetricsSnapshot(
                 name="udpsec-ingress:1:station-b",
@@ -501,6 +502,7 @@ def test_runtime_statistics_inputs_serializes_ordered_snapshots_and_calls_once()
                 transport_bytes=12000,
                 accepted_frames=40,
                 payload_bytes=3000,
+                display="2001:db8::1.17779",
             ),
         )
     )
@@ -514,7 +516,7 @@ def test_runtime_statistics_inputs_serializes_ordered_snapshots_and_calls_once()
     assert statistics.snapshot_calls == 0
     assert statistics.output_traffic_snapshot_calls == 0
     assert response == {
-        "version": 1,
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
         "request_id": "inputs-all",
         "ok": True,
         "result": {
@@ -526,6 +528,7 @@ def test_runtime_statistics_inputs_serializes_ordered_snapshots_and_calls_once()
                     "transport_bytes": 24000,
                     "accepted_frames": 96,
                     "payload_bytes": 7200,
+                    "display": "192.0.2.10:17778",
                 },
                 {
                     "name": "udpsec-ingress:1:station-b",
@@ -534,6 +537,7 @@ def test_runtime_statistics_inputs_serializes_ordered_snapshots_and_calls_once()
                     "transport_bytes": 12000,
                     "accepted_frames": 40,
                     "payload_bytes": 3000,
+                    "display": "2001:db8::1.17779",
                 },
             ]
         },
@@ -554,10 +558,10 @@ def test_runtime_statistics_inputs_filters_to_zero_or_one_match(
     statistics = RecordingStatisticsSource(
         inputs=(
             InputTrafficMetricsSnapshot(
-                "udp-ingress:0:station-a", "udp", 1, 2, 1, 2
+                "udp-ingress:0:station-a", "udp", 1, 2, 1, 2, "192.0.2.10:17778"
             ),
             InputTrafficMetricsSnapshot(
-                "udpsec-ingress:1:station-b", "udpsec", 3, 4, 1, 2
+                "udpsec-ingress:1:station-b", "udpsec", 3, 4, 1, 2, "2001:db8::1.17779"
             ),
         )
     )
@@ -636,7 +640,7 @@ def test_runtime_statistics_outputs_serializes_ordered_snapshots_and_calls_once(
     assert statistics.snapshot_calls == 0
     assert statistics.input_traffic_snapshot_calls == 0
     assert response == {
-        "version": 1,
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
         "request_id": "outputs-all",
         "ok": True,
         "result": {
@@ -758,7 +762,11 @@ def test_routing_methods_do_not_pull_runtime_statistics():
     [
         (
             {
-                "version": 2,
+                # The previous local control-protocol revision. Deliberately
+                # revised schemas (see BEHAVIORAL_CONTRACT.md) fail closed
+                # exactly like UDPSEC's own wire revision does: there is no
+                # negotiation or downgrade to an older local control version.
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION - 1,
                 "request_id": "stats-version",
                 "method": "runtime.statistics",
             },
@@ -766,7 +774,7 @@ def test_routing_methods_do_not_pull_runtime_statistics():
         ),
         (
             {
-                "version": 1,
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION,
                 "request_id": "stats-unknown",
                 "method": "runtime.statistics.extra",
             },
@@ -783,7 +791,7 @@ def test_runtime_statistics_keeps_version_and_unknown_method_compatibility(
 
     response = protocol.handle_request(raw_request)
 
-    assert ROUTING_CONTROL_PROTOCOL_VERSION == 1
+    assert ROUTING_CONTROL_PROTOCOL_VERSION == 2
     assert_error(response, error_code, request_id=raw_request["request_id"])
     assert statistics.snapshot_calls == 0
 
@@ -793,7 +801,7 @@ def test_runtime_statistics_keeps_version_and_unknown_method_compatibility(
     [
         (
             {
-                "version": 1,
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION,
                 "request_id": "req-1",
                 "method": "routing.status",
                 "extra": True,
@@ -802,22 +810,22 @@ def test_runtime_statistics_keeps_version_and_unknown_method_compatibility(
             "req-1",
         ),
         ({"request_id": "req-1", "method": "routing.status"}, ERROR_INVALID_REQUEST, "req-1"),
-        ({"version": 1, "method": "routing.status"}, ERROR_INVALID_REQUEST, None),
-        ({"version": 1, "request_id": "req-1"}, ERROR_INVALID_REQUEST, "req-1"),
-        ({"version": 1, "request_id": "", "method": "routing.status"}, ERROR_INVALID_REQUEST, None),
-        ({"version": 1, "request_id": 7, "method": "routing.status"}, ERROR_INVALID_REQUEST, None),
-        ({"version": 1, "request_id": "req-1", "method": ""}, ERROR_INVALID_REQUEST, "req-1"),
-        ({"version": 1, "request_id": "req-1", "method": 7}, ERROR_INVALID_REQUEST, "req-1"),
-        ({"version": "1", "request_id": "req-1", "method": "routing.status"}, ERROR_INVALID_REQUEST, "req-1"),
+        ({"version": ROUTING_CONTROL_PROTOCOL_VERSION, "method": "routing.status"}, ERROR_INVALID_REQUEST, None),
+        ({"version": ROUTING_CONTROL_PROTOCOL_VERSION, "request_id": "req-1"}, ERROR_INVALID_REQUEST, "req-1"),
+        ({"version": ROUTING_CONTROL_PROTOCOL_VERSION, "request_id": "", "method": "routing.status"}, ERROR_INVALID_REQUEST, None),
+        ({"version": ROUTING_CONTROL_PROTOCOL_VERSION, "request_id": 7, "method": "routing.status"}, ERROR_INVALID_REQUEST, None),
+        ({"version": ROUTING_CONTROL_PROTOCOL_VERSION, "request_id": "req-1", "method": ""}, ERROR_INVALID_REQUEST, "req-1"),
+        ({"version": ROUTING_CONTROL_PROTOCOL_VERSION, "request_id": "req-1", "method": 7}, ERROR_INVALID_REQUEST, "req-1"),
+        ({"version": str(ROUTING_CONTROL_PROTOCOL_VERSION), "request_id": "req-1", "method": "routing.status"}, ERROR_INVALID_REQUEST, "req-1"),
         ({"version": True, "request_id": "req-1", "method": "routing.status"}, ERROR_INVALID_REQUEST, "req-1"),
         (
-            {"version": 1, "request_id": "req-1", "method": "routing.replace"},
+            {"version": ROUTING_CONTROL_PROTOCOL_VERSION, "request_id": "req-1", "method": "routing.replace"},
             ERROR_INVALID_REQUEST,
             "req-1",
         ),
         (
             {
-                "version": 1,
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION,
                 "request_id": "req-1",
                 "method": "routing.replace",
                 "params": [],
@@ -827,7 +835,7 @@ def test_runtime_statistics_keeps_version_and_unknown_method_compatibility(
         ),
         (
             {
-                "version": 1,
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION,
                 "request_id": "req-1",
                 "method": "routing.replace",
                 "params": {},
@@ -837,7 +845,7 @@ def test_runtime_statistics_keeps_version_and_unknown_method_compatibility(
         ),
         (
             {
-                "version": 1,
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION,
                 "request_id": "req-1",
                 "method": "routing.replace",
                 "params": {"routing": routing_section(), "extra": True},
@@ -847,7 +855,7 @@ def test_runtime_statistics_keeps_version_and_unknown_method_compatibility(
         ),
         (
             {
-                "version": 1,
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION,
                 "request_id": "req-1",
                 "method": "routing.disable",
                 "params": [],
@@ -857,7 +865,7 @@ def test_runtime_statistics_keeps_version_and_unknown_method_compatibility(
         ),
         (
             {
-                "version": 1,
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION,
                 "request_id": "req-1",
                 "method": "routing.disable",
                 "params": {"extra": True},
@@ -876,18 +884,22 @@ def test_runtime_statistics_keeps_version_and_unknown_method_compatibility(
             "req-1",
         ),
         (
-            {"version": 2, "request_id": "req-1", "method": "routing.status"},
+            {
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION - 1,
+                "request_id": "req-1",
+                "method": "routing.status",
+            },
             ERROR_UNSUPPORTED_VERSION,
             "req-1",
         ),
         (
-            {"version": 1, "request_id": "req-1", "method": "routing.reload"},
+            {"version": ROUTING_CONTROL_PROTOCOL_VERSION, "request_id": "req-1", "method": "routing.reload"},
             ERROR_UNKNOWN_METHOD,
             "req-1",
         ),
         (
             {
-                "version": 1,
+                "version": ROUTING_CONTROL_PROTOCOL_VERSION,
                 "request_id": "req-1",
                 "method": "routing.status",
                 "params": {},
@@ -927,7 +939,7 @@ def test_status_success_while_routing_is_disabled():
     response = protocol.handle_request(status_request())
 
     assert response == {
-        "version": 1,
+        "version": ROUTING_CONTROL_PROTOCOL_VERSION,
         "request_id": "req-1",
         "ok": True,
         "result": {
@@ -1087,7 +1099,11 @@ def test_request_id_is_echoed_in_success_and_error_responses():
 
     success = protocol.handle_request(status_request(request_id="client-123"))
     error = protocol.handle_request(
-        {"version": 1, "request_id": "client-456", "method": "routing.reload"}
+        {
+            "version": ROUTING_CONTROL_PROTOCOL_VERSION,
+            "request_id": "client-456",
+            "method": "routing.reload",
+        }
     )
 
     assert success["request_id"] == "client-123"
@@ -1206,7 +1222,10 @@ def test_disable_response_uses_returned_status_without_extra_status_lookup():
 
 def test_decode_json_request_accepts_bytes_input():
     request = decode_json_request(
-        b'{"version":1,"request_id":"req-1","method":"routing.status"}'
+        (
+            '{"version":%d,"request_id":"req-1","method":"routing.status"}'
+            % ROUTING_CONTROL_PROTOCOL_VERSION
+        ).encode("utf-8")
     )
 
     assert request["method"] == "routing.status"
@@ -1214,7 +1233,8 @@ def test_decode_json_request_accepts_bytes_input():
 
 def test_decode_json_request_accepts_string_input():
     request = decode_json_request(
-        '{"version":1,"request_id":"req-1","method":"routing.status"}'
+        '{"version":%d,"request_id":"req-1","method":"routing.status"}'
+        % ROUTING_CONTROL_PROTOCOL_VERSION
     )
 
     assert request["request_id"] == "req-1"
@@ -1242,7 +1262,9 @@ def test_schema_valid_json_object_error_is_invalid_request():
     _state, protocol = make_protocol()
 
     response = parse_response(
-        protocol.handle_json('{"version":1,"request_id":"req-1"}')
+        protocol.handle_json(
+            '{"version":%d,"request_id":"req-1"}' % ROUTING_CONTROL_PROTOCOL_VERSION
+        )
     )
 
     assert_error(response, ERROR_INVALID_REQUEST)
@@ -1279,7 +1301,8 @@ def test_unicode_content_round_trips():
 
     response = parse_response(
         protocol.handle_json(
-            '{"version":1,"request_id":"заявка","method":"routing.status"}'
+            '{"version":%d,"request_id":"заявка","method":"routing.status"}'
+            % ROUTING_CONTROL_PROTOCOL_VERSION
         )
     )
 
@@ -1291,7 +1314,8 @@ def test_success_response_contains_no_python_only_objects():
 
     response = parse_response(
         protocol.handle_json(
-            '{"version":1,"request_id":"req-1","method":"routing.status"}'
+            '{"version":%d,"request_id":"req-1","method":"routing.status"}'
+            % ROUTING_CONTROL_PROTOCOL_VERSION
         )
     )
 

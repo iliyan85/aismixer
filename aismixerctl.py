@@ -801,9 +801,33 @@ _INPUT_TRAFFIC_RESULT_FIELDS = (
     "transport_bytes",
     "accepted_frames",
     "payload_bytes",
+    "display",
+)
+_INPUT_TRAFFIC_COUNTER_FIELDS = (
+    "transport_packets",
+    "transport_bytes",
+    "accepted_frames",
+    "payload_bytes",
+)
+# Column order for the rendered table: the operator-facing display label
+# leads (it is what an operator actually wants to look at), followed by the
+# stable selector (what `--input` actually filters against -- kept visible
+# so an operator can see which exact string to pass), then kind and
+# counters. This is a presentation-only ordering; it is independent of
+# _INPUT_TRAFFIC_RESULT_FIELDS, which only states which fields must be
+# present in one result row.
+_INPUT_TRAFFIC_COLUMN_ORDER = (
+    "display",
+    "name",
+    "kind",
+    "transport_packets",
+    "transport_bytes",
+    "accepted_frames",
+    "payload_bytes",
 )
 _INPUT_TRAFFIC_HEADERS = (
     "INPUT",
+    "SELECTOR",
     "KIND",
     "TRANSPORT PACKETS",
     "TRANSPORT BYTES",
@@ -943,14 +967,19 @@ def _input_traffic_table_row(
         raise RoutingControlResponseError(
             f"Runtime statistics {description} name is invalid."
         )
+    display = row["display"]
+    if not isinstance(display, str) or not display:
+        raise RoutingControlResponseError(
+            f"Runtime statistics {description} display is invalid."
+        )
     kind = row["kind"]
     if not isinstance(kind, str) or kind not in {"udp", "udpsec"}:
         raise RoutingControlResponseError(
             f"Runtime statistics {description} kind is invalid."
         )
-    for field_name in _INPUT_TRAFFIC_RESULT_FIELDS[2:]:
+    for field_name in _INPUT_TRAFFIC_COUNTER_FIELDS:
         _require_counter(row[field_name], f"{description}.{field_name}")
-    return tuple(str(row[field_name]) for field_name in _INPUT_TRAFFIC_RESULT_FIELDS)
+    return tuple(str(row[field_name]) for field_name in _INPUT_TRAFFIC_COLUMN_ORDER)
 
 
 def format_runtime_statistics_outputs(result: object) -> str:

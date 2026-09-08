@@ -7,8 +7,13 @@ from cryptography.hazmat.primitives import serialization
 
 import aismixer
 from assembler import AIVDMAssembler
-from core.data_plane import DeduplicationMode
+from core.data_plane import (
+    DeduplicationMode,
+    ProcessingSnapshot,
+    ProcessingWorkItem,
+)
 from core.event import IngressEvent
+from core.ingress_frame import IngressFrame
 from core.metrics import EgressMetricsSnapshot, QueueMetricsSnapshot
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.routing_control_protocol import ROUTING_CONTROL_PROTOCOL_VERSION
@@ -658,6 +663,24 @@ class _MainTestIdentity:
     private_key = object()
 
 
+class _MainTestSecureStateStub:
+    """R5/F5: a stand-in for `aismixer_secure.secure_state`'s `close()`
+    teardown, called from `main()`'s own final shutdown when `SEC_INPUTS`
+    is non-empty. Without this, a test whose `supervisor` returns
+    immediately (never genuinely running `secure_server()`) would
+    otherwise trigger a REAL, uncached-per-test import of `aismixer_secure`
+    and permanently close the actual process-wide `secure_state` singleton
+    for the rest of this pytest process -- a test-isolation hazard, not a
+    behavior most tests using this helper are even exercising. Records
+    each call for the one test that does exercise it."""
+
+    def __init__(self):
+        self.close_calls = []
+
+    def close(self, now):
+        self.close_calls.append(now)
+
+
 def _configure_main_lifecycle_test(
     monkeypatch,
     *,
@@ -697,6 +720,11 @@ def _configure_main_lifecycle_test(
         lambda active_sec_inputs: (
             _MainTestIdentity() if active_sec_inputs else None
         ),
+    )
+    monkeypatch.setattr(
+        aismixer,
+        "_load_secure_state",
+        lambda: _MainTestSecureStateStub(),
     )
     if supervisor is not None:
         monkeypatch.setattr(
@@ -1029,6 +1057,314 @@ def test_udpsec_main_generates_and_injects_prepared_identity(
     asyncio.run(scenario())
 
 
+def test_main_closes_the_shared_secure_state_owner_on_final_shutdown_when_udpsec_configured(
+    monkeypatch,
+):
+    """R5/F5: once every listener sharing the process-default UDPSEC
+    `SecureState` has stopped (`_supervise_named_tasks` has returned),
+    `main()`'s own final `finally` block must tear down that shared
+    owner exactly once -- but only when UDPSEC was actually configured,
+    never forcing the otherwise-lazy `aismixer_secure` import for a
+    plain-UDP-only deployment."""
+
+    async def scenario():
+        async def supervisor(_task_specs):
+            return None
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10112,
+                },
+            ),
+            supervisor=supervisor,
+        )
+        stub = _MainTestSecureStateStub()
+        monkeypatch.setattr(aismixer, "_load_secure_state", lambda: stub)
+        monkeypatch.setattr(
+            aismixer,
+            "_load_secure_server",
+            lambda: (lambda *_a, **_kw: None),
+        )
+
+        await aismixer.main()
+
+        assert len(stub.close_calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_main_never_loads_secure_state_when_udpsec_is_not_configured(
+    monkeypatch,
+):
+    """A plain-UDP-only deployment (no `sec_inputs`) must not force the
+    otherwise-lazy UDPSEC import merely for final shutdown."""
+
+    async def scenario():
+        async def supervisor(_task_specs):
+            return None
+
+        _configure_main_lifecycle_test(monkeypatch, supervisor=supervisor)
+
+        def fail_if_loaded():
+            raise AssertionError(
+                "plain-UDP-only deployment must not load UDPSEC's "
+                "SecureState merely for final shutdown"
+            )
+
+        monkeypatch.setattr(aismixer, "_load_secure_state", fail_if_loaded)
+
+        await aismixer.main()
+
+    asyncio.run(scenario())
+
+
+class _RaisingControlServer:
+    def __init__(self):
+        self.close_count = 0
+
+    async def start(self):
+        return None
+
+    async def close(self):
+        self.close_count += 1
+        raise OSError("control server close failed")
+
+
+def test_main_still_closes_secure_state_owner_when_control_server_close_raises(
+    monkeypatch,
+):
+    """R6/F5: an earlier cleanup step failing must not prevent the final
+    owner-level UDPSEC teardown from running -- nested try/finally,
+    matching `secure_server()`'s own shutdown chain, not a swallowed
+    error: the OSError still propagates out of `main()`."""
+
+    async def scenario():
+        async def supervisor(_task_specs):
+            return None
+
+        control_server = _RaisingControlServer()
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10114,
+                },
+            ),
+            control_server=control_server,
+            supervisor=supervisor,
+        )
+        stub = _MainTestSecureStateStub()
+        monkeypatch.setattr(aismixer, "_load_secure_state", lambda: stub)
+        monkeypatch.setattr(
+            aismixer,
+            "_load_secure_server",
+            lambda: (lambda *_a, **_kw: None),
+        )
+
+        with pytest.raises(OSError, match="control server close failed"):
+            await aismixer.main()
+
+        assert control_server.close_count == 1
+        assert len(stub.close_calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_main_still_closes_secure_state_owner_when_forwarder_close_raises(
+    monkeypatch,
+):
+    """Same property, for a `forwarder.close()` failure -- the step that
+    runs immediately before the owner-level UDPSEC teardown."""
+
+    async def scenario():
+        async def supervisor(_task_specs):
+            return None
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10115,
+                },
+            ),
+            supervisor=supervisor,
+        )
+
+        def raising_close():
+            raise OSError("forwarder close failed")
+
+        monkeypatch.setattr(aismixer.forwarder, "close", raising_close)
+        stub = _MainTestSecureStateStub()
+        monkeypatch.setattr(aismixer, "_load_secure_state", lambda: stub)
+        monkeypatch.setattr(
+            aismixer,
+            "_load_secure_server",
+            lambda: (lambda *_a, **_kw: None),
+        )
+
+        with pytest.raises(OSError, match="forwarder close failed"):
+            await aismixer.main()
+
+        assert len(stub.close_calls) == 1
+
+    asyncio.run(scenario())
+
+
+class _RaisingCloseSocket(_MainTestSocket):
+    def __init__(self, close_exc):
+        super().__init__()
+        self._close_exc = close_exc
+
+    def close(self):
+        super().close()
+        raise self._close_exc
+
+
+def test_main_closes_every_udp_socket_even_when_an_earlier_one_raises(
+    monkeypatch,
+):
+    """R7/Section 6: a `for sock in udp_sockets: sock.close()` loop that
+    aborts on the first failure would leave every LATER socket in it
+    unclosed. Every socket must have its own close attempted regardless
+    of an earlier failure, and the first failure (not silently masked)
+    must still propagate once every socket has had its chance -- and
+    must still leave later cleanup steps (control server, forwarder,
+    owner teardown) to run via the existing nested try/finally chain."""
+
+    async def scenario():
+        async def supervisor(_task_specs):
+            return None
+
+        first_socket = _RaisingCloseSocket(OSError("first socket close failed"))
+        second_socket = _MainTestSocket()
+        third_socket = _MainTestSocket()
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            udp_inputs=(
+                {
+                    "id": "plain_one",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10117,
+                },
+                {
+                    "id": "plain_two",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10118,
+                },
+                {
+                    "id": "plain_three",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10119,
+                },
+            ),
+            sockets=(first_socket, second_socket, third_socket),
+            supervisor=supervisor,
+        )
+
+        with pytest.raises(OSError, match="first socket close failed"):
+            await aismixer.main()
+
+        assert first_socket.close_count == 1
+        assert second_socket.close_count == 1
+        assert third_socket.close_count == 1
+
+    asyncio.run(scenario())
+
+
+class _RecordingReleaseLease:
+    def __init__(self, sink):
+        self._sink = sink
+
+    def release(self, now):
+        self._sink.append(now)
+
+
+def test_main_releases_leaked_admission_leases_from_abandoned_backlog_on_shutdown(
+    monkeypatch,
+):
+    """R6/F4: a frame accepted by UDPSEC but never consumed by the
+    fan-in reader or the processor stage before shutdown (abandoned
+    ingress/processing backlog, not a crash) must still have its
+    namespace lease released -- `main()`'s final shutdown drains both
+    queue kinds for exactly this reason, once every producer/consumer
+    task sharing them has already stopped."""
+
+    async def scenario():
+        released = []
+
+        async def supervisor(task_specs):
+            specs = {spec.name: spec for spec in task_specs}
+            fan_in_factory = specs["ingress-fan-in"].coroutine_factory
+            processor_factory = specs["processor-stage"].coroutine_factory
+            ingress_queues = fan_in_factory.args[0]
+            processing_queue = fan_in_factory.args[1]
+            assert processor_factory.args[0] is processing_queue
+
+            leaked_ingress_frame = IngressFrame(
+                kind="sec",
+                source_id="udpsec:boat_001",
+                alias_for_s=None,
+                remote_ip=None,
+                assembler_key="udpsec-assembly:leak1",
+                payload=b"",
+                admission_lease=_RecordingReleaseLease(released),
+            )
+            await ingress_queues[0].put(leaked_ingress_frame)
+
+            leaked_processing_frame = IngressFrame(
+                kind="sec",
+                source_id="udpsec:boat_002",
+                alias_for_s=None,
+                remote_ip=None,
+                assembler_key="udpsec-assembly:leak2",
+                payload=b"",
+                admission_lease=_RecordingReleaseLease(released),
+            )
+            await processing_queue.admit(
+                lambda: ProcessingWorkItem(
+                    frame=leaked_processing_frame,
+                    snapshot=ProcessingSnapshot(
+                        routing_generation=0,
+                        deduplication_mode=DeduplicationMode.GLOBAL,
+                        target_ids=(),
+                    ),
+                )
+            )
+            return None
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10116,
+                },
+            ),
+            supervisor=supervisor,
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "_load_secure_server",
+            lambda: (lambda *_a, **_kw: None),
+        )
+
+        await aismixer.main()
+
+        assert len(released) == 2
+
+    asyncio.run(scenario())
+
+
 def test_udpsec_identity_failure_prevents_runtime_activation(
     monkeypatch,
     tmp_path,
@@ -1239,6 +1575,7 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         assert [spec.name for spec in specs] == [
             "udpsec-ingress:0:secure_one",
             "udpsec-ingress:1:secure_two",
+            "udpsec-state-maintenance",
             "udp-ingress:0:plain_one",
             "udp-ingress:1:plain_two",
             "ingress-fan-in",
@@ -1250,12 +1587,18 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
         secure_factories = tuple(
             spec.coroutine_factory for spec in specs[:2]
         )
+        maintenance_factory = specs[2].coroutine_factory
         udp_factories = tuple(
-            spec.coroutine_factory for spec in specs[2:4]
+            spec.coroutine_factory for spec in specs[3:5]
         )
-        fan_in_factory = specs[4].coroutine_factory
-        processor_factory = specs[5].coroutine_factory
-        egress_factory = specs[6].coroutine_factory
+        fan_in_factory = specs[5].coroutine_factory
+        processor_factory = specs[6].coroutine_factory
+        egress_factory = specs[7].coroutine_factory
+
+        # F3: exactly one shared-state maintenance task regardless of how
+        # many secure inputs are configured (two, here) -- a bare
+        # zero-argument factory, not a per-listener partial.
+        assert maintenance_factory is aismixer.secure_state_maintenance
 
         assert all(
             factory.func is aismixer.secure_server
@@ -1287,6 +1630,10 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
             "plain_two",
         ]
 
+        # Ingress specs are no longer a contiguous prefix: the shared-state
+        # maintenance spec sits between the secure and plain UDP ingress
+        # specs (see the exact name list asserted above).
+        ingress_specs = specs[:2] + specs[3:5]
         input_queues = tuple(
             factory.args[0] for factory in secure_factories
         ) + tuple(factory.args[1] for factory in udp_factories)
@@ -1308,13 +1655,13 @@ def test_main_hands_every_essential_role_to_one_runtime_supervisor(monkeypatch):
                 spec.name,
                 aismixer.DEFAULT_INGRESS_QUEUE_MAXSIZE,
             )
-            for spec in specs[:4]
+            for spec in ingress_specs
         )
         traffic_snapshots = tuple(
             owner.input_traffic_snapshot() for owner in input_traffic
         )
         assert tuple(snapshot.name for snapshot in traffic_snapshots) == tuple(
-            spec.name for spec in specs[:4]
+            spec.name for spec in ingress_specs
         )
         assert tuple(snapshot.kind for snapshot in traffic_snapshots) == (
             "udpsec",
@@ -1429,10 +1776,14 @@ def test_main_accepts_explicit_capacities_with_isolated_input_queues(
 
         specs = supervision_calls[0]
         secure_queue = specs[0].coroutine_factory.args[0]
-        udp_queue = specs[1].coroutine_factory.args[1]
-        fan_in_factory = specs[2].coroutine_factory
-        processor_factory = specs[3].coroutine_factory
-        egress_factory = specs[4].coroutine_factory
+        # specs[1] is the F3 shared-state maintenance task (a bare
+        # zero-argument factory, always inserted between the secure and
+        # plain UDP ingress specs when any secure input is configured).
+        assert specs[1].coroutine_factory is aismixer.secure_state_maintenance
+        udp_queue = specs[2].coroutine_factory.args[1]
+        fan_in_factory = specs[3].coroutine_factory
+        processor_factory = specs[4].coroutine_factory
+        egress_factory = specs[5].coroutine_factory
 
         assert secure_queue is not udp_queue
         assert isinstance(secure_queue, aismixer._ObservedQueue)

@@ -215,14 +215,208 @@ def test_ingress_task_name_escapes_and_bounds_configured_diagnostic_label():
         "udp",
         2,
         {"id": "unsafe\nidentity" + ("x" * 200)},
-        "127.0.0.1",
-        10110,
     )
 
     prefix = "udp-ingress:2:"
     assert name.startswith(prefix + r"unsafe\nidentity")
     assert "\n" not in name
     assert len(name.removeprefix(prefix)) <= 80
+
+
+# Codex audit Finding B / operator revision 3: AISMixer's own bracketed-IPv6
+# selector convention has been removed entirely, not merely relocated to a
+# separate field. An unnamed ingress input's selector is now
+# "role-ingress:index" -- address-independent by construction, since the
+# declaration index alone (not any rendered endpoint) provides uniqueness.
+# These tests exercise the REAL selector construction (`_ingress_task_name`)
+# and the REAL selection path (`_runtime_statistics_inputs_result`), not
+# hard-coded string comparisons.
+
+
+def _input_row_for_selector(task_name, kind, *, selector):
+    from core.routing_control_protocol import _runtime_statistics_inputs_result
+    from core.runtime_statistics import InputTrafficMetrics
+
+    metrics = InputTrafficMetrics(task_name, kind)
+    result = _runtime_statistics_inputs_result(
+        (metrics.input_traffic_snapshot(),),
+        input_name=selector,
+    )
+    return result["inputs"]
+
+
+def test_unnamed_ingress_selector_is_address_independent():
+    """No project-owned bracketed (or any other) rendered endpoint appears
+    in an unnamed input's selector -- it is exactly `role-ingress:index`
+    regardless of address family, spelling, or port."""
+    task_name = aismixer._ingress_task_name("udp", 0, {})
+
+    assert task_name == "udp-ingress:0"
+    assert "[" not in task_name and "]" not in task_name
+
+    rows = _input_row_for_selector(task_name, "udp", selector="udp-ingress:0")
+    assert len(rows) == 1
+    assert rows[0]["name"] == task_name
+
+
+def test_unnamed_ingress_selector_is_identical_across_address_families():
+    """The selector depends only on role and declaration index: the same
+    (role, index) pair produces the same selector whether the input is
+    configured for IPv4 or IPv6, since the address never enters it."""
+    ipv4_name = aismixer._ingress_task_name("udpsec", 0, {})
+    ipv6_name = aismixer._ingress_task_name("udpsec", 0, {})
+
+    assert ipv4_name == ipv6_name == "udpsec-ingress:0"
+
+
+def test_named_ingress_input_keeps_stable_configured_id_selector():
+    task_name = aismixer._ingress_task_name(
+        "udpsec", 1, {"id": "boat_named"}
+    )
+
+    rows = _input_row_for_selector(
+        task_name, "udpsec", selector="udpsec-ingress:1:boat_named"
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["name"] == "udpsec-ingress:1:boat_named"
+
+
+def test_multiple_ingress_inputs_remain_distinguishable_by_selector():
+    from core.routing_control_protocol import _runtime_statistics_inputs_result
+    from core.runtime_statistics import InputTrafficMetrics
+
+    name_a = aismixer._ingress_task_name("udp", 0, {})
+    name_b = aismixer._ingress_task_name("udp", 1, {})
+    name_c = aismixer._ingress_task_name("udpsec", 0, {"id": "boat_named"})
+    assert name_a == "udp-ingress:0"
+    assert name_b == "udp-ingress:1"
+    assert name_c == "udpsec-ingress:0:boat_named"
+    assert len({name_a, name_b, name_c}) == 3
+
+    snapshots = (
+        InputTrafficMetrics(name_a, "udp").input_traffic_snapshot(),
+        InputTrafficMetrics(name_b, "udp").input_traffic_snapshot(),
+        InputTrafficMetrics(name_c, "udpsec").input_traffic_snapshot(),
+    )
+
+    all_rows = _runtime_statistics_inputs_result(
+        snapshots, input_name=None
+    )["inputs"]
+    assert {row["name"] for row in all_rows} == {name_a, name_b, name_c}
+
+    for expected_name in (name_a, name_b, name_c):
+        selected = _runtime_statistics_inputs_result(
+            snapshots, input_name=expected_name
+        )["inputs"]
+        assert [row["name"] for row in selected] == [expected_name]
+
+
+def test_ingress_display_label_uses_configured_id_or_tcpdump_endpoint():
+    """`_ingress_display_label` -- the operator-facing counterpart to the
+    address-independent `_ingress_task_name` selector -- prefers a
+    configured id verbatim, and otherwise uses the project's tcpdump-style
+    human endpoint convention."""
+    assert (
+        aismixer._ingress_display_label({}, "::", 17778) == "::.17778"
+    )
+    assert (
+        aismixer._ingress_display_label({}, "192.0.2.10", 17778)
+        == "192.0.2.10:17778"
+    )
+    assert (
+        aismixer._ingress_display_label(
+            {"id": "boat_named"}, "2001:db8::1", 17779
+        )
+        == "boat_named"
+    )
+
+
+def test_runtime_statistics_row_carries_both_selector_and_display():
+    """End-to-end reproduction of the real `main()` wiring: the stable
+    selector (`name`) and the operator-facing rendering (`display`) reach
+    the runtime-statistics result as two distinct fields, filtering still
+    matches on the exact selector, and an unnamed input's display differs
+    from its (address-independent) selector while a named input's display
+    equals its configured id."""
+    from core.routing_control_protocol import _runtime_statistics_inputs_result
+    from core.runtime_statistics import InputTrafficMetrics
+
+    unnamed_entry, unnamed_ip, unnamed_port = {}, "::", 17778
+    named_entry, named_ip, named_port = (
+        {"id": "boat_named"},
+        "2001:db8::1",
+        17779,
+    )
+
+    unnamed_name = aismixer._ingress_task_name("udp", 0, unnamed_entry)
+    unnamed_display = aismixer._ingress_display_label(
+        unnamed_entry, unnamed_ip, unnamed_port
+    )
+    named_name = aismixer._ingress_task_name("udpsec", 1, named_entry)
+    named_display = aismixer._ingress_display_label(
+        named_entry, named_ip, named_port
+    )
+
+    snapshots = (
+        InputTrafficMetrics(
+            unnamed_name, "udp", display=unnamed_display
+        ).input_traffic_snapshot(),
+        InputTrafficMetrics(
+            named_name, "udpsec", display=named_display
+        ).input_traffic_snapshot(),
+    )
+
+    all_rows = _runtime_statistics_inputs_result(
+        snapshots, input_name=None
+    )["inputs"]
+    assert {row["name"] for row in all_rows} == {unnamed_name, named_name}
+    assert {row["display"] for row in all_rows} == {
+        unnamed_display,
+        named_display,
+    }
+
+    # Filtering still matches the exact legacy selector, unaffected by the
+    # additional display field, and returns exactly the right row's display
+    # alongside it -- no ambiguity or cross-row mixup with multiple inputs.
+    unnamed_selected = _runtime_statistics_inputs_result(
+        snapshots, input_name=unnamed_name
+    )["inputs"]
+    assert len(unnamed_selected) == 1
+    assert unnamed_selected[0]["name"] == unnamed_name
+    assert unnamed_selected[0]["display"] == "::.17778"
+    assert unnamed_selected[0]["display"] != unnamed_selected[0]["name"]
+
+    named_selected = _runtime_statistics_inputs_result(
+        snapshots, input_name=named_name
+    )["inputs"]
+    assert len(named_selected) == 1
+    assert named_selected[0]["name"] == named_name
+    assert named_selected[0]["display"] == "boat_named"
+
+    nonmatching = _runtime_statistics_inputs_result(
+        snapshots, input_name="udp-ingress:9:unknown"
+    )["inputs"]
+    assert nonmatching == []
+
+
+def test_human_endpoint_display_stays_independent_of_selector_labels():
+    """The selector and the operator-facing display string are
+    deliberately different concerns: `core.endpoint_display.format_endpoint`
+    still owns the tcpdump-style human rendering for genuinely
+    operator-facing text (used only via `_ingress_display_label`), while
+    the selector (`_ingress_task_name`) no longer derives from the address
+    at all -- there is no project-owned bracketed or otherwise
+    address-derived selector convention left to keep in sync with it."""
+    from core.endpoint_display import format_endpoint
+
+    display = format_endpoint("2001:db8::1", 17779)
+    selector = aismixer._ingress_task_name("udpsec", 0, {})
+
+    assert display == "2001:db8::1.17779"
+    assert selector == "udpsec-ingress:0"
+    assert "2001:db8::1" not in selector
+    assert "17779" not in selector
 
 
 async def run_named_failure_case(failing_role):

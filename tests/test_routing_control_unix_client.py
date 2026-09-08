@@ -208,7 +208,7 @@ def test_malformed_or_non_object_json_response_is_rejected(monkeypatch, response
 @pytest.mark.parametrize(
     "response",
     [
-        {**response_mapping(), "version": 2},
+        {**response_mapping(), "version": ROUTING_CONTROL_PROTOCOL_VERSION + 1},
         {**response_mapping(), "version": True},
         {**response_mapping(), "request_id": "other"},
         {**response_mapping(), "request_id": None},

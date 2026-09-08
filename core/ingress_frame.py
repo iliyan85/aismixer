@@ -19,6 +19,40 @@ class IngressFrame:
     assembler_key: str
     payload: bytes
     text_mode: PayloadTextMode = PayloadTextMode.UTF8_IGNORE
+    # Monotonic timestamp of admission into the pipeline (NOT the
+    # transport's own arrival time, and NOT wall-clock), or `None` when
+    # the source does not need one. Currently populated only by UDPSEC
+    # (`aismixer_secure`), whose `assembler_key` is derived from a
+    # process-wide `assembly_namespace` identifier that can legitimately
+    # be reserved for an unrelated station once its own retirement window
+    # elapses (see `core.session_identity_registry`); plain UDP/serial
+    # assembler keys are address-derived and stable for that peer, so they
+    # have no analogous reuse hazard and never set this. See
+    # `core.python_data_plane` for where and why this is enforced.
+    admitted_at: Optional[float] = None
+    # R6/F4: an optional, narrowly-scoped hold on this exact frame's own
+    # right to use `assembler_key`'s underlying process-wide reservation
+    # (see `core.session_identity_registry.SessionIdentityRegistry.lease`),
+    # taken out at admission time -- while the owning session is provably
+    # still live -- and released exactly once via
+    # `release_admission_lease()`, by whichever pipeline stage is the
+    # last to touch this frame, regardless of outcome (successful
+    # processing, a stale-age drop, a queue-admission failure, or
+    # cancellation). `None` for every source with no analogous reuse
+    # hazard (every non-UDPSEC frame, and a UDPSEC frame whose lease
+    # could not be acquired because its session had already died by
+    # admission time). Deliberately untyped here (structural: anything
+    # exposing `release(now)`) so this module has no dependency on
+    # `core.session_identity_registry` or `aismixer_secure` -- a plain
+    # UDP/serial frame never sets this and pays no such cost.
+    admission_lease: Optional[object] = None
+
+    def release_admission_lease(self, now: float) -> None:
+        """Idempotently release `admission_lease`, if this frame carries
+        one (a no-op otherwise). Safe to call more than once: the
+        lease's own `release()` is itself idempotent."""
+        if self.admission_lease is not None:
+            self.admission_lease.release(now)
 
 
 def frame_from_text_payload(
@@ -29,6 +63,8 @@ def frame_from_text_payload(
     remote_ip: Optional[str],
     assembler_key: str,
     payload: object,
+    admitted_at: Optional[float] = None,
+    admission_lease: Optional[object] = None,
 ) -> Optional[IngressFrame]:
     if not isinstance(payload, str):
         return None
@@ -45,6 +81,8 @@ def frame_from_text_payload(
             errors="surrogatepass",
         ),
         text_mode=PayloadTextMode.UTF8_SURROGATEPASS,
+        admitted_at=admitted_at,
+        admission_lease=admission_lease,
     )
 
 

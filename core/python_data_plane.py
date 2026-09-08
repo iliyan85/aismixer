@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from secrets import randbelow
@@ -20,9 +21,99 @@ from core.metrics import ProcessorMetricsSnapshot
 from core.output_builder import build_output_bytes
 from core.parsed_sentence import parse_frame_sentences, parse_leading_s_value
 from core.s_policy import choose_s_value_from_candidates
+from core.session_identity_registry import RETIREMENT_SECONDS
 from core.state.s_cache import SourceState
 from core.target_identity import EgressTargetId
 from dedup import Deduplicator
+
+
+# F4: how long a namespace-bearing frame (see `IngressFrame.admitted_at`)
+# may sit anywhere in the ingress/processing pipeline before this
+# processor refuses to feed it to the assembler at all. UDPSEC's shared
+# `SessionIdentityRegistry` retires a released `assembly_namespace` for
+# `core.session_identity_registry.RETIREMENT_SECONDS` before it can be
+# reserved by an unrelated station; that retirement window is only a
+# genuine safety margin if a frame can never reach the assembler after
+# this bound has passed, since none of this pipeline's ingress/processing
+# queues (see `aismixer.py`) impose a maximum residence time of their own
+# -- only a maximum depth, under ordinary blocking backpressure. This
+# value, together with `AIVDMAssembler`'s own default group timeout and a
+# margin for scheduling/GC jitter, is what `RETIREMENT_SECONDS` is
+# actually derived from -- see that constant's own comment, and
+# `_validate_retention_compatibility` below for the enforced relationship
+# between the three.
+MAX_INGRESS_FRAME_AGE_SECONDS = 20.0
+
+
+def _validate_retention_compatibility(max_ingress_frame_age, assembler):
+    """R5/F4: fail closed, at construction time, for any configured
+    combination of `max_ingress_frame_age` and the assembler's own group
+    `timeout` that would not actually be covered by
+    `core.session_identity_registry.RETIREMENT_SECONDS`.
+
+    The safety property this enforces: a namespace-bearing frame cannot
+    reach the assembler after `max_ingress_frame_age` from its own
+    admission (enforced in `_process_impl`), and once fed, an assembler
+    GROUP is only kept alive `assembler.timeout` seconds past its most
+    recently accepted fragment (`last_progress_at` is updated on every
+    unique fragment, not only the first -- see `assembler.py`). Every
+    fragment contributing to one group was itself admitted while its
+    owning session was still live, so the LATEST any fragment in a group
+    can have been admitted is the instant that session closed; the
+    group's own last possible expiry is therefore bounded by
+    `session_close_time + max_ingress_frame_age + assembler.timeout`.
+    For the namespace's retirement window (measured from that same
+    session-close instant) to be a genuine safety margin rather than a
+    number that merely looks generous, it must be no smaller than that
+    bound:
+
+        max_ingress_frame_age + assembler.timeout <= RETIREMENT_SECONDS
+
+    Only enforced when `assembler` actually exposes a numeric `timeout`
+    (the production `AIVDMAssembler` always does); an assembler stand-in
+    without one is trusted as-is rather than guessed at.
+
+    R6/F4: `frame.admission_lease` (see `IngressFrame` and `process()`)
+    now makes the in-flight pipeline residence itself unconditionally
+    safe -- a lease-carrying frame cannot be outlived by the namespace's
+    retirement while `process()` is still running, regardless of
+    `max_ingress_frame_age`. This formula's remaining job is the tail
+    AFTER that lease is released (when `process()` returns): the
+    assembler GROUP it fed may still be alive for up to
+    `assembler.timeout` more seconds, and this inequality is what keeps
+    that tail inside the registry's own retirement window.
+    """
+    if not isinstance(max_ingress_frame_age, (int, float)) or isinstance(
+        max_ingress_frame_age, bool
+    ):
+        raise TypeError("max_ingress_frame_age must be a real number")
+    if not math.isfinite(max_ingress_frame_age):
+        raise ValueError("max_ingress_frame_age must be finite")
+    if max_ingress_frame_age <= 0:
+        raise ValueError("max_ingress_frame_age must be positive")
+
+    assembler_timeout = getattr(assembler, "timeout", None)
+    if assembler_timeout is None:
+        return
+    if not isinstance(assembler_timeout, (int, float)) or isinstance(
+        assembler_timeout, bool
+    ):
+        raise TypeError("assembler.timeout must be a real number")
+    if not math.isfinite(assembler_timeout) or assembler_timeout < 0:
+        raise ValueError("assembler.timeout must be finite and non-negative")
+
+    if max_ingress_frame_age + assembler_timeout > RETIREMENT_SECONDS:
+        raise ValueError(
+            "max_ingress_frame_age "
+            f"({max_ingress_frame_age}s) + assembler.timeout "
+            f"({assembler_timeout}s) exceeds RETIREMENT_SECONDS "
+            f"({RETIREMENT_SECONDS}s): this combination would let an "
+            "assembler group tied to a namespace still be legitimately "
+            "alive after that namespace becomes eligible for reuse by "
+            "an unrelated station. Lower max_ingress_frame_age, use an "
+            "assembler with a smaller timeout, or this configuration is "
+            "not supported without also increasing RETIREMENT_SECONDS."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +147,8 @@ class PythonDataPlaneProcessor:
         "_assembler",
         "_deduplicator",
         "_wall_clock",
+        "_monotonic_clock",
+        "_max_ingress_frame_age",
         "_gid_generator",
         "_source_state",
         "_multipart_s_ctx",
@@ -68,6 +161,7 @@ class PythonDataPlaneProcessor:
         "_outputless_calls",
         "_output_batches",
         "_output_messages",
+        "_stale_frames_dropped",
         "_reset_calls",
         "_reset_completed",
         "_reset_failed",
@@ -85,6 +179,8 @@ class PythonDataPlaneProcessor:
         assembler: AIVDMAssembler | None = None,
         deduplicator: Deduplicator | None = None,
         wall_clock: Callable[[], float] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+        max_ingress_frame_age: float = MAX_INGRESS_FRAME_AGE_SECONDS,
         gid_generator: Callable[[int], str] | None = None,
         source_state: SourceState | None = None,
     ) -> None:
@@ -106,6 +202,11 @@ class PythonDataPlaneProcessor:
             else deduplicator
         )
         self._wall_clock = time.time if wall_clock is None else wall_clock
+        self._monotonic_clock = (
+            time.monotonic if monotonic_clock is None else monotonic_clock
+        )
+        _validate_retention_compatibility(max_ingress_frame_age, self._assembler)
+        self._max_ingress_frame_age = max_ingress_frame_age
         self._gid_generator = (
             _generate_numeric_gid_fixed
             if gid_generator is None
@@ -124,10 +225,19 @@ class PythonDataPlaneProcessor:
         self._outputless_calls = 0
         self._output_batches = 0
         self._output_messages = 0
+        self._stale_frames_dropped = 0
         self._reset_calls = 0
         self._reset_completed = 0
         self._reset_failed = 0
         self._reset_in_flight = 0
+
+    @property
+    def stale_frames_dropped(self) -> int:
+        """Count of frames refused as too old to safely feed to the
+        assembler (see `MAX_INGRESS_FRAME_AGE_SECONDS`). Diagnostic only,
+        not part of the shared `ProcessorMetricsSnapshot` contract."""
+
+        return self._stale_frames_dropped
 
     def process(
         self,
@@ -154,6 +264,17 @@ class PythonDataPlaneProcessor:
             return output_batch
         finally:
             self._process_in_flight -= 1
+            # R6/F4: release this frame's own namespace lease (if any)
+            # exactly once here, covering every exit from `_process_impl`
+            # -- normal completion, an early stale-age drop, or any
+            # exception -- rather than at each individual return point.
+            # This is what actually closes the post-age-check pause race:
+            # for as long as this call has not reached this line, the
+            # lease keeps the frame's `assembler_key` reservation live no
+            # matter how long `_process_impl` takes, so the identifier
+            # cannot be retired and reissued to an unrelated station out
+            # from under an in-flight parse-and-feed operation.
+            frame.release_admission_lease(self._monotonic_clock())
 
     def _process_impl(
         self,
@@ -161,6 +282,46 @@ class PythonDataPlaneProcessor:
         snapshot: ProcessingSnapshot,
     ) -> OutputBatch:
         """Run the existing Python processing algorithm."""
+
+        # F4: a frame whose assembler_key is tied to a process-wide
+        # identifier with a bounded reuse window (currently only UDPSEC's
+        # assembly_namespace -- see `IngressFrame.admitted_at`) is refused
+        # once it has sat in the ingress/processing pipeline for too long
+        # -- none of those queues impose a maximum residence time of
+        # their own (only a maximum depth), so old backlog could
+        # otherwise sit indefinitely under sustained pressure. A frame
+        # with no `admitted_at` (every non-UDPSEC source) has no such
+        # hazard and is never subject to this check.
+        #
+        # R6/F4: this is now a bounded-backlog/QoS policy, NOT the
+        # mechanism that actually prevents a namespace-reuse race. The
+        # authoritative safety property comes from `frame.admission_lease`
+        # (see `core.session_identity_registry.SessionIdentityRegistry.
+        # lease` and `process()`'s `finally`, above): a lease-carrying
+        # frame holds its own independent, live reference on the
+        # underlying registry reservation from admission until `process()`
+        # actually returns, so the identifier CANNOT be retired and
+        # reissued to an unrelated station during this call, no matter
+        # how long it runs -- an arbitrary OS-level thread preemption or
+        # GC pause included, not merely the realistic scheduling/GC
+        # jitter this age check alone could ever assume away. A frame
+        # that fails this age check is simply refused before ever being
+        # fed to the assembler; it does not depend on the lease to be
+        # correct, and the lease does not depend on this check either --
+        # each is a complete, independent safety/QoS layer.
+        #
+        # `age` is validated, not merely computed: a non-finite value (a
+        # corrupted or mismatched-clock-domain `admitted_at`) or a
+        # NEGATIVE value (`admitted_at` appearing to be in the future
+        # relative to this processor's own clock -- impossible for a
+        # genuine same-clock-domain observation) both fail closed as
+        # stale, rather than one silently being treated as "very fresh"
+        # and bypassing this check entirely.
+        if frame.admitted_at is not None:
+            age = self._monotonic_clock() - frame.admitted_at
+            if not math.isfinite(age) or age < 0 or age > self._max_ingress_frame_age:
+                self._stale_frames_dropped += 1
+                return OutputBatch(outputs=())
 
         deduplication_mode = snapshot.deduplication_mode
         route_target_ids = snapshot.target_ids

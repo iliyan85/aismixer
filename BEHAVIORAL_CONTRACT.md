@@ -363,29 +363,376 @@ below, and -- unlike an active session -- pending identity is still the
 exact endpoint-token/peer-address tuple from the handshake; see below.
 
 A `LogicalSession` carries two deliberately separate process-local
-identifiers that must not be conflated. `session_handle` identifies one
-concrete `LogicalSession` *object* incarnation: it is always freshly minted
-on construction, including when a same-relation authenticated replacement
-occurs, is never reused merely because the relation key matches, and is
-unaffected by touch/activity. `assembly_namespace` identifies secure
-multipart continuity lineage: it is normally also freshly minted, but a
-same-relation authenticated replacement carries it forward from the session
-it replaces *only* when that replacement's authenticated `station_id`
-exactly matches the station_id of the live session currently at that
-relation. Relation equality alone is never sufficient for this carry-
-forward -- a replacement authenticating as a different station always gets
-a fresh `assembly_namespace`, with no exception. Neither identifier survives
-a relation that is not currently live: expiry, close, capacity eviction,
+identifiers that must not be conflated. Both are opaque 16-byte values,
+reserved through one shared, process-wide, in-memory
+`core.session_identity_registry.SessionIdentityRegistry` instance
+(`aismixer_secure._SESSION_IDENTITY_REGISTRY`), not merely drawn independently
+from `os.urandom` and hoped not to collide: `reserve()` draws a fixed-width
+random candidate and, under the registry's own short internal lock, checks
+it against every currently live-or-recently-retired reservation before
+committing it, retrying a bounded number of times and failing closed
+(`SessionIdentityExhaustedError`) rather than ever returning an unchecked or
+weaker value. This is the same standard of guarantee `session_locator`
+generation already used, applied to a value two independent owners can also
+mint from. Every owner sharing one real Python import of `aismixer_secure`
+-- the shared production default and any additional `SecureState()`
+constructed by a multi-listener configuration or a test, including two
+owners running on two genuinely different OS threads -- shares this exact
+registry object (`sys.modules` import caching), so two owners can never
+simultaneously hold the same `session_handle` or `assembly_namespace`. A
+test harness that deliberately reloads `aismixer_secure.py` under a
+synthetic module name to simulate a second process gets its own completely
+independent registry, exactly like it gets its own independent
+`AUTHORIZED_KEYS` and `secure_state` -- this is a fully separate simulated
+process for every piece of module state, not a partial gap in identifier
+sharing alone. This matters because the assembler namespace derived from
+`assembly_namespace` (see below) can be shared across owners by whatever
+feeds their frames to a common downstream assembler; per-owner-only
+uniqueness would let two unrelated authenticated stations on different
+owners collide onto the same assembly group. `session_handle` identifies
+one concrete `LogicalSession` *object* incarnation: it is always freshly
+reserved on construction, including when a same-relation authenticated
+replacement occurs, is never reused merely because the relation key
+matches, and is unaffected by touch/activity; it is released back to the
+registry (entering a bounded retirement window, described below) the
+instant its exact `LogicalSession` incarnation is removed, for any reason.
+`assembly_namespace` identifies secure multipart continuity lineage: it is
+normally also freshly reserved, but a same-relation authenticated
+replacement carries it forward -- `claim()`ing an additional live reference
+on the SAME reservation rather than drawing a new one -- from the session it
+replaces *only* when that replacement's authenticated `station_id` exactly
+matches the station_id of the live session currently at that relation.
+Relation equality alone is never sufficient for this carry-forward -- a
+replacement authenticating as a different station always gets a fresh
+`assembly_namespace`, with no exception. Neither identifier survives a
+relation that is not currently live: expiry, close, capacity eviction,
 nonce exhaustion, or process restart all mean the next establishment at that
-relation gets both a fresh `session_handle` and a fresh `assembly_namespace`;
-there is no historical cache of removed relations, stations, or namespaces.
-This carry-forward is a transitional mechanism for the current stage, where
-a rekey still replaces the whole `LogicalSession` object; it is not the
-final rekey architecture. Once a later stage lets an authenticated refresh
-replace only `current_epoch` on an unchanged `LogicalSession`, both
-identifiers will naturally remain stable across rekey simply because the
-session object itself persists, and this reuse logic will no longer be
-needed.
+relation gets both a fresh `session_handle` and a fresh `assembly_namespace`.
+The registry itself is not an unlimited historical database: a released
+reservation is retired (occupied, but no longer counted live, so it cannot
+be re-drawn) for `RETIREMENT_SECONDS` (30 seconds) and then purged, via a
+bounded, lazy-deletion min-heap scan (see below) piggybacked on
+`SecureState`'s own existing monotonic cleanup pass rather than a dedicated
+thread or a full per-packet scan of every retiring entry.
+
+R6/Blocker B: the age-based policy described above (`MAX_INGRESS_FRAME_AGE_
+SECONDS`, `RETIREMENT_SECONDS`'s formula) remains in force, but is no
+longer, by itself, what makes namespace reuse safe -- a one-time age
+observation taken at the top of `_process_impl` only protects against a
+delay that already elapsed BEFORE that observation; it cannot protect
+against an arbitrary pause (real OS thread preemption or a GC pause, not
+merely the absence of `await`) landing AFTER the check passes but BEFORE
+the frame actually reaches the assembler. The authoritative safety
+mechanism is an explicit, frame-scoped hold: `_secure_server_loop`
+attaches a `core.session_identity_registry.SessionIdentityRegistry.lease`
+on a namespace-bearing frame's `assembly_namespace` to it as
+`IngressFrame.admission_lease`. This is an ADDITIONAL live reference on
+the same registry reservation the owning session already holds
+(reference-counted, exactly like a same-station replacement's `claim()`),
+independent of that session's own lifetime: for as long as the lease is
+outstanding, `reserve()` cannot draw that value for anyone else, no matter
+how long the frame takes to actually reach the assembler or how long the
+owning session has already been gone. `PythonDataPlaneProcessor.process()`
+holds this lease for the frame's entire `_process_impl` call and releases
+it exactly once, in its own `finally`, regardless of outcome (normal
+completion, an early stale-age drop, or a raised exception), using a
+FRESH clock reading taken at that release instant -- so a frame that is
+mid-`process()` when its owning session's OWN reference is released still
+keeps the namespace alive until `process()` itself returns, and the
+namespace's own eventual retirement is timed from when this frame's use
+of it actually ended, not from admission time.
+
+R7/Correction A: every OTHER release call site along this frame's journey
+-- `_secure_server_loop`'s own release on a queue-put failure or a task
+cancellation while awaiting queue capacity (potentially after an
+arbitrarily long wait), and `ingress_fan_in_loop`'s reader releasing on an
+admission failure or cancellation while blocked waiting for processing
+capacity (see below) -- likewise samples a FRESH reading from that
+component's own injected monotonic clock at the actual release instant,
+never a cached admission/receive-time value. A stale cached timestamp
+used at release would backdate the computed retirement deadline and could
+let the namespace become eligible for reuse before an assembler group fed
+by this exact frame (or, in the queue-wait case, by an earlier frame that
+legitimately reached the assembler under the same namespace) has actually
+had a chance to expire.
+
+R7/Correction B: ownership of a dequeued ingress frame (and any lease it
+carries) belongs to `ingress_fan_in_loop`'s reader from the moment it
+dequeues the item until `processing_queue.admit()` actually transfers it
+into the processing queue. If `admit()` fails or the reader is cancelled
+before that transfer completes -- whether while still waiting for
+capacity, or during the atomic bind-and-enqueue step itself --
+ownership never passed anywhere else, and the reader releases the lease
+itself before the failure/cancellation propagates; once `admit()`
+succeeds, the reader releases nothing further, since the processing
+queue's eventual consumer (`processor_stage_loop`/`PythonDataPlaneProcessor
+.process()`) now owns that responsibility. Without this, a frame accepted
+by UDPSEC but never consumed before its reader task is cancelled (a
+supported, low-severity but genuine scenario -- not merely a theoretical
+one) would leave its lease permanently outstanding: a real, if bounded,
+registry-reference leak that neither garbage collection nor another
+owner's own cleanup would ever reclaim on its own.
+
+R7/Correction C: `SecureState.acquire_namespace_lease(session, now)` is
+the sole, atomic way `_secure_server_loop` acquires this hold -- it
+re-verifies, under this owner's own lock, that `session` is STILL the
+exact live incarnation at its own key immediately before acquiring the
+lease, in ONE locked transaction with no gap between the two steps.
+Separately confirming liveness (via `touch_session`/
+`is_live_session_handle`) and only later asking the shared registry for a
+lease against the raw `assembly_namespace` bytes leaves a window, however
+small, between those two separate lock acquisitions -- another thread
+sharing this exact owner could remove `session` in between, and if its
+exact namespace bytes ever retired and were reissued to an unrelated
+incarnation before the second call ran, that raw two-step pattern would
+attach the frame's protection to the WRONG lineage without any error,
+since a bare `lease()` call only knows whether the raw bytes are
+currently live, never whether they still belong to the caller that
+originally authorized them. `acquire_namespace_lease` closes this
+possibility entirely rather than merely narrowing it: a session no longer
+live returns `None` without ever touching the registry, exactly like
+every other `_get_live_session_handle`-gated method's exact-object-
+identity semantics.
+
+Every other admission-time loss (an abandoned `None` from
+`frame_from_text_payload`) releases the lease right there instead.
+`aismixer.py`'s final shutdown additionally drains any residual
+ingress/processing backlog and releases whatever leases those abandoned
+frames still held, since none of this pipeline's queues are drained by
+ordinary task cancellation alone. A frame with no `admitted_at` (every
+non-UDPSEC source) never carries a lease and is completely unaffected by
+any of this.
+
+`RETIREMENT_SECONDS`'s own formula still matters for the tail AFTER a
+lease is released: `RETIREMENT_SECONDS` is NOT simply a multiple of the
+assembler's own group timeout -- a downstream `AIVDMAssembler` group's
+timeout only starts once a frame actually reaches the assembler, not when
+UDPSEC admits it, and no ingress/processing queue between those two points
+imposes a maximum residence time (only a maximum depth) -- but the lease
+above already makes that residence-time gap itself unconditionally safe.
+The actual enforcement point for the REMAINING (post-release) tail is
+`core.python_data_plane.MAX_INGRESS_FRAME_AGE_SECONDS` (20 seconds), a
+bounded-backlog/QoS policy applied independently of the lease: any
+namespace-bearing frame older than that when the processor is about to
+feed it to the assembler is refused outright, never reaching the assembler
+in any form. `RETIREMENT_SECONDS` is the SUM of that enforced bound, the
+assembler's own default 1-second group timeout, and a margin for
+scheduling/GC jitter -- so no assembler group tied to a given namespace can
+still be alive once that namespace becomes eligible for reuse. This
+accounts for an assembler group's LATEST possible progress, not only its
+first fragment (`AIVDMAssembler` resets a group's own timeout on every
+uniquely-accepted fragment, not just the first): every fragment
+contributing to one group was itself admitted while its owning session was
+still live, so the latest any fragment can have been admitted is the
+instant that session closed, bounding the group's own last possible
+expiry at `session_close_time + max_ingress_frame_age + assembler.timeout`
+-- which is exactly the relationship `PythonDataPlaneProcessor` validates
+at construction (`max_ingress_frame_age + assembler.timeout <=
+RETIREMENT_SECONDS`), rejecting an incompatible configured combination
+(a longer assembler timeout, a longer permitted frame age, non-finite or
+non-positive values) with a clear error rather than silently claiming the
+same guarantee as the default. The age check itself, and the computed
+`age` it is based on, are validated too: a non-finite or negative age (a
+corrupted `admitted_at`, or one appearing to be in the future relative to
+the processor's own clock -- impossible for a genuine same-clock-domain
+observation) fails closed as stale rather than bypassing the check.
+None of this is a claim of durable or cross-process uniqueness, or that a
+finite random space can never repeat in principle -- only that every draw is
+checked and retried under a real lock, and that this process's bookkeeping
+of what is currently live or recently retired is accurate. This carry-forward is a
+transitional mechanism for the current stage, where a rekey still replaces
+the whole `LogicalSession` object; it is not the final rekey architecture.
+Once a later stage lets an authenticated refresh replace only
+`current_epoch` on an unchanged `LogicalSession`, both identifiers will
+naturally remain stable across rekey simply because the session object
+itself persists, and this reuse logic will no longer be needed.
+
+`claim()` only ever adds a reference to an ALREADY-live reservation -- it
+raises rather than silently reviving a merely-retiring value or admitting
+an unknown one as a fresh live entry, since the only legitimate caller
+always reads the value directly off a `LogicalSession` it has just
+confirmed is still live. `reserve()`/`claim()`/`release()` on
+`install_session`/`promote_pending_session` follow a strict prepare-then-
+commit discipline: `assembly_namespace` and `session_handle` are both
+acquired, and the full replacement `LogicalSession` object constructed,
+BEFORE any destructive mutation -- removing the previous session at that
+relation, evicting a capacity victim, or (for promotion) popping the
+pending candidate and releasing its locator reservation. If any
+acquisition or construction step fails, exactly what was newly acquired in
+that attempt is released once and every pre-existing store is left
+untouched; a still-valid previous session, its pending candidate's locator
+reservation, and any already-admitted confirmation-nonce accounting can
+never be destroyed by a failed replacement. Legitimate expiry cleanup (see
+below) may still remove genuinely expired state before an unrelated
+operation fails -- that is not a violation of this guarantee.
+
+`SecureState` itself is safe under the real shared-owner, multi-thread
+model its own test suite exercises: one reentrant lock
+(`threading.RLock()`, reentrant because several public methods call other
+public methods as an internal implementation detail -- `install_session`
+and `promote_pending_session` both call `cleanup_expired_sessions`;
+`accept_data_nonce` calls `admit_data_nonce`) protects every composite
+state transaction -- handshake replay admission, pending and active
+install/replace/remove, locator reservation, promotion, nonce admission,
+capacity eviction, and statistics snapshots -- as a single linearizable
+commit point. Internal `_`-prefixed helper methods do not acquire their own
+lock; they rely on their caller already holding it, and must never be
+called directly from outside a public method's locked section. The lock is
+held only for in-memory dict/set/counter work: it is never held across the
+identity registry's own calls needing to re-enter it (lock order is always
+`SecureState`'s lock first, the registry's own internal lock second, never
+the reverse), and never across ECDHE/AEAD/JSON, network I/O, or an `await`.
+This closes the specific defect an earlier corrective pass introduced: a
+naive single-owner-thread lock model that broke the real multi-listener
+tests below has been replaced by a lock scoped to each public method's own
+transaction rather than to the whole receive loop, which those same real
+concurrent-thread tests (and dedicated capacity/locator/nonce race tests
+using real threads and, for the aggregate and pending capacity cases, real
+loopback listeners) now verify directly.
+
+Active and pending expiry each have their own authoritative deadline index
+-- a lazy-deletion min-heap ordered strictly by deadline VALUE -- separate
+from `_sessions`'/`_pending_sessions`' `OrderedDict` position, which exists
+only for LRU/capacity-eviction ordering. The lock above serializes
+mutations, but does not make commit order track the `now` values callers
+happened to sample before acquiring it: two listener threads can commit in
+an order that does not match their own timestamps. A front-prefix scan of
+an `OrderedDict` silently assumes commit order tracks deadline order; where
+it does not, a genuinely expired entry can sit behind a newer one and never
+be found, letting expired active or pending state be treated as live. The
+heap has no such assumption -- popping always yields the true minimum
+deadline regardless of insertion order.
+
+R6/Blocker A: each heap entry carries the exact object (`LogicalSession` or
+`_PendingSecureSession`) it was pushed for, not merely its key. A popped
+entry is validated by OBJECT IDENTITY against whatever currently occupies
+that key -- not by the key's mere presence -- before being acted on at all;
+an entry whose object no longer matches (superseded by a replacement, or an
+active session's locator-derived key coincidentally reused after a long
+retirement) is discarded outright, never treated as authority to inspect or
+reschedule whatever object actually occupies that key now. This closes a
+previously-reported unbounded-growth defect specific to PENDING candidates:
+a pending relation key, unlike an active session's fresh-per-replacement
+locator-derived key, is NOT fresh across a same-relation replacement, so a
+stale entry belonging to an already-replaced candidate would still resolve
+that key to whichever candidate currently occupied it and recompute/
+reschedule THAT candidate's deadline on the strength of an entry that was
+never pushed for it -- one entry added per replacement, never discarded, so
+continuous same-relation handshake churn (an authorized station replacing
+its own pending candidate repeatedly, entirely within its own rate) grew
+this heap linearly with total historical replacement count rather than with
+live/due state. With object identity checked, a superseded entry is
+discarded in O(1) the moment it is popped, keeping retained heap size
+bounded by live state plus recent churn rather than by all-time traffic.
+For an ACTIVE session, whose `last_seen` DOES change via `touch_session`
+without pushing a new heap entry, an identity-matched but now-stale entry
+(superseded by a later touch) is still re-queued with its real current
+deadline rather than discarded, so `touch_session` clamping `last_seen` to
+never move backwards still means a stale, out-of-order `now` can never
+shorten a session's real remaining lifetime, and repeated touches alone
+never grow retained heap size beyond one entry per live session.
+
+The heap fix above corrects a commit-order defect, but not a distinct one:
+correct heap ordering still trusts whatever `now` a caller actually
+supplies for the admission decision, and a `now` sampled before a delay (a
+different thread, a slow prior parsing/crypto step, or an old asynchronous
+task holding a stale session reference) can itself be wrong relative to
+real elapsed time, independent of commit order. `SecureState` accepts an
+optional authoritative `clock` at construction (`__init__`'s `clock`
+parameter, `None` by default, preserving every existing caller's exact
+prior behavior); when configured, every public method that takes `now`
+floors it at that clock's own current reading before using it for
+anything -- expiry comparison, `last_seen`/`created_at` recording, heap
+deadline computation, registry release timestamps -- so a stale, too-small
+`now` can no longer make an object the clock already knows is past its
+deadline appear live, while a `now` already at or ahead of the clock is
+used unchanged (ordinary deterministic testing is unaffected). Production's
+module-level `secure_state` singleton is the one owner explicitly
+configured this way, with real `time.monotonic`; a `SecureState` a test
+constructs directly defaults to no clock and is unaffected unless it opts
+in. `run_periodic_maintenance()` -- an independent, opt-in coroutine an
+operator's runtime spawns once per shared owner (not per listener) to run
+this same expiry/retirement-purge housekeeping on a timer, so it still runs
+eventually even on an owner that currently receives no packets on any of
+its listeners -- samples this SAME configured clock (falling back to real
+`time.monotonic` if none is configured), never an independently injectable
+one, so maintenance can never observe a different, incoherent clock domain
+than every other decision this owner makes. None of this is security-
+relevant on its own, since every public entry point already re-validates
+liveness through this same authoritative path regardless of when
+maintenance last ran; it only bounds memory reclamation on an idle owner. A
+`SecureState` sharing the process-wide identity registry with other owners
+must use a clock domain compatible with theirs, since the registry's own
+retirement bookkeeping is keyed by whatever `now` each owner's removals
+pass it -- every owner sharing the process-wide default registry in
+production shares the same real `time.monotonic`.
+
+A standalone `SecureState` owner has two distinct, explicit teardown paths
+at two different scopes. `close_owned_sessions()` gracefully closes (sends
+a close message for, then removes) every active session ONE LISTENER
+installed or promoted, and the companion `close_owned_pending_sessions()`
+immediately discards that same listener's own still-pending candidates
+(freeing their locator reservation and pending-capacity slot) rather than
+leaving them to expire on their own TTL -- sending no wire message, since
+an unconfirmed candidate has no confirmed key material to notify with.
+Both are exact-object-checked (`close_session`/`close_pending_session`) so
+a handle already superseded by a later replacement is silently ignored,
+never discarding whatever legitimately occupies that relation now. Pending
+candidates hold no `_SESSION_IDENTITY_REGISTRY` reservation of their own to
+release (`session_handle`/`assembly_namespace` are minted only by
+`install_session`/`promote_pending_session`), so discarding one never
+touches the registry; tearing down one listener's own sessions/pending
+candidates never affects any other owner, or any OTHER listener sharing
+the same owner, sharing the same process-wide registry.
+
+`close()` is the wider, OWNER-level operation: it discards EVERYTHING one
+exact `SecureState` instance holds -- every active session and pending
+candidate regardless of which listener installed it, releasing exactly
+that owner's own registry reservations -- and marks the owner closed.
+Idempotent (closing an already-closed owner is a no-op); `install_session`/
+`install_pending_session` raise `SecureStateClosedError` afterward rather
+than silently creating new state, since there is no reopen contract (a
+fresh `SecureState()` is the supported way to get a new owner). It never
+touches any other owner or clears the shared registry, and does not rely on
+`__del__`/garbage collection. This is a genuinely different operation from
+`close_owned_sessions()`/`close_owned_pending_sessions()`, which exist
+specifically so ONE listener can stop without disturbing a state SEVERAL
+listeners still share -- `close()` ends the owner's own lifecycle and must
+only be called once nothing else is still using that exact instance. The
+default daemon runtime calls it exactly once, on the process-wide
+`secure_state` singleton, in `aismixer.py`'s own final shutdown -- strictly
+after every listener sharing it has already stopped and run its own
+listener-level cleanup -- and only when UDPSEC was actually configured, so
+a plain-UDP-only deployment never forces the otherwise-lazy import.
+
+R6/F5 residual completion: `close()` also discards this owner's handshake
+replay ledger and clears both expiry heaps outright -- a closed owner has
+no active/pending state left for either heap's entries to meaningfully
+describe (dead weight, not a live hazard, now that the heap fix above
+discards a superseded entry on sight regardless), but the replay ledger is
+a genuine resurrection surface if left populated: `accept_handshake_replay`
+itself now checks `self._closed` first and rejects (an ordinary handshake
+failure, not an exception) rather than admitting a new record into a
+ledger `close()` just emptied. Every other mutating public method already
+fails closed against removed state through its own existing exact-object-
+identity check; a bare locator-generation call is not restricted, since it
+reserves nothing and is not itself a demonstrated resurrection path.
+Final-shutdown ordering in `aismixer.py` is a nested try/finally chain,
+mirroring `secure_server()`'s own shutdown chain for its per-listener
+cleanup: a UDP socket, the control server, or the forwarder failing to
+close cleanly does not prevent a later step (including the final owner
+`close()`) from running, and does not silently mask the failure either --
+each step's own exception, if any, still propagates once every later step
+has had its chance to run. Within the UDP-socket step itself, every
+socket's own `close()` is attempted individually (the first failure, if
+any, is what ultimately propagates) rather than a single `for sock in
+udp_sockets: sock.close()` that would abort on the first failure and
+leave every later socket in that same loop unclosed. That same final
+shutdown also drains any
+residual UDPSEC ingress/processing backlog and releases whatever namespace
+lease each abandoned frame still held (see Blocker B above), immediately
+before calling `close()`, so a frame that was accepted but never consumed
+by this same shutdown does not hold the registry open indefinitely.
 
 Each physical secure-listener socket incarnation owns one opaque endpoint
 token. The token has process-local object-identity semantics, remains stable
@@ -403,8 +750,29 @@ A DATA packet whose locator matches a live active session but whose source
 address does not structurally match that session's `active_path` is dropped
 before decryption is attempted, exactly as an unknown locator is; a locator
 is a lookup hint, never a bypass for path admission. Structural path
-equality compares `(ip, port)` for IPv4 and `(ip, port, scope_id)` for IPv6;
-IPv6 flow label (`flowinfo`) is not significant to path identity.
+equality -- one shared model (`core.sockaddr_identity`) used identically by
+the server's active-path/relation-index comparison and the client's pinned-
+remote-address check -- normalizes a raw address tuple to `(family, ip,
+port)` for IPv4 and `(family, ip, port, scope_id)` for IPv6, where `ip` is
+the canonical string form (so equivalent spellings, e.g. differing case or
+IPv6 zero-compression, compare equal); IPv6 flow label (`flowinfo`) is not
+significant to path identity. A bare IPv6 2-tuple (no scope information
+available) is compared as scope_id `0` explicitly -- never as a wildcard
+that matches any scope_id -- so it agrees with, and only with, a native
+4-tuple whose own scope_id is `0`. The canonical result is a distinct
+immutable type, not a plain tuple: a native IPv6 4-tuple and this
+canonical IPv6 form are both 4 elements long, so a plain-tuple result
+could otherwise be fed back in and silently misparsed as a different raw
+address; the distinct type makes normalization explicitly one-way, and
+handing a canonical value back in fails closed rather than being
+reinterpreted. A malformed or ambiguous address -- an unsupported tuple
+shape, a non-string IP, an IP string that does not parse, an out-of-range
+or non-integer port, a non-integer or negative flowinfo/scope_id, or an
+IPv6 zone-qualified address string (native OS sockaddrs convey scope only
+as the separate 4th tuple element, never embedded in the address string)
+-- fails closed rather than being treated as equivalent to a well-formed
+address. IPv4-mapped IPv6 literals remain IPv6 identity; they are never
+collapsed to IPv4.
 
 A bounded secondary relation index, keyed by endpoint token and the
 structurally-canonicalized active path, maps a relation to its current
@@ -754,10 +1122,21 @@ record has exactly one removal reason. Reading statistics invokes neither
 clock, performs no cleanup, exposes no mutable state, and does not change an
 earlier snapshot.
 
-This section governs only process-local secure state and the encrypted graceful
-close described above. It does not otherwise redefine secure packet formats,
-cryptographic algorithms, the signed handshake transcript, session-key
-derivation, or `nmea_sproxy` protocol compatibility.
+This section's UDPSEC revision-2 changes are real, not merely local
+bookkeeping: DATA framing (`DATA_PREFIX`, the session locator, and the
+locator-aware AAD described above), the authenticated transcript inputs
+(protocol version and locator bound into the server auth digest and session
+transcript hash), and `nmea_sproxy` wire compatibility (no V1 fallback, no
+downgrade, no negotiation) are all part of this revision and are documented
+above and in the surrounding protocol/crypto modules, not left unspecified.
+What this section does NOT change is the underlying cryptographic
+algorithms (P-256 ECDSA/ECDHE, HKDF-SHA256, AES-256-GCM) or the lifecycle
+policies intentionally preserved from the prior revision (TTL, capacity,
+LRU, replay, and nonce-exhaustion semantics as documented above). Path
+migration and a true in-session `CryptoEpoch` refresh that preserves an
+unchanged `LogicalSession`/`session_locator` are explicitly not yet
+implemented; every rekey in this revision still replaces the whole
+`LogicalSession` and mints a fresh locator, exactly as documented above.
 
 ## 12. Routing snapshot boundary
 
@@ -1194,12 +1573,43 @@ read-only protocol methods:
 | Protocol method | Parameters and result |
 |---|---|
 | `runtime.statistics` | `params` must be absent. One aggregate pull returns `ingress_queues`, `processing_queue`, `processor`, `egress_queue`, and `egress_operations`. |
-| `runtime.statistics.inputs` | `params` may be absent, empty, or exactly `{ "input": <non-empty string> }`. One detailed input-traffic pull returns `inputs` in runtime declaration order, optionally filtered by exact input name; no match returns an empty list. |
+| `runtime.statistics.inputs` | `params` may be absent, empty, or exactly `{ "input": <non-empty string> }`. One detailed input-traffic pull returns `inputs` in runtime declaration order, optionally filtered by exact input `name`; no match returns an empty list. |
 | `runtime.statistics.outputs` | `params` may be absent, empty, or contain exactly one of non-negative integer `target_id` or non-empty string `name`. One detailed output-traffic pull returns `outputs` in numeric target order, optionally filtered by that exact value; no match returns an empty list. |
 
 These methods only read the injected statistics provider and cannot replace,
 disable, or otherwise mutate routing or data-plane state. Conversely, routing
 status and mutation methods do not pull statistics.
+
+Each `runtime.statistics.inputs` row carries two deliberately separate
+string fields: `name` is the stable, machine-facing selector identity --
+the exact value `{ "input": ... }` matches against -- and `display` is
+the separate, purely operator-facing rendering. `name` is
+address-independent by construction, not merely differently formatted
+from `display`: for an ingress input lacking a configured `id`, `name` is
+exactly `role-ingress:index` (the declaration position within its role's
+list, which AISMixer's own startup already requires to be unique), never
+a rendered endpoint of any form -- this project's earlier bracketed-IPv6
+selector convention (`[ip]:port`) has been removed outright, not relocated
+to another field, since it was project-owned and never required by
+UDPSEC, socket identity, or the OS. A configured `id` remains part of
+`name` (`role-ingress:index:id`), since an operator-chosen label is
+already address-independent. `display` is the configured `id` verbatim
+when one exists, otherwise this project's tcpdump-style endpoint
+convention (`ip.port` for IPv6, `ip:port` for IPv4). `display` is never
+matched against a filter and must never be parsed back into an identity.
+`aismixerctl`'s interactive table renders both -- `display` under an
+`INPUT` column, `name` under a `SELECTOR` column -- so an operator can see
+the value to pass back as a filter.
+
+`ROUTING_CONTROL_PROTOCOL_VERSION` is `2`. It was deliberately bumped from
+`1` because the `runtime.statistics.inputs` result schema and the unnamed-
+input selector convention both changed in a way this local control
+protocol does not treat as backward-compatible; a version-`1` request now
+fails closed with `ERROR_UNSUPPORTED_VERSION`, with no negotiation or
+downgrade. This version number is entirely local to AISMixer's optional
+control plane and is unrelated to `UDPSEC_PROTOCOL_VERSION` (currently
+`2` for a different reason -- UDPSEC's own wire revision); the two must
+never be conflated.
 
 `aismixerctl` presents these protocol methods as `show statistics`,
 `show statistics inputs [INPUT]`, and `show statistics outputs [OUTPUT]`.

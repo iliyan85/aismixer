@@ -75,19 +75,83 @@ async def secure_server(*args, **kwargs):
     await implementation(*args, **kwargs)
 
 
+_secure_state_impl = None
+
+
+def _load_secure_state():
+    """Load UDPSEC's shared process-wide SecureState only for
+    configurations that require it -- same lazy-import discipline as
+    `_load_secure_server`."""
+
+    global _secure_state_impl
+    if _secure_state_impl is None:
+        from aismixer_secure import secure_state as implementation
+
+        _secure_state_impl = implementation
+    return _secure_state_impl
+
+
+async def secure_state_maintenance():
+    """Run the shared UDPSEC SecureState's periodic expiry/retirement-
+    purge housekeeping (F3), independent of any listener's own packet
+    traffic -- see `SecureState.run_periodic_maintenance` for why this
+    exists and what it does and does not affect. One task services every
+    secure listener sharing this process's default state, since they
+    already share its packet-triggered cleanup too; spawned at most once
+    regardless of how many secure inputs are configured."""
+
+    await _load_secure_state().run_periodic_maintenance()
+
+
 def ts() -> str:
     return str(time.time())
 
 
-def _ingress_task_name(role, index, entry, ip, port):
+def _ingress_task_name(role, index, entry):
+    """Stable, machine-facing selector/task-name identity for one ingress
+    input.
+
+    This is the exact runtime-statistics/routing-control selector name for
+    that input's traffic metrics (see `InputTrafficMetrics`/
+    `_runtime_statistics_inputs_result`) as well as its asyncio task and
+    ingress-queue name. It is deliberately address-independent: an ingress
+    input lacking a configured ``id`` gets ``role-ingress:index`` alone
+    (role plus its declaration position, which the enumeration in `main()`
+    already guarantees is unique), never a rendered endpoint. This
+    project's own earlier bracketed-IPv6 convention (``[ip]:port``) has
+    been removed entirely -- it was project-owned, not required by UDPSEC,
+    socket identity, or the OS, and coupling the selector to address
+    spelling meant any future change to human-facing endpoint rendering
+    (`core.endpoint_display.format_endpoint`) could silently change the
+    selector too.
+
+    A configured ``id`` remains part of the selector (``role-ingress:
+    index:id``) since it is already an operator-chosen, address-
+    independent label, not an endpoint rendering.
+    """
     configured_id = entry.get("id")
-    label = (
-        configured_id
-        if isinstance(configured_id, str) and configured_id
-        else format_endpoint(ip, port)
-    )
-    safe_label = label.encode("unicode_escape").decode("ascii")[:80]
-    return f"{role}-ingress:{index}:{safe_label}"
+    if isinstance(configured_id, str) and configured_id:
+        safe_label = configured_id.encode("unicode_escape").decode("ascii")[:80]
+        return f"{role}-ingress:{index}:{safe_label}"
+    return f"{role}-ingress:{index}"
+
+
+def _ingress_display_label(entry, ip, port):
+    """Operator-facing display label for one ingress input: the configured
+    ``id`` when present (an operator's own chosen label needs no further
+    rendering), otherwise this project's tcpdump-style endpoint convention
+    (`core.endpoint_display.format_endpoint`).
+
+    Deliberately separate from `_ingress_task_name`'s address-independent
+    selector above: the selector must stay stable regardless of address
+    spelling, interface choice, or how endpoints are rendered for humans,
+    while this label exists specifically to render the endpoint for an
+    operator to read.
+    """
+    configured_id = entry.get("id")
+    if isinstance(configured_id, str) and configured_id:
+        return configured_id
+    return format_endpoint(ip, port)
 
 
 def load_config():
@@ -416,6 +480,23 @@ class _BoundedProcessingQueue:
         self._slots.release()
         return work_item
 
+    def drain(self):
+        """Remove and return every currently queued work item immediately,
+        without waiting for or releasing admission permits.
+
+        R6/F4: intended only for final shutdown cleanup, after every
+        producer/consumer task sharing this queue has already stopped --
+        not for ordinary flow control, which must go through `get()`. A
+        work item abandoned here may still hold a namespace lease (see
+        `IngressFrame.admission_lease`) that nothing would otherwise ever
+        release.
+        """
+
+        items = []
+        while not self._work_queue.empty():
+            items.append(self._work_queue.get_nowait())
+        return items
+
     def metrics_snapshot(self) -> QueueMetricsSnapshot:
         """Return fresh immutable admission-queue lifetime metrics."""
 
@@ -527,6 +608,7 @@ async def ingress_fan_in_loop(
     *,
     routing_state=None,
     legacy_target_ids,
+    monotonic_clock=None,
 ):
     """Bind accepted ingress items while owning every private reader task.
 
@@ -540,6 +622,7 @@ async def ingress_fan_in_loop(
             "legacy_target_ids must be a non-string iterable"
         )
     legacy_target_ids = tuple(legacy_target_ids)
+    monotonic_now = time.monotonic if monotonic_clock is None else monotonic_clock
 
     async def reader(q):
         while True:
@@ -547,14 +630,34 @@ async def ingress_fan_in_loop(
             frame = coerce_ingress_frame(item)
             if frame is None:
                 continue
-            await processing_queue.admit(
-                partial(
-                    _bind_processing_work_item,
-                    frame,
-                    routing_state=routing_state,
-                    legacy_target_ids=legacy_target_ids,
+            # R7: this reader is the sole holder of `frame` (and any
+            # namespace lease it carries -- see `IngressFrame.
+            # admission_lease`) from here until `admit()` actually
+            # transfers it into the processing queue. `admit()` either
+            # completes normally (ownership has transferred: ordinary
+            # queue depth accounting and, eventually, `processor_stage_
+            # loop`/`PythonDataPlaneProcessor.process()` own releasing
+            # it) or raises for ANY reason -- capacity never freed before
+            # this task was cancelled, `work_item_factory` failing, or a
+            # cancellation landing during the atomic bind-and-enqueue
+            # step itself -- in which case ownership never transferred
+            # anywhere else, and this reader must release the lease
+            # itself rather than silently dropping it. A fresh clock
+            # reading is taken now, not a cached admission-time value, so
+            # the release reflects the actual instant this frame's
+            # journey ended, however long it waited for capacity first.
+            try:
+                await processing_queue.admit(
+                    partial(
+                        _bind_processing_work_item,
+                        frame,
+                        routing_state=routing_state,
+                        legacy_target_ids=legacy_target_ids,
+                    )
                 )
-            )
+            except BaseException:
+                frame.release_admission_lease(monotonic_now())
+                raise
 
     if not input_queues:
         await asyncio.get_running_loop().create_future()
@@ -944,15 +1047,17 @@ async def main(
                 "udpsec",
                 index,
                 entry,
-                ip,
-                port,
             )
             q = _ObservedQueue(
                 name=task_name,
                 maxsize=ingress_queue_maxsize,
             )
             input_queues.append(q)
-            traffic = InputTrafficMetrics(task_name, "udpsec")
+            traffic = InputTrafficMetrics(
+                task_name,
+                "udpsec",
+                display=_ingress_display_label(entry, ip, port),
+            )
             input_traffic.append(traffic)
             sec_id = entry.get("id")
             print(f"{ts()} Secure listening on {format_endpoint(ip, port)}")
@@ -973,6 +1078,19 @@ async def main(
                 )
             )
 
+        if SEC_INPUTS:
+            # F3: one shared-state maintenance task regardless of how
+            # many secure inputs are configured -- every listener above
+            # shares this same process-default `secure_state`, so one
+            # task keeps its expiry/retirement-purge housekeeping running
+            # even while every configured listener is otherwise idle.
+            runtime_task_specs.append(
+                _RuntimeTaskSpec(
+                    name="udpsec-state-maintenance",
+                    coroutine_factory=secure_state_maintenance,
+                )
+            )
+
         # UDP входове
         for index, (entry, ingress_policy) in enumerate(
             zip(UDP_INPUTS, udp_input_policies)
@@ -983,15 +1101,17 @@ async def main(
                 "udp",
                 index,
                 entry,
-                ip,
-                port,
             )
             q = _ObservedQueue(
                 name=task_name,
                 maxsize=ingress_queue_maxsize,
             )
             input_queues.append(q)
-            traffic = InputTrafficMetrics(task_name, "udp")
+            traffic = InputTrafficMetrics(
+                task_name,
+                "udp",
+                display=_ingress_display_label(entry, ip, port),
+            )
             input_traffic.append(traffic)
             sock = create_udp_listener_socket(ip, reuse_address=True)
             udp_sockets.append(sock)
@@ -1080,11 +1200,75 @@ async def main(
         )
         await _supervise_named_tasks(runtime_task_specs)
     finally:
-        for sock in udp_sockets:
-            sock.close()
-        if control_server_started:
-            await control_server.close()
-        forwarder.close()
+        # R6/F5: nested try/finally, matching the pattern
+        # `secure_server()`'s own shutdown already uses for
+        # `close_owned_sessions`/`close_owned_pending_sessions`/
+        # `sock.close()` -- an exception from an earlier step (a UDP
+        # socket, the control server, or the forwarder failing to close
+        # cleanly) must not prevent a later step from running, and must
+        # not silently disappear either: each `finally` here still lets
+        # its own exception (if any) propagate once every later step has
+        # had its chance to run too.
+        try:
+            # R7: attempt every socket's close even if an earlier one
+            # raises -- a plain `for sock in udp_sockets: sock.close()`
+            # would abort the loop on the first failure and leave every
+            # later socket in it unclosed. The first failure (if any) is
+            # still raised once every socket has had its own close
+            # attempted, so a genuine close error is never silently
+            # masked.
+            first_socket_close_error = None
+            for sock in udp_sockets:
+                try:
+                    sock.close()
+                except BaseException as exc:
+                    if first_socket_close_error is None:
+                        first_socket_close_error = exc
+            if first_socket_close_error is not None:
+                raise first_socket_close_error
+        finally:
+            try:
+                if control_server_started:
+                    await control_server.close()
+            finally:
+                try:
+                    forwarder.close()
+                finally:
+                    if SEC_INPUTS:
+                        # R5/F5: final owner-level teardown of the shared
+                        # UDPSEC state, once every listener sharing it has
+                        # already stopped (each secure listener already
+                        # closed its own exact sessions/pending candidates
+                        # in `secure_server()`'s own shutdown `finally`
+                        # block, as part of `_supervise_named_tasks`
+                        # returning above) -- safe here specifically
+                        # because nothing else can still be using this
+                        # owner past this point.
+                        shutdown_now = time.monotonic()
+                        # R6/F4: release any namespace lease still held by
+                        # a frame that was accepted but never reached the
+                        # processor -- abandoned ingress/processing
+                        # backlog from this same shutdown, bounded by
+                        # each queue's own configured capacity, not by
+                        # total lifetime traffic. A plain-UDP-only frame
+                        # never carries a lease, so this is a no-op for
+                        # it; every producer/consumer task sharing these
+                        # queues has already stopped, so draining them
+                        # here is safe.
+                        for work_item in processor_queue.drain():
+                            work_item.frame.release_admission_lease(
+                                shutdown_now
+                            )
+                        for ingress_queue in input_queues:
+                            while not ingress_queue.empty():
+                                frame = coerce_ingress_frame(
+                                    ingress_queue.get_nowait()
+                                )
+                                if frame is not None:
+                                    frame.release_admission_lease(
+                                        shutdown_now
+                                    )
+                        _load_secure_state().close(shutdown_now)
 
 def _raise_keyboard_interrupt_for_sigterm(_signum, _frame):
     raise KeyboardInterrupt

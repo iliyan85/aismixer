@@ -53,6 +53,8 @@ def make_frame(
     alias_for_s=None,
     remote_ip=REMOTE_IP,
     assembler_key=ASSEMBLER_KEY,
+    admitted_at=None,
+    admission_lease=None,
 ):
     return IngressFrame(
         kind="udp",
@@ -61,6 +63,8 @@ def make_frame(
         remote_ip=remote_ip,
         assembler_key=assembler_key,
         payload=payload.encode("utf-8"),
+        admitted_at=admitted_at,
+        admission_lease=admission_lease,
     )
 
 
@@ -1469,3 +1473,386 @@ def test_multipart_crosses_generations_and_uses_completion_numeric_targets():
     )
     assert assembler.stats().completed == 1
     assert assembler.stats().resets == 0
+
+
+# --- F4 (UDPSEC V2 Corrective Closure R4): enforced maximum ingress frame
+# age, closing the gap where none of the ingress/processing queues between
+# UDPSEC admission and this processor impose a maximum residence time.
+
+
+def test_frame_with_no_admitted_at_is_never_age_checked():
+    """Only namespace-bearing (UDPSEC) frames set `admitted_at`; every
+    other source's frames must be processed normally regardless of how
+    far forward the clock has moved, since they carry no reuse hazard."""
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 10_000.0,
+        max_ingress_frame_age=1.0,
+    )
+
+    outputs = process_outputs(
+        processor, make_frame(SENTENCE, admitted_at=None), make_snapshot()
+    )
+
+    assert len(outputs) == 1
+    assert processor.stale_frames_dropped == 0
+
+
+def test_stale_ingress_frame_is_dropped_without_reaching_assembler():
+    """A frame older than the configured maximum age must be refused
+    outright -- not fed to the assembler in any form, single-sentence or
+    multipart -- and produces no output."""
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 100.0,
+        max_ingress_frame_age=20.0,
+    )
+    stats_before = assembler.stats()
+
+    outputs = process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=50.0),  # age = 100 - 50 = 50 > 20
+        make_snapshot(),
+    )
+
+    assert outputs == ()
+    assert processor.stale_frames_dropped == 1
+    # The assembler was never called at all -- not merely "produced no
+    # output" -- so every one of its own counters is untouched.
+    assert assembler.stats() == stats_before
+
+
+def test_fresh_ingress_frame_within_age_bound_is_processed_normally():
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 100.0,
+        max_ingress_frame_age=20.0,
+    )
+
+    outputs = process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=85.0),  # age = 100 - 85 = 15 < 20
+        make_snapshot(),
+    )
+
+    assert len(outputs) == 1
+    assert processor.stale_frames_dropped == 0
+
+
+def test_ingress_frame_exactly_at_the_age_boundary_is_accepted():
+    """Boundary semantics match the rest of this codebase's TTL checks:
+    exactly at the limit is still accepted, only strictly OVER it is
+    refused."""
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 100.0,
+        max_ingress_frame_age=20.0,
+    )
+
+    outputs = process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=80.0),  # age == 20.0 exactly
+        make_snapshot(),
+    )
+
+    assert len(outputs) == 1
+    assert processor.stale_frames_dropped == 0
+
+
+def test_stale_frame_drop_accounts_as_a_completed_outputless_call():
+    """A deliberate staleness drop is a normal completed call with zero
+    outputs -- not a failure -- matching how any other empty-output
+    completion is accounted."""
+    processor = make_processor(
+        monotonic_clock=lambda: 100.0,
+        max_ingress_frame_age=20.0,
+    )
+
+    process_batch(processor, make_frame(SENTENCE, admitted_at=0.0), make_snapshot())
+
+    metrics = processor.metrics_snapshot()
+    assert metrics.process_calls == 1
+    assert metrics.process_completed == 1
+    assert metrics.process_failed == 0
+    assert metrics.outputless_calls == 1
+    assert metrics.output_batches == 0
+    assert processor.stale_frames_dropped == 1
+
+
+def test_max_ingress_frame_age_defaults_to_module_constant():
+    processor = make_processor()
+    assert (
+        processor._max_ingress_frame_age
+        == python_data_plane_module.MAX_INGRESS_FRAME_AGE_SECONDS
+    )
+
+
+# --- R5/F4: the complete namespace-lifetime contract -- configuration
+# validation, the exact retention-formula boundary, and safe handling of
+# invalid/non-finite/future timestamps.
+
+
+def test_assembler_timeout_incompatible_with_default_frame_age_is_rejected():
+    """An assembler timeout long enough that max_ingress_frame_age +
+    assembler.timeout would exceed RETIREMENT_SECONDS must be rejected at
+    construction, not silently accepted while claiming the same
+    guarantee as the default configuration."""
+    incompatible_assembler = AIVDMAssembler(timeout=15.0)  # 20 + 15 > 30
+
+    with pytest.raises(ValueError):
+        make_processor(assembler=incompatible_assembler)
+
+
+def test_incompatible_max_ingress_frame_age_is_rejected():
+    with pytest.raises(ValueError):
+        make_processor(max_ingress_frame_age=35.0)  # 35 + 1 > 30
+
+
+def test_retention_relationship_is_accepted_exactly_at_its_boundary():
+    """max_ingress_frame_age + assembler.timeout == RETIREMENT_SECONDS
+    exactly is a genuinely covered configuration, not an off-by-one
+    rejection: `<=`, not `<`."""
+    assembler = AIVDMAssembler(timeout=1.0)
+    processor = make_processor(
+        assembler=assembler, max_ingress_frame_age=29.0
+    )  # 29 + 1 == 30 == RETIREMENT_SECONDS
+    assert processor._max_ingress_frame_age == 29.0
+
+
+def test_retention_relationship_one_second_past_its_boundary_is_rejected():
+    assembler = AIVDMAssembler(timeout=1.0)
+    with pytest.raises(ValueError):
+        make_processor(assembler=assembler, max_ingress_frame_age=29.1)
+
+
+@pytest.mark.parametrize(
+    "bad_age", [0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_non_finite_or_non_positive_max_ingress_frame_age_is_rejected(bad_age):
+    with pytest.raises(ValueError):
+        make_processor(max_ingress_frame_age=bad_age)
+
+
+def test_max_ingress_frame_age_must_be_a_real_number():
+    with pytest.raises(TypeError):
+        make_processor(max_ingress_frame_age="20")
+    with pytest.raises(TypeError):
+        make_processor(max_ingress_frame_age=True)
+
+
+def test_assembler_without_a_timeout_attribute_skips_the_cross_check():
+    """An assembler stand-in with no `.timeout` (not the production
+    `AIVDMAssembler`) is trusted as-is for the cross-check -- this
+    processor cannot introspect an unknown assembler's own group
+    lifetime, so it does not guess."""
+
+    class _AssemblerWithoutTimeout:
+        def feed_parsed_outcome(self, parsed):
+            raise AssertionError("not called in this test")
+
+        def reset(self):
+            return ()
+
+    # Would exceed RETIREMENT_SECONDS if timeout were assumed to be the
+    # AIVDMAssembler default -- but there is no `.timeout` to check here.
+    processor = make_processor(
+        assembler=_AssemblerWithoutTimeout(), max_ingress_frame_age=29.9
+    )
+    assert processor._max_ingress_frame_age == 29.9
+
+
+@pytest.mark.parametrize("bad_age_value", [float("nan"), float("inf")])
+def test_non_finite_computed_age_is_refused_as_stale(monkeypatch, bad_age_value):
+    """A non-finite `age` (a corrupted or mismatched-clock-domain
+    `admitted_at`) must fail closed as stale, not crash or bypass the
+    check."""
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: bad_age_value,
+    )
+
+    outputs = process_outputs(
+        processor, make_frame(SENTENCE, admitted_at=0.0), make_snapshot()
+    )
+
+    assert outputs == ()
+    assert processor.stale_frames_dropped == 1
+
+
+def test_admitted_at_appearing_to_be_in_the_future_is_refused_as_stale():
+    """A NEGATIVE computed age (`admitted_at` in the future relative to
+    this processor's own clock) is impossible for a genuine same-clock-
+    domain observation and must fail closed rather than being treated as
+    'very fresh' and bypassing the check entirely."""
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 10.0,
+    )
+
+    outputs = process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=20.0),  # "future" relative to 10.0
+        make_snapshot(),
+    )
+
+    assert outputs == ()
+    assert processor.stale_frames_dropped == 1
+
+
+def test_multi_sentence_frame_cannot_use_a_stale_timestamp_for_any_sentence():
+    """A single frame's age is observed exactly once, before parsing --
+    proving a stale multi-sentence frame is refused in its entirety
+    (every sentence), never processing some sentences under the age
+    check and others past it, since no delay can elapse between them
+    within one synchronous call."""
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 100.0,
+        max_ingress_frame_age=20.0,
+    )
+    two_sentence_payload = "\n".join(
+        (make_multipart_sentence(1, "first"), make_multipart_sentence(2, "second"))
+    )
+
+    outputs = process_outputs(
+        processor,
+        make_frame(two_sentence_payload, admitted_at=50.0),  # age 50 > 20
+        make_snapshot(),
+    )
+
+    assert outputs == ()
+    assert processor.stale_frames_dropped == 1
+    assert assembler.stats().current_groups == 0
+    assert assembler.stats().completed == 0
+
+
+def test_reset_does_not_affect_stale_frame_accounting_or_age_configuration():
+    """reset() clears assembler/dedup/source-state and multipart metadata
+    only -- it must not create a hidden extension of any namespace's
+    enforced lifetime by resetting or bypassing the age-check
+    configuration or its counters."""
+    assembler = AIVDMAssembler(clock=lambda: 0.0)
+    processor = make_processor(
+        assembler=assembler,
+        monotonic_clock=lambda: 100.0,
+        max_ingress_frame_age=20.0,
+    )
+    process_outputs(
+        processor, make_frame(SENTENCE, admitted_at=0.0), make_snapshot()
+    )
+    assert processor.stale_frames_dropped == 1
+
+    processor.reset()
+
+    assert processor.stale_frames_dropped == 1
+    assert processor._max_ingress_frame_age == 20.0
+    # Still enforced identically after reset, using the same clock.
+    outputs = process_outputs(
+        processor, make_frame(SENTENCE, admitted_at=0.0), make_snapshot()
+    )
+    assert outputs == ()
+    assert processor.stale_frames_dropped == 2
+
+
+def test_frame_with_no_admission_lease_is_unaffected_by_the_release_call():
+    """R6/F4: a plain UDP/serial frame (no `admitted_at`, no
+    `admission_lease`) must behave exactly as before -- `process()`'s new
+    `release_admission_lease()` call in its `finally` is a documented
+    no-op when `admission_lease` is `None`, not a new requirement placed
+    on non-UDPSEC sources."""
+    processor = make_processor()
+
+    outputs = process_outputs(
+        processor, make_frame(SENTENCE), make_snapshot()
+    )
+
+    assert len(outputs) == 1
+
+
+class _RecordingLease:
+    def __init__(self):
+        self.release_calls = []
+
+    def release(self, now):
+        self.release_calls.append(now)
+
+
+def test_admission_lease_is_released_exactly_once_on_successful_completion():
+    lease = _RecordingLease()
+    processor = make_processor(monotonic_clock=lambda: 42.0)
+
+    process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=0.0, admission_lease=lease),
+        make_snapshot(),
+    )
+
+    assert lease.release_calls == [42.0]
+
+
+def test_admission_lease_is_released_exactly_once_on_a_stale_age_drop():
+    lease = _RecordingLease()
+    processor = make_processor(
+        monotonic_clock=lambda: 1000.0, max_ingress_frame_age=20.0
+    )
+
+    outputs = process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=0.0, admission_lease=lease),
+        make_snapshot(),
+    )
+
+    assert outputs == ()
+    assert processor.stale_frames_dropped == 1
+    assert lease.release_calls == [1000.0]
+
+
+def test_admission_lease_is_released_exactly_once_even_when_processing_raises():
+    lease = _RecordingLease()
+
+    class _RaisingAssembler:
+        timeout = None
+
+        def feed_parsed_outcome(self, _parsed):
+            raise RuntimeError("boom")
+
+        def reset(self):
+            return ()
+
+    processor = make_processor(
+        assembler=_RaisingAssembler(), monotonic_clock=lambda: 5.0
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        processor.process(
+            make_frame(SENTENCE, admitted_at=0.0, admission_lease=lease),
+            make_snapshot(),
+        )
+
+    assert lease.release_calls == [5.0]
+
+
+def test_reset_does_not_release_or_otherwise_touch_any_admission_lease():
+    """`reset()` operates on the assembler/dedup/source-state/multipart
+    metadata this processor owns -- never on a frame's lease, which is
+    scoped strictly to one `process()` call and always already released
+    by the time that call returns."""
+    lease = _RecordingLease()
+    processor = make_processor(monotonic_clock=lambda: 1.0)
+    process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=0.0, admission_lease=lease),
+        make_snapshot(),
+    )
+    assert lease.release_calls == [1.0]
+
+    processor.reset()
+
+    assert lease.release_calls == [1.0]  # unchanged: reset() never touches it

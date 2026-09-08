@@ -544,6 +544,268 @@ def test_fan_in_normalizes_legacy_target_ids_once_for_repeated_use():
     asyncio.run(scenario())
 
 
+class _RecordingLease:
+    def __init__(self):
+        self.release_calls = []
+
+    def release(self, now):
+        self.release_calls.append(now)
+
+
+def make_leased_frame(label, lease):
+    return IngressFrame(
+        kind="sec",
+        source_id=f"udpsec:{label}",
+        alias_for_s=None,
+        remote_ip=None,
+        assembler_key=f"udpsec-assembly:{label}",
+        payload=f"!AIVDM,1,1,,A,{label},0*00".encode("ascii"),
+        admission_lease=lease,
+    )
+
+
+async def _wait_for_put_waiters(queue, expected):
+    async def observe():
+        while queue.metrics_snapshot().current_put_waiters != expected:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(observe(), timeout=1.0)
+
+
+def test_r7_reader_cancelled_while_blocked_in_admit_releases_its_lease_exactly_once():
+    """R7/Correction B: the exact independently-reproduced defect. Once
+    the reader has dequeued a lease-bearing frame from its ingress queue,
+    it is that frame's sole owner until `processing_queue.admit()`
+    actually transfers it in. If the reader is cancelled while still
+    blocked waiting for processing capacity, ownership never transferred
+    anywhere else -- the reader itself must release the lease exactly
+    once, using a fresh clock reading, rather than silently dropping it
+    (a real, low-severity but genuine registry-reference leak)."""
+
+    async def scenario():
+        processing_queue = aismixer._BoundedProcessingQueue(1)
+        # Fill the only processing slot so the reader's own admit() call
+        # is forced to genuinely block waiting for capacity.
+        await processing_queue.admit(
+            lambda: make_work_item(make_frame("occupied"))
+        )
+
+        ingress_queue = asyncio.Queue()
+        lease = _RecordingLease()
+        await ingress_queue.put(make_leased_frame("boat_001", lease))
+
+        clock_readings = iter([555.0])
+        fan_in_task = asyncio.create_task(
+            aismixer.ingress_fan_in_loop(
+                (ingress_queue,),
+                processing_queue,
+                legacy_target_ids=(),
+                monotonic_clock=lambda: next(clock_readings, 555.0),
+            )
+        )
+        try:
+            await _wait_for_put_waiters(processing_queue, 1)
+            assert not fan_in_task.done()
+            assert lease.release_calls == []
+
+            fan_in_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await fan_in_task
+        finally:
+            if not fan_in_task.done():
+                await cancel_task(fan_in_task)
+
+        assert lease.release_calls == [555.0]
+
+    asyncio.run(scenario())
+
+
+def test_r7_successful_admit_does_not_release_the_lease():
+    """Companion to the cancellation test above: when `admit()` actually
+    succeeds, ownership has transferred to the processing queue -- the
+    reader must NOT release the lease itself; only the eventual consumer
+    (`processor_stage_loop`/`PythonDataPlaneProcessor.process()`) does,
+    once it actually finishes with the frame."""
+
+    async def scenario():
+        processing_queue = aismixer._BoundedProcessingQueue(2)
+        ingress_queue = asyncio.Queue()
+        lease = _RecordingLease()
+        await ingress_queue.put(make_leased_frame("boat_002", lease))
+
+        task = asyncio.create_task(
+            aismixer.ingress_fan_in_loop(
+                (ingress_queue,),
+                processing_queue,
+                legacy_target_ids=(),
+            )
+        )
+        try:
+            work_item = await asyncio.wait_for(
+                processing_queue.get(), timeout=1.0
+            )
+        finally:
+            await cancel_task(task)
+
+        assert work_item.frame.admission_lease is lease
+        assert lease.release_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_r7_work_item_factory_failure_releases_lease_and_restores_capacity():
+    """A `work_item_factory` failure inside `admit()` (here: a routing
+    snapshot that raises) means ownership never transferred either --
+    the reader must release the lease and `admit()`'s own existing
+    permit-restoration must still leave capacity usable afterward."""
+
+    async def scenario():
+        class FailingRoutingState:
+            def snapshot(self):
+                raise RuntimeError("snapshot failed")
+
+        processing_queue = aismixer._BoundedProcessingQueue(1)
+        ingress_queue = asyncio.Queue()
+        lease = _RecordingLease()
+        await ingress_queue.put(make_leased_frame("boat_003", lease))
+
+        task = asyncio.create_task(
+            aismixer.ingress_fan_in_loop(
+                (ingress_queue,),
+                processing_queue,
+                routing_state=FailingRoutingState(),
+                legacy_target_ids=(),
+                monotonic_clock=lambda: 999.0,
+            )
+        )
+        # The reader's own task fails (via the essential-task supervisor
+        # re-raising), so awaiting it surfaces the underlying error.
+        with pytest.raises(RuntimeError, match="snapshot failed"):
+            await asyncio.wait_for(task, timeout=1.0)
+
+        assert lease.release_calls == [999.0]
+        # Capacity was restored: a fresh admission still succeeds.
+        recovery_lease = _RecordingLease()
+        await processing_queue.admit(
+            lambda: make_work_item(make_leased_frame("recovery", recovery_lease))
+        )
+        assert (await processing_queue.get()).frame.admission_lease is (
+            recovery_lease
+        )
+
+    asyncio.run(scenario())
+
+
+def test_r7_plain_udp_frame_without_a_lease_is_unaffected_by_cancellation():
+    """A non-UDPSEC frame never carries a lease -- the reader's new
+    try/except around `admit()` must impose no new requirement or cost
+    on it: cancellation while blocked is a plain re-raise, same as
+    before this correction."""
+
+    async def scenario():
+        processing_queue = aismixer._BoundedProcessingQueue(1)
+        await processing_queue.admit(
+            lambda: make_work_item(make_frame("occupied"))
+        )
+        ingress_queue = asyncio.Queue()
+        await ingress_queue.put(make_frame("plain"))
+
+        fan_in_task = asyncio.create_task(
+            aismixer.ingress_fan_in_loop(
+                (ingress_queue,),
+                processing_queue,
+                legacy_target_ids=(),
+            )
+        )
+        try:
+            await _wait_for_put_waiters(processing_queue, 1)
+            fan_in_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await fan_in_task
+        finally:
+            if not fan_in_task.done():
+                await cancel_task(fan_in_task)
+
+    asyncio.run(scenario())
+
+
+def test_r7_reader_cancellation_does_not_permanently_block_the_real_registry(
+    monkeypatch,
+):
+    """End-to-end with the REAL `SessionIdentityRegistry` (not a test
+    double): a lease taken out on a real reservation and abandoned by a
+    cancelled reader must not permanently prevent that exact value from
+    ever being reused, and must not affect a second, independent live
+    reservation the registry also holds throughout -- proving the fix
+    closes the leak rather than merely instrumenting it."""
+    import core.session_identity_registry as identity_registry_module
+    from core.session_identity_registry import SessionIdentityRegistry
+
+    async def scenario():
+        registry = SessionIdentityRegistry(retirement_seconds=30.0)
+        namespace = registry.reserve()
+        other_owner_value = registry.reserve()  # a second, unrelated owner
+        lease = registry.lease(namespace)
+        registry.release(namespace, now=0.0)  # the "owning session" is done
+        assert registry.is_live(namespace)  # the lease alone keeps it so
+
+        processing_queue = aismixer._BoundedProcessingQueue(1)
+        await processing_queue.admit(
+            lambda: make_work_item(make_frame("occupied"))
+        )
+        ingress_queue = asyncio.Queue()
+        frame = IngressFrame(
+            kind="sec",
+            source_id="udpsec:boat_001",
+            alias_for_s=None,
+            remote_ip=None,
+            assembler_key=f"udpsec-assembly:{namespace.hex()}",
+            payload=b"!AIVDM,1,1,,A,payload,0*00",
+            admission_lease=lease,
+        )
+        await ingress_queue.put(frame)
+
+        fan_in_task = asyncio.create_task(
+            aismixer.ingress_fan_in_loop(
+                (ingress_queue,),
+                processing_queue,
+                legacy_target_ids=(),
+                monotonic_clock=lambda: 30.0,
+            )
+        )
+        try:
+            await _wait_for_put_waiters(processing_queue, 1)
+            fan_in_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await fan_in_task
+        finally:
+            if not fan_in_task.done():
+                await cancel_task(fan_in_task)
+
+        # The lease was released at the cancellation instant: the value
+        # is now genuinely retiring, not permanently live.
+        assert not registry.is_live(namespace)
+        assert registry.is_retiring(namespace)
+        # The second, unrelated owner's own reservation is completely
+        # unaffected throughout.
+        assert registry.is_live(other_owner_value)
+
+        registry.purge_expired(now=30.0 + 30.0 + 1.0)
+        assert not registry.is_retiring(namespace)
+        # Forced onto the exact same bytes to directly prove reuse is now
+        # possible -- a controlled allocator draw, not a claim about
+        # breaking real randomness.
+        monkeypatch.setattr(
+            identity_registry_module.os, "urandom", lambda _length: namespace
+        )
+        result = registry.reserve()
+        assert result == namespace
+        assert registry.is_live(namespace)
+        assert registry.is_live(other_owner_value)
+
+    asyncio.run(scenario())
+
+
 def test_non_empty_global_target_ids_reach_numeric_egress_unchanged():
     async def scenario():
         payload = b"global\r\n"
