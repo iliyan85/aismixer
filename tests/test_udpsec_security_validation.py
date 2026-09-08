@@ -2266,6 +2266,96 @@ def test_real_concurrent_pending_handshakes_respect_pending_capacity(
                 client.close()
 
 
+def test_r6_sustained_pending_replacement_churn_via_real_secure_receive_path(
+    real_udpsec_endpoints,
+):
+    """Blocker A (R6), reproduced through the real, production
+    `_secure_server_loop` receive path with real signed ClientHello
+    packets from one physical client address -- not direct `SecureState`
+    manipulation. Matches the audit's own real-path reproduction (100
+    ClientHellos, one live pending candidate, 100 heap entries): before
+    this fix, a same-relation pending replacement's stale heap entry
+    (keyed only by relation, not by the specific candidate incarnation)
+    would be found "still occupied" by whatever candidate currently held
+    that relation and recompute/reschedule THAT candidate's deadline
+    rather than being discarded -- so the heap grew by one entry per
+    ClientHello despite only one pending candidate ever being live."""
+    endpoints = real_udpsec_endpoints
+    state = endpoints.secure.SecureState(
+        pending_session_ttl=3.0, max_pending_sessions=1
+    )
+    replacement_count = 100
+    # A real socket round-trip is far faster than a 3-second TTL, so a
+    # real wall clock would never actually reach cleanup due-ness within
+    # this test -- a shared gated clock lets each ClientHello advance
+    # time by exactly one second, deterministically reproducing the
+    # audit's own "replacement every second" pacing.
+    clock = _GatedClock(0.0)
+
+    with _running_secure_server(
+        endpoints.secure,
+        endpoints.server_private_key,
+        socket.AF_INET,
+        "127.0.0.1",
+        state=state,
+        monotonic_clock=clock,
+    ) as server:
+        client = _client_socket(socket.AF_INET, "127.0.0.1")
+        try:
+            for step in range(replacement_count):
+                clock.set(float(step))
+                client_random = os.urandom(32)
+                client_ephemeral_private_key = ec.generate_private_key(
+                    ec.SECP256R1()
+                )
+                client_ephemeral_public_key = (
+                    client_ephemeral_private_key.public_key().public_bytes(
+                        encoding=serialization.Encoding.X962,
+                        format=serialization.PublicFormat.CompressedPoint,
+                    )
+                )
+                digest = endpoints.proxy.build_client_auth_digest(
+                    protocol_version=UDPSEC_PROTOCOL_VERSION,
+                    station_id=STATION_ID,
+                    timestamp=int(time.time()),
+                    client_random=client_random,
+                    client_ephemeral_public_key=client_ephemeral_public_key,
+                )
+                signature = endpoints.proxy.sign_transcript_digest(
+                    endpoints.station_private_key, digest
+                )
+                hello = ClientHello(
+                    protocol_version=UDPSEC_PROTOCOL_VERSION,
+                    station_id=STATION_ID,
+                    timestamp=int(time.time()),
+                    client_random=client_random,
+                    client_ephemeral_public_key=client_ephemeral_public_key,
+                    client_signature=signature,
+                )
+                client.sendto(
+                    build_client_hello_packet(hello), server.remote_addr
+                )
+                client.recvfrom(8192)
+
+            def snapshot():
+                return (
+                    state.stats(),
+                    len(state._pending_sessions),
+                    len(state._pending_expiry_heap),
+                )
+
+            stats, pending_count, heap_size = server.call_in_loop(snapshot)
+            assert stats.pending_sessions_created == replacement_count
+            assert pending_count == 1
+            assert heap_size <= 5, (
+                f"pending expiry heap retained {heap_size} entries after "
+                f"{replacement_count} real ClientHello replacements from "
+                "one address"
+            )
+        finally:
+            client.close()
+
+
 def test_ipv6_remote_comparison_uses_ip_port_and_scope_from_four_tuple(
     real_udpsec_endpoints,
 ):

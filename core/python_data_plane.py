@@ -72,6 +72,16 @@ def _validate_retention_compatibility(max_ingress_frame_age, assembler):
     Only enforced when `assembler` actually exposes a numeric `timeout`
     (the production `AIVDMAssembler` always does); an assembler stand-in
     without one is trusted as-is rather than guessed at.
+
+    R6/F4: `frame.admission_lease` (see `IngressFrame` and `process()`)
+    now makes the in-flight pipeline residence itself unconditionally
+    safe -- a lease-carrying frame cannot be outlived by the namespace's
+    retirement while `process()` is still running, regardless of
+    `max_ingress_frame_age`. This formula's remaining job is the tail
+    AFTER that lease is released (when `process()` returns): the
+    assembler GROUP it fed may still be alive for up to
+    `assembler.timeout` more seconds, and this inequality is what keeps
+    that tail inside the registry's own retirement window.
     """
     if not isinstance(max_ingress_frame_age, (int, float)) or isinstance(
         max_ingress_frame_age, bool
@@ -254,6 +264,17 @@ class PythonDataPlaneProcessor:
             return output_batch
         finally:
             self._process_in_flight -= 1
+            # R6/F4: release this frame's own namespace lease (if any)
+            # exactly once here, covering every exit from `_process_impl`
+            # -- normal completion, an early stale-age drop, or any
+            # exception -- rather than at each individual return point.
+            # This is what actually closes the post-age-check pause race:
+            # for as long as this call has not reached this line, the
+            # lease keeps the frame's `assembler_key` reservation live no
+            # matter how long `_process_impl` takes, so the identifier
+            # cannot be retired and reissued to an unrelated station out
+            # from under an in-flight parse-and-feed operation.
+            frame.release_admission_lease(self._monotonic_clock())
 
     def _process_impl(
         self,
@@ -264,28 +285,30 @@ class PythonDataPlaneProcessor:
 
         # F4: a frame whose assembler_key is tied to a process-wide
         # identifier with a bounded reuse window (currently only UDPSEC's
-        # assembly_namespace -- see `IngressFrame.admitted_at`) must never
-        # reach the assembler after that window could plausibly have
-        # elapsed and let the identifier be reused for an unrelated
-        # station. None of the ingress/processing queues between UDPSEC
-        # admission and here impose a maximum residence time (only a
-        # maximum depth), so this is the actual enforcement point, not
-        # merely a documented assumption. A frame with no `admitted_at`
-        # (every non-UDPSEC source) has no such hazard and is never
-        # subject to this check.
+        # assembly_namespace -- see `IngressFrame.admitted_at`) is refused
+        # once it has sat in the ingress/processing pipeline for too long
+        # -- none of those queues impose a maximum residence time of
+        # their own (only a maximum depth), so old backlog could
+        # otherwise sit indefinitely under sustained pressure. A frame
+        # with no `admitted_at` (every non-UDPSEC source) has no such
+        # hazard and is never subject to this check.
         #
-        # This one observation, taken once, covers every sentence in this
-        # frame and every `feed_parsed_outcome()` call the loop below may
-        # make: `_process_impl` is a single synchronous call with no
-        # `await` or other yield point, so no further delay can elapse
-        # between sentences within it. This does not protect against an
-        # OS-level thread preemption or GC pause happening to land inside
-        # that call and lasting long enough to matter -- the same
-        # execution-model assumption every other latency-sensitive
-        # synchronous path in this codebase already relies on, not a new
-        # one introduced here -- so `RETIREMENT_SECONDS`'s margin is sized
-        # for realistic scheduling/GC jitter of one bounded parse-and-feed
-        # call, not for arbitrary suspension.
+        # R6/F4: this is now a bounded-backlog/QoS policy, NOT the
+        # mechanism that actually prevents a namespace-reuse race. The
+        # authoritative safety property comes from `frame.admission_lease`
+        # (see `core.session_identity_registry.SessionIdentityRegistry.
+        # lease` and `process()`'s `finally`, above): a lease-carrying
+        # frame holds its own independent, live reference on the
+        # underlying registry reservation from admission until `process()`
+        # actually returns, so the identifier CANNOT be retired and
+        # reissued to an unrelated station during this call, no matter
+        # how long it runs -- an arbitrary OS-level thread preemption or
+        # GC pause included, not merely the realistic scheduling/GC
+        # jitter this age check alone could ever assume away. A frame
+        # that fails this age check is simply refused before ever being
+        # fed to the assembler; it does not depend on the lease to be
+        # correct, and the lease does not depend on this check either --
+        # each is a complete, independent safety/QoS layer.
         #
         # `age` is validated, not merely computed: a non-finite value (a
         # corrupted or mismatched-clock-domain `admitted_at`) or a

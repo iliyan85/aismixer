@@ -7,8 +7,13 @@ from cryptography.hazmat.primitives import serialization
 
 import aismixer
 from assembler import AIVDMAssembler
-from core.data_plane import DeduplicationMode
+from core.data_plane import (
+    DeduplicationMode,
+    ProcessingSnapshot,
+    ProcessingWorkItem,
+)
 from core.event import IngressEvent
+from core.ingress_frame import IngressFrame
 from core.metrics import EgressMetricsSnapshot, QueueMetricsSnapshot
 from core.python_data_plane import PythonDataPlaneProcessor
 from core.routing_control_protocol import ROUTING_CONTROL_PROTOCOL_VERSION
@@ -1113,6 +1118,187 @@ def test_main_never_loads_secure_state_when_udpsec_is_not_configured(
         monkeypatch.setattr(aismixer, "_load_secure_state", fail_if_loaded)
 
         await aismixer.main()
+
+    asyncio.run(scenario())
+
+
+class _RaisingControlServer:
+    def __init__(self):
+        self.close_count = 0
+
+    async def start(self):
+        return None
+
+    async def close(self):
+        self.close_count += 1
+        raise OSError("control server close failed")
+
+
+def test_main_still_closes_secure_state_owner_when_control_server_close_raises(
+    monkeypatch,
+):
+    """R6/F5: an earlier cleanup step failing must not prevent the final
+    owner-level UDPSEC teardown from running -- nested try/finally,
+    matching `secure_server()`'s own shutdown chain, not a swallowed
+    error: the OSError still propagates out of `main()`."""
+
+    async def scenario():
+        async def supervisor(_task_specs):
+            return None
+
+        control_server = _RaisingControlServer()
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10114,
+                },
+            ),
+            control_server=control_server,
+            supervisor=supervisor,
+        )
+        stub = _MainTestSecureStateStub()
+        monkeypatch.setattr(aismixer, "_load_secure_state", lambda: stub)
+        monkeypatch.setattr(
+            aismixer,
+            "_load_secure_server",
+            lambda: (lambda *_a, **_kw: None),
+        )
+
+        with pytest.raises(OSError, match="control server close failed"):
+            await aismixer.main()
+
+        assert control_server.close_count == 1
+        assert len(stub.close_calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_main_still_closes_secure_state_owner_when_forwarder_close_raises(
+    monkeypatch,
+):
+    """Same property, for a `forwarder.close()` failure -- the step that
+    runs immediately before the owner-level UDPSEC teardown."""
+
+    async def scenario():
+        async def supervisor(_task_specs):
+            return None
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10115,
+                },
+            ),
+            supervisor=supervisor,
+        )
+
+        def raising_close():
+            raise OSError("forwarder close failed")
+
+        monkeypatch.setattr(aismixer.forwarder, "close", raising_close)
+        stub = _MainTestSecureStateStub()
+        monkeypatch.setattr(aismixer, "_load_secure_state", lambda: stub)
+        monkeypatch.setattr(
+            aismixer,
+            "_load_secure_server",
+            lambda: (lambda *_a, **_kw: None),
+        )
+
+        with pytest.raises(OSError, match="forwarder close failed"):
+            await aismixer.main()
+
+        assert len(stub.close_calls) == 1
+
+    asyncio.run(scenario())
+
+
+class _RecordingReleaseLease:
+    def __init__(self, sink):
+        self._sink = sink
+
+    def release(self, now):
+        self._sink.append(now)
+
+
+def test_main_releases_leaked_admission_leases_from_abandoned_backlog_on_shutdown(
+    monkeypatch,
+):
+    """R6/F4: a frame accepted by UDPSEC but never consumed by the
+    fan-in reader or the processor stage before shutdown (abandoned
+    ingress/processing backlog, not a crash) must still have its
+    namespace lease released -- `main()`'s final shutdown drains both
+    queue kinds for exactly this reason, once every producer/consumer
+    task sharing them has already stopped."""
+
+    async def scenario():
+        released = []
+
+        async def supervisor(task_specs):
+            specs = {spec.name: spec for spec in task_specs}
+            fan_in_factory = specs["ingress-fan-in"].coroutine_factory
+            processor_factory = specs["processor-stage"].coroutine_factory
+            ingress_queues = fan_in_factory.args[0]
+            processing_queue = fan_in_factory.args[1]
+            assert processor_factory.args[0] is processing_queue
+
+            leaked_ingress_frame = IngressFrame(
+                kind="sec",
+                source_id="udpsec:boat_001",
+                alias_for_s=None,
+                remote_ip=None,
+                assembler_key="udpsec-assembly:leak1",
+                payload=b"",
+                admission_lease=_RecordingReleaseLease(released),
+            )
+            await ingress_queues[0].put(leaked_ingress_frame)
+
+            leaked_processing_frame = IngressFrame(
+                kind="sec",
+                source_id="udpsec:boat_002",
+                alias_for_s=None,
+                remote_ip=None,
+                assembler_key="udpsec-assembly:leak2",
+                payload=b"",
+                admission_lease=_RecordingReleaseLease(released),
+            )
+            await processing_queue.admit(
+                lambda: ProcessingWorkItem(
+                    frame=leaked_processing_frame,
+                    snapshot=ProcessingSnapshot(
+                        routing_generation=0,
+                        deduplication_mode=DeduplicationMode.GLOBAL,
+                        target_ids=(),
+                    ),
+                )
+            )
+            return None
+
+        _configure_main_lifecycle_test(
+            monkeypatch,
+            sec_inputs=(
+                {
+                    "id": "secure",
+                    "listen_ip": "127.0.0.1",
+                    "listen_port": 10116,
+                },
+            ),
+            supervisor=supervisor,
+        )
+        monkeypatch.setattr(
+            aismixer,
+            "_load_secure_server",
+            lambda: (lambda *_a, **_kw: None),
+        )
+
+        await aismixer.main()
+
+        assert len(released) == 2
 
     asyncio.run(scenario())
 

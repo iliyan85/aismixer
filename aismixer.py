@@ -480,6 +480,23 @@ class _BoundedProcessingQueue:
         self._slots.release()
         return work_item
 
+    def drain(self):
+        """Remove and return every currently queued work item immediately,
+        without waiting for or releasing admission permits.
+
+        R6/F4: intended only for final shutdown cleanup, after every
+        producer/consumer task sharing this queue has already stopped --
+        not for ordinary flow control, which must go through `get()`. A
+        work item abandoned here may still hold a namespace lease (see
+        `IngressFrame.admission_lease`) that nothing would otherwise ever
+        release.
+        """
+
+        items = []
+        while not self._work_queue.empty():
+            items.append(self._work_queue.get_nowait())
+        return items
+
     def metrics_snapshot(self) -> QueueMetricsSnapshot:
         """Return fresh immutable admission-queue lifetime metrics."""
 
@@ -1161,20 +1178,61 @@ async def main(
         )
         await _supervise_named_tasks(runtime_task_specs)
     finally:
-        for sock in udp_sockets:
-            sock.close()
-        if control_server_started:
-            await control_server.close()
-        forwarder.close()
-        if SEC_INPUTS:
-            # R5/F5: final owner-level teardown of the shared UDPSEC
-            # state, once every listener sharing it has already stopped
-            # (each secure listener already closed its own exact
-            # sessions/pending candidates in `secure_server()`'s own
-            # shutdown `finally` block, as part of `_supervise_named_tasks`
-            # returning above) -- safe here specifically because nothing
-            # else can still be using this owner past this point.
-            _load_secure_state().close(time.monotonic())
+        # R6/F5: nested try/finally, matching the pattern
+        # `secure_server()`'s own shutdown already uses for
+        # `close_owned_sessions`/`close_owned_pending_sessions`/
+        # `sock.close()` -- an exception from an earlier step (a UDP
+        # socket, the control server, or the forwarder failing to close
+        # cleanly) must not prevent a later step from running, and must
+        # not silently disappear either: each `finally` here still lets
+        # its own exception (if any) propagate once every later step has
+        # had its chance to run too.
+        try:
+            for sock in udp_sockets:
+                sock.close()
+        finally:
+            try:
+                if control_server_started:
+                    await control_server.close()
+            finally:
+                try:
+                    forwarder.close()
+                finally:
+                    if SEC_INPUTS:
+                        # R5/F5: final owner-level teardown of the shared
+                        # UDPSEC state, once every listener sharing it has
+                        # already stopped (each secure listener already
+                        # closed its own exact sessions/pending candidates
+                        # in `secure_server()`'s own shutdown `finally`
+                        # block, as part of `_supervise_named_tasks`
+                        # returning above) -- safe here specifically
+                        # because nothing else can still be using this
+                        # owner past this point.
+                        shutdown_now = time.monotonic()
+                        # R6/F4: release any namespace lease still held by
+                        # a frame that was accepted but never reached the
+                        # processor -- abandoned ingress/processing
+                        # backlog from this same shutdown, bounded by
+                        # each queue's own configured capacity, not by
+                        # total lifetime traffic. A plain-UDP-only frame
+                        # never carries a lease, so this is a no-op for
+                        # it; every producer/consumer task sharing these
+                        # queues has already stopped, so draining them
+                        # here is safe.
+                        for work_item in processor_queue.drain():
+                            work_item.frame.release_admission_lease(
+                                shutdown_now
+                            )
+                        for ingress_queue in input_queues:
+                            while not ingress_queue.empty():
+                                frame = coerce_ingress_frame(
+                                    ingress_queue.get_nowait()
+                                )
+                                if frame is not None:
+                                    frame.release_admission_lease(
+                                        shutdown_now
+                                    )
+                        _load_secure_state().close(shutdown_now)
 
 def _raise_keyboard_interrupt_for_sigterm(_signum, _frame):
     raise KeyboardInterrupt

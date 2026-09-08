@@ -18,6 +18,7 @@ from core.session_identity_registry import (
     IDENTIFIER_WIDTH_BYTES,
     MAX_GENERATION_ATTEMPTS,
     RETIREMENT_SECONDS,
+    NamespaceLease,
     SessionIdentityExhaustedError,
     SessionIdentityRegistry,
 )
@@ -448,6 +449,94 @@ def test_default_registry_uses_the_module_level_bounded_attempt_budget(
         registry.reserve()
 
     assert call_count == MAX_GENERATION_ATTEMPTS
+
+
+def test_lease_returns_a_namespace_lease_and_adds_a_live_reference():
+    registry = SessionIdentityRegistry()
+    value = registry.reserve()
+
+    lease = registry.lease(value)
+
+    assert isinstance(lease, NamespaceLease)
+    assert registry.is_live(value)
+    # Two live references now (the original reserve() plus this lease):
+    # one release() must not be enough to retire it.
+    registry.release(value, now=0.0)
+    assert registry.is_live(value)
+    assert not registry.is_retiring(value)
+
+
+def test_lease_rejects_a_merely_retiring_or_unknown_value():
+    registry = SessionIdentityRegistry()
+    retiring_value = registry.reserve()
+    registry.release(retiring_value, now=0.0)
+    never_seen = b"\x77" * IDENTIFIER_WIDTH_BYTES
+
+    with pytest.raises(ValueError):
+        registry.lease(retiring_value)
+    with pytest.raises(ValueError):
+        registry.lease(never_seen)
+
+    # Neither rejected attempt mutated anything.
+    assert registry.is_retiring(retiring_value)
+    assert not registry.is_live(retiring_value)
+    assert not registry.is_live(never_seen)
+    assert not registry.is_retiring(never_seen)
+
+
+def test_lease_release_is_idempotent():
+    registry = SessionIdentityRegistry()
+    value = registry.reserve()
+    lease = registry.lease(value)
+
+    registry.release(value, now=0.0)  # the original reserve()'s own ref
+    assert registry.is_live(value)
+
+    lease.release(now=1.0)
+    assert not registry.is_live(value)
+    assert registry.is_retiring(value)
+    retire_at_after_first_release = registry._retiring_until[value]
+
+    # A second (and third) release of the SAME lease must be a no-op --
+    # not a second decrement of a reference count that is already at
+    # zero, and not a second push onto the retirement heap with a later
+    # deadline.
+    lease.release(now=999.0)
+    lease.release(now=999.0)
+    assert registry.is_retiring(value)
+    assert registry._retiring_until[value] == retire_at_after_first_release
+
+
+def test_lease_blocks_a_forced_reissue_while_outstanding_then_permits_it_after_release_and_purge(
+    monkeypatch,
+):
+    """The core R6/F4 safety property, proven directly at the registry
+    level: for as long as a lease is outstanding, the underlying value
+    cannot be reissued by `reserve()` -- even when every OTHER live
+    reference (here, none at all: the owning "session" already released
+    its own reference) is gone. Only after the lease itself is released
+    AND the full retirement window has elapsed does `reserve()` accept
+    the value again."""
+    registry = SessionIdentityRegistry(retirement_seconds=30.0)
+    value = registry.reserve()
+    lease = registry.lease(value)
+    registry.release(value, now=0.0)  # the "owning session" is done
+    assert registry.is_live(value)  # the lease alone keeps it live
+
+    monkeypatch.setattr("os.urandom", lambda _length: value)
+    with pytest.raises(SessionIdentityExhaustedError):
+        registry.reserve()  # forced onto `value`: every attempt collides
+
+    lease.release(now=1.0)
+    assert registry.is_retiring(value)
+    with pytest.raises(SessionIdentityExhaustedError):
+        registry.reserve()  # still occupied: retiring, not yet purged
+
+    registry.purge_expired(now=1.0 + 30.0 + 1.0)
+    assert not registry.is_retiring(value)
+    result = registry.reserve()
+    assert result == value
+    assert registry.is_live(value)
 
 
 def test_retirement_seconds_constant_documents_a_concrete_margin():

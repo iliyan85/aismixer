@@ -844,6 +844,16 @@ class SecureState:
     def accept_handshake_replay(self, key, now):
         with self._lock:
             now = self._authoritative_now(now)
+            if self._closed:
+                # R6/F5: a terminal owner must not accept new replay
+                # records either -- exactly like `install_session`/
+                # `install_pending_session`, there is no reopen contract.
+                # `close()` has already discarded every existing replay
+                # record; treating a post-close ClientHello as an ordinary
+                # rejection (not raising) matches every caller's existing
+                # "print and continue" handling of a rejected handshake.
+                self._handshake_replay_rejected += 1
+                return False
             admission = self._handshake_replays.accept(key, now)
             self._handshake_replay_expired += admission.expired
             self._handshake_replay_capacity_evicted += (
@@ -934,22 +944,34 @@ class SecureState:
         return pending
 
     def _push_session_expiry(self, session):
+        # R6: the pushed tuple carries the exact `session` OBJECT, not
+        # just its key -- see `cleanup_expired_sessions` for why identity,
+        # not mere key presence, is what a popped entry must be validated
+        # against.
         heapq.heappush(
             self._session_expiry_heap,
             (
                 session.last_seen + self._session_ttl,
                 next(self._expiry_heap_sequence),
                 session._session_key,
+                session,
             ),
         )
 
     def _push_pending_expiry(self, pending):
+        # R6: same identity-carrying shape as `_push_session_expiry`, and
+        # for a stronger reason here: `_relation_key` is NOT fresh across
+        # a same-relation pending replacement (unlike an active session's
+        # locator-derived key), so without the object itself a popped
+        # entry could not tell "this candidate was replaced" from "this
+        # candidate is still exactly the one that occupies this relation".
         heapq.heappush(
             self._pending_expiry_heap,
             (
                 pending.created_at + self._pending_session_ttl,
                 next(self._expiry_heap_sequence),
                 pending._relation_key,
+                pending,
             ),
         )
 
@@ -958,15 +980,32 @@ class SecureState:
             now = self._authoritative_now(now)
             expired = []
             while self._session_expiry_heap:
-                deadline, _sequence, session_key = (
+                deadline, _sequence, session_key, pushed_session = (
                     self._session_expiry_heap[0]
                 )
                 if deadline > now:
                     break
                 heapq.heappop(self._session_expiry_heap)
                 session = self._sessions.get(session_key)
-                if session is None:
-                    continue  # removed already via another path
+                # R6: identity, not mere key presence, is authoritative.
+                # `session_key` is a fresh locator on every replacement, so
+                # an orphaned entry usually already fails a plain
+                # `is None` check -- but a session_key value CAN
+                # legitimately be reused after a long enough retirement
+                # (a fresh random locator draw colliding with a long-gone
+                # one), and at that point a stale entry's `session_key`
+                # would resolve to a completely unrelated, newer
+                # incarnation. Comparing the exact object this entry was
+                # pushed for -- not just what currently occupies its key
+                # -- means a superseded/replaced/reused-key entry is
+                # always discarded outright here, never mistaken for
+                # authority to inspect or reschedule whatever object
+                # actually occupies that key now (this is also what keeps
+                # heap size bounded under sustained same-relation
+                # replacement churn: a discarded entry is never re-pushed
+                # on behalf of an object it was never pushed for).
+                if session is not pushed_session:
+                    continue  # superseded, reused key, or removed outright
                 current_deadline = session.last_seen + self._session_ttl
                 if current_deadline > now:
                     # This entry predates a later touch: the session's
@@ -980,6 +1019,7 @@ class SecureState:
                             current_deadline,
                             next(self._expiry_heap_sequence),
                             session_key,
+                            session,
                         ),
                     )
                     continue
@@ -998,28 +1038,33 @@ class SecureState:
             now = self._authoritative_now(now)
             expired = []
             while self._pending_expiry_heap:
-                deadline, _sequence, relation_key = (
+                deadline, _sequence, relation_key, pushed_pending = (
                     self._pending_expiry_heap[0]
                 )
                 if deadline > now:
                     break
                 heapq.heappop(self._pending_expiry_heap)
                 pending = self._pending_sessions.get(relation_key)
-                if pending is None:
-                    continue  # removed already via another path
-                current_deadline = (
-                    pending.created_at + self._pending_session_ttl
-                )
-                if current_deadline > now:
-                    heapq.heappush(
-                        self._pending_expiry_heap,
-                        (
-                            current_deadline,
-                            next(self._expiry_heap_sequence),
-                            relation_key,
-                        ),
-                    )
-                    continue
+                # R6: unlike an active session's locator-derived key, a
+                # pending relation_key is NOT fresh across a same-relation
+                # replacement -- a new ServerHello at the same relation
+                # keeps the exact same `_EndpointPeerKey`. Without this
+                # identity check, a stale entry pushed for an earlier,
+                # already-replaced candidate would still resolve
+                # `relation_key` to whatever candidate currently occupies
+                # it and could recompute/reschedule THAT candidate's
+                # deadline on the strength of an entry that was never
+                # pushed for it -- exactly the previously-reported defect,
+                # where continuous same-relation replacement grew this
+                # heap without bound even though only one pending
+                # candidate was ever live at a time. `pending.created_at`
+                # never changes after installation (pending candidates
+                # are never touched/extended the way active sessions are),
+                # so an identity match here always means this entry's
+                # deadline is still exactly correct -- no recompute is
+                # ever needed, unlike the active-session heap above.
+                if pending is not pushed_pending:
+                    continue  # superseded, reused key, or removed outright
                 self._remove_pending_session(relation_key, "expired")
                 expired.append(relation_key)
             return expired
@@ -1559,6 +1604,17 @@ class SecureState:
         lifecycle a caller manages (a test, or a runtime's own final
         shutdown once every listener sharing this owner has already
         stopped).
+
+        R6/F5: also discards this owner's handshake replay ledger and
+        both expiry heaps -- a closed owner has no active/pending state
+        left for either heap's entries to meaningfully describe, and
+        `accept_handshake_replay` already refuses to admit anything new
+        once closed (see that method), so retaining old replay records
+        here would only be dead weight, not a live security boundary.
+        Does not touch the shared `_SESSION_IDENTITY_REGISTRY`: every
+        reservation this owner held was already released above, via the
+        normal per-session/per-pending removal paths, exactly like any
+        other removal.
         """
         with self._lock:
             if self._closed:
@@ -1568,6 +1624,9 @@ class SecureState:
                 self._remove_session(session_key, "closed", now)
             for relation_key in list(self._pending_sessions.keys()):
                 self._remove_pending_session(relation_key, "closed")
+            self._handshake_replays.discard_all()
+            self._session_expiry_heap.clear()
+            self._pending_expiry_heap.clear()
             self._closed = True
 
     def promote_pending_session(self, pending, now):
@@ -2420,6 +2479,35 @@ async def _secure_server_loop(
                 assembler_key = (
                     f"udpsec-assembly:{session.assembly_namespace.hex()}"
                 )
+                # R6/F4: an explicit, frame-scoped hold on this exact
+                # assembly_namespace reservation, taken out now -- while
+                # `session` is known live, because `touch_session` above
+                # just confirmed it, with no `await` in between -- so
+                # THIS frame's own right to eventually reach the
+                # assembler survives even an arbitrary pause anywhere
+                # downstream, independent of the owning session's own
+                # remaining lifetime. See `core.session_identity_registry.
+                # SessionIdentityRegistry.lease` and
+                # `IngressFrame.admission_lease`/`release_admission_lease`
+                # for the release side of this, and
+                # `core.python_data_plane` for why this -- not the age
+                # check below -- is what actually closes the race a
+                # one-time age observation cannot.
+                try:
+                    namespace_lease = _SESSION_IDENTITY_REGISTRY.lease(
+                        session.assembly_namespace
+                    )
+                except ValueError:
+                    # The session's own reference on this namespace was
+                    # released concurrently, between `touch_session`
+                    # above and here -- only possible if another thread
+                    # sharing this exact SecureState removed this exact
+                    # session in that instant. There is no live
+                    # reservation left to protect, so this data message
+                    # is dropped exactly like any other lost race against
+                    # session removal, rather than raising out of this
+                    # handler.
+                    continue
                 frame = frame_from_text_payload(
                     kind="sec",
                     source_id=build_udpsec_source_id(station_id),
@@ -2432,14 +2520,27 @@ async def _secure_server_loop(
                     # reserved for an unrelated station once its
                     # retirement window elapses. Recording admission time
                     # here lets the processor (core.python_data_plane)
-                    # refuse to feed an over-age frame to the assembler,
-                    # closing the residence-time gap between UDPSEC
-                    # admission and the assembler group actually starting
-                    # its own timeout.
+                    # apply its own bounded-backlog/QoS policy, on top of
+                    # (not instead of) the lease above.
                     admitted_at=local_now,
+                    admission_lease=namespace_lease,
                 )
-                if frame is not None:
-                    await queue.put(frame)
+                if frame is None:
+                    # Unreachable in practice (payload was already
+                    # validated as a str above), but defensively release
+                    # rather than leak if it ever is.
+                    namespace_lease.release(local_now)
+                else:
+                    try:
+                        await queue.put(frame)
+                    except BaseException:
+                        # The frame never actually entered the pipeline
+                        # (queue admission failed, or this task was
+                        # cancelled while awaiting capacity) -- ownership
+                        # of the lease never transferred anywhere else,
+                        # so it must be released here, not leaked.
+                        namespace_lease.release(local_now)
+                        raise
                     if input_traffic is not None:
                         input_traffic.frame_accepted(frame.payload)
 

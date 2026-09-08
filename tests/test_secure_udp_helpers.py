@@ -11493,6 +11493,174 @@ def test_two_real_threads_racing_pending_commit_order_does_not_defeat_expiry(
     assert state.promote_pending_session(pending_a, now=15.0) is not None
 
 
+def test_r6_sustained_pending_replacement_churn_keeps_expiry_heap_bounded(
+    monkeypatch,
+):
+    """R6/Blocker A: the exact Codex-reported reproduction. Before this
+    fix, `_pending_expiry_heap` entries were keyed only by `relation_key`
+    -- NOT fresh across a same-relation replacement, unlike an active
+    session's locator-derived key -- so a stale entry for an already-
+    replaced candidate, once popped, would still resolve `relation_key`
+    to whatever candidate currently occupied it and recompute/reschedule
+    THAT candidate's deadline on the strength of an entry that was never
+    pushed for it. The result: with pending_session_ttl=3 and one
+    replacement per second, cleanup after every operation, only entries
+    at the very FRONT of the heap were ever due at all (the rest sat
+    behind, never yet due), so the heap simply grew by one entry per
+    replacement -- 1000 replacements, 1000 heap entries, despite exactly
+    one live pending candidate the entire time. This is now fixed by
+    carrying the exact pushed object in each heap entry and discarding
+    (never recomputing/rescheduling) any entry whose object no longer
+    matches what currently occupies its key."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(pending_session_ttl=3.0, max_pending_sessions=1)
+    relation = _relation_key(secure, ("192.0.2.50", 50000))
+    replacement_count = 1000
+
+    for step in range(replacement_count):
+        now = float(step)
+        state.install_pending_session(
+            relation, "boat_001", _fresh_test_locator(), object(), object(),
+            now,
+        )
+        state.cleanup_expired_pending_sessions(now)
+
+    stats = state.stats()
+    assert stats.pending_sessions_created == replacement_count
+    assert stats.current_pending_sessions == 1
+    assert len(state._pending_sessions) == 1
+    # The historical defect made this proportional to `replacement_count`
+    # (1000). A correctly bounded heap never needs to retain more than a
+    # small handful of entries relative to how many are due per cleanup
+    # call: at most one authoritative entry per still-live candidate, plus
+    # whatever stale entries have been pushed since the last cleanup but
+    # have not yet reached the front of the heap.
+    assert len(state._pending_expiry_heap) <= 5, (
+        f"pending expiry heap retained {len(state._pending_expiry_heap)} "
+        f"entries after {replacement_count} same-relation replacements "
+        "with cleanup after each -- expiry metadata is growing with total "
+        "historical churn, not with live/due state"
+    )
+
+
+def test_r6_stale_pending_heap_entry_cannot_expire_or_reschedule_a_replacement(
+    monkeypatch,
+):
+    """Surgical proof of the mechanism, independent of the bulk-churn
+    test above: candidate A's OWN heap entry, once stale, must never be
+    interpreted as authority over candidate B (a same-relation
+    replacement) -- neither to prematurely expire B nor to silently
+    reschedule B's deadline on A's behalf."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(pending_session_ttl=3.0)
+    relation = _relation_key(secure, ("192.0.2.51", 50000))
+
+    pending_a = state.install_pending_session(
+        relation, "boat_001", _fresh_test_locator(), object(), object(),
+        now=0.0,
+    )
+    # A's own entry: (3.0, seq, relation, pending_a). Replace at now=1.0
+    # with B, which is NOT yet due at A's original deadline (3.0).
+    pending_b = state.install_pending_session(
+        relation, "boat_001", _fresh_test_locator(), object(), object(),
+        now=1.0,
+    )
+    assert state._pending_sessions[relation] is pending_b
+
+    # At now=3.0, A's stale entry becomes due (3.0 <= 3.0) -- but A is
+    # long gone. B's own real deadline is 1.0+3.0=4.0, still not due.
+    state.cleanup_expired_pending_sessions(now=3.0)
+    assert state._pending_sessions.get(relation) is pending_b, (
+        "a stale entry belonging to a replaced candidate must never "
+        "expire the candidate that replaced it"
+    )
+    assert state.stats().pending_sessions_expired == 0
+
+    # B's own, correct deadline (4.0) is still honored.
+    state.cleanup_expired_pending_sessions(now=4.0)
+    assert relation not in state._pending_sessions
+    assert state.stats().pending_sessions_expired == 1
+
+
+def test_r6_stale_active_heap_entry_cannot_remove_or_reschedule_a_reused_locator(
+    monkeypatch,
+):
+    """Active-session equivalent, using a directly-controlled (not
+    randomly drawn) locator reused across two unrelated relations after
+    the first session is long gone -- a deterministic stand-in for the
+    2**128-scale coincidence a real random reissue would require. Once
+    reused, the new incarnation must be governed only by its own object
+    identity and its own `last_seen`, never by a stale entry pushed for
+    the session that previously held that locator."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=5.0)
+    relation_a = _relation_key(secure, ("192.0.2.52", 50000))
+    relation_b = _relation_key(secure, ("192.0.2.53", 50001))
+    shared_locator = _fresh_test_locator()
+
+    session_a = state.install_session(
+        relation_a, "boat_001", shared_locator, object(), object(), now=0.0,
+    )
+    assert state.close_session(session_a, now=0.5)
+    # session_a's own heap entry (deadline 5.0) is now stale -- lazily
+    # left behind, exactly like production.
+
+    session_b = state.install_session(
+        relation_b, "boat_002", shared_locator, object(), object(), now=1.0,
+    )
+    assert session_b._session_key == session_a._session_key
+    assert session_b is not session_a
+
+    # At now=5.0, session_a's stale entry becomes due (5.0<=5.0), but the
+    # SAME KEY now names session_b, whose own real deadline is 1.0+5.0=6.0
+    # -- not due yet, and must not be disturbed by an entry that was
+    # never pushed for it.
+    state.cleanup_expired_sessions(now=5.0)
+    assert state._sessions.get(session_b._session_key) is session_b, (
+        "a stale entry belonging to a removed, reused-key incarnation "
+        "must never remove or reschedule the incarnation that reused it"
+    )
+    assert state.stats().sessions_expired == 0
+
+    state.cleanup_expired_sessions(now=6.0)
+    assert session_b._session_key not in state._sessions
+    assert state.stats().sessions_expired == 1
+
+
+def test_r6_high_rate_active_touches_do_not_grow_retained_expiry_metadata(
+    monkeypatch,
+):
+    """A session touched thousands of times over a period exceeding its
+    TTL must retain expiry metadata bounded by the number of LIVE
+    sessions, not by the total number of historical touches: `touch_session`
+    never pushes a new heap entry (only `install_session`/
+    `promote_pending_session` do), so at most one authoritative entry for
+    this session can ever exist at a time, occasionally recomputed/
+    re-pushed in place when a stale entry predates a later touch."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState(session_ttl=10.0)
+    session = state.install_session(
+        _relation_key(secure, ("192.0.2.54", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0,
+    )
+
+    touch_count = 5000
+    for step in range(1, touch_count + 1):
+        now = step * 0.01  # spans 0.01 .. 50.0, well past session_ttl=10.0
+        assert state.touch_session(session, now)
+        state.cleanup_expired_sessions(now)
+
+    assert state.stats().sessions_touched == touch_count
+    assert state.stats().sessions_expired == 0
+    assert session._session_key in state._sessions
+    assert len(state._session_expiry_heap) <= 2, (
+        f"active session expiry heap retained "
+        f"{len(state._session_expiry_heap)} entries after {touch_count} "
+        "touches -- retained metadata is growing with total historical "
+        "touch count, not with live session count"
+    )
+
+
 def test_stale_time_touch_cannot_move_last_seen_backwards_or_revive_expiry(
     monkeypatch,
 ):
@@ -11894,6 +12062,117 @@ def test_close_then_periodic_maintenance_tick_does_not_resurrect_or_crash(
     assert state.stats().current_sessions == 0
 
 
+def test_r6_close_discards_handshake_replay_ledger_and_expiry_heaps(
+    monkeypatch,
+):
+    """R6/F5 residual: R5's `close()` correctly discarded active/pending
+    state and released this owner's registry reservations, but left the
+    handshake replay ledger and both expiry heaps behind -- dead weight
+    for the heaps (harmless given the R6/Blocker-A identity check, but
+    needless retained memory), and a live security-relevant defect for
+    the replay ledger (see the next test)."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    state.install_session(
+        _relation_key(secure, ("192.0.2.60", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    state.install_pending_session(
+        _relation_key(secure, ("192.0.2.61", 50001)),
+        "boat_002", _fresh_test_locator(), object(), object(), now=0.0)
+    assert state.accept_handshake_replay(b"\x01" * 32, now=0.0)
+    assert len(state._handshake_replays) == 1
+    assert len(state._session_expiry_heap) == 1
+    assert len(state._pending_expiry_heap) == 1
+
+    state.close(now=1.0)
+
+    assert len(state._handshake_replays) == 0
+    assert len(state._session_expiry_heap) == 0
+    assert len(state._pending_expiry_heap) == 0
+    assert state.stats().current_handshake_replays == 0
+
+
+def test_r6_closed_owner_refuses_new_handshake_replay_records(monkeypatch):
+    """R6/F5 residual: a terminal owner must not accept new replay
+    records either -- otherwise a post-close ClientHello (from a
+    listener that has not yet noticed shutdown, or a lingering direct
+    caller in a test) could silently repopulate a ledger `close()` just
+    emptied, defeating the "no resurrection" guarantee for the one store
+    that isn't keyed by an object `close()` already removed."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    state.close(now=0.0)
+
+    accepted = state.accept_handshake_replay(b"\x02" * 32, now=1.0)
+
+    assert accepted is False
+    assert len(state._handshake_replays) == 0
+    assert state.stats().handshake_replay_rejected == 1
+    assert state.stats().handshake_replay_accepted == 0
+
+
+def test_r6_secure_server_loop_rejects_handshake_after_owner_close(
+    monkeypatch,
+):
+    """Same property, through the real `_secure_server_loop` receive
+    path: a ClientHello arriving at a closed owner must be rejected as
+    an ordinary handshake failure (logged, no ServerHello sent, no
+    pending candidate created), not raise `SecureStateClosedError` out
+    of the listener."""
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    state = secure.SecureState()
+    state.close(now=0.0)
+    packet = _signed_handshake_packet(
+        secure, client_identity_private_key, "boat_001", 1000,
+    )
+
+    _, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, ("127.0.0.1", 50333))],
+        state=state,
+        wall_clock=_FakeClock(1000.0),
+        monotonic_clock=_FakeClock(10.0),
+    )
+
+    assert fake_socket.sent == []
+    assert len(state._pending_sessions) == 0
+
+
+def test_r6_close_owner_close_guarantees_final_state_regardless_of_prior_errors(
+    monkeypatch,
+):
+    """Limited scope check: `close()` completes the FULL sweep (every
+    session, every pending candidate, the replay ledger, both heaps, the
+    `_closed` flag) as one sequence -- it does not stop partway and
+    leave the owner in an ambiguous "partially closed" state that a
+    caller could not safely retry or reason about, even though no
+    individual removal step in this class is expected to raise under
+    normal conditions."""
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    state.install_session(
+        _relation_key(secure, ("192.0.2.62", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    state.install_session(
+        _relation_key(secure, ("192.0.2.63", 50001)),
+        "boat_002", _fresh_test_locator(), object(), object(), now=0.0)
+    state.install_pending_session(
+        _relation_key(secure, ("192.0.2.64", 50002)),
+        "boat_003", _fresh_test_locator(), object(), object(), now=0.0)
+
+    state.close(now=1.0)
+
+    assert state._closed is True
+    assert len(state._sessions) == 0
+    assert len(state._pending_sessions) == 0
+    assert len(state._handshake_replays) == 0
+    assert len(state._session_expiry_heap) == 0
+    assert len(state._pending_expiry_heap) == 0
+
+
 def test_f4_delayed_old_frame_after_namespace_reuse_does_not_cross_combine(
     monkeypatch,
 ):
@@ -12008,6 +12287,420 @@ def test_f4_delayed_old_frame_after_namespace_reuse_does_not_cross_combine(
     # cross-station-completed message.
     assert new_outputs == ()
     assert real_assembler.stats().completed == 0
+
+
+def test_r6_inflight_frame_lease_blocks_namespace_reuse_during_a_pause(
+    monkeypatch,
+):
+    """R6/Blocker B: the exact independently-reproduced race, closed.
+
+    The age check alone only protects against a delay BEFORE it runs --
+    it is evaluated once, at the top of `_process_impl`, and does not
+    protect against a pause that happens AFTER it passes but BEFORE the
+    frame actually reaches the assembler (real OS thread preemption or a
+    GC pause, not merely the absence of `await`). This test simulates
+    exactly that: the age check passes (age=1s, well under the 20s
+    default), then execution is paused -- modeled by wrapping the real
+    assembler's `feed_parsed_outcome` so the FIRST call it receives, for
+    this frame, first attempts to force-reuse the frame's own
+    `assembly_namespace` for an unrelated station before delegating to
+    the real assembler. Because the frame carries an explicit
+    `admission_lease` acquired at admission time (while its session was
+    still live), that reuse attempt must fail -- not because of the age
+    check (which already passed), and not because of luck avoiding a
+    128-bit collision (forced deterministically here), but because the
+    registry itself refuses to reissue a value with an outstanding live
+    reference."""
+    from assembler import AIVDMAssembler
+    from core.data_plane import DeduplicationMode, ProcessingSnapshot
+    from core.ingress_frame import IngressFrame
+    from core.python_data_plane import PythonDataPlaneProcessor
+    from core.session_identity_registry import (
+        RETIREMENT_SECONDS,
+        SessionIdentityExhaustedError,
+    )
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+
+    session_a = state.install_session(
+        _relation_key(secure, ("192.0.2.30", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    namespace = session_a.assembly_namespace
+    assembler_key = f"udpsec-assembly:{namespace.hex()}"
+
+    # Admission time: the session is provably live (it was just
+    # installed), so this lease succeeds -- exactly like
+    # `_secure_server_loop`'s own admission-time `.lease()` call.
+    lease = registry.lease(namespace)
+    old_frame = IngressFrame(
+        kind="sec",
+        source_id="udpsec:boat_001",
+        alias_for_s="boat_001",
+        remote_ip="192.0.2.30",
+        assembler_key=assembler_key,
+        payload=b"!AIVDM,2,1,9,A,delayed-old,0*00",
+        admitted_at=0.0,
+        admission_lease=lease,
+    )
+
+    # Station A's session closes well before processing actually
+    # happens -- exactly the audit's own timeline (session closes at
+    # t=0.5; processing does not resume until t=31).
+    assert state.close_session(session_a, now=0.5)
+    # The value is still LIVE: old_frame's own independent lease keeps it
+    # so, even though the owning session is completely gone and its own
+    # reference has already been released.
+    assert registry.is_live(namespace)
+    assert not registry.is_retiring(namespace)
+
+    real_assembler = AIVDMAssembler(timeout=1.0)
+    reuse_attempted = []
+    original_feed = real_assembler.feed_parsed_outcome
+
+    def feed_with_simulated_pause(parsed):
+        # Models the audit's step 3-4: execution has already passed the
+        # age check (evaluated once, well before this point) and is only
+        # NOW -- mid-call -- actually about to touch the assembler. This
+        # is the precise instant an unrelated reuse attempt would land if
+        # nothing held the namespace live in the meantime. Forced onto
+        # the exact same bytes to make the scenario deterministic -- a
+        # controlled allocator draw, not a claim about breaking real
+        # randomness.
+        reuse_attempted.append(True)
+        monkeypatch.setattr(secure.os, "urandom", lambda _length: namespace)
+        with pytest.raises(SessionIdentityExhaustedError):
+            state.install_session(
+                _relation_key(secure, ("192.0.2.31", 50001)),
+                "boat_002", _fresh_test_locator(), object(), object(),
+                now=31.0,
+            )
+        return original_feed(parsed)
+
+    monkeypatch.setattr(
+        real_assembler, "feed_parsed_outcome", feed_with_simulated_pause
+    )
+
+    # The processor's own single clock sample (for the age check) reads
+    # 1.0 -- well within the age budget -- then, on the SECOND read (this
+    # frame's lease release in `process()`'s own `finally`), reads 31.0:
+    # a genuine 30 seconds passed mid-call, exactly like the reported
+    # race, even though the processor itself only ever "looked" at its
+    # clock at the very start and the very end.
+    clock_readings = iter([1.0, 31.0])
+    processor = PythonDataPlaneProcessor(
+        assembler=real_assembler,
+        monotonic_clock=lambda: next(clock_readings, 31.0),
+    )
+    snapshot = ProcessingSnapshot(
+        routing_generation=0,
+        deduplication_mode=DeduplicationMode.GLOBAL,
+        target_ids=(),
+    )
+
+    outputs = processor.process(old_frame, snapshot).outputs
+
+    assert reuse_attempted == [True]
+    assert outputs == ()  # a lone fragment 1/2 never completes by itself
+    assert processor.stale_frames_dropped == 0  # not refused by the age check
+    assert real_assembler.stats().current_groups == 1
+
+    # The lease is released only now that processing has actually
+    # finished -- not before. The namespace still cannot be reused
+    # immediately: it is genuinely retiring, exactly like ordinary
+    # session removal, with the retirement clock now measured from this
+    # later release rather than from the session's own earlier removal.
+    assert not registry.is_live(namespace)
+    assert registry.is_retiring(namespace)
+
+    # Only after the full retirement window elapses (now correctly
+    # measured from the LATER of the two releases) does legitimate reuse
+    # become possible again.
+    purge_time = 31.0 + RETIREMENT_SECONDS + 1.0
+    state.cleanup_expired_sessions(now=purge_time)
+    assert not registry.is_retiring(namespace)
+    # Only the FIRST draw (assembly_namespace) needs to be forced onto the
+    # reused value; the second draw (session_handle) must land on a
+    # genuinely free value, not collide with the namespace it was just
+    # handed (matching the existing namespace-reuse test's own pattern).
+    draws = iter([namespace])
+    fresh_handle = b"\xaa" * len(namespace)
+    monkeypatch.setattr(
+        secure.os, "urandom", lambda _length: next(draws, fresh_handle)
+    )
+    session_b = state.install_session(
+        _relation_key(secure, ("192.0.2.31", 50001)),
+        "boat_002", _fresh_test_locator(), object(), object(),
+        now=purge_time)
+    assert session_b.assembly_namespace == namespace
+
+
+def test_r6_lease_release_covers_stale_drop_completion_and_processor_exception(
+    monkeypatch,
+):
+    """R6/Blocker B: `process()`'s single `finally` releases a frame's
+    lease exactly once regardless of how `_process_impl` exits -- an
+    early stale-age drop, ordinary successful completion, or a raised
+    exception -- so no path can leak a live registry reference."""
+    from core.data_plane import DeduplicationMode, ProcessingSnapshot
+    from core.ingress_frame import IngressFrame
+    from core.python_data_plane import PythonDataPlaneProcessor
+
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    state = secure.SecureState()
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    snapshot = ProcessingSnapshot(
+        routing_generation=0,
+        deduplication_mode=DeduplicationMode.GLOBAL,
+        target_ids=(),
+    )
+
+    def make_leased_frame(namespace, payload, admitted_at, *, remote_ip):
+        lease = registry.lease(namespace)
+        return IngressFrame(
+            kind="sec",
+            source_id="udpsec:boat_001",
+            alias_for_s="boat_001",
+            remote_ip=remote_ip,
+            assembler_key=f"udpsec-assembly:{namespace.hex()}",
+            payload=payload,
+            admitted_at=admitted_at,
+            admission_lease=lease,
+        )
+
+    # Each scenario gets its OWN fresh session/namespace so the
+    # assertions below can check the registry's exact live/retiring
+    # state without one scenario's release interfering with another's.
+
+    # 1) Stale-age drop: the age check itself refuses the frame before
+    # ever touching the assembler.
+    session_1 = state.install_session(
+        _relation_key(secure, ("192.0.2.32", 50000)),
+        "boat_001", _fresh_test_locator(), object(), object(), now=0.0)
+    stale_frame = make_leased_frame(
+        session_1.assembly_namespace,
+        b"!AIVDM,1,1,,A,stale,0*00",
+        admitted_at=0.0,
+        remote_ip="192.0.2.32",
+    )
+    # Before processing: the session's own reference plus this frame's
+    # lease means releasing just the session must not be enough to
+    # retire the namespace.
+    assert state.close_session(session_1, now=0.1)
+    assert registry.is_live(session_1.assembly_namespace)
+    processor = PythonDataPlaneProcessor(monotonic_clock=lambda: 1000.0)
+    processor.process(stale_frame, snapshot)
+    assert processor.stale_frames_dropped == 1
+    # The lease's own release (in process()'s finally) was the LAST live
+    # reference: the namespace is now retiring, not still live.
+    assert not registry.is_live(session_1.assembly_namespace)
+    assert registry.is_retiring(session_1.assembly_namespace)
+
+    # 2) Ordinary successful completion.
+    session_2 = state.install_session(
+        _relation_key(secure, ("192.0.2.33", 50001)),
+        "boat_002", _fresh_test_locator(), object(), object(), now=0.0)
+    complete_frame = make_leased_frame(
+        session_2.assembly_namespace,
+        b"!AIVDM,1,1,,A,ok,0*00",
+        admitted_at=0.0,
+        remote_ip="192.0.2.33",
+    )
+    assert state.close_session(session_2, now=0.1)
+    assert registry.is_live(session_2.assembly_namespace)
+    processor2 = PythonDataPlaneProcessor(monotonic_clock=lambda: 0.5)
+    processor2.process(complete_frame, snapshot)
+    assert not registry.is_live(session_2.assembly_namespace)
+    assert registry.is_retiring(session_2.assembly_namespace)
+
+    # 3) A raised exception from _process_impl must still release the
+    # lease via `process()`'s `finally`.
+    session_3 = state.install_session(
+        _relation_key(secure, ("192.0.2.34", 50002)),
+        "boat_003", _fresh_test_locator(), object(), object(), now=0.0)
+    boom_frame = make_leased_frame(
+        session_3.assembly_namespace,
+        b"!AIVDM,1,1,,A,boom,0*00",
+        admitted_at=0.0,
+        remote_ip="192.0.2.34",
+    )
+    assert state.close_session(session_3, now=0.1)
+    assert registry.is_live(session_3.assembly_namespace)
+
+    class _RaisingAssembler:
+        timeout = None  # _validate_retention_compatibility skips: no numeric timeout
+
+        def feed_parsed_outcome(self, _parsed):
+            raise RuntimeError("boom")
+
+        def reset(self):
+            return ()
+
+    processor3 = PythonDataPlaneProcessor(
+        assembler=_RaisingAssembler(), monotonic_clock=lambda: 0.5
+    )
+    with pytest.raises(RuntimeError, match="boom"):
+        processor3.process(boom_frame, snapshot)
+    assert not registry.is_live(session_3.assembly_namespace)
+    assert registry.is_retiring(session_3.assembly_namespace)
+
+
+class _RaisingQueue:
+    """R6/F4 test double: a queue whose `put()` always fails, standing in
+    for a real admission failure or a task cancelled while awaiting queue
+    capacity -- `_secure_server_loop` must release the just-acquired
+    namespace lease in that case, since the frame never actually entered
+    the pipeline and nothing else will ever release it.
+
+    Records each offered item's `admission_lease` for the caller to
+    assert on AFTER the loop returns: an exception raised from inside
+    `put()` itself is caught by `_secure_server_loop`'s own broad
+    `except Exception` handler and merely logged, so an assertion made
+    HERE would be silently swallowed rather than failing the test."""
+
+    def __init__(self):
+        self.offered_leases = []
+
+    async def put(self, item):
+        self.offered_leases.append(item.admission_lease)
+        raise RuntimeError("queue admission failed")
+
+
+def test_r6_secure_server_loop_releases_lease_when_queue_admission_fails(
+    monkeypatch,
+):
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    addr = ("127.0.0.1", 50321)
+    station_id = "boat_001"
+    client_to_server_key = b"\x01" * 32
+    server_to_client_key = b"\x02" * 32
+    state = secure.SecureState()
+    session, _, _ = _install_test_session(
+        secure, state, addr, client_to_server_key, server_to_client_key,
+    )
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    namespace = session.assembly_namespace
+    assert registry._live_refcounts[namespace] == 1  # only the session's own
+
+    packet = _encrypted_data_packet(
+        secure, client_to_server_key, b"\x00" * 12,
+        session._session_key.session_locator,
+        source_id=station_id,
+    )
+    fake_socket = _FakeSecureSocket()
+    fake_loop = _FakeSecureLoop([(packet, addr)])
+    monkeypatch.setattr(secure, "asyncio", _FakeAsyncioModule(fake_loop))
+    monotonic_clock = _FakeClock(1000.0)
+    owned_sessions = dict(state._sessions)
+    owned_pending_sessions = dict(state._pending_sessions)
+
+    raising_queue = _RaisingQueue()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            secure._secure_server_loop(
+                fake_socket,
+                raising_queue,
+                "127.0.0.1",
+                9999,
+                endpoint_token=_test_endpoint_token(secure),
+                state=state,
+                wall_clock=_FakeClock(1010.0),
+                monotonic_clock=monotonic_clock,
+                server_private_key=_PREPARED_SERVER_PRIVATE_KEY,
+                owned_sessions=owned_sessions,
+                owned_pending_sessions=owned_pending_sessions,
+            )
+        )
+
+    # The offered frame actually carried a lease -- proves the admission-
+    # time `.lease()` wiring ran at all, not merely that nothing crashed.
+    assert len(raising_queue.offered_leases) == 1
+    assert raising_queue.offered_leases[0] is not None
+    # The frame never entered the pipeline (put() always raised), so the
+    # lease's release must have happened right there in the loop -- back
+    # to exactly the session's own single reference, not leaked at 2 and
+    # not over-released to zero.
+    assert registry._live_refcounts[namespace] == 1
+    assert registry.is_live(namespace)
+    assert not registry.is_retiring(namespace)
+
+
+def test_r6_secure_server_loop_drops_data_message_when_session_dies_before_lease(
+    monkeypatch,
+):
+    """The other admission-time release path: `lease()` itself raises
+    `ValueError` because the session's own reference was released
+    concurrently between `touch_session` and the lease attempt (only
+    reachable with a second real listener sharing this exact
+    `SecureState` -- modeled here directly by closing the session from
+    under the loop via a `SecureState` subclass whose `touch_session`
+    also closes it, so the real `_secure_server_loop` code path -- not a
+    hand-rolled substitute -- exercises the `except ValueError` branch).
+    The data message must be dropped, not raise out of the handler, and
+    nothing is left half-admitted."""
+    secure, client_identity_private_key = load_secure_module_with_fake_keys(
+        monkeypatch, with_client_private_key=True
+    )
+    addr = ("127.0.0.1", 50322)
+    station_id = "boat_001"
+    client_to_server_key = b"\x03" * 32
+    server_to_client_key = b"\x04" * 32
+    state = secure.SecureState()
+    session, _, _ = _install_test_session(
+        secure, state, addr, client_to_server_key, server_to_client_key,
+    )
+    registry = secure._SESSION_IDENTITY_REGISTRY
+    namespace = session.assembly_namespace
+
+    original_touch_session = state.touch_session
+
+    def touch_then_close(touched_session, now):
+        result = original_touch_session(touched_session, now)
+        # Simulate a concurrent close landing exactly between
+        # touch_session (which _secure_server_loop already called) and
+        # the lease attempt that follows it, in the same synchronous
+        # block -- releasing the session's own reference right out from
+        # under the frame construction that is about to run.
+        state.close_session(touched_session, now)
+        return result
+
+    monkeypatch.setattr(state, "touch_session", touch_then_close)
+
+    packet = _encrypted_data_packet(
+        secure, client_to_server_key, b"\x00" * 12,
+        session._session_key.session_locator,
+        source_id=station_id,
+    )
+    fake_socket = _FakeSecureSocket()
+    fake_loop = _FakeSecureLoop([(packet, addr)])
+    monkeypatch.setattr(secure, "asyncio", _FakeAsyncioModule(fake_loop))
+    fake_queue = _FakeQueue()
+    owned_sessions = dict(state._sessions)
+    owned_pending_sessions = dict(state._pending_sessions)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            secure._secure_server_loop(
+                fake_socket,
+                fake_queue,
+                "127.0.0.1",
+                9999,
+                endpoint_token=_test_endpoint_token(secure),
+                state=state,
+                wall_clock=_FakeClock(1010.0),
+                monotonic_clock=_FakeClock(1000.0),
+                server_private_key=_PREPARED_SERVER_PRIVATE_KEY,
+                owned_sessions=owned_sessions,
+                owned_pending_sessions=owned_pending_sessions,
+            )
+        )
+
+    assert fake_queue.items == []  # dropped, never reached the pipeline
+    assert not registry.is_live(namespace)
+    assert registry.is_retiring(namespace)
 
 
 def test_independent_owners_share_assembler_without_cross_station_combination(

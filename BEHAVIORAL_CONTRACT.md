@@ -413,15 +413,57 @@ reservation is retired (occupied, but no longer counted live, so it cannot
 be re-drawn) for `RETIREMENT_SECONDS` (30 seconds) and then purged, via a
 bounded, lazy-deletion min-heap scan (see below) piggybacked on
 `SecureState`'s own existing monotonic cleanup pass rather than a dedicated
-thread or a full per-packet scan of every retiring entry. `RETIREMENT_SECONDS`
-is NOT simply a multiple of the assembler's own group timeout -- a downstream
-`AIVDMAssembler` group's timeout only starts once a frame actually reaches
-the assembler, not when UDPSEC admits it, and no ingress/processing queue
-between those two points imposes a maximum residence time (only a maximum
-depth). The actual enforcement point is
-`core.python_data_plane.MAX_INGRESS_FRAME_AGE_SECONDS` (20 seconds): any
-namespace-bearing frame (one whose `IngressFrame.admitted_at` is set --
-currently only UDPSEC's) older than that when the processor is about to
+thread or a full per-packet scan of every retiring entry.
+
+R6/Blocker B: the age-based policy described above (`MAX_INGRESS_FRAME_AGE_
+SECONDS`, `RETIREMENT_SECONDS`'s formula) remains in force, but is no
+longer, by itself, what makes namespace reuse safe -- a one-time age
+observation taken at the top of `_process_impl` only protects against a
+delay that already elapsed BEFORE that observation; it cannot protect
+against an arbitrary pause (real OS thread preemption or a GC pause, not
+merely the absence of `await`) landing AFTER the check passes but BEFORE
+the frame actually reaches the assembler. The authoritative safety
+mechanism is now an explicit, frame-scoped hold: `_secure_server_loop`
+takes out a `core.session_identity_registry.SessionIdentityRegistry.lease`
+on a namespace-bearing frame's `assembly_namespace` at admission time --
+while `touch_session` has just proven the owning session live, with no
+`await` in between -- and attaches it as `IngressFrame.admission_lease`.
+This is an ADDITIONAL live reference on the same registry reservation the
+owning session already holds (reference-counted, exactly like a same-
+station replacement's `claim()`), independent of that session's own
+lifetime: for as long as the lease is outstanding, `reserve()` cannot draw
+that value for anyone else, no matter how long the frame takes to actually
+reach the assembler or how long the owning session has already been gone.
+`PythonDataPlaneProcessor.process()` holds this lease for the frame's
+entire `_process_impl` call and releases it exactly once, in its own
+`finally`, regardless of outcome (normal completion, an early stale-age
+drop, or a raised exception) -- so a frame that is mid-`process()` when
+its owning session's OWN reference is released still keeps the namespace
+alive until `process()` itself returns. A frame whose lease attempt fails
+(the owning session's own reference was released concurrently, between
+`touch_session` and the lease call -- reachable only with a second real
+listener sharing the same `SecureState`) is dropped like any other lost
+race, never queued. Every other admission-time loss (queue-put failure or
+task cancellation before the frame entered the pipeline, an abandoned
+`None` from `frame_from_text_payload`) releases the lease right there
+instead. `aismixer.py`'s final shutdown additionally drains any residual
+ingress/processing backlog and releases whatever leases those abandoned
+frames still held, since none of this pipeline's queues are drained by
+ordinary task cancellation alone. A frame with no `admitted_at` (every
+non-UDPSEC source) never carries a lease and is completely unaffected by
+any of this.
+
+`RETIREMENT_SECONDS`'s own formula still matters for the tail AFTER a
+lease is released: `RETIREMENT_SECONDS` is NOT simply a multiple of the
+assembler's own group timeout -- a downstream `AIVDMAssembler` group's
+timeout only starts once a frame actually reaches the assembler, not when
+UDPSEC admits it, and no ingress/processing queue between those two points
+imposes a maximum residence time (only a maximum depth) -- but the lease
+above already makes that residence-time gap itself unconditionally safe.
+The actual enforcement point for the REMAINING (post-release) tail is
+`core.python_data_plane.MAX_INGRESS_FRAME_AGE_SECONDS` (20 seconds), a
+bounded-backlog/QoS policy applied independently of the lease: any
+namespace-bearing frame older than that when the processor is about to
 feed it to the assembler is refused outright, never reaching the assembler
 in any form. `RETIREMENT_SECONDS` is the SUM of that enforced bound, the
 assembler's own default 1-second group timeout, and a margin for
@@ -443,14 +485,7 @@ same guarantee as the default. The age check itself, and the computed
 `age` it is based on, are validated too: a non-finite or negative age (a
 corrupted `admitted_at`, or one appearing to be in the future relative to
 the processor's own clock -- impossible for a genuine same-clock-domain
-observation) fails closed as stale rather than bypassing the check. This
-one age observation, taken once per frame before parsing, covers every
-sentence in that frame and every assembler-feed call its processing may
-make, since `_process_impl` is one synchronous call with no `await` or
-other yield point -- it does not protect against an OS-level thread
-preemption or GC pause happening to land inside that call and lasting
-long enough to matter, the same execution-model assumption every other
-latency-sensitive synchronous path in this codebase already relies on.
+observation) fails closed as stale rather than bypassing the check.
 None of this is a claim of durable or cross-process uniqueness, or that a
 finite random space can never repeat in principle -- only that every draw is
 checked and retried under a real lock, and that this process's bookkeeping
@@ -516,13 +551,36 @@ an `OrderedDict` silently assumes commit order tracks deadline order; where
 it does not, a genuinely expired entry can sit behind a newer one and never
 be found, letting expired active or pending state be treated as live. The
 heap has no such assumption -- popping always yields the true minimum
-deadline regardless of insertion order -- and each popped entry is
-revalidated against the live store's own current field before being acted
-on, so a stale entry (superseded by a later touch, for active sessions) is
-silently discarded and re-queued with its real current deadline rather than
-either resurrecting or wrongly expiring anything. `touch_session` clamps
-`last_seen` to never move backwards, so a stale, out-of-order `now` can
-never shorten a session's real remaining lifetime.
+deadline regardless of insertion order.
+
+R6/Blocker A: each heap entry carries the exact object (`LogicalSession` or
+`_PendingSecureSession`) it was pushed for, not merely its key. A popped
+entry is validated by OBJECT IDENTITY against whatever currently occupies
+that key -- not by the key's mere presence -- before being acted on at all;
+an entry whose object no longer matches (superseded by a replacement, or an
+active session's locator-derived key coincidentally reused after a long
+retirement) is discarded outright, never treated as authority to inspect or
+reschedule whatever object actually occupies that key now. This closes a
+previously-reported unbounded-growth defect specific to PENDING candidates:
+a pending relation key, unlike an active session's fresh-per-replacement
+locator-derived key, is NOT fresh across a same-relation replacement, so a
+stale entry belonging to an already-replaced candidate would still resolve
+that key to whichever candidate currently occupied it and recompute/
+reschedule THAT candidate's deadline on the strength of an entry that was
+never pushed for it -- one entry added per replacement, never discarded, so
+continuous same-relation handshake churn (an authorized station replacing
+its own pending candidate repeatedly, entirely within its own rate) grew
+this heap linearly with total historical replacement count rather than with
+live/due state. With object identity checked, a superseded entry is
+discarded in O(1) the moment it is popped, keeping retained heap size
+bounded by live state plus recent churn rather than by all-time traffic.
+For an ACTIVE session, whose `last_seen` DOES change via `touch_session`
+without pushing a new heap entry, an identity-matched but now-stale entry
+(superseded by a later touch) is still re-queued with its real current
+deadline rather than discarded, so `touch_session` clamping `last_seen` to
+never move backwards still means a stale, out-of-order `now` can never
+shorten a session's real remaining lifetime, and repeated touches alone
+never grow retained heap size beyond one entry per live session.
 
 The heap fix above corrects a commit-order defect, but not a distinct one:
 correct heap ordering still trusts whatever `now` a caller actually
@@ -596,6 +654,30 @@ default daemon runtime calls it exactly once, on the process-wide
 after every listener sharing it has already stopped and run its own
 listener-level cleanup -- and only when UDPSEC was actually configured, so
 a plain-UDP-only deployment never forces the otherwise-lazy import.
+
+R6/F5 residual completion: `close()` also discards this owner's handshake
+replay ledger and clears both expiry heaps outright -- a closed owner has
+no active/pending state left for either heap's entries to meaningfully
+describe (dead weight, not a live hazard, now that the heap fix above
+discards a superseded entry on sight regardless), but the replay ledger is
+a genuine resurrection surface if left populated: `accept_handshake_replay`
+itself now checks `self._closed` first and rejects (an ordinary handshake
+failure, not an exception) rather than admitting a new record into a
+ledger `close()` just emptied. Every other mutating public method already
+fails closed against removed state through its own existing exact-object-
+identity check; a bare locator-generation call is not restricted, since it
+reserves nothing and is not itself a demonstrated resurrection path.
+Final-shutdown ordering in `aismixer.py` is a nested try/finally chain,
+mirroring `secure_server()`'s own shutdown chain for its per-listener
+cleanup: a UDP socket, the control server, or the forwarder failing to
+close cleanly does not prevent a later step (including the final owner
+`close()`) from running, and does not silently mask the failure either --
+each step's own exception, if any, still propagates once every later step
+has had its chance to run. That same final shutdown also drains any
+residual UDPSEC ingress/processing backlog and releases whatever namespace
+lease each abandoned frame still held (see Blocker B above), immediately
+before calling `close()`, so a frame that was accepted but never consumed
+by this same shutdown does not hold the registry open indefinitely.
 
 Each physical secure-listener socket incarnation owns one opaque endpoint
 token. The token has process-local object-identity semantics, remains stable

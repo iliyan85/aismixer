@@ -54,6 +54,7 @@ def make_frame(
     remote_ip=REMOTE_IP,
     assembler_key=ASSEMBLER_KEY,
     admitted_at=None,
+    admission_lease=None,
 ):
     return IngressFrame(
         kind="udp",
@@ -63,6 +64,7 @@ def make_frame(
         assembler_key=assembler_key,
         payload=payload.encode("utf-8"),
         admitted_at=admitted_at,
+        admission_lease=admission_lease,
     )
 
 
@@ -1757,3 +1759,100 @@ def test_reset_does_not_affect_stale_frame_accounting_or_age_configuration():
     )
     assert outputs == ()
     assert processor.stale_frames_dropped == 2
+
+
+def test_frame_with_no_admission_lease_is_unaffected_by_the_release_call():
+    """R6/F4: a plain UDP/serial frame (no `admitted_at`, no
+    `admission_lease`) must behave exactly as before -- `process()`'s new
+    `release_admission_lease()` call in its `finally` is a documented
+    no-op when `admission_lease` is `None`, not a new requirement placed
+    on non-UDPSEC sources."""
+    processor = make_processor()
+
+    outputs = process_outputs(
+        processor, make_frame(SENTENCE), make_snapshot()
+    )
+
+    assert len(outputs) == 1
+
+
+class _RecordingLease:
+    def __init__(self):
+        self.release_calls = []
+
+    def release(self, now):
+        self.release_calls.append(now)
+
+
+def test_admission_lease_is_released_exactly_once_on_successful_completion():
+    lease = _RecordingLease()
+    processor = make_processor(monotonic_clock=lambda: 42.0)
+
+    process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=0.0, admission_lease=lease),
+        make_snapshot(),
+    )
+
+    assert lease.release_calls == [42.0]
+
+
+def test_admission_lease_is_released_exactly_once_on_a_stale_age_drop():
+    lease = _RecordingLease()
+    processor = make_processor(
+        monotonic_clock=lambda: 1000.0, max_ingress_frame_age=20.0
+    )
+
+    outputs = process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=0.0, admission_lease=lease),
+        make_snapshot(),
+    )
+
+    assert outputs == ()
+    assert processor.stale_frames_dropped == 1
+    assert lease.release_calls == [1000.0]
+
+
+def test_admission_lease_is_released_exactly_once_even_when_processing_raises():
+    lease = _RecordingLease()
+
+    class _RaisingAssembler:
+        timeout = None
+
+        def feed_parsed_outcome(self, _parsed):
+            raise RuntimeError("boom")
+
+        def reset(self):
+            return ()
+
+    processor = make_processor(
+        assembler=_RaisingAssembler(), monotonic_clock=lambda: 5.0
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        processor.process(
+            make_frame(SENTENCE, admitted_at=0.0, admission_lease=lease),
+            make_snapshot(),
+        )
+
+    assert lease.release_calls == [5.0]
+
+
+def test_reset_does_not_release_or_otherwise_touch_any_admission_lease():
+    """`reset()` operates on the assembler/dedup/source-state/multipart
+    metadata this processor owns -- never on a frame's lease, which is
+    scoped strictly to one `process()` call and always already released
+    by the time that call returns."""
+    lease = _RecordingLease()
+    processor = make_processor(monotonic_clock=lambda: 1.0)
+    process_outputs(
+        processor,
+        make_frame(SENTENCE, admitted_at=0.0, admission_lease=lease),
+        make_snapshot(),
+    )
+    assert lease.release_calls == [1.0]
+
+    processor.reset()
+
+    assert lease.release_calls == [1.0]  # unchanged: reset() never touches it

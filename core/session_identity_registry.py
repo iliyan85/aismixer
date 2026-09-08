@@ -86,6 +86,47 @@ class SessionIdentityExhaustedError(RuntimeError):
     """
 
 
+class NamespaceLease:
+    """R6/F4: an explicit, independently-releasable hold on one already-
+    live reservation, taken out by a CALLER OTHER THAN the owning
+    session -- specifically, one accepted `IngressFrame` (see
+    `core.ingress_frame.IngressFrame.admission_lease`) -- so that
+    caller's own right to use the reservation survives even after the
+    owning session itself is gone, for as long as the lease itself
+    remains unreleased.
+
+    This closes the gap a bare age check cannot: an ingress frame is
+    admitted while its session is provably live, but nothing about a
+    one-time age comparison later in the pipeline stops the underlying
+    `assembly_namespace` from being retired and reissued to an unrelated
+    station DURING an arbitrary pause between that check and the frame
+    actually reaching the assembler (real OS thread preemption or a GC
+    pause, not merely the absence of an `await`). Holding a lease for
+    the frame's entire actual lifetime -- from admission to the instant
+    processing of it completes, however long that takes -- means the
+    registry itself refuses to reissue the value for the whole time,
+    rather than relying on a scheduling/GC margin alone.
+
+    `release()` is idempotent: calling it more than once (a defensive
+    `finally` racing an already-completed normal release, for example)
+    is a safe no-op, not a double-decrement of the registry's reference
+    count.
+    """
+
+    __slots__ = ("_registry", "_value", "_released")
+
+    def __init__(self, registry: "SessionIdentityRegistry", value: bytes) -> None:
+        self._registry = registry
+        self._value = value
+        self._released = False
+
+    def release(self, now: float) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._registry.release(self._value, now)
+
+
 class SessionIdentityRegistry:
     """Shared, lock-protected, reference-counted registry of live and
     recently-retired opaque identifier reservations.
@@ -173,6 +214,21 @@ class SessionIdentityRegistry:
                     "claim() target is not a currently live reservation"
                 )
             self._live_refcounts[value] += 1
+
+    def lease(self, value: bytes) -> "NamespaceLease":
+        """Take out one additional, independently-releasable live
+        reference on an already-live reservation, for a caller (an
+        `IngressFrame`, not the owning `SecureState`/session) whose own
+        lifetime is decoupled from the session's.
+
+        Thin wrapper around `claim()` -- the value must already be live
+        (raises `ValueError` otherwise, exactly like `claim()`) -- that
+        returns a `NamespaceLease` handle so the caller can release this
+        specific reference later, from wherever its own use of the value
+        actually ends, without needing to track the raw bytes itself.
+        """
+        self.claim(value)
+        return NamespaceLease(self, value)
 
     def release(self, value: bytes, now: float) -> None:
         """Drop one live reference. When the reference count reaches zero,
