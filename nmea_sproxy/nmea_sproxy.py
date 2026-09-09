@@ -833,6 +833,50 @@ class _ClientEpochRefresh:
         except OSError as exc:
             print(f"❌ Epoch refresh send error: {exc}")
 
+    def _admit_send(self, epochs, sock, remote_addr, clock, build_packet):
+        """The one transaction-owned admission gate for every actual
+        REFRESH_INIT / REFRESH_CONFIRM datagram -- the initial send and
+        every retransmission alike.
+
+        `build_packet` is `_encrypt_init` or `_encrypt_confirm`; it is
+        invoked here, and a FRESH monotonic observation is taken from
+        `clock` AFTER it returns and immediately before the real send,
+        because AEAD encryption / allocation / an OS deschedule can
+        themselves cross the transaction deadline. `now >= self._deadline`
+        (equality included) refuses: the pending candidate is abandoned,
+        nothing is transmitted, and the caller must not anchor cadence,
+        count an attempt or report progress.
+
+        Returns the admitted monotonic send time, or `None` when the send
+        was refused (deadline reached) or when a reentrant transport
+        replaced the transaction/phase across `_send` (in which case the
+        newer transaction's timers must not be clobbered)."""
+        if not self.active:
+            return None
+        if clock() >= self._deadline:
+            self._abandon(epochs)
+            return None
+        packet = build_packet()
+        if packet is None:
+            return None
+        now = clock()
+        if now >= self._deadline:
+            self._abandon(epochs)
+            return None
+        txn, phase, deadline = self._txn, self.phase, self._deadline
+        self._send(sock, remote_addr, packet)
+        if (
+            self._txn is not txn
+            or self.phase != phase
+            or self._deadline != deadline
+        ):
+            # A reentrant/test transport advanced the machine to a newer
+            # transaction or phase while `_send` was running; the datagram
+            # for the transaction we were serving did go out, but its
+            # timers no longer own this object.
+            return None
+        return now
+
     def _encrypt_init(self):
         """A fresh-nonce encryption of the immutable REFRESH_INIT message
         under the parent (E1) client->server key."""
@@ -872,9 +916,14 @@ class _ClientEpochRefresh:
             server_refresh_signature=reply.refresh_signature,
         )
 
-    def start(self, epochs, sock, remote_addr, now):
+    def start(self, epochs, sock, remote_addr, clock):
+        """Begin a transaction and send the first REFRESH_INIT. `clock` is a
+        zero-argument monotonic-time source (the same domain as
+        `forward_loop`'s deadlines), re-sampled by `_admit_send` immediately
+        before the actual datagram leaves."""
         if self.active:
             return
+        now = clock()
         parent_gen = epochs.generation
         next_gen = parent_gen + 1
         if next_gen > MAX_EPOCH_GENERATION:
@@ -912,40 +961,52 @@ class _ClientEpochRefresh:
         )
         self._parent_c2s_key = epochs.client_to_server_key
         self.phase = self.INIT_SENT
-        self._attempts = 1
+        self._attempts = 0
         self._deadline = now + REFRESH_TRANSACTION_TIMEOUT_SECONDS
         self._next_send_at = now + REFRESH_RETRANSMIT_SECONDS
         print("Starting in-session authenticated epoch refresh.")
-        self._send(sock, remote_addr, self._encrypt_init())
+        sent_at = self._admit_send(
+            epochs, sock, remote_addr, clock, self._encrypt_init
+        )
+        if sent_at is None:
+            return  # deadline already crossed during preparation -> abandoned
+        self._attempts = 1
+        self._next_send_at = sent_at + REFRESH_RETRANSMIT_SECONDS
 
-    def tick(self, epochs, sock, remote_addr, now):
+    def tick(self, epochs, sock, remote_addr, clock):
         """Retransmit / abandon. Returns True if the transaction was
-        abandoned this tick (E1 stays current)."""
+        abandoned this tick (E1 stays current). `clock` is the injectable
+        monotonic-time source; the actual send is admitted (and its time
+        re-observed) by `_admit_send`."""
         if not self.active:
             return False
+        now = clock()
         if now >= self._deadline:
             self._abandon(epochs)
             return True
-        if now >= self._next_send_at:
-            if self._attempts >= REFRESH_MAX_ATTEMPTS:
-                self._next_send_at = self._deadline
-                return False
-            self._attempts += 1
-            self._next_send_at = now + REFRESH_RETRANSMIT_SECONDS
-            if self.phase == self.CONFIRM_SENT:
-                packet = (
-                    self._encrypt_confirm()
-                    if self._confirm_message is not None
-                    else None
-                )
-            else:
-                packet = (
-                    self._encrypt_init()
-                    if self._init_message is not None
-                    else None
-                )
-            if packet is not None:
-                self._send(sock, remote_addr, packet)
+        if now < self._next_send_at:
+            return False
+        if self._attempts >= REFRESH_MAX_ATTEMPTS:
+            self._next_send_at = self._deadline
+            return False
+        build_packet = (
+            self._encrypt_confirm
+            if self.phase == self.CONFIRM_SENT
+            else self._encrypt_init
+        )
+        sent_at = self._admit_send(
+            epochs, sock, remote_addr, clock, build_packet
+        )
+        if sent_at is None:
+            # `_admit_send` either abandoned the transaction (deadline
+            # crossed during encryption) or a reentrant transport moved it
+            # on; either way this tick added no in-budget send.
+            return not self.active
+        self._attempts += 1
+        # Anchor the next allowed send to the ACTUAL admitted send time, not
+        # a stale value captured before encryption -- a send delayed across
+        # its scheduled slot must not be followed by an immediate retry.
+        self._next_send_at = sent_at + REFRESH_RETRANSMIT_SECONDS
         return False
 
     def next_deadline(self, now):
@@ -1076,9 +1137,19 @@ class _ClientEpochRefresh:
             timestamp=int(time.time()),
         )
         self.phase = self.CONFIRM_SENT
-        self._attempts = 1
+        self._attempts = 0
         self._next_send_at = now + REFRESH_RETRANSMIT_SECONDS
-        self._send(sock, remote_addr, self._encrypt_confirm())
+        # The CONFIRM datagram goes out through the same send-admission gate:
+        # building/encrypting it can itself cross the deadline, and if it
+        # does the candidate is abandoned WITHOUT a send and this is not
+        # `REPLY_ADVANCED` (no progress, no liveness credit).
+        sent_at = self._admit_send(
+            epochs, sock, remote_addr, clock, self._encrypt_confirm
+        )
+        if sent_at is None:
+            return self.REPLY_NONE
+        self._attempts = 1
+        self._next_send_at = sent_at + REFRESH_RETRANSMIT_SECONDS
         return self.REPLY_ADVANCED
 
     def on_ack(self, ack, epochs, clock, *, authenticated_generation):
@@ -1911,22 +1982,22 @@ def forward_loop(
             # transaction if one is not already in flight.
             session_started_at = now
             if not refresh.active:
-                refresh.start(epochs, out_sock, remote_addr, now)
+                refresh.start(epochs, out_sock, remote_addr, time.monotonic)
             return None
         if action is not None:
             print(f"Secure session invalidated: {action}")
         return action
 
-    def drive_refresh(now):
+    def drive_refresh():
         if refresh is not None:
-            refresh.tick(epochs, out_sock, remote_addr, now)
+            refresh.tick(epochs, out_sock, remote_addr, time.monotonic)
 
     while True:
         now = time.monotonic()
         deadline_reason = apply_due_deadline(now)
         if deadline_reason is not None:
             return deadline_reason
-        drive_refresh(now)
+        drive_refresh()
 
         if stats.is_heartbeat_due(now):
             print_forwarding_heartbeat(
@@ -1957,7 +2028,7 @@ def forward_loop(
         deadline_reason = apply_due_deadline(now)
         if deadline_reason is not None:
             return deadline_reason
-        drive_refresh(now)
+        drive_refresh()
         poll_timeout = session_poll_timeout(
             now,
             session_started_at,
@@ -1987,7 +2058,7 @@ def forward_loop(
         deadline_reason = apply_due_deadline(now)
         if deadline_reason is not None:
             return deadline_reason
-        drive_refresh(now)
+        drive_refresh()
 
         if out_sock in readable:
             try:
@@ -2049,7 +2120,7 @@ def forward_loop(
             deadline_reason = apply_due_deadline(now)
             if deadline_reason is not None:
                 return deadline_reason
-            drive_refresh(now)
+            drive_refresh()
             if result == SERVER_PACKET_AUTHENTICATED:
                 last_authenticated_peer = now
                 expected_ping_seq = None

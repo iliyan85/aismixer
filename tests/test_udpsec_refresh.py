@@ -1217,10 +1217,10 @@ class _ClientServerRefresh:
 
     # -- client drivers ----------------------------------------------------
     def start(self):
-        self.refresh.start(self.epochs, self, self.remote, self.now)
+        self.refresh.start(self.epochs, self, self.remote, self.clock)
 
     def tick(self):
-        return self.refresh.tick(self.epochs, self, self.remote, self.now)
+        return self.refresh.tick(self.epochs, self, self.remote, self.clock)
 
     def deliver(self, packet):
         return self.proxy._try_handle_refresh_message(
@@ -1544,3 +1544,218 @@ def test_f4_forged_duplicate_reply_in_confirm_sent_is_ignored(env):
     assert h.deliver(forged) is None
     assert h.refresh.phase == h.proxy._ClientEpochRefresh.CONFIRM_SENT
     assert h.epochs.pending_generation == 1  # still on the real candidate
+
+
+# --------------------------------------------------------------------------
+# F3 send boundary -- an INIT/CONFIRM datagram must not be encrypted and
+# transmitted after the original transaction deadline, and a send delayed
+# across its scheduled slot must not be immediately followed by another.
+# --------------------------------------------------------------------------
+
+
+def _gate_encryption(h, monkeypatch, kind, jump_to, once=True):
+    """Advance the harness monotonic clock to `jump_to` the moment the
+    client encrypts a control message of type `kind` -- modelling an OS
+    deschedule / slow AES-GCM crossing the deadline between the last check
+    and the actual send. One-shot by default."""
+    real = h.proxy.encrypt_secure_json_message
+    fired = []
+
+    def gated(message, *args, **kwargs):
+        if (
+            isinstance(message, dict)
+            and message.get("type") == kind
+            and not (once and fired)
+        ):
+            fired.append(True)
+            h.now = jump_to
+        return real(message, *args, **kwargs)
+
+    monkeypatch.setattr(h.proxy, "encrypt_secure_json_message", gated)
+    return fired
+
+
+def test_f3_no_delay_control_commits_e2_once_near_deadline(env):
+    """The no-delay control: a full refresh whose REPLY/CONFIRM/ACK all
+    land at 124.999 still commits E2 exactly once on both peers."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()
+    reply = h.server_inbox.pop(0)
+    h.now = 124.999
+    assert h.deliver(reply) == h.proxy.SERVER_PACKET_REFRESH_PROGRESS
+    ack = h.server_inbox.pop(0)
+    assert h.deliver(ack) == h.proxy.SERVER_PACKET_REFRESH_COMMITTED
+    assert h.epochs.generation == 1
+    assert h.session.current_epoch.generation == 1
+    assert h.state.stats().epoch_refreshes_committed == 1
+
+
+def test_f3_confirm_send_delayed_across_deadline_is_refused(env, monkeypatch):
+    """`on_reply` clears its last check at 124.999; CONFIRM encryption then
+    crosses the deadline to 125.001. No CONFIRM leaves, the server never
+    commits, there is no progress/liveness credit, the candidate is
+    abandoned, and E1 stays usable."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()
+    reply = h.server_inbox.pop(0)
+    h.now = 124.999
+    sends_before = len(h.client_sends)
+    _gate_encryption(h, monkeypatch, "refresh_confirm", 125.001)
+
+    assert h.deliver(reply) is None                     # NOT progress
+    assert len(h.client_sends) == sends_before          # no CONFIRM datagram
+    assert not h.refresh.active
+    assert h.refresh.phase == h.proxy._ClientEpochRefresh.IDLE
+    assert h.epochs.pending_generation is None          # candidate abandoned
+    assert h.session.current_epoch.generation == 0      # server saw no CONFIRM
+    e1, role = h.state.select_data_epoch(
+        h.session, udpsec_protocol.epoch_selector_for_generation(0), h.now
+    )
+    assert role == "current" and e1 is h.session.current_epoch
+
+
+def test_f3_initial_init_send_delayed_across_deadline_is_refused(
+    env, monkeypatch
+):
+    """INIT preparation for the very first send crosses the original
+    deadline: nothing is transmitted and the transaction is abandoned."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    _gate_encryption(h, monkeypatch, "refresh_init", 125.001)
+    h.start()
+    assert h.client_sends == []
+    assert not h.refresh.active
+    assert h.refresh._attempts == 0
+    assert h.session.current_epoch.generation == 0
+
+
+def test_f3_init_retry_delayed_across_deadline_is_refused(env, monkeypatch):
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()                       # INIT #1 at 110
+    assert len(h.client_sends) == 1
+    h.now = 124.999
+    _gate_encryption(h, monkeypatch, "refresh_init", 125.001)
+    assert h.tick() is True         # abandoned, not retransmitted
+    assert len(h.client_sends) == 1
+    assert not h.refresh.active
+
+
+def test_f3_confirm_retry_delayed_across_deadline_is_refused(env, monkeypatch):
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()
+    reply = h.server_inbox.pop(0)
+    assert h.deliver(reply) == h.proxy.SERVER_PACKET_REFRESH_PROGRESS  # CONFIRM #1
+    sends = len(h.client_sends)
+    h.server_inbox.clear()          # drop the ACK
+    h.now = 124.999
+    _gate_encryption(h, monkeypatch, "refresh_confirm", 125.001)
+    assert h.tick() is True
+    assert len(h.client_sends) == sends
+    assert not h.refresh.active
+
+
+@pytest.mark.parametrize("offset", [0.0, 0.001])
+def test_f3_send_paths_reject_at_and_after_the_deadline(env, monkeypatch, offset):
+    """Equality and deadline+epsilon both refuse an initial INIT send."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    _gate_encryption(h, monkeypatch, "refresh_init", 125.0 + offset)
+    h.start()
+    assert h.client_sends == []
+    assert not h.refresh.active
+
+
+def test_f3_retry_cadence_anchors_to_actual_admitted_send_time(
+    env, monkeypatch
+):
+    """A retry scheduled for 112 whose encryption is delayed to 114 is
+    admitted at 114; the next tick at 114 must NOT send again -- the 2s
+    cadence runs from the ACTUAL admitted send time, not the stale slot."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()                                   # INIT #1 at 110
+    send_times = []
+    real_sendto = h.sendto
+
+    def observe(p, a):
+        send_times.append(h.now)
+        return real_sendto(p, a)
+
+    monkeypatch.setattr(h, "sendto", observe)
+    _gate_encryption(h, monkeypatch, "refresh_init", 114.0)
+
+    h.now = 112.0
+    assert h.tick() is False                    # retry, encryption delays to 114
+    assert send_times == [114.0]
+    assert h.refresh._next_send_at == 116.0     # anchored to 114, not 112
+
+    h.now = 114.0
+    assert h.tick() is False
+    assert send_times == [114.0]                # NO back-to-back retry
+
+    h.now = 116.0
+    assert h.tick() is False
+    assert send_times == [114.0, 116.0]
+
+    # every actual datagram (initial + 2 retries) was counted, capped at 6
+    assert h.refresh._attempts == 3
+    assert len([p for p in h.client_sends
+                if h._peek_kind(p) == "refresh_init"]) == 3
+
+
+def test_f3_tick_spin_and_budget_exhaustion_after_delayed_sends(env):
+    """Repeated ticks at one instant and past budget exhaustion cause no
+    extra sends; total INIT attempts never exceed six."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.drop_server = lambda index: True          # never deliver a REPLY
+    h.start()
+    for step in range(1, 29):
+        h.now = 110.0 + 0.5 * step              # 110.5 .. 124.0, all < deadline
+        for _ in range(6):                      # many ticks at the same instant
+            h.tick()
+    init_sends = [p for p in h.client_sends if h._peek_kind(p) == "refresh_init"]
+    assert len(init_sends) == 6                 # exactly the phase budget
+    assert h.refresh._attempts == 6
+    # after exhaustion the next scheduled point is the original deadline
+    assert h.refresh._next_send_at == h.refresh._deadline == 125.0
+    h.now = 125.0
+    assert h.tick() is True                     # abandoned at the deadline
+    assert len(
+        [p for p in h.client_sends if h._peek_kind(p) == "refresh_init"]
+    ) == 6
+
+
+def test_f3_reentrant_transport_does_not_clobber_a_newer_transaction(
+    env, monkeypatch
+):
+    """If the transport re-enters and a newer transaction is started while
+    `_send` is running, the older send's cadence/attempt bookkeeping must
+    not land on the newer transaction."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()
+    original_txn = h.refresh._txn
+    real_sendto = h.sendto
+    swapped = []
+
+    def reentrant(p, a):
+        if not swapped:
+            swapped.append(True)
+            h.refresh._reset()
+            h.now = 130.0
+            h.refresh.start(h.epochs, h, h.remote, h.clock)  # brand-new txn
+        return real_sendto(p, a)
+
+    monkeypatch.setattr(h, "sendto", reentrant)
+    h.now = 112.0
+    h.tick()                                     # retransmit -> reentrant swap
+
+    assert h.refresh._txn != original_txn
+    assert h.refresh._attempts == 1              # the NEW txn's initial send only
+    assert h.refresh._deadline == 145.0          # 130 + 15
+    assert h.refresh._next_send_at == 132.0      # 130 + 2, not 112-derived

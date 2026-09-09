@@ -303,10 +303,13 @@ epoch refresh (REFRESH_INIT/REPLY/CONFIRM/ACK with fresh ephemeral ECDHE):
 the traffic keys roll over on the same session without a new handshake,
 locator, or forwarding-loop restart. Zero disables planned refresh. Each
 control retransmission re-encrypts the same signed message under a fresh
-nonce and one bounded per-phase attempt budget; the client commits only on
-a REFRESH_ACK authenticated under the pending epoch and only before the
-transaction deadline. Session and replay state are in-memory and
-non-durable, so process restart establishes a fresh session.
+nonce and one bounded per-phase attempt budget; every datagram passes a
+final monotonic deadline check taken after encryption and immediately
+before it is sent, and the retransmit interval runs from the actual send
+time. The client commits only on a REFRESH_ACK authenticated under the
+pending epoch and only before the transaction deadline. Session and replay
+state are in-memory and non-durable, so process restart establishes a
+fresh session.
 
 A receiver remembers every admitted DATA nonce for the full usable directional
 traffic-key epoch. Those nonce records have no independent TTL and are not

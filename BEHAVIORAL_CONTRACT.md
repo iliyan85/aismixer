@@ -1272,10 +1272,21 @@ answers it idempotently.
 
 The transaction is abandoned (E1 stays current) if not committed within
 `REFRESH_TRANSACTION_TIMEOUT_SECONDS` (15s). Every `refresh_init` /
-`refresh_confirm` send -- the first and every retransmission alike -- is
-governed by one phase-scoped policy: at most `REFRESH_MAX_ATTEMPTS` (6)
-sends per phase, no closer together than `REFRESH_RETRANSMIT_SECONDS` (2s),
-and no send at all once the phase budget is spent (no busy loop). A
+`refresh_confirm` datagram -- the first and every retransmission alike --
+passes through one transaction-owned send-admission gate. The gate builds
+and AEAD-encrypts the datagram, then takes a FRESH monotonic observation
+from the same injectable clock domain immediately before the actual send,
+because encryption / allocation / an OS deschedule can themselves cross
+the deadline after the last state-machine check. `now >= deadline`
+(equality included) refuses: nothing is transmitted, the pending candidate
+is abandoned, no attempt is counted, and no progress / liveness is
+reported. An admitted send counts exactly one attempt (at most
+`REFRESH_MAX_ATTEMPTS` (6) per phase; no send once the budget is spent, no
+busy loop), and the next allowed send is anchored to the ACTUAL admitted
+send time, so a send delayed across its 2s (`REFRESH_RETRANSMIT_SECONDS`)
+slot is never immediately followed by another. If a reentrant transport
+replaces the transaction/phase while the datagram is in flight, the older
+send does not clobber the newer transaction's timers or attempt count. A
 duplicate `refresh_reply` received after E2 is derived is recognised only
 when its signed transcript hash is identical to the reply the client
 already verified; it is then a benign duplicate that triggers no send and,
@@ -1292,14 +1303,18 @@ commits nothing, clears no pending state, credits no liveness and resets
 no timer; only genuine server-commit evidence under E2 commits the client.
 
 Every deadline-sensitive transition -- `refresh_reply` acceptance,
-duplicate handling, retransmission, candidate abandonment and the final
-`refresh_ack` commit -- takes a fresh monotonic observation immediately
-before it acts (never a value sampled before blocking I/O or before the
-signature / ECDHE / HKDF work) and treats the deadline as exclusive:
-`now >= deadline` rejects and abandons the candidate rather than
-committing, sending outside budget, renewing liveness or retaining the
-candidate. An independently valid E1 is preserved; further recovery is the
-existing terminal path.
+duplicate handling, retransmission, candidate abandonment, the actual
+`refresh_init` / `refresh_confirm` send (see the send-admission gate
+above), and the final `refresh_ack` commit -- takes a fresh monotonic
+observation immediately before it acts (never a value sampled before
+blocking I/O, before the signature / ECDHE / HKDF work, or before AEAD
+encryption) and treats the deadline as exclusive: `now >= deadline`
+rejects and abandons the candidate rather than committing, sending outside
+budget, renewing liveness or retaining the candidate. An independently
+valid E1 is preserved; further recovery is the existing terminal path.
+`start`, `tick`, `on_reply` and `on_ack` all take a zero-argument
+monotonic clock callable (the same domain as `forward_loop`'s deadlines);
+there is no scalar-`now` send path.
 
 The first verified `refresh_reply` and a genuine `refresh_ack` commit
 advance `last_authenticated_peer` (the peer-timeout backstop) but do NOT
