@@ -1231,7 +1231,10 @@ generation is still `G`, and no incompatible transition is unresolved
 a retiring epoch is still within its cutoff, is rejected: there is no
 chain of pending refreshes. A retransmit of the SAME transaction is
 idempotent -- its fresh nonce is admitted but no new keys are derived and
-the cached `refresh_reply` packet is re-sent.
+the cached `refresh_reply` packet is re-sent. A byte-for-byte replayed
+`refresh_init`/`refresh_confirm` (identical nonce) is rejected by the
+pre-decrypt per-epoch replay ledger before any state-machine step, so it
+can never re-derive, re-commit, move liveness or extend a deadline.
 
 On a valid `refresh_confirm` for the live candidate the server commits
 atomically under the lock (all fallible work already happened at
@@ -1256,16 +1259,56 @@ receives the `refresh_ack` it switches sending to E2. A planned
 fresh establishment handshake; `session_refresh_interval = 0` still
 disables planned refresh, and proactive rekey on an unanswered keepalive
 ping still performs a genuine fresh-establishment handshake for real
-liveness failure. The transaction is abandoned (E1 stays current) if not
-committed within `REFRESH_TRANSACTION_TIMEOUT_SECONDS` (15s);
-`refresh_init`/`refresh_confirm` are retransmitted every
-`REFRESH_RETRANSMIT_SECONDS` (2s) up to `REFRESH_MAX_ATTEMPTS` (6) per
-phase. A valid `refresh_reply` or `refresh_ack` advances
-`last_authenticated_peer` (the peer-timeout backstop) but does NOT clear
-an outstanding keepalive `expected_ping_seq`; normal keepalive/rekey
-deadlines remain due on their existing schedule. A successful commit
-reanchors only the client's own planned-refresh cadence, never
-`session.created_at` on the server.
+liveness failure.
+
+The client caches the two canonical control messages (`refresh_init` and,
+once E2 is derived, `refresh_confirm`) -- never their ciphertext -- and
+re-encrypts every scheduled (re)transmission with a FRESH AEAD nonce under
+the same key/generation. The signed ECDHE contributions, candidate keys,
+transaction id, generations and the original transaction deadline are
+never regenerated for a retry; only the datagram nonce changes, so the
+server's strict per-epoch replay ledger admits every retransmission and
+answers it idempotently.
+
+The transaction is abandoned (E1 stays current) if not committed within
+`REFRESH_TRANSACTION_TIMEOUT_SECONDS` (15s). Every `refresh_init` /
+`refresh_confirm` send -- the first and every retransmission alike -- is
+governed by one phase-scoped policy: at most `REFRESH_MAX_ATTEMPTS` (6)
+sends per phase, no closer together than `REFRESH_RETRANSMIT_SECONDS` (2s),
+and no send at all once the phase budget is spent (no busy loop). A
+duplicate `refresh_reply` received after E2 is derived is recognised only
+when its signed transcript hash is identical to the reply the client
+already verified; it is then a benign duplicate that triggers no send and,
+unlike the first verified `refresh_reply`, is NOT fresh peer evidence.
+
+Exact epoch-role authority is enforced for inbound control datagrams at
+BOTH the packet dispatcher and the state machine: a `refresh_reply` is
+accepted only when it authenticated under the exact current parent (E1)
+epoch of the live transaction, and a `refresh_ack` only when it
+authenticated under the exact pending candidate (E2) epoch, in
+`CONFIRM_SENT`, matching the transaction, generation and station identity.
+A parent-E1-authenticated `refresh_ack` (correct JSON, wrong epoch)
+commits nothing, clears no pending state, credits no liveness and resets
+no timer; only genuine server-commit evidence under E2 commits the client.
+
+Every deadline-sensitive transition -- `refresh_reply` acceptance,
+duplicate handling, retransmission, candidate abandonment and the final
+`refresh_ack` commit -- takes a fresh monotonic observation immediately
+before it acts (never a value sampled before blocking I/O or before the
+signature / ECDHE / HKDF work) and treats the deadline as exclusive:
+`now >= deadline` rejects and abandons the candidate rather than
+committing, sending outside budget, renewing liveness or retaining the
+candidate. An independently valid E1 is preserved; further recovery is the
+existing terminal path.
+
+The first verified `refresh_reply` and a genuine `refresh_ack` commit
+advance `last_authenticated_peer` (the peer-timeout backstop) but do NOT
+clear an outstanding keepalive `expected_ping_seq`, do not reset the
+outstanding ping sequence / `last_ping_at` / peer timeout, and do not
+extend the transaction deadline; a duplicate control datagram advances
+none of these. Normal keepalive/rekey deadlines remain due on their
+existing schedule. A successful commit reanchors only the client's own
+planned-refresh cadence, never `session.created_at` on the server.
 
 **Epoch-specific replay and receive admission.** Every DATA operation
 retains the EXACT `CryptoEpoch` object it selected for authentication.

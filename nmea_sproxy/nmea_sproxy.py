@@ -11,7 +11,7 @@ import sys
 import json
 import select
 from cryptography.exceptions import UnsupportedAlgorithm
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import constant_time, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -124,6 +124,11 @@ SERVER_PACKET_AUTHENTICATED = "authenticated"
 SERVER_PACKET_PEER_CLOSE = "peer_close"
 SERVER_PACKET_REFRESH_PROGRESS = "refresh_progress"
 SERVER_PACKET_REFRESH_COMMITTED = "refresh_committed"
+# A refresh control datagram that was authenticated and handled but is only
+# a benign duplicate of evidence already consumed (a repeated REFRESH_REPLY
+# after the client already derived E2). It advances nothing and, unlike
+# genuine first progress, is NOT fresh peer-liveness evidence.
+SERVER_PACKET_REFRESH_BENIGN = "refresh_benign"
 SESSION_END_PLANNED_REFRESH = "planned_refresh"
 SESSION_END_PROACTIVE_REKEY = "proactive_rekey"
 SESSION_END_PEER_GRACEFUL_CLOSE = "peer_graceful_close"
@@ -751,6 +756,12 @@ class _ClientEpochRefresh:
     INIT_SENT = "init_sent"
     CONFIRM_SENT = "confirm_sent"
 
+    # `on_reply` outcomes -- distinguished so a repeated REFRESH_REPLY is
+    # never mistaken for fresh peer-liveness evidence.
+    REPLY_NONE = "none"          # not for us / rejected -- advanced nothing
+    REPLY_ADVANCED = "advanced"  # first verified REPLY: derived E2, sent CONFIRM
+    REPLY_DUPLICATE = "duplicate"  # benign duplicate of the already-verified REPLY
+
     def __init__(
         self, station_private_key, station_id, session_locator
     ):
@@ -765,8 +776,20 @@ class _ClientEpochRefresh:
         self._client_epoch_random = None
         self._client_epoch_public_bytes = None
         self._init_signature = None
-        self._init_packet = None
-        self._confirm_packet = None
+        # The canonical control messages plus the exact keys/generations
+        # they must be encrypted under. Each scheduled (re)transmission is
+        # re-encrypted with a FRESH AEAD nonce from these -- the transaction,
+        # signed ECDHE contributions and candidate keys never change on a
+        # retry, only the datagram nonce does, so the server's strict
+        # per-epoch replay ledger admits every retransmission.
+        self._init_message = None
+        self._parent_c2s_key = None
+        self._confirm_message = None
+        self._next_c2s_key = None
+        # Transaction-local digest of the REPLY we verified, so a duplicate
+        # REPLY is recognised only when its signed content is identical --
+        # never on arbitrary E1-authenticated fields.
+        self._reply_transcript_hash = None
         self._deadline = None
         self._next_send_at = None
         self._attempts = 0
@@ -784,11 +807,24 @@ class _ClientEpochRefresh:
         self._client_epoch_random = None
         self._client_epoch_public_bytes = None
         self._init_signature = None
-        self._init_packet = None
-        self._confirm_packet = None
+        self._init_message = None
+        self._parent_c2s_key = None
+        self._confirm_message = None
+        self._next_c2s_key = None
+        self._reply_transcript_hash = None
         self._deadline = None
         self._next_send_at = None
         self._attempts = 0
+
+    def _abandon(self, epochs):
+        """Give up on the in-flight transaction; E1 stays current. Used both
+        by the retransmit-loop timeout and by an authoritative deadline
+        check at any state transition."""
+        print(
+            "Secure epoch refresh deadline reached; keeping the current epoch."
+        )
+        epochs.clear_pending()
+        self._reset()
 
     @staticmethod
     def _send(sock, remote_addr, packet):
@@ -796,6 +832,45 @@ class _ClientEpochRefresh:
             sock.sendto(packet, remote_addr)
         except OSError as exc:
             print(f"❌ Epoch refresh send error: {exc}")
+
+    def _encrypt_init(self):
+        """A fresh-nonce encryption of the immutable REFRESH_INIT message
+        under the parent (E1) client->server key."""
+        return encrypt_secure_json_message(
+            self._init_message,
+            self._parent_c2s_key,
+            self._session_locator,
+            self._parent_gen,
+        )
+
+    def _encrypt_confirm(self):
+        """A fresh-nonce encryption of the immutable REFRESH_CONFIRM message
+        under the candidate (E2) client->server key."""
+        return encrypt_secure_json_message(
+            self._confirm_message,
+            self._next_c2s_key,
+            self._session_locator,
+            self._next_gen,
+        )
+
+    def _reply_transcript_for(self, reply):
+        """The refresh transcript hash implied by `reply` combined with this
+        transaction's fixed client contribution -- the exact value stored in
+        `self._reply_transcript_hash` for the REPLY we verified."""
+        return build_refresh_transcript_hash(
+            protocol_version=UDPSEC_PROTOCOL_VERSION,
+            station_id=self._station_id,
+            session_locator=self._session_locator,
+            parent_generation=self._parent_gen,
+            next_generation=self._next_gen,
+            transaction_id=self._txn,
+            client_epoch_random=self._client_epoch_random,
+            client_epoch_public_key=self._client_epoch_public_bytes,
+            client_refresh_signature=self._init_signature,
+            server_epoch_random=reply.server_epoch_random,
+            server_epoch_public_key=reply.server_epoch_public_key,
+            server_refresh_signature=reply.refresh_signature,
+        )
 
     def start(self, epochs, sock, remote_addr, now):
         if self.active:
@@ -825,7 +900,7 @@ class _ClientEpochRefresh:
         self._init_signature = sign_transcript_digest(
             self._station_private_key, init_digest
         )
-        init_message = build_refresh_init_message(
+        self._init_message = build_refresh_init_message(
             station_id=self._station_id,
             transaction_id=self._txn,
             parent_generation=parent_gen,
@@ -835,18 +910,13 @@ class _ClientEpochRefresh:
             refresh_signature=self._init_signature,
             timestamp=int(time.time()),
         )
-        self._init_packet = encrypt_secure_json_message(
-            init_message,
-            epochs.client_to_server_key,
-            self._session_locator,
-            parent_gen,
-        )
+        self._parent_c2s_key = epochs.client_to_server_key
         self.phase = self.INIT_SENT
         self._attempts = 1
         self._deadline = now + REFRESH_TRANSACTION_TIMEOUT_SECONDS
         self._next_send_at = now + REFRESH_RETRANSMIT_SECONDS
         print("Starting in-session authenticated epoch refresh.")
-        self._send(sock, remote_addr, self._init_packet)
+        self._send(sock, remote_addr, self._encrypt_init())
 
     def tick(self, epochs, sock, remote_addr, now):
         """Retransmit / abandon. Returns True if the transaction was
@@ -854,11 +924,7 @@ class _ClientEpochRefresh:
         if not self.active:
             return False
         if now >= self._deadline:
-            print(
-                "Secure epoch refresh timed out; keeping the current epoch."
-            )
-            epochs.clear_pending()
-            self._reset()
+            self._abandon(epochs)
             return True
         if now >= self._next_send_at:
             if self._attempts >= REFRESH_MAX_ATTEMPTS:
@@ -866,11 +932,18 @@ class _ClientEpochRefresh:
                 return False
             self._attempts += 1
             self._next_send_at = now + REFRESH_RETRANSMIT_SECONDS
-            packet = (
-                self._confirm_packet
-                if self.phase == self.CONFIRM_SENT
-                else self._init_packet
-            )
+            if self.phase == self.CONFIRM_SENT:
+                packet = (
+                    self._encrypt_confirm()
+                    if self._confirm_message is not None
+                    else None
+                )
+            else:
+                packet = (
+                    self._encrypt_init()
+                    if self._init_message is not None
+                    else None
+                )
             if packet is not None:
                 self._send(sock, remote_addr, packet)
         return False
@@ -890,24 +963,48 @@ class _ClientEpochRefresh:
         server_identity_public_key,
         sock,
         remote_addr,
-        now,
+        clock,
+        *,
+        authenticated_generation,
     ):
+        """Handle a REFRESH_REPLY. `authenticated_generation` is the exact
+        epoch generation the datagram authenticated under; `clock` is the
+        monotonic-time source, re-sampled immediately before any state
+        transition. Returns one of `REPLY_NONE` / `REPLY_ADVANCED` /
+        `REPLY_DUPLICATE`."""
         if self.phase not in (self.INIT_SENT, self.CONFIRM_SENT):
-            return False
+            return self.REPLY_NONE
+        # A REFRESH_REPLY is only ever authoritative under the exact current
+        # parent (E1) epoch of this live transaction.
+        if authenticated_generation != self._parent_gen:
+            return self.REPLY_NONE
         if reply.transaction_id != self._txn:
-            return False
+            return self.REPLY_NONE
         if (
             reply.parent_generation != self._parent_gen
             or reply.next_generation != self._next_gen
         ):
-            return False
+            return self.REPLY_NONE
+        if clock() >= self._deadline:
+            self._abandon(epochs)
+            return self.REPLY_NONE
+
         if self.phase == self.CONFIRM_SENT:
-            # Idempotent: E2 already derived and CONFIRM already sent. A
-            # duplicate REPLY only means our CONFIRM may have been lost --
-            # resend it.
-            if self._confirm_packet is not None:
-                self._send(sock, remote_addr, self._confirm_packet)
-            return True
+            # E2 already derived and CONFIRM already sent. Recognise this
+            # only as a benign duplicate of the REPLY we actually verified
+            # -- recompute its transcript hash and require an exact match,
+            # so no arbitrary E1-authenticated field set can pose as a
+            # previously verified reply. A duplicate is NOT fresh liveness
+            # and triggers no send here: the bounded retransmit cadence in
+            # `tick` already resends CONFIRM within the phase attempt budget.
+            if self._reply_transcript_hash is None:
+                return self.REPLY_NONE
+            if not constant_time.bytes_eq(
+                self._reply_transcript_for(reply),
+                self._reply_transcript_hash,
+            ):
+                return self.REPLY_NONE
+            return self.REPLY_DUPLICATE
 
         reply_digest = build_refresh_reply_digest(
             protocol_version=UDPSEC_PROTOCOL_VERSION,
@@ -927,13 +1024,13 @@ class _ClientEpochRefresh:
             reply.refresh_signature,
             reply_digest,
         ):
-            return False
+            return self.REPLY_NONE
         try:
             server_epoch_public_key = parse_ephemeral_public_key(
                 reply.server_epoch_public_key
             )
         except ValueError:
-            return False
+            return self.REPLY_NONE
         transcript_hash = build_refresh_transcript_hash(
             protocol_version=UDPSEC_PROTOCOL_VERSION,
             station_id=self._station_id,
@@ -956,36 +1053,54 @@ class _ClientEpochRefresh:
         key_material = derive_refresh_epoch_key_material(
             shared_secret, transcript_hash
         )
+
+        # Fresh, authoritative monotonic observation immediately before the
+        # phase transition: the signature check + ECDHE + HKDF above must not
+        # be allowed to authorize a transition past the transaction deadline.
+        now = clock()
+        if now >= self._deadline:
+            self._abandon(epochs)
+            return self.REPLY_NONE
+
+        self._reply_transcript_hash = transcript_hash
+        self._next_c2s_key = key_material.client_to_server_key
         epochs.set_pending(
             self._next_gen,
             key_material.client_to_server_key,
             key_material.server_to_client_key,
         )
-        confirm_message = build_refresh_confirm_message(
+        self._confirm_message = build_refresh_confirm_message(
             station_id=self._station_id,
             transaction_id=self._txn,
             next_generation=self._next_gen,
             timestamp=int(time.time()),
         )
-        self._confirm_packet = encrypt_secure_json_message(
-            confirm_message,
-            key_material.client_to_server_key,
-            self._session_locator,
-            self._next_gen,
-        )
         self.phase = self.CONFIRM_SENT
         self._attempts = 1
         self._next_send_at = now + REFRESH_RETRANSMIT_SECONDS
-        self._send(sock, remote_addr, self._confirm_packet)
-        return True
+        self._send(sock, remote_addr, self._encrypt_confirm())
+        return self.REPLY_ADVANCED
 
-    def on_ack(self, ack, epochs, now):
+    def on_ack(self, ack, epochs, clock, *, authenticated_generation):
+        """Commit the epoch swap on a genuine REFRESH_ACK. `clock` is
+        re-sampled immediately before the (irreversible) commit."""
         if self.phase != self.CONFIRM_SENT:
+            return False
+        # The ACK is the server's evidence of its own commit under E2: it is
+        # only authoritative when it authenticated under the exact pending
+        # candidate epoch. A parent-E1-authenticated ACK commits nothing.
+        if authenticated_generation != self._next_gen:
+            return False
+        if epochs.pending_generation != self._next_gen:
             return False
         if (
             ack.transaction_id != self._txn
             or ack.next_generation != self._next_gen
         ):
+            return False
+        now = clock()
+        if now >= self._deadline:
+            self._abandon(epochs)
             return False
         committed = epochs.commit_pending(now)
         self._reset()
@@ -1173,18 +1288,24 @@ def _try_handle_refresh_message(
     station_id,
     server_identity_public_key,
     sock,
-    now,
+    clock,
 ):
     """Route one server DATA datagram to the epoch-refresh state machine if
     it is a REFRESH_REPLY or REFRESH_ACK for the active transaction.
 
+    ``clock`` is a zero-argument monotonic-time source (the same domain as
+    ``forward_loop``'s deadlines); the state machine re-samples it
+    immediately before each state transition.
+
     Returns ``SERVER_PACKET_REFRESH_COMMITTED`` (the epoch swap just
     finalized -- the caller reanchors the planned-refresh cadence),
-    ``SERVER_PACKET_REFRESH_PROGRESS`` (authenticated peer evidence that
-    advanced the machine or a benign duplicate), or ``None`` (not a refresh
+    ``SERVER_PACKET_REFRESH_PROGRESS`` (first authenticated peer evidence
+    that advanced the machine -- also fresh liveness),
+    ``SERVER_PACKET_REFRESH_BENIGN`` (an authenticated but duplicate control
+    datagram: handled, but not fresh liveness), or ``None`` (not a refresh
     message for us -- the caller falls through to `handle_server_packet`).
-    A forged/replayed/mismatched refresh message advances nothing and
-    returns ``None``."""
+    A forged/replayed/mismatched/epoch-mismatched refresh message advances
+    nothing and returns ``None``."""
     if refresh is None:
         return None
     if not remote_addresses_match(addr, remote_addr):
@@ -1197,7 +1318,7 @@ def _try_handle_refresh_message(
         return None
     if packet_locator != epochs.session_locator:
         return None
-    resolved = epochs.inbound_epoch(epoch_selector, now)
+    resolved = epochs.inbound_epoch(epoch_selector, clock())
     if resolved is None:
         return None
     key, generation = resolved
@@ -1211,30 +1332,45 @@ def _try_handle_refresh_message(
         return None
     kind = message.get("type")
     if kind == REFRESH_REPLY_TYPE:
+        # Dispatcher-level role gate: a REFRESH_REPLY is only ever valid
+        # under the exact current parent epoch.
+        if generation != epochs.generation:
+            return None
         try:
             reply = parse_refresh_reply_message(message)
         except (TypeError, ValueError):
             return None
         if reply.station_id != station_id:
             return None
-        if refresh.on_reply(
+        outcome = refresh.on_reply(
             reply,
             epochs,
             server_identity_public_key,
             sock,
             remote_addr,
-            now,
-        ):
+            clock,
+            authenticated_generation=generation,
+        )
+        if outcome == _ClientEpochRefresh.REPLY_ADVANCED:
             return SERVER_PACKET_REFRESH_PROGRESS
+        if outcome == _ClientEpochRefresh.REPLY_DUPLICATE:
+            return SERVER_PACKET_REFRESH_BENIGN
         return None
     if kind == REFRESH_ACK_TYPE:
+        # Dispatcher-level role gate: a REFRESH_ACK is only ever valid under
+        # the exact pending candidate (E2) epoch.
+        pending_generation = epochs.pending_generation
+        if pending_generation is None or generation != pending_generation:
+            return None
         try:
             ack = parse_refresh_ack_message(message)
         except (TypeError, ValueError):
             return None
         if ack.station_id != station_id:
             return None
-        if refresh.on_ack(ack, epochs, now):
+        if refresh.on_ack(
+            ack, epochs, clock, authenticated_generation=generation
+        ):
             return SERVER_PACKET_REFRESH_COMMITTED
         return None
     return None
@@ -1870,7 +2006,7 @@ def forward_loop(
                 config["station_id"],
                 server_identity_public_key,
                 out_sock,
-                now,
+                time.monotonic,
             )
             if refresh_result == SERVER_PACKET_REFRESH_COMMITTED:
                 print(
@@ -1883,6 +2019,11 @@ def forward_loop(
                 result = SERVER_PACKET_IGNORED
             elif refresh_result == SERVER_PACKET_REFRESH_PROGRESS:
                 last_authenticated_peer = now
+                result = SERVER_PACKET_IGNORED
+            elif refresh_result == SERVER_PACKET_REFRESH_BENIGN:
+                # Authenticated, handled, but only a duplicate of evidence
+                # already consumed -- explicitly NOT fresh peer liveness, so
+                # `last_authenticated_peer` is left where it was.
                 result = SERVER_PACKET_IGNORED
             else:
                 try:

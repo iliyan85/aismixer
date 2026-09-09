@@ -1101,3 +1101,446 @@ def test_client_planned_refresh_does_not_restart_forward_loop(env, monkeypatch):
     # a genuine re-establishment handshake (ClientHello) was never sent
     assert "refresh_init" in sock.sent_kinds
     assert sock.sent_kinds.count("refresh_confirm") >= 1
+
+
+# --------------------------------------------------------------------------
+# F. Prompt-3 corrective regressions (F1-F4)
+#
+# These drive the REAL `_ClientEpochRefresh` choreography against the REAL
+# server `_process_refresh_init` / `_process_refresh_confirm` state machine
+# over a controllable in-process "network" (packets can be dropped) with an
+# injected monotonic clock. Real P-256 / AES-GCM throughout.
+# --------------------------------------------------------------------------
+
+
+class _ClientServerRefresh:
+    def __init__(self, env, *, now=1000.0):
+        self.env = env
+        self.secure = env.secure
+        self.proxy = _load_proxy()
+        self.now = now
+        self.state = env.new_state()
+        self.session, c2s, s2c, self.token = env.install_session(
+            self.state, now=now
+        )
+        self.locator = self.session._session_key.session_locator
+        self.identity = self.session
+        self.confirmed = self.proxy.ConfirmedUdpsecSession(
+            session_locator=self.locator,
+            key_material=self.proxy.SessionKeyMaterial(
+                client_to_server_key=c2s, server_to_client_key=s2c
+            ),
+        )
+        self.epochs = self.proxy._ClientEpochSet(self.locator, _KM(c2s, s2c))
+        self.refresh = self.proxy._ClientEpochRefresh(
+            env.station_private_key, STATION_ID, self.locator
+        )
+        self.client_sends = []
+        self.server_sends = []
+        self.server_inbox = []
+        self.drop_client = lambda kind, index: False
+        self.drop_server = lambda index: False
+        self.remote = ("192.0.2.50", 19999)
+
+    # -- socket the client writes to -----------------------------------
+    def sendto(self, packet, addr):
+        self.client_sends.append(packet)
+        kind = self._peek_kind(packet)
+        index = sum(
+            1 for p in self.client_sends if self._peek_kind(p) == kind
+        )
+        if self.drop_client(kind, index):
+            return
+        self._server_rx(packet)
+
+    def clock(self):
+        return self.now
+
+    # -- also usable directly as a `forward_loop` output socket -----------
+    def bind(self, addr):
+        pass
+
+    def setblocking(self, flag):
+        pass
+
+    def settimeout(self, value):
+        pass
+
+    def recvfrom(self, _n):
+        if self.server_inbox:
+            return self.server_inbox.pop(0), self.remote
+        raise BlockingIOError()
+
+    def _decrypt_client(self, packet):
+        loc, sel, nonce, ct = udpsec_protocol.parse_data_packet(packet)
+        epoch, role = self.state.select_data_epoch(self.session, sel, self.now)
+        if epoch is None:
+            return None, None, None, None
+        try:
+            pt = epoch.client_to_server_aesgcm.decrypt(
+                nonce, ct, udpsec_protocol.build_data_aad(loc, epoch.generation)
+            )
+        except Exception:
+            return None, None, None, None
+        return json.loads(pt), epoch, role, nonce
+
+    def _peek_kind(self, packet):
+        msg, _e, _r, _n = self._decrypt_client(packet)
+        return None if msg is None else msg.get("type")
+
+    def _server_rx(self, packet):
+        loc = udpsec_protocol.parse_data_packet(packet)[0]
+        msg, epoch, role, nonce = self._decrypt_client(packet)
+        if msg is None:
+            return
+        # faithful pre-decrypt replay drop (mirrors `_secure_server_loop`)
+        if self.state.epoch_data_nonce_seen(
+            self.session, epoch, nonce, self.now
+        ):
+            return
+        kind = msg.get("type")
+        emitted = None
+        if kind == "refresh_init" and role == "current":
+            emitted = self.secure._process_refresh_init(
+                self.state, self.session, epoch, msg, nonce, loc,
+                self.env.server_private_key, lambda: 222, self.now,
+            )
+        elif kind == "refresh_confirm":
+            emitted, _newly = self.secure._process_refresh_confirm(
+                self.state, self.session, epoch, msg, nonce, loc,
+                lambda: 444, self.now,
+            )
+        if emitted is not None:
+            self.server_sends.append(emitted)
+            if not self.drop_server(len(self.server_sends)):
+                self.server_inbox.append(emitted)
+
+    # -- client drivers ----------------------------------------------------
+    def start(self):
+        self.refresh.start(self.epochs, self, self.remote, self.now)
+
+    def tick(self):
+        return self.refresh.tick(self.epochs, self, self.remote, self.now)
+
+    def deliver(self, packet):
+        return self.proxy._try_handle_refresh_message(
+            packet, self.remote, self.remote, self.epochs, self.refresh,
+            STATION_ID, self.env.server_public_key, self, self.clock,
+        )
+
+    def deliver_all(self):
+        outcomes = []
+        while self.server_inbox:
+            outcomes.append(self.deliver(self.server_inbox.pop(0)))
+        return outcomes
+
+    def nonces(self, kind):
+        out = []
+        for p in self.client_sends:
+            if self._peek_kind(p) == kind:
+                out.append(udpsec_protocol.parse_data_packet(p)[2])
+        return out
+
+
+@pytest.mark.parametrize("lost", ["reply", "confirm", "ack"])
+def test_f1_single_loss_recovers_with_fresh_nonce_retransmit(env, lost):
+    """A single lost REPLY / CONFIRM / ACK recovers within the retransmit
+    budget: retransmits carry FRESH AEAD nonces, the server admits them
+    (zero replay drops), the epoch commits exactly once, and it is the
+    SAME LogicalSession."""
+    h = _ClientServerRefresh(env)
+    if lost == "confirm":
+        h.drop_client = lambda kind, index: (
+            kind == "refresh_confirm" and index == 1
+        )
+    elif lost == "reply":
+        # the first server packet is the REPLY to the first INIT
+        h.drop_server = lambda index: index == 1
+    elif lost == "ack":
+        # server packet #2 is the ACK for the first (committing) CONFIRM
+        h.drop_server = lambda index: index == 2
+
+    h.now = 110.0
+    h.start()
+    for step in range(1, 8):
+        h.deliver_all()
+        if h.epochs.generation == 1:
+            break
+        h.now = 110.0 + 2.0 * step
+        h.tick()
+    h.deliver_all()
+
+    assert h.epochs.generation == 1
+    assert h.session.current_epoch.generation == 1
+    assert h.session is h.identity
+    assert h.state._sessions[h.session._session_key] is h.session
+    assert h.state.stats().epoch_refreshes_committed == 1
+    assert h.state.stats().sessions_replaced == 0
+    assert h.state.stats().data_nonce_replays == 0
+
+    init_nonces = h.nonces("refresh_init")
+    confirm_nonces = h.nonces("refresh_confirm")
+    assert len(init_nonces) == len(set(init_nonces))
+    assert len(confirm_nonces) == len(set(confirm_nonces))
+    if lost == "reply":
+        assert len(init_nonces) >= 2  # INIT retransmit yielded the cached REPLY
+    if lost in ("confirm", "ack"):
+        assert len(confirm_nonces) >= 2  # CONFIRM retransmit recovered it
+
+    # E2 is now current on the exact same server session
+    e2, role = h.state.select_data_epoch(
+        h.session, udpsec_protocol.epoch_selector_for_generation(1), h.now
+    )
+    assert role == "current" and e2 is h.session.current_epoch
+
+
+def test_f1_repeated_lost_acks_reack_without_second_commit(env):
+    """Several lost ACKs in a row: each fresh-nonce CONFIRM retransmit is
+    admitted and idempotently re-ACKed; the server commits exactly once."""
+    h = _ClientServerRefresh(env)
+    # server packet #1 is the REPLY; #2..#6 are ACK / re-ACKs -- drop #2..#5,
+    # deliver #6.
+    h.drop_server = lambda index: 2 <= index <= 5
+
+    h.now = 110.0
+    h.start()
+    h.deliver_all()  # REPLY -> derive E2 -> CONFIRM #1 -> server commits, ACK dropped
+    assert h.session.current_epoch.generation == 1
+    committed_epoch = h.session.current_epoch
+    assert h.epochs.generation == 0  # client did not get the ACK
+
+    for step in range(1, 4):
+        h.now = 110.0 + 2.0 * step
+        h.tick()          # fresh-nonce CONFIRM retransmit
+        h.deliver_all()   # re-ACK #<=4 dropped, so still no client commit
+        assert h.session.current_epoch is committed_epoch
+        assert h.state.stats().epoch_refreshes_committed == 1
+
+    confirm_nonces = h.nonces("refresh_confirm")
+    assert len(confirm_nonces) == len(set(confirm_nonces)) >= 4
+
+    # the next re-ACK (server packet #5) gets through -> client commits once
+    h.now = 120.0
+    h.tick()
+    h.deliver_all()
+    assert h.epochs.generation == 1
+    assert h.session.current_epoch is committed_epoch
+    assert h.state.stats().epoch_refreshes_committed == 1
+
+
+def test_f1_forward_loop_lost_ack_recovers_preserving_continuity(
+    env, monkeypatch
+):
+    """End-to-end through the REAL `forward_loop`: a dropped ACK recovers
+    via a fresh-nonce CONFIRM retransmit, on the SAME LogicalSession, with
+    the caller's `ForwardingStats` object and the input adapter untouched
+    and no re-establishment handshake."""
+    h = _ClientServerRefresh(env)
+    proxy = h.proxy
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: h.now)
+    monkeypatch.setattr(proxy.time, "time", lambda: 1000)
+    h.drop_server = lambda index: index == 2  # the first (committing) ACK
+
+    epoch_ref = []
+    stats = proxy.ForwardingStats()
+
+    class _Stop(BaseException):
+        pass
+
+    class _Inp:
+        closed = False
+
+        def selectable_sockets(self):
+            return []
+
+        def poll_interval(self):
+            return None
+
+        def read_ready(self, s):
+            return []
+
+        def read_pending(self):
+            return []
+
+    inp = _Inp()
+
+    def fake_select(r, w, x, timeout):
+        if epoch_ref and epoch_ref[0].generation == 1:
+            raise _Stop()
+        if not h.server_inbox:
+            h.now += timeout if timeout else 1.0
+        return ([s for s in r if getattr(s, "server_inbox", None)], [], [])
+
+    monkeypatch.setattr(proxy.select, "select", fake_select)
+
+    h.now = 100.0
+    config = {
+        "station_id": STATION_ID, "keepalive_interval": 100000,
+        "peer_timeout": 100000, "session_refresh_interval": 3,
+        "reconnect_delay": 1,
+    }
+    with pytest.raises(_Stop):
+        proxy.forward_loop(
+            inp, h, config, h.confirmed, h.remote, None, stats,
+            station_private_key=env.station_private_key,
+            server_identity_public_key=env.server_public_key,
+            epoch_state_ref=epoch_ref,
+        )
+
+    assert epoch_ref[0].generation == 1
+    assert h.session.current_epoch.generation == 1
+    # same LogicalSession object -> locator / handle / namespace /
+    # created_at / PathState all preserved
+    assert h.session is h.identity
+    assert h.state._sessions[h.session._session_key] is h.session
+    assert h.state.stats().epoch_refreshes_committed == 1
+    assert h.state.stats().sessions_replaced == 0
+    assert h.state.stats().data_nonce_replays == 0
+    assert stats.messages == 0            # caller's stats object, untouched
+    assert inp is not None and not inp.closed
+    confirm_nonces = h.nonces("refresh_confirm")
+    assert len(confirm_nonces) == len(set(confirm_nonces)) >= 2
+    # every client datagram was an in-session refresh control message --
+    # no ClientHello, i.e. no re-establishment handshake
+    kinds = {h._peek_kind(p) for p in h.client_sends}
+    assert kinds <= {"refresh_init", "refresh_confirm"}
+    assert all(
+        p.startswith(udpsec_protocol.DATA_PREFIX) for p in h.client_sends
+    )
+
+
+def test_f2_ack_authenticated_under_parent_epoch_does_not_commit(env):
+    """A REFRESH_ACK that authenticated only under the parent E1 epoch
+    (held-CONFIRM attack) commits nothing; the genuine E2 ACK commits
+    exactly once."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()
+    reply = h.server_inbox.pop(0)
+    # deliver the REPLY but withhold the CONFIRM from the server
+    withheld = []
+    h_sendto = h.sendto
+    h.sendto = lambda p, a: withheld.append(p)
+    assert h.deliver(reply) == h.proxy.SERVER_PACKET_REFRESH_PROGRESS
+    h.sendto = h_sendto
+    assert h.session.current_epoch.generation == 0
+    assert h.session.pending_epoch is not None
+    assert h.refresh.phase == h.proxy._ClientEpochRefresh.CONFIRM_SENT
+
+    # forge an ACK under the real E1 server->client key
+    forged_msg = env.secure.build_refresh_ack_message(
+        station_id=STATION_ID, transaction_id=h.refresh._txn,
+        next_generation=1, timestamp=1000,
+    )
+    e1_s2c = h.epochs.server_to_client_key
+    forged = h.proxy.encrypt_secure_json_message(
+        forged_msg, e1_s2c, h.locator, 0
+    )
+    assert h.deliver(forged) is None
+    assert h.epochs.generation == 0
+    assert h.session.current_epoch.generation == 0
+    assert h.refresh.phase == h.proxy._ClientEpochRefresh.CONFIRM_SENT
+
+    # now let the genuine CONFIRM reach the server -> commit + E2 ACK
+    for pkt in withheld:
+        h._server_rx(pkt)
+    outcomes = h.deliver_all()
+    assert h.proxy.SERVER_PACKET_REFRESH_COMMITTED in outcomes
+    assert h.epochs.generation == 1
+    assert h.session.current_epoch.generation == 1
+    assert h.state.stats().epoch_refreshes_committed == 1
+    # a replayed genuine ACK does not double-commit
+    assert h.state.stats().epoch_refreshes_committed == 1
+
+
+@pytest.mark.parametrize(
+    ("offset", "commits"),
+    [(-0.001, True), (0.0, False), (0.001, False)],
+)
+def test_f3_ack_deadline_is_exclusive(env, offset, commits):
+    """`now >= deadline` rejects the commit; strictly before it commits.
+    The candidate is abandoned (not retained) when the deadline is hit."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()
+    reply = h.server_inbox.pop(0)
+    assert h.deliver(reply) == h.proxy.SERVER_PACKET_REFRESH_PROGRESS
+    ack = h.server_inbox.pop(0)
+    assert h.refresh._deadline == 125.0
+
+    h.now = 125.0 + offset
+    result = h.deliver(ack)
+    if commits:
+        assert result == h.proxy.SERVER_PACKET_REFRESH_COMMITTED
+        assert h.epochs.generation == 1
+    else:
+        assert result is None
+        assert h.epochs.generation == 0
+        assert h.epochs.pending_generation is None  # candidate abandoned
+        assert h.refresh.phase == h.proxy._ClientEpochRefresh.IDLE
+
+
+def test_f3_reply_after_deadline_is_not_accepted(env):
+    """A REPLY that arrives at/after the transaction deadline abandons the
+    transaction rather than transitioning to CONFIRM_SENT."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()
+    reply = h.server_inbox.pop(0)
+    h.now = 125.0
+    assert h.deliver(reply) is None
+    assert h.refresh.phase == h.proxy._ClientEpochRefresh.IDLE
+    assert h.epochs.pending_generation is None
+
+
+def test_f4_duplicate_reply_is_benign_not_liveness_and_unbudgeted(env):
+    """Many duplicate REPLYs after E2 is derived: each is a benign
+    duplicate (never fresh liveness), triggers no CONFIRM send, and never
+    touches the attempt counter or the deadline."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()
+    reply = h.server_inbox.pop(0)
+    assert h.deliver(reply) == h.proxy.SERVER_PACKET_REFRESH_PROGRESS
+    sends_before = len(h.client_sends)
+    attempts_before = h.refresh._attempts
+    deadline_before = h.refresh._deadline
+
+    outcomes = []
+    for t in range(111, 125):
+        h.now = float(t)
+        outcomes.append(h.deliver(reply))
+
+    assert all(
+        o == h.proxy.SERVER_PACKET_REFRESH_BENIGN for o in outcomes
+    )
+    assert len(h.client_sends) == sends_before          # zero extra sends
+    assert h.refresh._attempts == attempts_before       # budget untouched
+    assert h.refresh._deadline == deadline_before       # deadline untouched
+
+
+def test_f4_forged_duplicate_reply_in_confirm_sent_is_ignored(env):
+    """A REPLY in CONFIRM_SENT whose signed transcript does NOT match the
+    one already verified is rejected -- duplicate recognition cannot be
+    bypassed with arbitrary E1-authenticated fields."""
+    h = _ClientServerRefresh(env)
+    h.now = 110.0
+    h.start()
+    reply = h.server_inbox.pop(0)
+    assert h.deliver(reply) == h.proxy.SERVER_PACKET_REFRESH_PROGRESS
+
+    other_pub = udpsec_crypto.serialize_ephemeral_public_key(
+        udpsec_crypto.generate_ephemeral_private_key().public_key()
+    )
+    forged_reply = env.secure.build_refresh_reply_message(
+        station_id=STATION_ID, transaction_id=h.refresh._txn,
+        parent_generation=0, next_generation=1,
+        epoch_random=b"\x00" * 32, epoch_public_key=other_pub,
+        refresh_signature=b"0" * 70, timestamp=1,
+    )
+    forged = h.proxy.encrypt_secure_json_message(
+        forged_reply, h.epochs.server_to_client_key, h.locator, 0
+    )
+    assert h.deliver(forged) is None
+    assert h.refresh.phase == h.proxy._ClientEpochRefresh.CONFIRM_SENT
+    assert h.epochs.pending_generation == 1  # still on the real candidate

@@ -301,9 +301,12 @@ An unresolved liveness failure starts a fresh signed handshake. Optional
 `session_refresh_interval` instead runs a true in-session authenticated
 epoch refresh (REFRESH_INIT/REPLY/CONFIRM/ACK with fresh ephemeral ECDHE):
 the traffic keys roll over on the same session without a new handshake,
-locator, or forwarding-loop restart. Zero disables planned refresh.
-Session and replay state are in-memory and non-durable, so process restart
-establishes a fresh session.
+locator, or forwarding-loop restart. Zero disables planned refresh. Each
+control retransmission re-encrypts the same signed message under a fresh
+nonce and one bounded per-phase attempt budget; the client commits only on
+a REFRESH_ACK authenticated under the pending epoch and only before the
+transaction deadline. Session and replay state are in-memory and
+non-durable, so process restart establishes a fresh session.
 
 A receiver remembers every admitted DATA nonce for the full usable directional
 traffic-key epoch. Those nonce records have no independent TTL and are not
