@@ -455,16 +455,21 @@ def _encrypted_plaintext_packet(
     session_locator,
     *,
     aad=None,
+    epoch_generation=0,
 ):
     associated_data = (
-        proxy.build_data_aad(session_locator) if aad is None else aad
+        proxy.build_data_aad(session_locator, epoch_generation)
+        if aad is None
+        else aad
     )
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, associated_data)
-    return proxy.build_data_packet(session_locator, nonce, ciphertext)
+    return proxy.build_data_packet(
+        session_locator, epoch_generation, nonce, ciphertext
+    )
 
 
 def _encrypted_json_packet(
-    proxy, key, nonce, message, session_locator, *, aad=None
+    proxy, key, nonce, message, session_locator, *, aad=None, epoch_generation=0
 ):
     return _encrypted_plaintext_packet(
         proxy,
@@ -473,6 +478,7 @@ def _encrypted_json_packet(
         json.dumps(message, separators=(",", ":")).encode(),
         session_locator,
         aad=aad,
+        epoch_generation=epoch_generation,
     )
 
 
@@ -2856,7 +2862,7 @@ def test_real_listener_rejects_data_corpus_without_state_mutation(
                             endpoints.proxy,
                             confirmed_session.key_material.client_to_server_key,
                             _nonce(828),
-                            b"x" * 8141,
+                            b"x" * 8140,
                             confirmed_session.session_locator),
                     ),
                 ]
@@ -3243,6 +3249,9 @@ def test_session_state_retains_only_directional_cipher_contexts(
         "assembly_namespace",
         "current_epoch",
         "path_state",
+        "pending_epoch",
+        "retiring_epoch",
+        "retiring_deadline",
     }
     assert set(vars(pending)) == {
         "_relation_key",
@@ -3257,12 +3266,16 @@ def test_session_state_retains_only_directional_cipher_contexts(
         "server_to_client_aesgcm",
         "seen_data_nonces",
         "created_at",
+        "generation",
+        "transaction_id",
     }
     assert set(vars(pending.current_epoch)) == {
         "client_to_server_aesgcm",
         "server_to_client_aesgcm",
         "seen_data_nonces",
         "created_at",
+        "generation",
+        "transaction_id",
     }
     assert set(vars(active.path_state)) == {"active_path"}
     forbidden_field_fragments = {

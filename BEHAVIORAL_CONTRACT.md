@@ -320,24 +320,40 @@ default is module-wide, while an isolated state owner and clocks may be
 injected into a secure listener. This state is in-memory and process-local; it
 is neither durable nor shared across processes.
 
-UDPSEC is protocol revision 2 (`UDPSEC_PROTOCOL_VERSION = 2`). There is no
+UDPSEC is protocol version 2 (`UDPSEC_PROTOCOL_VERSION = 2`). There is no
 negotiation or downgrade: a ClientHello or ServerHello whose declared version
 is not exactly `2` fails closed, and the version is itself part of the
 authenticated handshake transcript (the client digest, the server auth
 digest, and the session transcript hash all bind it). Revision 1 wire
 compatibility does not exist.
 
+The V2 DATA wire format is epoch-aware: this is an evolution of the V2 wire
+format, not a new protocol version. The DATA frame carries a one-byte
+plaintext epoch selector and the full 32-bit epoch generation is bound into
+the AEAD associated data, which lets the same established `LogicalSession`
+and `session_locator` carry more than one directional traffic-key epoch
+during a bounded, authenticated in-session refresh (see the dedicated
+subsection below). This is NOT wire-compatible with pre-refresh V2 binaries:
+a DATA frame without the epoch selector, or with the old locator-only
+associated data, fails current authentication and admission -- there is no
+legacy parser, negotiation, version fallback, or silent downgrade -- so
+`aismixer` and `nmea_sproxy` must be upgraded together.
+
 An established relation is internally represented as three separate
 ownership layers: a `LogicalSession` (authenticated station identity, its
-endpoint token, two distinct process-local identifiers described below, and
-`created_at`/`last_seen`), the `LogicalSession`'s `current_epoch` (the
-directional AES-GCM owners and the private data-nonce set -- exactly what
-earlier revisions of this section described as flat session fields), and the
-`LogicalSession`'s `path_state` (currently only `active_path`, the address
-ordinary established-session replies are sent to). This separation exists so
-a later development stage can let path and cryptographic epoch change
-independently of the logical session; as of this revision it changes nothing
-externally observable beyond the locator-based lookup described next.
+endpoint token, two distinct process-local identifiers described below,
+`created_at`/`last_seen`, and its at-most-one `pending_epoch` /
+`retiring_epoch` refresh transition slots), the `LogicalSession`'s
+`current_epoch` (the directional AES-GCM owners, the private data-nonce
+set, and the epoch `generation` plus, for a refresh-derived epoch, the
+confirmed refresh `transaction_id`), and the `LogicalSession`'s `path_state`
+(only `active_path`, the address ordinary established-session replies are
+sent to). An in-session epoch refresh replaces `current_epoch` on the
+exact same `LogicalSession` object -- its `_session_key`, `session_locator`,
+`session_handle`, `assembly_namespace`, `station_id`, `created_at`,
+`path_state`/`active_path`, listener ownership, registry reservations, and
+the `sessions_created`/`sessions_replaced` counters are all untouched. Path
+migration is still not implemented and a refresh authorizes no path change.
 
 **Established (active) session identity is the exact combination of the
 endpoint token and a server-minted, opaque 16-byte `session_locator` -- not
@@ -350,14 +366,26 @@ session-lifetime lookup hint, never a credential: it is never derived from
 station identity, network address, or ECDHE material, and by itself it
 cannot bypass AEAD authentication, `allow_from`, active-path checks, replay
 admission, or listener scoping. Every DATA packet (NMEA payload, ping, pong,
-and graceful close alike) uses V2 framing: `DATA_PREFIX` (`b"NMEA-D2"`)
-followed by the 16-byte `session_locator`, a 12-byte nonce, and the AES-GCM
-ciphertext plus tag; associated data is `build_data_aad(session_locator) =
-DATA_PREFIX || session_locator`, so the locator is cryptographically bound
-into every authenticated DATA exchange in both directions, not merely used
-for lookup. A packet whose locator identifies no live pending or active
-session on the receiving endpoint_token is dropped without attempting
-decryption or any trial across other locators. A pending relation remains
+graceful close, and the four epoch refresh control messages alike) uses the
+epoch-aware V2 framing: `DATA_PREFIX` (`b"NMEA-D2"`) followed by the 16-byte
+`session_locator`, a one-byte epoch selector, a 12-byte nonce, and the
+AES-GCM ciphertext plus tag; associated data is
+`build_data_aad(session_locator, epoch_generation) = DATA_PREFIX ||
+session_locator || uint32_be(epoch_generation)`, so the locator AND the
+full epoch generation are cryptographically bound into every authenticated
+DATA exchange in both directions, not merely used for lookup. The epoch
+selector is `epoch_generation & 0xFF` -- a plaintext lookup hint only: at
+most three epoch generations (retiring `G-1`, current `G`, pending `G+1`)
+are ever simultaneously live for one locator and consecutive generations
+have distinct low bytes, so the selector resolves to exactly one live epoch
+by exact-generation match, with a single AEAD attempt and no trial
+decryption. A captured epoch-`G` ciphertext re-sent with an epoch-`G+1`
+selector fails authentication under either key because the generation in
+the AAD no longer matches. A packet whose locator identifies no live
+pending or active session on the receiving endpoint_token, or whose
+selector names no live epoch on that session, is dropped without attempting
+decryption or any trial across other locators/epochs. A pending relation
+remains
 represented the same way, minus `path_state` and minus both identifiers
 below, and -- unlike an active session -- pending identity is still the
 exact endpoint-token/peer-address tuple from the handshake; see below.
@@ -539,13 +567,17 @@ observation) fails closed as stale rather than bypassing the check.
 None of this is a claim of durable or cross-process uniqueness, or that a
 finite random space can never repeat in principle -- only that every draw is
 checked and retried under a real lock, and that this process's bookkeeping
-of what is currently live or recently retired is accurate. This carry-forward is a
-transitional mechanism for the current stage, where a rekey still replaces
-the whole `LogicalSession` object; it is not the final rekey architecture.
-Once a later stage lets an authenticated refresh replace only
-`current_epoch` on an unchanged `LogicalSession`, both identifiers will
-naturally remain stable across rekey simply because the session object
-itself persists, and this reuse logic will no longer be needed.
+of what is currently live or recently retired is accurate. An in-session
+authenticated epoch refresh preserves both identifiers trivially, because
+it replaces only `current_epoch` on the unchanged `LogicalSession` object
+and never draws or claims a namespace at all.
+This carry-forward mechanism now applies ONLY to genuine
+whole-`LogicalSession` replacement -- a fresh establishment handshake for
+terminal recovery or a genuinely new session -- where a same-relation,
+same-authenticated-station replacement still carries the
+`assembly_namespace` forward so a routine reconnect does not split an
+in-flight multipart message. An ordinary successful refresh never
+exercises it.
 
 `claim()` only ever adds a reference to an ALREADY-live reservation -- it
 raises rather than silently reviving a merely-retiring value or admitting
@@ -951,14 +983,20 @@ at about 30 seconds and an unanswered ping normally selects proactive rekey at
 about 60 seconds, before the 90-second timeout.
 
 Forwarding-loop deadlines use monotonic time and become due at equality. When
-deadlines coincide, deterministic priority is `peer_timeout`, then planned
-session refresh, then the keepalive action: proactive rekey for an unresolved
-ping or a new ping when none is outstanding. A due deadline is resolved before
-poll-ready packets, so a matching pong must be fully authenticated and accepted
-before its boundary to refresh liveness or prevent proactive rekey. Deadline
-checks use fresh monotonic observations. After any pending local-input
-forwarding, the final poll timeout is recomputed from another fresh monotonic
-observation immediately before `select()`.
+deadlines coincide, deterministic priority is `peer_timeout`, then the planned
+session-refresh action (start an in-session epoch refresh transaction, or --
+if the loop was not given the station/server keys -- end the loop with a
+planned-refresh reason for a fresh establishment handshake), then the
+keepalive action: proactive rekey for an unresolved ping or a new ping when
+none is outstanding. A due deadline is resolved before poll-ready packets, so
+a matching pong must be fully authenticated and accepted before its boundary
+to refresh liveness or prevent proactive rekey. The planned-refresh action
+does not end the loop when an epoch refresh is available; the transaction
+runs alongside normal forwarding and its own retransmit/timeout deadline
+additionally bounds the poll wait. Deadline checks use fresh monotonic
+observations. After any pending local-input forwarding, the final poll
+timeout is recomputed from another fresh monotonic observation immediately
+before `select()`.
 
 Timing values must be finite integer or float values, excluding booleans and
 numeric strings. UDPSEC requires `keepalive_interval > 0`,
@@ -968,19 +1006,23 @@ refresh. These constraints are independent: there is no cross-field ordering
 or ratio requirement. Plain UDP shares only the `reconnect_delay >= 0`
 validation; the other three fields are UDPSEC-only.
 
-Proactive recovery and configured planned refresh both reuse the normal signed
-ClientHello, authenticated ServerHello, directional ECDHE-derived traffic keys,
-and encrypted sequence-zero confirmation. They add no reset, probe, or separate
-recovery protocol. Every attempt generates fresh ephemeral ECDHE material, so
-each confirmed replacement has fresh directional traffic keys. The fresh
-ClientHello installs or replaces only pending state; the old active server
-session remains usable while confirmation is pending, failed confirmation does
-not destroy it, and successful confirmation atomically promotes the candidate
-and replaces the old active state as specified below. Planned refresh and the
-first proactive-rekey attempt are immediate; peer graceful close,
-`peer_timeout`, handshake failure, local forwarding failure, and socket failure
-use `reconnect_delay`. No NMEA payload is buffered or replayed as part of any
-recovery path.
+Proactive recovery (an unanswered keepalive ping) reuses the normal signed
+ClientHello, authenticated ServerHello, directional ECDHE-derived traffic
+keys, and encrypted sequence-zero confirmation for a genuine fresh
+establishment -- it adds no reset, probe, or separate recovery protocol,
+generates fresh ephemeral ECDHE material, installs or replaces only pending
+state (the old active server session stays usable while confirmation is
+pending, failed confirmation does not destroy it, and successful
+confirmation atomically promotes the candidate as specified below).
+Configured planned refresh (`session_refresh_interval > 0`) instead runs
+the in-session authenticated epoch refresh described in the epoch-refresh
+subsection above: it does not restart forwarding, does not
+invoke ClientHello/ServerHello on success, and leaves the same server
+`LogicalSession` in place. The first proactive-rekey attempt and each
+planned-refresh transaction start are immediate; peer graceful close,
+`peer_timeout`, handshake failure, local forwarding failure, and socket
+failure use `reconnect_delay`. No NMEA payload is buffered or replayed as
+part of any recovery or refresh path.
 
 A pending session is promoted only when a DATA packet decrypts under its
 client-to-server AES-GCM owner and decodes to a confirmation ping. Confirmation
@@ -1109,34 +1151,247 @@ nonce nor touches or exhausts its active session. It produces no frame or queue
 item; later packets continue to be processed.
 
 `stats()` returns an immutable point-in-time `SecureStateStats` snapshot. It
-reports replay, pending-session, active-session, and data-nonce lifecycle
-counts, including `sessions_closed` for normal active-session removal, plus
-current and peak sizes. `data_nonce_exhaustions` counts fail-closed removal of
-an exact active or pending traffic-key epoch and is not counted as normal close,
-expiry, replacement, or active- or pending-session capacity eviction. The
-legacy `data_nonces_expired` and `data_nonces_capacity_evicted` fields remain in
-the snapshot for compatibility but stay zero; accepted data nonces no longer
-expire or undergo live-entry eviction. Retained records discarded when their
-owner epoch ends contribute to `data_nonces_session_discarded`. Every removed
+reports replay, pending-session, active-session, data-nonce, and epoch-
+refresh lifecycle counts, including `sessions_closed` for normal active-
+session removal, plus current and peak sizes. `data_nonce_exhaustions`
+counts fail-closed removal of an exact active, pending-session, pending-
+epoch, or retiring-epoch traffic-key epoch and is not counted as normal
+close, expiry, replacement, or active- or pending-session capacity
+eviction. `epoch_refreshes_committed`, `pending_epochs_created`,
+`pending_epochs_discarded`, `retiring_epochs_retired`,
+`current_pending_epochs`, and `current_retiring_epochs` are the epoch-
+refresh lifecycle counters. The legacy `data_nonces_expired` and
+`data_nonces_capacity_evicted` fields remain in the snapshot for
+compatibility but stay zero; accepted data nonces no longer expire or
+undergo live-entry eviction. Retained records discarded when their owner
+epoch ends contribute to `data_nonces_session_discarded`. Every removed
 record has exactly one removal reason. Reading statistics invokes neither
 clock, performs no cleanup, exposes no mutable state, and does not change an
 earlier snapshot.
 
-This section's UDPSEC revision-2 changes are real, not merely local
-bookkeeping: DATA framing (`DATA_PREFIX`, the session locator, and the
-locator-aware AAD described above), the authenticated transcript inputs
-(protocol version and locator bound into the server auth digest and session
-transcript hash), and `nmea_sproxy` wire compatibility (no V1 fallback, no
-downgrade, no negotiation) are all part of this revision and are documented
-above and in the surrounding protocol/crypto modules, not left unspecified.
-What this section does NOT change is the underlying cryptographic
-algorithms (P-256 ECDSA/ECDHE, HKDF-SHA256, AES-256-GCM) or the lifecycle
-policies intentionally preserved from the prior revision (TTL, capacity,
-LRU, replay, and nonce-exhaustion semantics as documented above). Path
-migration and a true in-session `CryptoEpoch` refresh that preserves an
-unchanged `LogicalSession`/`session_locator` are explicitly not yet
-implemented; every rekey in this revision still replaces the whole
-`LogicalSession` and mints a fresh locator, exactly as documented above.
+### In-session authenticated epoch refresh
+
+A confirmed `LogicalSession` can refresh its traffic-key epoch in place,
+without re-establishing the session, its wire locator, its assembly
+identity, or its validated network path. The transition is:
+
+    Before:  S -> current_epoch E1 (generation G)
+    Pending: S -> E1 + pending_epoch E2 (generation G+1)
+    After:   S -> current_epoch E2 (generation G+1), retiring_epoch E1
+
+The exact `LogicalSession` object S is unchanged; a successful refresh
+mints no locator/handle/assembly namespace, never invokes
+`install_session`/`promote_pending_session`, releases none of S's
+identities, and does not increment `sessions_created`/`sessions_replaced`.
+The same-station `assembly_namespace` carry-forward mechanism remains for
+genuine whole-session replacement and terminal recovery only; an ordinary
+successful refresh never exercises it, and in-flight multipart AIS
+messages simply continue under S's unchanged `assembly_namespace`.
+
+**Wire.** Four strict, closed-schema JSON control messages carried inside
+the existing encrypted DATA channel (same framing, locator/generation AAD
+binding, active-path admission, source-policy-before-crypto, per-epoch
+nonce admission):
+
+- `refresh_init` (client -> server, under E1 client->server keys, selector
+  `G & 0xFF`): carries a fresh 32-byte transaction id, the parent (`G`)
+  and next (`G+1`) generations, a fresh 32-byte client epoch random, a
+  fresh 33-byte client P-256 ephemeral point, a timestamp, and a P-256
+  ECDSA identity signature over `build_refresh_init_digest(...)` in a
+  distinct `AISMIXER-UDPSEC-EPOCH-REFRESH` domain that binds the protocol
+  revision, station id, session locator, both generations, the
+  transaction id, and both fresh client contributions.
+- `refresh_reply` (server -> client, under E1 server->client keys): echoes
+  the transaction identity and adds a fresh server epoch random, a fresh
+  server P-256 ephemeral point, and a server identity signature over
+  `build_refresh_reply_digest(...)` (all `refresh_init` fields plus the
+  client signature plus both server contributions).
+- `refresh_confirm` (client -> server, under the candidate E2 client->
+  server keys, selector `(G+1) & 0xFF`): proves the client derived E2
+  correctly. Carries only the transaction id, next generation, timestamp.
+- `refresh_ack` (server -> client, under E2 server->client keys): the
+  authenticated evidence of the server commit.
+
+Directional E2 keys are HKDF-SHA256 over a refresh-domain-separated key
+schedule with the fresh P-256 ECDHE secret as IKM and
+`build_refresh_transcript_hash(...)` as salt -- never derived from E1's
+symmetric keys, and never able to collide with the establishment key
+schedule.
+
+**Server state machine.** A confirmed session owns at most one
+`pending_epoch` and, for a short window immediately after a commit, at
+most one `retiring_epoch`. On a valid `refresh_init` the server verifies
+the signature and derives E2 entirely outside the `SecureState` lock, then
+under the lock re-verifies that S is still live, `current_epoch` is still
+the exact epoch object the `refresh_init` was decrypted under, its
+generation is still `G`, and no incompatible transition is unresolved
+(no other pending epoch, no still-live retiring epoch); it admits the
+`refresh_init` nonce into E1's ledger and attaches the candidate. A
+`refresh_init` for a different transaction while one is pending, or while
+a retiring epoch is still within its cutoff, is rejected: there is no
+chain of pending refreshes. A retransmit of the SAME transaction is
+idempotent -- its fresh nonce is admitted but no new keys are derived and
+the cached `refresh_reply` packet is re-sent. A byte-for-byte replayed
+`refresh_init`/`refresh_confirm` (identical nonce) is rejected by the
+pre-decrypt per-epoch replay ledger before any state-machine step, so it
+can never re-derive, re-commit, move liveness or extend a deadline.
+
+On a valid `refresh_confirm` for the live candidate the server commits
+atomically under the lock (all fallible work already happened at
+`refresh_init` time): `retiring_epoch <- current_epoch` with an exact
+monotonic cutoff `now + RETIRING_EPOCH_OVERLAP_SECONDS` (5s),
+`current_epoch <- candidate` (its `created_at` set to now, generation
+`G+1`, confirmed `transaction_id` recorded), `pending_epoch <- None`; the
+confirmation nonce is retained through the commit in what becomes the new
+current epoch's ledger. The server then sends `refresh_ack` under E2. A
+`refresh_confirm` that arrives after the commit (a lost ACK) selects the
+now-current epoch, matches its recorded transaction, has its nonce
+admitted, and gets the ACK re-sent WITHOUT a second commit. There is no
+rollback from a committed E2 back to E1.
+
+**Client.** `nmea_sproxy` runs the transaction inside its existing
+forwarding runtime: no `forward_loop()` restart, no second receiver on the
+output socket, and the input adapter, output socket, `ForwardingStats`,
+session locator, and liveness/ping counters all stay put. Normal NMEA
+forwarding continues under E1 while E2 is pending; after the client
+receives the `refresh_ack` it switches sending to E2. A planned
+`session_refresh_interval` now triggers this epoch refresh instead of a
+fresh establishment handshake; `session_refresh_interval = 0` still
+disables planned refresh, and proactive rekey on an unanswered keepalive
+ping still performs a genuine fresh-establishment handshake for real
+liveness failure.
+
+The client caches the two canonical control messages (`refresh_init` and,
+once E2 is derived, `refresh_confirm`) -- never their ciphertext -- and
+re-encrypts every scheduled (re)transmission with a FRESH AEAD nonce under
+the same key/generation. The signed ECDHE contributions, candidate keys,
+transaction id, generations and the original transaction deadline are
+never regenerated for a retry; only the datagram nonce changes, so the
+server's strict per-epoch replay ledger admits every retransmission and
+answers it idempotently.
+
+The transaction is abandoned (E1 stays current) if not committed within
+`REFRESH_TRANSACTION_TIMEOUT_SECONDS` (15s). Every `refresh_init` /
+`refresh_confirm` datagram -- the first and every retransmission alike --
+passes through one transaction-owned send-admission gate. The gate builds
+and AEAD-encrypts the datagram, then takes a FRESH monotonic observation
+from the same injectable clock domain immediately before the actual send,
+because encryption / allocation / an OS deschedule can themselves cross
+the deadline after the last state-machine check. `now >= deadline`
+(equality included) refuses: nothing is transmitted, the pending candidate
+is abandoned, no attempt is counted, and no progress / liveness is
+reported. An admitted send counts exactly one attempt (at most
+`REFRESH_MAX_ATTEMPTS` (6) per phase; no send once the budget is spent, no
+busy loop), and the next allowed send is anchored to the ACTUAL admitted
+send time, so a send delayed across its 2s (`REFRESH_RETRANSMIT_SECONDS`)
+slot is never immediately followed by another. If a reentrant transport
+replaces the transaction/phase while the datagram is in flight, the older
+send does not clobber the newer transaction's timers or attempt count. A
+duplicate `refresh_reply` received after E2 is derived is recognised only
+when its signed transcript hash is identical to the reply the client
+already verified; it is then a benign duplicate that triggers no send and,
+unlike the first verified `refresh_reply`, is NOT fresh peer evidence.
+
+Exact epoch-role authority is enforced for inbound control datagrams at
+BOTH the packet dispatcher and the state machine: a `refresh_reply` is
+accepted only when it authenticated under the exact current parent (E1)
+epoch of the live transaction, and a `refresh_ack` only when it
+authenticated under the exact pending candidate (E2) epoch, in
+`CONFIRM_SENT`, matching the transaction, generation and station identity.
+A parent-E1-authenticated `refresh_ack` (correct JSON, wrong epoch)
+commits nothing, clears no pending state, credits no liveness and resets
+no timer; only genuine server-commit evidence under E2 commits the client.
+
+Every deadline-sensitive transition -- `refresh_reply` acceptance,
+duplicate handling, retransmission, candidate abandonment, the actual
+`refresh_init` / `refresh_confirm` send (see the send-admission gate
+above), and the final `refresh_ack` commit -- takes a fresh monotonic
+observation immediately before it acts (never a value sampled before
+blocking I/O, before the signature / ECDHE / HKDF work, or before AEAD
+encryption) and treats the deadline as exclusive: `now >= deadline`
+rejects and abandons the candidate rather than committing, sending outside
+budget, renewing liveness or retaining the candidate. An independently
+valid E1 is preserved; further recovery is the existing terminal path.
+`start`, `tick`, `on_reply` and `on_ack` all take a zero-argument
+monotonic clock callable (the same domain as `forward_loop`'s deadlines);
+there is no scalar-`now` send path.
+
+The first verified `refresh_reply` and a genuine `refresh_ack` commit
+advance `last_authenticated_peer` (the peer-timeout backstop) but do NOT
+clear an outstanding keepalive `expected_ping_seq`, do not reset the
+outstanding ping sequence / `last_ping_at` / peer timeout, and do not
+extend the transaction deadline; a duplicate control datagram advances
+none of these. Normal keepalive/rekey deadlines remain due on their
+existing schedule. A successful commit reanchors only the client's own
+planned-refresh cadence, never `session.created_at` on the server.
+
+**Epoch-specific replay and receive admission.** Every DATA operation
+retains the EXACT `CryptoEpoch` object it selected for authentication.
+The server receive path is: source policy -> locator/endpoint-token
+lookup -> `active_path` match (wrong path dropped before crypto) ->
+exact epoch selection by the plaintext selector among {retiring, current,
+pending} -> per-role message gate (a pending epoch carries only
+`refresh_confirm`; a retiring epoch carries only `nmea`/`ping`/`close`,
+never a refresh, path change, or current-epoch replacement) -> pre-decrypt
+replay check against THAT epoch's ledger -> AEAD outside the lock with
+AAD binding that generation -> canonical message + source + semantic
+validation -> authoritative locked re-verification that the exact epoch
+object is still that live role -> nonce admission into THAT epoch's
+ledger -> action authorized by the same admitted epoch. A receive thread
+that decrypts under E1 and then loses a concurrent commit race admits its
+nonce into E1's own (now retiring) ledger, or is told E1 is stale --
+never into E2's ledger. Each usable epoch keeps its own bounded replay
+ledger for its entire accepted lifetime; the same 12 nonce bytes may
+occur under independently derived E1 and E2 keys but never twice under
+one key. Aggregate process-wide nonce accounting spans all live ledgers
+(at most three per session), each capped at
+`DATA_NONCE_MAX_PER_SESSION`. Current-epoch exhaustion is terminal for
+the whole session exactly as before; pending- or retiring-epoch
+exhaustion discards only that epoch and leaves the session and E1 intact.
+A pending E2 is never permission to use an expired or exhausted E1, and
+E1's ledger is never reset to buy time.
+
+**Retiring epoch cutoff.** During the exact monotonic overlap window the
+retiring epoch (generation `G-1`) still authenticates INCOMING
+`nmea`/`ping`/`close` DATA only, with its full replay ledger retained,
+so an in-flight straggler is not lost and a server pong for an E1
+keepalive ping still returns under E1. The boundary is exact: `age >=
+cutoff` retires it (matching every other UDPSEC TTL), and it is then
+discarded deterministically (lazily per packet and by
+`run_periodic_maintenance`, via a third lazy-deletion deadline heap
+alongside the active and pending session heaps). Session close, idle
+expiry, capacity eviction, nonce exhaustion, listener shutdown, and owner
+`close()` all discard any pending and retiring epoch state.
+
+**Bounds.** `PENDING_EPOCH_TTL_SECONDS = 30` (server-side unconfirmed
+candidate lifetime; a retry never extends it),
+`RETIRING_EPOCH_OVERLAP_SECONDS = 5`, and the client
+transaction-timeout/retransmit/attempt bounds above. All are validated
+through the existing positive-int/positive-TTL helpers (NaN, infinity,
+booleans rejected). No mandatory permanent session-age cap is introduced:
+an epoch's usable lifetime is the logical-session lifetime unless planned
+refresh or nonce pressure triggers earlier.
+
+This section's UDPSEC in-session epoch refresh is a real evolution of the
+V2 wire format, not merely local bookkeeping: the DATA framing
+(`DATA_PREFIX b"NMEA-D2"`, the one-byte epoch selector, and the
+generation-bound AAD), the four authenticated refresh transcripts and
+their domain-separated key schedule, and `nmea_sproxy` wire compatibility
+(no legacy parser, no fallback, no downgrade, no negotiation; both
+endpoints upgraded together) are all part of this format and are
+documented above and in the surrounding protocol/crypto modules, not left
+unspecified. The protocol version number stays `2`. What this section
+does NOT change is the underlying cryptographic algorithms (P-256
+ECDSA/ECDHE, HKDF-SHA256, AES-256-GCM) or the lifecycle policies
+intentionally preserved from before the refresh work (TTL, capacity, LRU,
+replay, and nonce-exhaustion semantics as documented above). Path
+migration and NAT rebinding are still explicitly not implemented; a
+refresh authorizes no path change, DATA from a tuple other than
+`active_path` still fails before any cryptographic work, and the
+NAT/CGNAT stable-source-tuple restriction stays in force. A genuine
+fresh-establishment handshake (a new `LogicalSession` with a fresh
+locator) still exists for a genuinely new session and for terminal
+recovery after real liveness or security failure.
 
 ## 12. Routing snapshot boundary
 

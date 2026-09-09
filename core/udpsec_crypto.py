@@ -36,6 +36,20 @@ CLIENT_AUTH_LABEL = b"CLIENT-AUTH"
 SERVER_AUTH_LABEL = b"SERVER-AUTH"
 SESSION_TRANSCRIPT_LABEL = b"SESSION-TRANSCRIPT"
 
+# UDPSEC V2 in-session epoch refresh. A DELIBERATELY DISTINCT domain from
+# `DOMAIN_CONTEXT`: an establishment (ClientHello/ServerHello) transcript
+# digest and a refresh transcript digest can never collide, so a captured
+# establishment signature cannot be replayed as a refresh message and vice
+# versa. The refresh key schedule is likewise domain-separated from the
+# establishment key schedule. The wire label below is a stable transcript
+# constant and is not a protocol version identifier.
+REFRESH_DOMAIN_CONTEXT = b"AISMIXER-UDPSEC-EPOCH-REFRESH"
+REFRESH_INIT_LABEL = b"REFRESH-INIT"
+REFRESH_REPLY_LABEL = b"REFRESH-REPLY"
+REFRESH_TRANSCRIPT_LABEL = b"REFRESH-TRANSCRIPT"
+_REFRESH_KEY_SCHEDULE_LABEL = b"EPOCH-REFRESH-KEY-SCHEDULE"
+_MAX_EPOCH_GENERATION = (1 << 32) - 1
+
 _MAX_FRAMED_FIELD_LENGTH = (1 << 32) - 1
 _MAX_TIMESTAMP = (1 << 64) - 1
 _COMPRESSED_PUBLIC_KEY_LENGTH = 33
@@ -62,14 +76,22 @@ __all__ = (
     "CLIENT_AUTH_LABEL",
     "DOMAIN_CONTEXT",
     "ECDHE_CURVE",
+    "REFRESH_DOMAIN_CONTEXT",
+    "REFRESH_INIT_LABEL",
+    "REFRESH_REPLY_LABEL",
+    "REFRESH_TRANSCRIPT_LABEL",
     "SERVER_AUTH_LABEL",
     "SessionKeyMaterial",
     "SESSION_TRANSCRIPT_LABEL",
     "TRANSCRIPT_HASH",
     "build_client_auth_digest",
+    "build_refresh_init_digest",
+    "build_refresh_reply_digest",
+    "build_refresh_transcript_hash",
     "build_server_auth_digest",
     "build_session_transcript_hash",
     "derive_ephemeral_shared_secret",
+    "derive_refresh_epoch_key_material",
     "derive_session_key_material",
     "generate_ephemeral_private_key",
     "parse_ephemeral_public_key",
@@ -202,16 +224,29 @@ def _session_key_info(direction_label: bytes) -> bytes:
     )
 
 
+def _refresh_key_info(direction_label: bytes) -> bytes:
+    return b"".join(
+        _framed_hkdf_info_field(value)
+        for value in (
+            REFRESH_DOMAIN_CONTEXT,
+            _REFRESH_KEY_SCHEDULE_LABEL,
+            direction_label,
+            _AES_256_GCM_KEY_LABEL,
+        )
+    )
+
+
 def _derive_directional_session_key(
     shared_secret: bytes,
     session_transcript_hash: bytes,
     direction_label: bytes,
+    info_builder=_session_key_info,
 ) -> bytes:
     key = HKDF(
         algorithm=hashes.SHA256(),
         length=_SESSION_KEY_LENGTH,
         salt=session_transcript_hash,
-        info=_session_key_info(direction_label),
+        info=info_builder(direction_label),
     ).derive(shared_secret)
     if not isinstance(key, bytes) or len(key) != _SESSION_KEY_LENGTH:
         raise RuntimeError(
@@ -477,11 +512,227 @@ def _update_framed(digest: hashes.Hash, field: bytes) -> None:
     digest.update(field)
 
 
-def _digest_fields(label: bytes, fields: tuple[bytes, ...]) -> bytes:
+def _labelled_digest(
+    domain: bytes,
+    label: bytes,
+    fields: tuple[bytes, ...],
+) -> bytes:
     digest = hashes.Hash(TRANSCRIPT_HASH)
-    for field in (DOMAIN_CONTEXT, label, *fields):
+    for field in (domain, label, *fields):
         _update_framed(digest, field)
     return digest.finalize()
+
+
+def _digest_fields(label: bytes, fields: tuple[bytes, ...]) -> bytes:
+    return _labelled_digest(DOMAIN_CONTEXT, label, fields)
+
+
+def _epoch_generation_bytes(name: str, value: object) -> bytes:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer epoch generation")
+    if not 0 <= value <= _MAX_EPOCH_GENERATION:
+        raise ValueError(f"{name} must fit in an unsigned 32-bit integer")
+    return value.to_bytes(4, "big", signed=False)
+
+
+def _refresh_parent_fields(
+    protocol_version: object,
+    station_id: object,
+    session_locator: object,
+    parent_generation: object,
+    next_generation: object,
+    transaction_id: object,
+    client_epoch_random: object,
+    client_epoch_public_key: object,
+) -> tuple[bytes, ...]:
+    return (
+        _protocol_version_bytes(protocol_version),
+        _station_id_bytes(station_id),
+        _session_locator_bytes(session_locator),
+        _epoch_generation_bytes("parent_generation", parent_generation),
+        _epoch_generation_bytes("next_generation", next_generation),
+        _required_bytes("transaction_id", transaction_id),
+        _required_bytes("client_epoch_random", client_epoch_random),
+        _required_bytes(
+            "client_epoch_public_key", client_epoch_public_key
+        ),
+    )
+
+
+def build_refresh_init_digest(
+    *,
+    protocol_version: int,
+    station_id: str,
+    session_locator: bytes | bytearray | memoryview,
+    parent_generation: int,
+    next_generation: int,
+    transaction_id: bytes | bytearray | memoryview,
+    client_epoch_random: bytes | bytearray | memoryview,
+    client_epoch_public_key: bytes | bytearray | memoryview,
+) -> bytes:
+    """Hash the REFRESH_INIT authentication transcript.
+
+    Field order is refresh domain, refresh-init label, protocol version,
+    UTF-8 station ID, the existing session locator, parent epoch generation,
+    next epoch generation, the fresh unpredictable transaction id, the fresh
+    client epoch random, and the fresh client epoch public key. A refresh
+    signature therefore cannot be reinterpreted as authenticating an
+    establishment message, a different protocol revision, a different
+    session locator, or a different parent/next epoch generation.
+    """
+
+    return _labelled_digest(
+        REFRESH_DOMAIN_CONTEXT,
+        REFRESH_INIT_LABEL,
+        _refresh_parent_fields(
+            protocol_version,
+            station_id,
+            session_locator,
+            parent_generation,
+            next_generation,
+            transaction_id,
+            client_epoch_random,
+            client_epoch_public_key,
+        ),
+    )
+
+
+def build_refresh_reply_digest(
+    *,
+    protocol_version: int,
+    station_id: str,
+    session_locator: bytes | bytearray | memoryview,
+    parent_generation: int,
+    next_generation: int,
+    transaction_id: bytes | bytearray | memoryview,
+    client_epoch_random: bytes | bytearray | memoryview,
+    client_epoch_public_key: bytes | bytearray | memoryview,
+    client_refresh_signature: bytes | bytearray | memoryview,
+    server_epoch_random: bytes | bytearray | memoryview,
+    server_epoch_public_key: bytes | bytearray | memoryview,
+) -> bytes:
+    """Hash the REFRESH_REPLY authentication transcript.
+
+    Field order is refresh domain, refresh-reply label, every REFRESH_INIT
+    field, the client refresh signature, the fresh server epoch random, and
+    the fresh server epoch public key. The server reply signature therefore
+    binds the complete client contribution it is answering.
+    """
+
+    parent = _refresh_parent_fields(
+        protocol_version,
+        station_id,
+        session_locator,
+        parent_generation,
+        next_generation,
+        transaction_id,
+        client_epoch_random,
+        client_epoch_public_key,
+    )
+    return _labelled_digest(
+        REFRESH_DOMAIN_CONTEXT,
+        REFRESH_REPLY_LABEL,
+        (
+            *parent,
+            _required_bytes(
+                "client_refresh_signature", client_refresh_signature
+            ),
+            _required_bytes("server_epoch_random", server_epoch_random),
+            _required_bytes(
+                "server_epoch_public_key", server_epoch_public_key
+            ),
+        ),
+    )
+
+
+def build_refresh_transcript_hash(
+    *,
+    protocol_version: int,
+    station_id: str,
+    session_locator: bytes | bytearray | memoryview,
+    parent_generation: int,
+    next_generation: int,
+    transaction_id: bytes | bytearray | memoryview,
+    client_epoch_random: bytes | bytearray | memoryview,
+    client_epoch_public_key: bytes | bytearray | memoryview,
+    client_refresh_signature: bytes | bytearray | memoryview,
+    server_epoch_random: bytes | bytearray | memoryview,
+    server_epoch_public_key: bytes | bytearray | memoryview,
+    server_refresh_signature: bytes | bytearray | memoryview,
+) -> bytes:
+    """Hash the final authenticated epoch-refresh transcript.
+
+    Field order is refresh domain, refresh-transcript label, every
+    REFRESH_INIT field, the client refresh signature, both server epoch
+    contributions, and the server refresh signature. This hash is the HKDF
+    salt for the candidate epoch's directional keys, so changing the
+    protocol version, session locator, parent/next generation, transaction
+    id, either ephemeral contribution, or either signature changes the
+    derived traffic keys.
+    """
+
+    parent = _refresh_parent_fields(
+        protocol_version,
+        station_id,
+        session_locator,
+        parent_generation,
+        next_generation,
+        transaction_id,
+        client_epoch_random,
+        client_epoch_public_key,
+    )
+    return _labelled_digest(
+        REFRESH_DOMAIN_CONTEXT,
+        REFRESH_TRANSCRIPT_LABEL,
+        (
+            *parent,
+            _required_bytes(
+                "client_refresh_signature", client_refresh_signature
+            ),
+            _required_bytes("server_epoch_random", server_epoch_random),
+            _required_bytes(
+                "server_epoch_public_key", server_epoch_public_key
+            ),
+            _required_bytes(
+                "server_refresh_signature", server_refresh_signature
+            ),
+        ),
+    )
+
+
+def derive_refresh_epoch_key_material(
+    shared_secret: bytes | bytearray | memoryview,
+    refresh_transcript_hash: bytes | bytearray | memoryview,
+) -> SessionKeyMaterial:
+    """Derive the candidate epoch's independent client/server AES-256-GCM
+    keys with HKDF-SHA256 over a refresh-domain-separated key schedule."""
+
+    normalized_secret = _session_key_input_bytes(
+        "shared_secret",
+        shared_secret,
+    )
+    normalized_transcript_hash = _session_key_input_bytes(
+        "refresh_transcript_hash",
+        refresh_transcript_hash,
+    )
+    client_to_server_key = _derive_directional_session_key(
+        normalized_secret,
+        normalized_transcript_hash,
+        _CLIENT_TO_SERVER_LABEL,
+        _refresh_key_info,
+    )
+    server_to_client_key = _derive_directional_session_key(
+        normalized_secret,
+        normalized_transcript_hash,
+        _SERVER_TO_CLIENT_LABEL,
+        _refresh_key_info,
+    )
+    if client_to_server_key == server_to_client_key:
+        raise RuntimeError("directional HKDF epoch keys must differ")
+    return SessionKeyMaterial(
+        client_to_server_key=client_to_server_key,
+        server_to_client_key=server_to_client_key,
+    )
 
 
 def build_client_auth_digest(

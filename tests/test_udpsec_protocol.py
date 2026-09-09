@@ -224,6 +224,15 @@ def test_protocol_api_and_wire_prefixes_are_public():
         "parse_client_hello_packet",
         "parse_data_packet",
         "parse_server_hello_packet",
+        "build_refresh_init_message",
+        "build_refresh_reply_message",
+        "build_refresh_confirm_message",
+        "build_refresh_ack_message",
+        "parse_refresh_init_message",
+        "parse_refresh_reply_message",
+        "parse_refresh_confirm_message",
+        "parse_refresh_ack_message",
+        "epoch_selector_for_generation",
     } <= set(udpsec_protocol.__all__)
     assert CLIENT_HELLO_PREFIX == b"NMEA-H"
     assert DATA_PREFIX == b"NMEA-D2"
@@ -1313,7 +1322,7 @@ def test_builders_emit_canonical_base64_for_every_binary_field(
 
 
 # ---------------------------------------------------------------------------
-# UDPSEC protocol revision 2: explicit protocol_version field.
+# UDPSEC protocol version 2: explicit protocol_version field.
 # ---------------------------------------------------------------------------
 
 
@@ -1339,7 +1348,7 @@ def test_protocol_version_rejects_non_integer_types_and_bool(factory, version):
     (_client_hello, _server_hello),
     ids=("client", "server"),
 )
-@pytest.mark.parametrize("version", (0, 1, 3, -1, 255))
+@pytest.mark.parametrize("version", (0, 1, 3, 4, -1, 255))
 def test_protocol_version_rejects_any_value_other_than_current(
     factory,
     version,
@@ -1358,7 +1367,7 @@ def test_protocol_version_rejects_any_value_other_than_current(
         pytest.param(parse_server_hello_packet, SERVER_PACKET, id="server"),
     ),
 )
-@pytest.mark.parametrize("encoded", (b"1", b"3", b"0", b"255"))
+@pytest.mark.parametrize("encoded", (b"1", b"3", b"4", b"0", b"255"))
 def test_parsers_reject_any_wire_version_other_than_current(
     parser,
     packet,
@@ -1438,7 +1447,7 @@ def test_old_v1_server_hello_shape_without_version_or_locator_is_rejected():
 
 
 # ---------------------------------------------------------------------------
-# UDPSEC protocol revision 2: server-minted session locator.
+# UDPSEC protocol version 2: server-minted session locator.
 # ---------------------------------------------------------------------------
 
 
@@ -1491,24 +1500,30 @@ def test_locator_is_never_reused_as_random_or_transcript_material():
 
 
 # ---------------------------------------------------------------------------
-# UDPSEC protocol revision 2: DATA framing (NMEA-D2 | locator | nonce | ct).
+# UDPSEC V2 epoch-aware DATA framing
+# (NMEA-D2 | locator | epoch_selector | nonce | ct) with the full epoch
+# generation bound into the AEAD associated data.
 # ---------------------------------------------------------------------------
 
 
 DATA_LOCATOR = SESSION_LOCATOR
 DATA_NONCE = bytes(range(80, 92))
 DATA_CIPHERTEXT = b"ciphertext-and-gcm-tag-placeholder"
+DATA_EPOCH_GENERATION = 0
+_HEADER_LEN = len(DATA_PREFIX) + SESSION_LOCATOR_BYTES + 1
 
 
-def test_data_prefix_is_version_distinct_from_v1():
+def test_data_prefix_is_the_v2_prefix_and_distinct_from_v1():
     assert DATA_PREFIX == b"NMEA-D2"
     assert DATA_PREFIX != b"NMEA-D"
 
 
-def test_data_aad_is_prefix_concatenated_with_locator():
-    aad = build_data_aad(DATA_LOCATOR)
+def test_data_aad_binds_prefix_locator_and_full_epoch_generation():
+    aad = build_data_aad(DATA_LOCATOR, 0x01020304)
 
-    assert aad == DATA_PREFIX + DATA_LOCATOR
+    assert aad == DATA_PREFIX + DATA_LOCATOR + b"\x01\x02\x03\x04"
+    # The full 32-bit generation, not merely the one-byte selector.
+    assert build_data_aad(DATA_LOCATOR, 0) != build_data_aad(DATA_LOCATOR, 256)
 
 
 def test_build_data_aad_rejects_wrong_length_locator():
@@ -1516,23 +1531,56 @@ def test_build_data_aad_rejects_wrong_length_locator():
         ValueError,
         match="session_locator must be exactly 16 bytes",
     ):
-        build_data_aad(b"x" * 15)
+        build_data_aad(b"x" * 15, DATA_EPOCH_GENERATION)
 
 
-def test_data_packet_round_trips_exactly():
-    packet = build_data_packet(DATA_LOCATOR, DATA_NONCE, DATA_CIPHERTEXT)
+@pytest.mark.parametrize(
+    ("generation", "error"),
+    (
+        (True, TypeError),
+        (1.0, TypeError),
+        (-1, ValueError),
+        (1 << 32, ValueError),
+    ),
+)
+def test_build_data_aad_rejects_invalid_epoch_generation(generation, error):
+    with pytest.raises(error):
+        build_data_aad(DATA_LOCATOR, generation)
 
-    assert packet == DATA_PREFIX + DATA_LOCATOR + DATA_NONCE + DATA_CIPHERTEXT
+
+def test_data_packet_round_trips_with_epoch_selector():
+    packet = build_data_packet(
+        DATA_LOCATOR, DATA_EPOCH_GENERATION, DATA_NONCE, DATA_CIPHERTEXT
+    )
+
+    assert packet == (
+        DATA_PREFIX + DATA_LOCATOR + b"\x00" + DATA_NONCE + DATA_CIPHERTEXT
+    )
     assert type(packet) is bytes
 
-    locator, nonce, ciphertext = parse_data_packet(packet)
+    locator, selector, nonce, ciphertext = parse_data_packet(packet)
 
     assert locator == DATA_LOCATOR
     assert type(locator) is bytes
+    assert selector == 0
+    assert type(selector) is int
     assert nonce == DATA_NONCE
-    assert type(nonce) is bytes
     assert ciphertext == DATA_CIPHERTEXT
-    assert type(ciphertext) is bytes
+
+
+@pytest.mark.parametrize(
+    ("generation", "selector"),
+    ((0, 0), (1, 1), (255, 255), (256, 0), (258, 2), ((1 << 32) - 1, 255)),
+)
+def test_data_packet_selector_is_low_byte_of_generation(generation, selector):
+    from core.udpsec_protocol import epoch_selector_for_generation
+
+    assert epoch_selector_for_generation(generation) == selector
+    packet = build_data_packet(
+        DATA_LOCATOR, generation, DATA_NONCE, DATA_CIPHERTEXT
+    )
+    _, wire_selector, _, _ = parse_data_packet(packet)
+    assert wire_selector == selector
 
 
 def test_build_data_packet_rejects_wrong_length_locator():
@@ -1540,19 +1588,55 @@ def test_build_data_packet_rejects_wrong_length_locator():
         ValueError,
         match="session_locator must be exactly 16 bytes",
     ):
-        build_data_packet(b"x" * 17, DATA_NONCE, DATA_CIPHERTEXT)
+        build_data_packet(
+            b"x" * 17, DATA_EPOCH_GENERATION, DATA_NONCE, DATA_CIPHERTEXT
+        )
 
 
 def test_build_data_packet_rejects_wrong_length_nonce():
     with pytest.raises(ValueError, match="nonce must be exactly 12 bytes"):
-        build_data_packet(DATA_LOCATOR, b"x" * 11, DATA_CIPHERTEXT)
+        build_data_packet(
+            DATA_LOCATOR, DATA_EPOCH_GENERATION, b"x" * 11, DATA_CIPHERTEXT
+        )
 
 
-def test_parse_data_packet_rejects_old_v1_prefix():
-    old_v1_packet = b"NMEA-D" + DATA_LOCATOR + DATA_NONCE + DATA_CIPHERTEXT
+def test_pre_refresh_v2_data_without_selector_is_not_accepted():
+    """The epoch-aware V2 DATA frame is not wire-compatible with pre-refresh
+    V2 binaries, and there is no legacy/compat parser: a historical
+    no-selector `NMEA-D2 || locator || nonce || ct` frame either fails the
+    length check outright or -- when long enough to parse at all -- has its
+    bytes reinterpreted under the current layout and fails AEAD
+    authentication. It is never admitted through a fallback path."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+    # Too short to be a current frame -> structural rejection.
+    short_old = b"NMEA-D2" + DATA_LOCATOR + DATA_NONCE + b"x" * 16
     with pytest.raises(ValueError):
-        parse_data_packet(old_v1_packet)
+        parse_data_packet(short_old)
+
+    # A genuinely-encrypted old-format frame (old locator-only AAD, no
+    # selector byte). It is long enough to parse, but the current parser
+    # reads a selector out of the old nonce bytes and the current AEAD
+    # construction (generation-bound AAD, shifted nonce/ciphertext) cannot
+    # authenticate it under the correct key.
+    key = AESGCM.generate_key(bit_length=256)
+    aesgcm = AESGCM(key)
+    nonce = bytes(range(12))
+    old_aad = b"NMEA-D2" + DATA_LOCATOR
+    ciphertext = aesgcm.encrypt(nonce, b'{"type":"ping"}', old_aad)
+    old_frame = b"NMEA-D2" + DATA_LOCATOR + nonce + ciphertext
+
+    locator_out, selector_out, nonce_out, ciphertext_out = parse_data_packet(
+        old_frame
+    )
+    assert locator_out == DATA_LOCATOR
+    assert (nonce_out, ciphertext_out) != (nonce, ciphertext)
+    with pytest.raises(Exception):
+        aesgcm.decrypt(
+            nonce_out,
+            ciphertext_out,
+            build_data_aad(locator_out, selector_out),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1562,8 +1646,9 @@ def test_parse_data_packet_rejects_old_v1_prefix():
         DATA_PREFIX,
         DATA_PREFIX + b"x" * 10,
         DATA_PREFIX + DATA_LOCATOR,
-        DATA_PREFIX + DATA_LOCATOR + DATA_NONCE,
-        DATA_PREFIX + DATA_LOCATOR + DATA_NONCE + b"x" * 15,
+        DATA_PREFIX + DATA_LOCATOR + b"\x00",
+        DATA_PREFIX + DATA_LOCATOR + b"\x00" + DATA_NONCE,
+        DATA_PREFIX + DATA_LOCATOR + b"\x00" + DATA_NONCE + b"x" * 15,
     ),
 )
 def test_parse_data_packet_rejects_too_short_packets(packet):
@@ -1573,21 +1658,24 @@ def test_parse_data_packet_rejects_too_short_packets(packet):
 
 def test_parse_data_packet_accepts_exact_minimum_length():
     minimum_packet = (
-        DATA_PREFIX + DATA_LOCATOR + DATA_NONCE + b"x" * 16
+        DATA_PREFIX + DATA_LOCATOR + b"\x07" + DATA_NONCE + b"x" * 16
     )
 
-    locator, nonce, ciphertext = parse_data_packet(minimum_packet)
+    locator, selector, nonce, ciphertext = parse_data_packet(minimum_packet)
 
     assert locator == DATA_LOCATOR
+    assert selector == 7
     assert nonce == DATA_NONCE
     assert ciphertext == b"x" * 16
 
 
 def test_parse_data_packet_preserves_arbitrary_length_ciphertext():
     long_ciphertext = b"y" * 1000
-    packet = build_data_packet(DATA_LOCATOR, DATA_NONCE, long_ciphertext)
+    packet = build_data_packet(
+        DATA_LOCATOR, DATA_EPOCH_GENERATION, DATA_NONCE, long_ciphertext
+    )
 
-    _, _, ciphertext = parse_data_packet(packet)
+    _, _, _, ciphertext = parse_data_packet(packet)
 
     assert ciphertext == long_ciphertext
 
@@ -1603,17 +1691,17 @@ def test_captured_ciphertext_with_modified_locator_fails_aead_under_same_key():
     tampered_locator = bytes([original_locator[0] ^ 0xFF]) + original_locator[1:]
 
     ciphertext = aesgcm.encrypt(
-        nonce, plaintext, build_data_aad(original_locator)
+        nonce, plaintext, build_data_aad(original_locator, 0)
     )
-    captured_packet = build_data_packet(original_locator, nonce, ciphertext)
+    captured_packet = build_data_packet(original_locator, 0, nonce, ciphertext)
 
     tampered_packet = (
         DATA_PREFIX
         + tampered_locator
         + captured_packet[len(DATA_PREFIX) + SESSION_LOCATOR_BYTES:]
     )
-    tampered_locator_out, tampered_nonce, tampered_ciphertext = parse_data_packet(
-        tampered_packet
+    tampered_locator_out, _, tampered_nonce, tampered_ciphertext = (
+        parse_data_packet(tampered_packet)
     )
 
     assert tampered_locator_out == tampered_locator
@@ -1622,12 +1710,51 @@ def test_captured_ciphertext_with_modified_locator_fails_aead_under_same_key():
         aesgcm.decrypt(
             tampered_nonce,
             tampered_ciphertext,
-            build_data_aad(tampered_locator_out),
+            build_data_aad(tampered_locator_out, 0),
         )
 
     # The original locator with the original ciphertext still authenticates.
-    locator_out, nonce_out, ciphertext_out = parse_data_packet(captured_packet)
+    locator_out, _, nonce_out, ciphertext_out = parse_data_packet(
+        captured_packet
+    )
     assert (
-        aesgcm.decrypt(nonce_out, ciphertext_out, build_data_aad(locator_out))
+        aesgcm.decrypt(
+            nonce_out, ciphertext_out, build_data_aad(locator_out, 0)
+        )
         == plaintext
     )
+
+
+def test_captured_ciphertext_replayed_under_a_different_epoch_selector_fails():
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    epoch4 = AESGCM(AESGCM.generate_key(bit_length=256))
+    epoch5 = AESGCM(AESGCM.generate_key(bit_length=256))
+    plaintext = b'{"type":"nmea"}'
+    nonce = os.urandom(12)
+
+    # Produced under epoch generation 4 (selector 4).
+    ciphertext = epoch4.encrypt(nonce, plaintext, build_data_aad(DATA_LOCATOR, 4))
+    packet = build_data_packet(DATA_LOCATOR, 4, nonce, ciphertext)
+
+    # An attacker flips the plaintext selector byte to 5 to try to have the
+    # captured epoch-4 ciphertext admitted against epoch 5's ledger/key.
+    tampered = packet[:_HEADER_LEN - 1] + b"\x05" + packet[_HEADER_LEN:]
+    _, tampered_selector, tampered_nonce, tampered_ct = parse_data_packet(
+        tampered
+    )
+    assert tampered_selector == 5
+
+    # An epoch-aware V2 receiver now selects the generation-5 epoch key and builds
+    # AAD for generation 5: both differ from what the ciphertext was produced
+    # under, so authentication fails.
+    with pytest.raises(Exception):
+        epoch5.decrypt(
+            tampered_nonce, tampered_ct, build_data_aad(DATA_LOCATOR, 5)
+        )
+    # And the generation-4 key with generation-5 AAD (selector-only trust)
+    # also fails.
+    with pytest.raises(Exception):
+        epoch4.decrypt(
+            tampered_nonce, tampered_ct, build_data_aad(DATA_LOCATOR, 5)
+        )
