@@ -7253,6 +7253,11 @@ def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
         "pending_epochs_created",
         "pending_epochs_discarded",
         "retiring_epochs_retired",
+        "path_candidates_opened",
+        "path_candidates_replaced",
+        "path_candidates_expired",
+        "path_migrations_committed",
+        "retired_paths_expired",
         "current_handshake_replays",
         "peak_handshake_replays",
         "current_sessions",
@@ -7263,6 +7268,8 @@ def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
         "peak_data_nonces",
         "current_pending_epochs",
         "current_retiring_epochs",
+        "current_candidate_paths",
+        "current_retired_paths",
     }
     assert all(value == 0 for value in vars(initial).values())
     with pytest.raises(FrozenInstanceError):
@@ -10183,17 +10190,19 @@ def test_active_ping_pong_reply_resolves_through_path_state_active_path(
     assert reply_addr == addr
 
 
-def test_correct_locator_but_wrong_path_is_silently_dropped_before_decrypt(
+def test_correct_locator_wrong_path_unauthenticable_creates_no_candidate(
     monkeypatch,
 ):
-    """One of the most important tests in this stage: a DATA packet
-    carrying the CORRECT locator for a live active session, but arriving
-    from a different transport address than that session's
-    `path_state.active_path`, must be dropped exactly like an unknown
-    locator -- no decrypt, no nonce lookup/admission, no touch, no reply,
-    no queued ingress frame, and no candidate-path state created. This is
-    the explicit boundary that a later migration stage will replace with
-    authenticated candidate-path evaluation; today, no migration exists."""
+    """UDPSEC V2 server path migration boundary: a DATA packet carrying
+    the CORRECT locator for a live active session but arriving from a path
+    other than `active_path` is no longer dropped before crypto -- it may
+    be a migration candidate. But an UNAUTHENTICABLE wrong-path packet
+    (its AEAD tag does not verify under the current epoch) still results
+    in NO candidate-path state, NO PATH_CHALLENGE, NO nonce admission, NO
+    session touch, NO queued ingress frame, and NO plaintext response.
+    Only genuinely authenticated, replay-admitted, current-epoch eligible
+    traffic can open a candidate (that positive path is covered by
+    tests/test_udpsec_path_migration.py)."""
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState()
     original_addr = ("192.0.2.44", 50034)
@@ -10208,13 +10217,16 @@ def test_correct_locator_but_wrong_path_is_silently_dropped_before_decrypt(
         server_to_client_key,
     )
     nonce = b"\x22" * 12
-    packet = _encrypted_data_packet(
+    authentic_packet = _encrypted_data_packet(
         secure,
         client_to_server_key,
         nonce,
         session._session_key.session_locator,
         payload="!AIVDM,1,1,,A,wrong-path,0*00",
     )
+    # Corrupt the final AEAD tag byte so authentication fails under the
+    # exact current epoch's key.
+    packet = authentic_packet[:-1] + bytes([authentic_packet[-1] ^ 0xFF])
 
     queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
@@ -10227,12 +10239,17 @@ def test_correct_locator_but_wrong_path_is_silently_dropped_before_decrypt(
     assert queue.items == []
     assert fake_socket.sent == []
     assert session.path_state.active_path == original_addr
+    assert session.path_state.candidate_path is None
+    assert session.path_state.retired_path is None
+    assert session.path_state.path_generation == 0
     assert session.last_seen == 1000.0
     assert len(session.current_epoch.seen_data_nonces) == 0
     stats = state.stats()
     assert stats.sessions_touched == 0
     assert stats.data_nonces_accepted == 0
     assert stats.current_data_nonces == 0
+    assert stats.path_candidates_opened == 0
+    assert stats.path_migrations_committed == 0
 
 
 class _SpyAESGCM:
@@ -10267,17 +10284,18 @@ def _spy_on_state_method(monkeypatch, state, method_name):
     return calls
 
 
-def test_wrong_path_correct_locator_never_reaches_decrypt_or_replay_lookup(
+def test_wrong_path_unauthenticable_packet_makes_one_bounded_aead_attempt(
     monkeypatch,
 ):
-    """Strengthens the state-only assertions above with OBSERVABLE spies
-    directly on the AEAD decrypt call and the replay lookup/admission
-    path, per the Codex audit's Finding E: proving the packet is dropped
-    before ANY of that machinery runs, not merely that its externally
-    visible side effects happen to be absent. A correct-path control
-    packet using the exact same spies proves they are attached to the
-    real exercised code path, not simply never invoked due to a broken
-    wrapper."""
+    """UDPSEC V2 server path migration: a correct-locator wrong-path DATA
+    frame is now allowed exactly ONE bounded AEAD attempt under the exact
+    current epoch so a migration candidate can be discovered (section 12).
+    When that attempt FAILS to authenticate, nothing else happens: the
+    pre-decrypt replay membership check runs once, the decrypt is
+    attempted once, and then -- no nonce admission, no session touch, no
+    candidate-path allocation, no PATH_CHALLENGE, no queued frame. A
+    correct-path control packet using the exact same spies proves they
+    are attached to the real exercised code path."""
     secure = load_secure_module_with_fake_keys(monkeypatch)
     state = secure.SecureState()
     original_addr = ("192.0.2.45", 50035)
@@ -10301,14 +10319,21 @@ def test_wrong_path_correct_locator_never_reaches_decrypt_or_replay_lookup(
         monkeypatch, state, "admit_epoch_data_nonce"
     )
     touch_calls = _spy_on_state_method(monkeypatch, state, "touch_session")
+    open_candidate_calls = _spy_on_state_method(
+        monkeypatch, state, "open_or_replace_candidate_path"
+    )
 
     wrong_path_nonce = b"\x27" * 12
-    wrong_path_packet = _encrypted_data_packet(
+    authentic_wrong_path_packet = _encrypted_data_packet(
         secure,
         client_to_server_key,
         wrong_path_nonce,
         session._session_key.session_locator,
         payload="!AIVDM,1,1,,A,wrong-path,0*00",
+    )
+    # Corrupt the final AEAD tag byte: the one permitted attempt fails.
+    wrong_path_packet = authentic_wrong_path_packet[:-1] + bytes(
+        [authentic_wrong_path_packet[-1] ^ 0xFF]
     )
     queue, fake_socket = _run_secure_server_with_packets(
         monkeypatch,
@@ -10318,15 +10343,17 @@ def test_wrong_path_correct_locator_never_reaches_decrypt_or_replay_lookup(
         monotonic_clock=_FakeClock(1.0),
     )
 
-    # No AEAD decrypt, no replay lookup, no admission, no session touch --
-    # not merely no visible side effect of any of those.
-    assert spy_aesgcm.decrypt_calls == 0
-    assert nonce_seen_calls == []
+    # Exactly one bounded AEAD attempt and one pre-decrypt replay lookup;
+    # nothing beyond that once authentication fails.
+    assert spy_aesgcm.decrypt_calls == 1
+    assert len(nonce_seen_calls) == 1
     assert admit_calls == []
     assert touch_calls == []
+    assert open_candidate_calls == []
     assert queue.items == []
     assert fake_socket.sent == []
     assert session.path_state.active_path == original_addr
+    assert session.path_state.candidate_path is None
 
     # Control: the exact same session, same spies, same locator -- but
     # from the session's own correct path -- must decrypt and admit
@@ -10348,10 +10375,15 @@ def test_wrong_path_correct_locator_never_reaches_decrypt_or_replay_lookup(
         monotonic_clock=_FakeClock(2.0),
     )
 
-    assert spy_aesgcm.decrypt_calls == 1
-    assert len(nonce_seen_calls) == 1
+    # The failed wrong-path attempt contributed one decrypt + one replay
+    # lookup; the correct-path control adds a second of each and, unlike
+    # the wrong-path packet, reaches admission, session touch, and the
+    # ingress queue.
+    assert spy_aesgcm.decrypt_calls == 2
+    assert len(nonce_seen_calls) == 2
     assert len(admit_calls) == 1
     assert len(touch_calls) == 1
+    assert len(open_candidate_calls) == 0
     assert len(queue_2.items) == 1
 
 
