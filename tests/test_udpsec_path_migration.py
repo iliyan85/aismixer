@@ -52,6 +52,27 @@ _PREPARED_SERVER_PRIVATE_KEY = None  # set lazily per module load
 # --------------------------------------------------------------------------
 
 
+class _DecryptHook:
+    """Wraps an AESGCM so each successful `decrypt` runs `on_decrypt()` once
+    -- used to deterministically mutate a fake monotonic clock (or state)
+    DURING the expensive AEAD step, reproducing a post-decrypt TOCTOU
+    without any sleep. `encrypt` is passed straight through."""
+
+    def __init__(self, real, on_decrypt):
+        self._real = real
+        self._on_decrypt = on_decrypt
+        self.decrypt_calls = 0
+
+    def decrypt(self, *args, **kwargs):
+        plaintext = self._real.decrypt(*args, **kwargs)
+        self.decrypt_calls += 1
+        self._on_decrypt()
+        return plaintext
+
+    def encrypt(self, *args, **kwargs):
+        return self._real.encrypt(*args, **kwargs)
+
+
 @pytest.fixture
 def env(monkeypatch):
     secure, client_private_key = load_secure_module_with_fake_keys(
@@ -175,34 +196,57 @@ class _Session:
 
     # -- server drive -----------------------------------------------------
 
-    def feed(self, packets, now, *, wall=None):
+    def feed(
+        self, packets, now, *, wall=None, clock=None,
+        on_decrypt=None, decrypt_epoch=None,
+    ):
         """Run one `_secure_server_loop` pass over `packets` (each a
         `(bytes, addr)` pair) at monotonic time `now`. Returns the
-        `_FakeSecureSocket` whose `.sent` list holds every server reply."""
+        `_FakeSecureSocket` whose `.sent` list holds every server reply.
+
+        `clock` reuses a caller-owned `_FakeClock` as the loop's monotonic
+        clock (so a test can observe/advance it across the AEAD step).
+        `on_decrypt` (with optional `decrypt_epoch` CryptoEpoch, default the
+        current epoch) wraps that epoch's client->server AESGCM so the
+        callback runs once after each successful decrypt -- used to
+        deterministically advance `clock` DURING the expensive AEAD step and
+        reproduce a post-decrypt deadline crossing without any sleep."""
         fake_socket = _FakeSecureSocket()
-        clock = _FakeClock(now)
+        loop_clock = clock if clock is not None else _FakeClock(now)
         wall_clock = _FakeClock(1_000_000.0 if wall is None else wall)
+        restore = None
+        if on_decrypt is not None:
+            target = decrypt_epoch or self.session.current_epoch
+            real_aesgcm = target.client_to_server_aesgcm
+            target.client_to_server_aesgcm = _DecryptHook(
+                real_aesgcm, on_decrypt
+            )
+            restore = (target, real_aesgcm)
         self.env.monkeypatch.setattr(
             self.env.secure, "asyncio", _FakeAsyncioModule(
                 _FakeSecureLoop(list(packets))
             )
         )
-        with pytest.raises(_asyncio.CancelledError):
-            _asyncio.run(
-                self.env.secure._secure_server_loop(
-                    fake_socket,
-                    self.queue,
-                    "127.0.0.1",
-                    9999,
-                    endpoint_token=self.endpoint_token,
-                    state=self.state,
-                    wall_clock=wall_clock,
-                    monotonic_clock=clock,
-                    server_private_key=self.env.server_private_key,
-                    owned_sessions=dict(self.state._sessions),
-                    owned_pending_sessions={},
+        try:
+            with pytest.raises(_asyncio.CancelledError):
+                _asyncio.run(
+                    self.env.secure._secure_server_loop(
+                        fake_socket,
+                        self.queue,
+                        "127.0.0.1",
+                        9999,
+                        endpoint_token=self.endpoint_token,
+                        state=self.state,
+                        wall_clock=wall_clock,
+                        monotonic_clock=loop_clock,
+                        server_private_key=self.env.server_private_key,
+                        owned_sessions=dict(self.state._sessions),
+                        owned_pending_sessions={},
+                    )
                 )
-            )
+        finally:
+            if restore is not None:
+                restore[0].client_to_server_aesgcm = restore[1]
         return fake_socket
 
     # -- reply decoding -------------------------------------------------
@@ -1426,3 +1470,353 @@ def test_path_generation_bounds_are_a_finite_closed_range():
         p.build_path_challenge_message(
             **_path_kwargs(path_generation=p.MAX_PATH_GENERATION + 1)
         )
+
+
+# ==========================================================================
+# P2 pre-audit corrective pass -- retired/candidate-path deadline TOCTOU
+#
+# Ordinary validated DATA (nmea/ping/close) must be admitted (and its path
+# role authorized) at a FRESH authoritative monotonic observation taken
+# AFTER the expensive AEAD -- never trusting the stale pre-decrypt role.
+# A retired grace or candidate TTL that elapses during decrypt is honoured.
+# ==========================================================================
+
+
+def _e1_e2_migrated_session(env, *, base=50000.0, refresh_at=50002.0):
+    """S established on A (E1), migrated A -> B, then E1 -> E2 refreshed on
+    the (stable) active path B. Returns `(state, sess, e2_c2s, e2_s2c)`.
+
+    Defaults: retired A deadline = base + 5.0 (RETIRED_PATH_GRACE_SECONDS);
+    E1 stays retiring until refresh_at + 5.0 (RETIRING_EPOCH_OVERLAP)."""
+    build_init, process_init, derive_e2, build_confirm, process_confirm = (
+        _refresh_helpers()
+    )
+    state = env.new_state()
+    sess = env.install_session(state, addr=ADDR_A, now=base)
+    sess.migrate(ADDR_A, ADDR_B, now=base)
+    assert sess.session.path_state.active_path == ADDR_B
+
+    init = build_init(env, sess.session)
+    reply_packet, _ = process_init(
+        env, state, sess.session, init, now=refresh_at - 1.0
+    )
+    km, _ = derive_e2(env, sess.session, init, reply_packet, sess.s2c_key)
+    confirm = build_confirm(env, sess.session, init, km)
+    _ack, newly, _n = process_confirm(
+        env, state, sess.session, confirm, now=refresh_at
+    )
+    assert newly is True
+    assert sess.session.current_epoch.generation == 1
+    assert sess.session.retiring_epoch is not None
+    assert sess.session.path_state.active_path == ADDR_B
+    return state, sess, km.client_to_server_key, km.server_to_client_key
+
+
+@pytest.mark.parametrize("cross_to", (50005.0, 50005.001))
+def test_A_retired_deadline_toctou_e1_retiring_straggler_fails_closed(
+    env, cross_to,
+):
+    """Original P2 blocker. Retired A deadline 50005; E1 retiring until
+    50007; a valid E1 NMEA from A is classified 'retired' at pre-decrypt
+    50004.999 but decrypt advances authoritative time to >= 50005. The
+    authoritative post-decrypt role is 'unknown', and 'unknown + retiring'
+    is unauthorized -> fail closed, nothing admitted or touched."""
+    state, sess, _e2_c2s, _e2_s2c = _e1_e2_migrated_session(env)
+    retiring_epoch = sess.session.retiring_epoch
+    assert sess.session.path_state.retired_path.deadline == 50005.0
+
+    stats_before = state.stats()
+    frames_before = len(sess.queue.items)
+
+    nonce = os.urandom(12)
+    e1_nmea = sess.nmea_packet(
+        "!AIVDM,1,1,,A,e1-straggler,0*00", generation=0, nonce=nonce
+    )
+    clock = _FakeClock(50004.999)
+    socket = sess.feed(
+        [(e1_nmea, ADDR_A)],
+        50004.999,
+        clock=clock,
+        on_decrypt=lambda: setattr(clock, "now", cross_to),
+        decrypt_epoch=retiring_epoch,
+    )
+
+    stats_after = state.stats()
+    # fail closed: no nonce, no activity, no queue, no candidate, no reply
+    assert stats_after.data_nonces_accepted == stats_before.data_nonces_accepted
+    assert stats_after.sessions_touched == stats_before.sessions_touched
+    assert len(sess.queue.items) == frames_before
+    assert socket.sent == []
+    assert not retiring_epoch.seen_data_nonces.contains(nonce)
+    assert sess.session.path_state.candidate_path is None
+    assert sess.session.path_state.active_path == ADDR_B
+    assert sess.session.current_epoch.generation == 1
+    # the retired grace legitimately expired during the crossing
+    assert stats_after.retired_paths_expired == (
+        stats_before.retired_paths_expired + 1
+    )
+    assert sess.session.path_state.retired_path is None
+
+
+def test_B_retired_deadline_no_delay_control_admits_e1_straggler_once(env):
+    """Same state, but the packet is fully processed BEFORE the retired
+    deadline (no decrypt-time advance): the E1 straggler is admitted once
+    under the same LogicalSession / assembly_namespace, session activity
+    follows the contract, and A gets no reverse candidate and no pong."""
+    state, sess, _e2_c2s, _e2_s2c = _e1_e2_migrated_session(env)
+    retiring_epoch = sess.session.retiring_epoch
+    namespace_hex = sess.session.assembly_namespace.hex()
+
+    stats_before = state.stats()
+    frames_before = len(sess.queue.items)
+
+    nonce = os.urandom(12)
+    e1_nmea = sess.nmea_packet(
+        "!AIVDM,1,1,,A,e1-late,0*00", generation=0, nonce=nonce
+    )
+    socket = sess.feed([(e1_nmea, ADDR_A)], 50004.999)
+
+    stats_after = state.stats()
+    assert stats_after.data_nonces_accepted == (
+        stats_before.data_nonces_accepted + 1
+    )
+    assert stats_after.sessions_touched == stats_before.sessions_touched + 1
+    assert retiring_epoch.seen_data_nonces.contains(nonce)
+    assert len(sess.queue.items) == frames_before + 1
+    assert sess.queue.items[-1].assembler_key == (
+        f"udpsec-assembly:{namespace_hex}"
+    )
+    # no reverse candidate, no ordinary pong / outbound authority to A
+    assert sess.session.path_state.candidate_path is None
+    assert sess.session.path_state.active_path == ADDR_B
+    assert socket.sent == []
+    # replay of the exact same datagram is still a replay
+    replay_socket = sess.feed([(e1_nmea, ADDR_A)], 50005.5)
+    assert len(sess.queue.items) == frames_before + 1
+    assert replay_socket.sent == []
+
+
+def test_C_current_e2_crossing_retired_deadline_opens_fresh_reverse_candidate(
+    env,
+):
+    """A valid CURRENT-epoch (E2) NMEA from A crosses the retired deadline
+    during decrypt: authoritative role becomes 'unknown' under the current
+    epoch, which is legitimate new-path continuity -- the NMEA is admitted
+    AND a fresh reverse candidate A is opened with a new token /
+    path_generation / deadline, with one PATH_CHALLENGE to A. Active stays
+    B until proof."""
+    state, sess, e2_c2s, e2_s2c = _e1_e2_migrated_session(env)
+    pg_before = sess.session.path_state.path_generation
+    frames_before = len(sess.queue.items)
+    namespace_hex = sess.session.assembly_namespace.hex()
+
+    nonce = os.urandom(12)
+    e2_nmea = sess.nmea_packet(
+        "!AIVDM,1,1,,A,e2-newpath,0*00", generation=1, nonce=nonce, key=e2_c2s
+    )
+    clock = _FakeClock(50004.999)
+    socket = sess.feed(
+        [(e2_nmea, ADDR_A)],
+        50004.999,
+        clock=clock,
+        on_decrypt=lambda: setattr(clock, "now", 50005.0),
+        decrypt_epoch=sess.session.current_epoch,
+    )
+
+    cand = sess.session.path_state.candidate_path
+    assert cand is not None
+    assert cand.identity == normalize_sockaddr(ADDR_A)
+    assert cand.path_generation == pg_before + 1
+    assert cand.epoch is sess.session.current_epoch
+    assert cand.deadline == 50005.0 + state._path_candidate_ttl
+    assert sess.session.path_state.active_path == ADDR_B  # unchanged until proof
+
+    challenge = sess.sole_challenge(
+        socket, expect_addr=ADDR_A, generation=1, s2c_key=e2_s2c
+    )
+    assert challenge.path_generation == cand.path_generation
+    assert challenge.challenge_token == cand.challenge_token
+
+    # the NMEA still reached the queue under the same assembly namespace
+    assert len(sess.queue.items) == frames_before + 1
+    assert sess.queue.items[-1].assembler_key == (
+        f"udpsec-assembly:{namespace_hex}"
+    )
+    assert sess.session.current_epoch.client_to_server_aesgcm.__class__ is not (
+        _DecryptHook
+    )
+
+    # and the fresh candidate can now be proved to complete A -> ... -> A
+    response = sess.path_response_packet(
+        challenge.challenge_token, challenge.path_generation,
+        generation=1, key=e2_c2s,
+    )
+    commit = sess.feed([(response, ADDR_A)], 50006.0)
+    assert any(
+        sess._is_type(d, p.PATH_ACK_TYPE, 1, s2c_key=e2_s2c)
+        for d, _ in commit.sent
+    )
+    assert sess.session.path_state.active_path == ADDR_A
+
+
+def test_D_candidate_deadline_crossing_during_decrypt_opens_fresh_incarnation(
+    env,
+):
+    """Candidate B is live just before its TTL. A valid current-epoch NMEA
+    from B crosses the candidate deadline during decrypt: the stale
+    candidate authority is not reused -- the authoritative role is
+    'unknown' and a FRESH candidate incarnation opens (new token, advanced
+    path_generation, new deadline); the old values are never revived or
+    extended."""
+    state = env.new_state(path_candidate_ttl=10.0)
+    sess = env.install_session(state, addr=ADDR_A, now=1000.0)
+
+    open_b = sess.feed(
+        [(sess.nmea_packet("!AIVDM,1,1,,A,first,0*00"), ADDR_B)], 1000.0
+    )
+    ch1 = sess.sole_challenge(open_b, expect_addr=ADDR_B)
+    assert sess.session.path_state.candidate_path.deadline == 1010.0
+    assert ch1.path_generation == 1
+    frames_before = len(sess.queue.items)
+
+    nonce = os.urandom(12)
+    b_nmea = sess.nmea_packet(
+        "!AIVDM,1,1,,A,second,0*00", nonce=nonce, generation=0
+    )
+    clock = _FakeClock(1009.999)
+    open_b2 = sess.feed(
+        [(b_nmea, ADDR_B)],
+        1009.999,
+        clock=clock,
+        on_decrypt=lambda: setattr(clock, "now", 1010.0),
+        decrypt_epoch=sess.session.current_epoch,
+    )
+
+    assert state.stats().path_candidates_expired == 1
+    cand = sess.session.path_state.candidate_path
+    assert cand is not None
+    assert cand.challenge_token != ch1.challenge_token
+    assert cand.path_generation == 2
+    assert cand.deadline == 1010.0 + 10.0
+    assert cand.deadline != 1010.0
+    ch2 = sess.sole_challenge(open_b2, expect_addr=ADDR_B)
+    assert ch2.path_generation == 2
+    assert ch2.challenge_token == cand.challenge_token
+    # the NMEA itself still queued
+    assert len(sess.queue.items) == frames_before + 1
+    # the stale token/generation can never commit
+    stale_response = sess.path_response_packet(
+        ch1.challenge_token, ch1.path_generation
+    )
+    stale_commit = sess.feed([(stale_response, ADDR_B)], 1011.0)
+    assert not any(
+        sess._is_type(d, p.PATH_ACK_TYPE, 0) for d, _ in stale_commit.sent
+    )
+    assert sess.session.path_state.active_path == ADDR_A
+
+
+def test_E_blocked_at_authoritative_admission_fails_closed(env):
+    """A source that is permissive ('unknown') at pre-decrypt but becomes a
+    sibling session's active path ('blocked') before authoritative
+    admission: the stale 'unknown' role is not trusted -- no nonce, no
+    touch, no queue, no candidate, no challenge, and the sibling is
+    untouched."""
+    state = env.new_state()
+    token = env.endpoint_token()
+    sess = env.install_session(
+        state, addr=ADDR_A, endpoint_token=token, now=1000.0
+    )
+    frames_before = len(sess.queue.items)
+    stats_before = state.stats()
+
+    sibling_holder = {}
+
+    def _install_sibling_at_c():
+        if not sibling_holder:
+            sibling_holder["s"] = env.install_session(
+                state, addr=ADDR_C, endpoint_token=token, now=1000.0
+            )
+
+    nonce = os.urandom(12)
+    c_nmea = sess.nmea_packet(
+        "!AIVDM,1,1,,A,from-c,0*00", nonce=nonce, generation=0
+    )
+    clock = _FakeClock(1000.0)
+    socket = sess.feed(
+        [(c_nmea, ADDR_C)],
+        1000.0,
+        clock=clock,
+        on_decrypt=_install_sibling_at_c,
+        decrypt_epoch=sess.session.current_epoch,
+    )
+
+    assert "s" in sibling_holder
+    sibling = sibling_holder["s"].session
+    stats_after = state.stats()
+    assert stats_after.data_nonces_accepted == stats_before.data_nonces_accepted
+    assert stats_after.sessions_touched == stats_before.sessions_touched
+    assert stats_after.path_candidates_opened == (
+        stats_before.path_candidates_opened
+    )
+    assert len(sess.queue.items) == frames_before
+    assert socket.sent == []
+    assert sess.session.path_state.candidate_path is None
+    assert not sess.session.current_epoch.seen_data_nonces.contains(nonce)
+    # sibling untouched
+    assert state._sessions[sibling._session_key] is sibling
+    assert sibling.path_state.active_path == ADDR_C
+
+
+def test_F_stable_active_current_epoch_traffic_is_unchanged(env):
+    """Regression guard: ordinary active-path current-epoch nmea / ping /
+    close still behave exactly as before the P2 fix."""
+    state = env.new_state()
+    sess = env.install_session(state, addr=ADDR_A, now=1000.0)
+
+    nmea_socket = sess.feed(
+        [(sess.nmea_packet("!AIVDM,1,1,,A,plain,0*00"), ADDR_A)], 1001.0
+    )
+    assert nmea_socket.sent == []
+    assert len(sess.queue.items) == 1
+    assert state.stats().data_nonces_accepted == 1
+    assert state.stats().sessions_touched == 1
+
+    ping_socket = sess.feed([(sess.ping_packet(1), ADDR_A)], 1002.0)
+    pongs = [
+        (d, a) for d, a in ping_socket.sent if sess._is_type(d, "pong", 0)
+    ]
+    assert len(pongs) == 1 and pongs[0][1] == ADDR_A
+
+    close_socket = sess.feed([(sess.close_packet(), ADDR_A)], 1003.0)
+    assert close_socket.sent == []
+    assert sess.session._session_key not in state._sessions
+
+
+def test_G_path_response_admission_stays_specialized_no_double_admit(env):
+    """PATH_RESPONSE nonce admission stays inside `commit_candidate_path`
+    (atomic with the migration commit) and is NOT double-admitted through
+    the ordinary path-data transaction."""
+    state = env.new_state()
+    sess = env.install_session(state, addr=ADDR_A, now=1000.0)
+    open_b = sess.feed(
+        [(sess.nmea_packet("!AIVDM,1,1,,A,x,0*00"), ADDR_B)], 1000.0
+    )
+    challenge = sess.sole_challenge(open_b, expect_addr=ADDR_B)
+    accepted_before = state.stats().data_nonces_accepted
+
+    resp_nonce = os.urandom(12)
+    response = sess.path_response_packet(
+        challenge.challenge_token, challenge.path_generation, nonce=resp_nonce
+    )
+    commit = sess.feed([(response, ADDR_B)], 1001.0)
+    assert any(sess._is_type(d, p.PATH_ACK_TYPE, 0) for d, _ in commit.sent)
+    assert sess.session.path_state.active_path == ADDR_B
+    # exactly one nonce accounted for the PATH_RESPONSE (via commit), and
+    # its nonce lives in the (unchanged) current epoch ledger once each.
+    assert state.stats().data_nonces_accepted == accepted_before + 1
+    assert sess.session.current_epoch.seen_data_nonces.contains(resp_nonce)
+    # a byte replay does not re-admit or re-commit
+    replay = sess.feed([(response, ADDR_B)], 1002.0)
+    assert not any(sess._is_type(d, p.PATH_ACK_TYPE, 0) for d, _ in replay.sent)
+    assert state.stats().data_nonces_accepted == accepted_before + 1
+    assert state.stats().path_migrations_committed == 1

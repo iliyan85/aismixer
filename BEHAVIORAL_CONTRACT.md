@@ -872,10 +872,26 @@ Handshake freshness remains inclusive at the boundary:
 `abs(wall_now - transmitted_timestamp) <= 30`. Monotonic time owns handshake
 replay TTL, pending-session creation and TTL, active-session creation and
 last-seen times, active-session TTL, and local capacity ordering. Each allowed
-received packet uses one monotonic observation for all of that packet's
-local-state decisions. Network policy is applied first; a denied packet
-performs no cryptographic work, state mutation, cleanup, or secure-state clock
-read.
+received packet takes one cheap monotonic observation up front for locator
+lookup, expiry cleanup, and cheap PRE-crypto early rejection. An ordinary
+validated DATA packet (`nmea`/`ping`/`close`) then takes a SECOND, fresh
+authoritative monotonic observation immediately before its locked
+nonce-admission transaction, because the expensive AEAD and message
+validation can themselves cross a deadline-sensitive boundary (a candidate
+TTL or a retired-path grace) after the pre-crypto observation. That locked
+transaction is one short decision: fresh authoritative time, path-state and
+epoch-transition expiry, fresh source-path classification against the
+current `PathState`, exact `CryptoEpoch` object/role revalidation, the
+path-role x epoch-role x message-type authorization matrix, and the
+per-epoch nonce admission -- and it returns the AUTHORITATIVE path role and
+admission time, which the downstream ordinary logic (session touch, pong,
+ingress queue, candidate observation, frame `admitted_at`) uses instead of
+the stale pre-crypto role/time. The specialized atomic transactions
+(PATH_RESPONSE in the migration commit, REFRESH_INIT/REFRESH_CONFIRM in
+their refresh transactions) keep their own single locked admission and are
+not double-admitted. Network policy is applied first; a denied packet
+performs no cryptographic work, state mutation, cleanup, or secure-state
+clock read.
 
 Every process-local TTL uses the same exact boundary: state is live while
 `age < ttl` and expires when `age >= ttl`. A duplicate handshake replay key
@@ -944,20 +960,23 @@ sessions are ordered from least to most recently seen across the
 process-wide `SecureState`.
 Installation and valid activity place a session at the most-recent end.
 Promotion counts as activity, and so does any fully validated,
-replay-admitted secure NMEA or ping packet that has passed the current
-path-role and message gates -- this includes a packet from the `active_path`
-and, under Prompt 4 path migration, a packet admitted for continuity from a
-newly observed current-epoch path (which then becomes the candidate), from
-an existing candidate path, or -- within its grace -- from the short-lived
+replay-admitted secure NMEA or ping packet that has passed the AUTHORITATIVE
+post-decrypt path-role and message gates (the fresh-time locked transaction
+described in the epoch-refresh subsection) -- this includes a packet from
+the `active_path` and, under Prompt 4 path migration, a packet admitted for
+continuity from a newly observed current-epoch path (which then becomes the
+candidate), from an existing candidate path, or -- while its grace is still
+live at the authoritative post-decrypt instant -- from the short-lived
 retired path. A `blocked` frame (source path owned by a different live
-session on this endpoint token) is dropped before any cryptographic work
-and does not touch. Invalid, malformed, mismatched, wrong-epoch, expired,
-or replayed traffic does not touch the active session, and neither does a
-graceful-close packet (it removes the session instead). `path_response`
-handling commits the migration but is not itself recorded as session
-activity; refresh-control (`refresh_init` / `refresh_confirm`) handling
-touches the session exactly as described in the in-session epoch refresh
-subsection.
+session on this endpoint token), and a straggler whose candidate TTL or
+retired grace elapsed during the AEAD so that its authoritative role no
+longer authorizes it under the epoch it selected, do not touch. Invalid,
+malformed, mismatched, wrong-epoch, expired, or replayed traffic does not
+touch the active session, and neither does a graceful-close packet (it
+removes the session instead). `path_response` handling commits the
+migration but is not itself recorded as session activity; refresh-control
+(`refresh_init` / `refresh_confirm`) handling touches the session exactly
+as described in the in-session epoch refresh subsection.
 
 After network policy accepts any packet, including a handshake or unknown
 packet type, the expired ordered prefixes of both pending and active session
@@ -1368,26 +1387,46 @@ planned-refresh cadence, never `session.created_at` on the server.
 **Epoch-specific replay and receive admission.** Every DATA operation
 retains the EXACT `CryptoEpoch` object it selected for authentication.
 The server receive path is: source policy -> locator/endpoint-token
-lookup -> path-role classification against `PathState`
-(active / candidate / retired / blocked / unknown; a 'blocked' frame -- one
-whose source path is the active path of a DIFFERENT live session on this
-endpoint token -- is dropped before any cryptographic work exactly as a
-wrong-path frame was before path migration existed; any other off-path
-frame takes the server-side path migration receive path in the subsection
-above rather than the ordinary path below, and an unproved off-path frame
-is confined to the exact current epoch) ->
+lookup -> CHEAP PRE-CRYPTO path-role classification against `PathState`
+(active / candidate / retired / blocked / unknown -- this session's own
+`active_path`, `candidate_path`, and `retired_path` records are matched
+first and always take precedence; only a source matching none of them is
+tested against the bounded relation index, where a match to a DIFFERENT
+live session on this endpoint token is 'blocked'. A 'blocked' frame is
+dropped before any cryptographic work exactly as a wrong-path frame was
+before path migration existed; any other off-path frame takes the
+server-side path migration receive path in the subsection above rather
+than the ordinary path below, and an unproved off-path frame is confined
+to the exact current epoch. This pre-crypto observation is NOT
+authoritative for a deadline-sensitive role) ->
 exact epoch selection by the plaintext selector among {retiring, current,
 pending} -> per-role message gate (a pending epoch carries only
 `refresh_confirm`; a retiring epoch carries only `nmea`/`ping`/`close`,
 never a refresh, path change, or current-epoch replacement) -> pre-decrypt
 replay check against THAT epoch's ledger -> AEAD outside the lock with
 AAD binding that generation -> canonical message + source + semantic
-validation -> authoritative locked re-verification that the exact epoch
-object is still that live role -> nonce admission into THAT epoch's
-ledger -> action authorized by the same admitted epoch. A receive thread
-that decrypts under E1 and then loses a concurrent commit race admits its
-nonce into E1's own (now retiring) ledger, or is told E1 is stale --
-never into E2's ledger. Each usable epoch keeps its own bounded replay
+validation -> ONE authoritative locked transaction at a FRESH authoritative
+monotonic observation: expire epoch-transition and path state, re-classify
+the source path against the CURRENT `PathState`, re-verify the exact
+`CryptoEpoch` object is still a live role, enforce the path-role x
+epoch-role x message-type authorization matrix, and admit the nonce into
+THAT epoch's ledger -> ordinary action (session touch, pong, ingress
+queue, candidate observation) authorized by the RETURNED authoritative
+path role and admission time, never the stale pre-crypto ones. The
+authorization matrix: `active` admits `nmea`/`ping`/`close` under the
+current or retiring epoch; `candidate` and `unknown` admit `nmea`/`ping`
+under the current epoch ONLY (a retiring epoch never authorizes an
+`unknown` or `candidate` source); `retired` admits `nmea`/`ping` under the
+current or retiring epoch ONLY while the grace is still live -- a
+straggler whose retired grace elapsed during the AEAD is re-classified
+`unknown` and, under a retiring epoch, fails closed with nothing admitted
+or touched, while under the current epoch it is legitimate new-path
+continuity that also opens a fresh reverse candidate; `blocked` admits
+nothing. Candidate/retired deadline equality is expired (`now >=
+deadline`), and a deadline is never extended by this transaction. A
+receive thread that decrypts under E1 and then loses a concurrent commit
+race admits its nonce into E1's own (now retiring) ledger, or is told E1
+is stale -- never into E2's ledger. Each usable epoch keeps its own bounded replay
 ledger for its entire accepted lifetime; the same 12 nonce bytes may
 occur under independently derived E1 and E2 keys but never twice under
 one key. Aggregate process-wide nonce accounting spans all live ledgers
@@ -1532,9 +1571,12 @@ authenticate under a retiring epoch, and retiring-epoch traffic can never
 open or prove a migration). Only after the plaintext is a semantically
 permitted message for an unproved path (`nmea`, `ping`, or
 `path_response`), its nonce passes that epoch's authoritative replay
-admission, and the session/epoch are re-verified as the exact live owners
-under the state-owner lock is a candidate created or replaced. A candidate
-does not change `active_path`. Authenticated `nmea` from a candidate is
+admission at a FRESH authoritative monotonic observation, and the
+session/epoch/path role are re-verified as the exact live owners under the
+state-owner lock is a candidate created or replaced -- and the candidate is
+opened for the role the AUTHORITATIVE post-decrypt classification returns
+(`unknown` for a brand-new path, or an existing `candidate`), never the
+stale pre-crypto role. A candidate does not change `active_path`. Authenticated `nmea` from a candidate is
 admitted to the normal ingress/assembler path under the session's exact
 existing `assembly_namespace` (so a multipart message may span the active
 and candidate paths), but the candidate has no outbound authority: an

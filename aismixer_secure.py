@@ -334,6 +334,26 @@ class _DataNonceAdmission(Enum):
     STALE = "stale"
 
 
+@dataclass(frozen=True)
+class _PathDataAdmission:
+    """Result of `SecureState.admit_epoch_data_nonce_for_path`.
+
+    `nonce_admission` is the `_DataNonceAdmission` outcome. `path_role`
+    ('active'/'candidate'/'retired'/'blocked'/'unknown' or None) and
+    `epoch_role` ('current'/'retiring'/'pending' or None) are the
+    AUTHORITATIVE roles decided under the owner lock at `effective_now` --
+    a fresh floored monotonic observation taken AFTER the expensive AEAD
+    and message validation, never the stale pre-decrypt sample. Downstream
+    ordinary DATA logic (touch / queue / candidate observation) must use
+    `path_role` and `effective_now`, not the cached pre-crypto role/time.
+    """
+
+    nonce_admission: object
+    path_role: object
+    epoch_role: object
+    effective_now: float
+
+
 class _PendingEpochInstall(Enum):
     """Outcome of `SecureState.install_pending_epoch`."""
 
@@ -2384,12 +2404,52 @@ class SecureState:
                 self._data_nonce_replays += 1
             return seen
 
+    def _admit_nonce_into_epoch_ledger(
+        self, session, epoch, epoch_role, nonce, now
+    ):
+        """Admit `nonce` into `epoch`'s own replay ledger with the standard
+        REPLAY / EXHAUSTED / ACCEPTED accounting. The caller holds the lock
+        and has already established `epoch_role` via `_session_epoch_role`.
+        EXHAUSTED on the current epoch removes the whole session; on a
+        pending or retiring epoch it discards only that epoch. Returns the
+        `_DataNonceAdmission`, or STALE if a current-epoch removal did not
+        take effect."""
+        admission = epoch.seen_data_nonces.admit(nonce)
+        if admission is _DataNonceAdmission.REPLAY:
+            self._data_nonce_replays += 1
+        elif admission is _DataNonceAdmission.EXHAUSTED:
+            if epoch_role == "current":
+                if not self._remove_exact_session(
+                    session, "nonce_exhausted", now
+                ):
+                    return _DataNonceAdmission.STALE
+            elif epoch_role == "pending":
+                self._discard_one_epoch_nonces(epoch)
+                session.pending_epoch = None
+                self._pending_epochs_discarded += 1
+                self._data_nonce_exhaustions += 1
+            else:  # retiring
+                self._discard_one_epoch_nonces(epoch)
+                session.retiring_epoch = None
+                session.retiring_deadline = None
+                self._retiring_epochs_retired += 1
+                self._data_nonce_exhaustions += 1
+        else:
+            self._account_accepted_data_nonce()
+        return admission
+
     def admit_epoch_data_nonce(self, session, epoch, nonce, now):
-        """Authoritative post-validation nonce admission into the EXACT
-        epoch the caller decrypted under. STALE if that epoch is no longer
-        a live role on `session`. EXHAUSTED on the current epoch is
-        terminal for the whole session (as before); EXHAUSTED on a
-        pending or retiring epoch discards only that epoch."""
+        """Lower-level nonce admission into the EXACT epoch the caller
+        decrypted under, revalidating only session + epoch-object identity
+        (NOT the source path role). STALE if that epoch is no longer a live
+        role on `session`. EXHAUSTED on the current epoch is terminal for
+        the whole session (as before); EXHAUSTED on a pending or retiring
+        epoch discards only that epoch.
+
+        For an ordinary validated DATA packet in `_secure_server_loop`
+        whose deadline-sensitive PATH role must ALSO be re-decided after
+        AEAD, use `admit_epoch_data_nonce_for_path` instead -- this method
+        alone would trust a stale pre-decrypt path role."""
         with self._lock:
             now = self._authoritative_now(now)
             if self._get_live_session_handle(session, now) is None:
@@ -2398,29 +2458,106 @@ class SecureState:
             role = self._session_epoch_role(session, epoch)
             if role is None:
                 return _DataNonceAdmission.STALE
-            admission = epoch.seen_data_nonces.admit(nonce)
-            if admission is _DataNonceAdmission.REPLAY:
-                self._data_nonce_replays += 1
-            elif admission is _DataNonceAdmission.EXHAUSTED:
-                if role == "current":
-                    if not self._remove_exact_session(
-                        session, "nonce_exhausted", now
-                    ):
-                        return _DataNonceAdmission.STALE
-                elif role == "pending":
-                    self._discard_one_epoch_nonces(epoch)
-                    session.pending_epoch = None
-                    self._pending_epochs_discarded += 1
-                    self._data_nonce_exhaustions += 1
-                else:  # retiring
-                    self._discard_one_epoch_nonces(epoch)
-                    session.retiring_epoch = None
-                    session.retiring_deadline = None
-                    self._retiring_epochs_retired += 1
-                    self._data_nonce_exhaustions += 1
-            else:
-                self._account_accepted_data_nonce()
-            return admission
+            return self._admit_nonce_into_epoch_ledger(
+                session, epoch, role, nonce, now
+            )
+
+    @staticmethod
+    def _ordinary_data_path_authorized(path_role, epoch_role, message_type):
+        """The AUTHORITATIVE post-decrypt authorization matrix for an
+        ordinary validated DATA message (`nmea` / `ping` / `close`) under
+        the freshly re-decided path role and epoch role. Mirrors the
+        pre-crypto early-rejection gates but is the decision of record:
+
+          active    : nmea/ping/close, current or retiring epoch
+          candidate : nmea/ping,       current epoch only
+          retired   : nmea/ping,       current or retiring epoch,
+                                       only while the grace is still live
+                                       (the caller expires it first, so a
+                                       just-expired retired path arrives
+                                       here classified 'unknown')
+          unknown   : nmea/ping,       current epoch only
+          blocked   : nothing
+
+        A RETIRING epoch never authorizes `unknown` (or `candidate`)
+        traffic: a straggler whose retired grace has elapsed cannot be
+        admitted under an epoch that is itself only being kept for
+        stragglers."""
+        if message_type not in ("nmea", "ping", SESSION_CLOSE_TYPE):
+            return False
+        if path_role == "active":
+            return epoch_role in ("current", "retiring")
+        if path_role == "retired":
+            return (
+                message_type in ("nmea", "ping")
+                and epoch_role in ("current", "retiring")
+            )
+        if path_role in ("candidate", "unknown"):
+            return message_type in ("nmea", "ping") and epoch_role == "current"
+        return False  # 'blocked' / None / anything else
+
+    def admit_epoch_data_nonce_for_path(
+        self, session, epoch, nonce, message_type, source_sockaddr, now
+    ):
+        """Authoritative, single-locked-transaction admission for an
+        ordinary validated DATA packet (`nmea` / `ping` / `close`) whose
+        deadline-sensitive path role and epoch role must be re-decided
+        AFTER the expensive AEAD and message validation.
+
+        Under ONE owner-lock transaction, at `now` freshly floored through
+        `_authoritative_now`:
+          1. revalidate the exact live `LogicalSession` object;
+          2. expire epoch-transition state;
+          3. expire this session's candidate/retired path state;
+          4. freshly classify the source path against the CURRENT
+             `PathState` ('active'/'candidate'/'retired'/'blocked'/
+             'unknown');
+          5. revalidate the exact `CryptoEpoch` object's live role
+             ('current'/'retiring'/'pending', or None -> STALE);
+          6. enforce path-role x epoch-role x message-type authorization
+             (`_ordinary_data_path_authorized`);
+          7. only if authorized, admit `nonce` into that exact epoch's
+             replay ledger with the existing REPLAY / EXHAUSTED / ACCEPTED
+             accounting;
+          8. return the ACTUALLY authoritative `path_role`, `epoch_role`,
+             and `effective_now` as a `_PathDataAdmission`.
+
+        A `blocked` source, an unauthorized (role x epoch x type)
+        combination, or a `CryptoEpoch` that is no longer a live role
+        returns `nonce_admission = _DataNonceAdmission.STALE` WITHOUT
+        recording the nonce or mutating any unrelated state -- exactly as
+        an equivalent pre-crypto drop would. `PATH_RESPONSE` and the
+        refresh control messages are NOT admitted here (they own their own
+        atomic specialized transactions). Only cheap in-memory work
+        happens under the lock: no AEAD, JSON, signatures, socket I/O, or
+        await."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return _PathDataAdmission(
+                    _DataNonceAdmission.STALE, None, None, now
+                )
+            self._expire_session_epoch_transitions(session, now)
+            self._expire_session_path_state(session, now)
+
+            epoch_role = self._session_epoch_role(session, epoch)
+            if epoch_role is None:
+                return _PathDataAdmission(
+                    _DataNonceAdmission.STALE, None, None, now
+                )
+            path_role = self._classify_source_path(session, source_sockaddr)
+
+            if not self._ordinary_data_path_authorized(
+                path_role, epoch_role, message_type
+            ):
+                return _PathDataAdmission(
+                    _DataNonceAdmission.STALE, path_role, epoch_role, now
+                )
+
+            admission = self._admit_nonce_into_epoch_ledger(
+                session, epoch, epoch_role, nonce, now
+            )
+            return _PathDataAdmission(admission, path_role, epoch_role, now)
 
     def install_pending_epoch(
         self,
@@ -2642,52 +2779,71 @@ class SecureState:
     # promotes/discards/rekeys any `CryptoEpoch`.
     #
 
+    def _classify_source_path(self, session, source_sockaddr):
+        """Classify `source_sockaddr` against `session`'s CURRENT
+        `PathState` as 'active' / 'candidate' / 'retired' / 'blocked' /
+        'unknown'. The caller holds the lock and has already run
+        `_get_live_session_handle` and `_expire_session_path_state` at the
+        authoritative `now`; this is a pure read/compare -- no expiry, no
+        mutation.
+
+        Precedence: THIS session's own already-existing `active_path`,
+        `candidate_path`, and `retired_path` records are matched first and
+        always win. Only when the source matches none of them is the
+        bounded relation index consulted, and a match there to a DIFFERENT
+        live session on this endpoint token yields 'blocked' -- the source
+        is that sibling's active path, an impossible migration target for
+        this session. Everything else is 'unknown'. A malformed/ambiguous
+        source sockaddr is 'unknown' (fail closed). Equality is structural
+        `core.sockaddr_identity` identity (IPv6 scope significant, flowinfo
+        excluded), exactly as `_structured_paths_match`."""
+        path_state = session.path_state
+        try:
+            identity = normalize_sockaddr(source_sockaddr)
+            if identity == normalize_sockaddr(path_state.active_path):
+                return "active"
+        except MalformedSockaddrError:
+            return "unknown"
+        candidate = path_state.candidate_path
+        if candidate is not None and candidate.identity == identity:
+            return "candidate"
+        retired = path_state.retired_path
+        if retired is not None and retired.identity == identity:
+            return "retired"
+        sibling = self._relation_index.get(
+            _EndpointPeerKey(
+                session._session_key.endpoint_token, identity
+            )
+        )
+        if sibling is not None and sibling != session._session_key:
+            return "blocked"
+        return "unknown"
+
     def resolve_incoming_path_role(self, session, source_sockaddr, now):
-        """Classify a DATA frame's source path against `session`'s live
-        `PathState` as one of 'active' / 'candidate' / 'retired' /
-        'blocked' / 'unknown'.
+        """Cheap PRE-CRYPTO classification of a DATA frame's source path
+        against `session`'s live `PathState` -- 'active' / 'candidate' /
+        'retired' / 'blocked' / 'unknown' -- used only for lookup and cheap
+        early rejection (a `blocked` frame is dropped before any AEAD).
 
-        'blocked' means the source path is the active path of a DIFFERENT
-        live session on this endpoint token: this session can never migrate
-        there, so the caller drops the frame before any cryptographic work,
-        exactly as a wrong-path frame was dropped before path migration
-        existed. 'active'/'candidate'/'retired' take precedence -- this
-        session's own path records are always honoured first.
+        This observation is NOT authoritative for a deadline-sensitive
+        role: it is taken before the expensive AEAD/validation step, so a
+        candidate or retired grace can elapse before the packet is actually
+        admitted. Ordinary validated DATA (`nmea`/`ping`/`close`) is
+        admitted through `admit_epoch_data_nonce_for_path`, which
+        re-classifies the source path (and re-checks the epoch role) at a
+        fresh authoritative monotonic observation inside the same locked
+        nonce-admission transaction and returns the role of record.
 
-        Lazily expires this session's own candidate/retired path state
-        first, so an expired record never classifies as anything but
-        'unknown'/'blocked'. A malformed/ambiguous source sockaddr, or a
-        session that is no longer the live incarnation, is 'unknown' (fail
-        closed). Equality is structural `core.sockaddr_identity` identity,
-        never display strings or raw tuple spelling; the current canonical
-        IPv4/IPv6 semantics (IPv6 scope significant, flowinfo excluded)
-        are exactly those of `_structured_paths_match`."""
+        Lazily expires this session's own candidate/retired path state so
+        an already-expired record cannot even be classified as candidate/
+        retired here; a session that is no longer the live incarnation is
+        'unknown' (fail closed)."""
         with self._lock:
             now = self._authoritative_now(now)
             if self._get_live_session_handle(session, now) is None:
                 return "unknown"
             self._expire_session_path_state(session, now)
-            path_state = session.path_state
-            try:
-                identity = normalize_sockaddr(source_sockaddr)
-                if identity == normalize_sockaddr(path_state.active_path):
-                    return "active"
-            except MalformedSockaddrError:
-                return "unknown"
-            candidate = path_state.candidate_path
-            if candidate is not None and candidate.identity == identity:
-                return "candidate"
-            retired = path_state.retired_path
-            if retired is not None and retired.identity == identity:
-                return "retired"
-            sibling = self._relation_index.get(
-                _EndpointPeerKey(
-                    session._session_key.endpoint_token, identity
-                )
-            )
-            if sibling is not None and sibling != session._session_key:
-                return "blocked"
-            return "unknown"
+            return self._classify_source_path(session, source_sockaddr)
 
     def open_or_replace_candidate_path(
         self, session, epoch, source_sockaddr, challenge_token, now
@@ -4041,9 +4197,25 @@ async def _secure_server_loop(
                     )
                     continue
 
-                admission = state_owner.admit_epoch_data_nonce(
-                    session, epoch, nonce, local_now
+                # P2 TOCTOU fix: the pre-decrypt `off_path_role` / `epoch_role`
+                # above are a CHEAP EARLY-REJECTION optimization only. The
+                # AUTHORITATIVE decision -- fresh authoritative monotonic
+                # time, fresh path-state expiry, fresh path classification,
+                # fresh epoch-role check, the full path x epoch x type
+                # authorization matrix, and the nonce admission -- is one
+                # locked transaction here. A candidate or retired grace that
+                # elapsed during the expensive AEAD is honoured: e.g. an E1
+                # (retiring) straggler from a path whose retired grace just
+                # expired arrives classified 'unknown', and 'unknown +
+                # retiring' is not authorized, so its nonce is never
+                # recorded and nothing is touched/queued. Downstream uses
+                # the RETURNED role and time, never the stale pre-AEAD ones.
+                path_admission = state_owner.admit_epoch_data_nonce_for_path(
+                    session, epoch, nonce, message_type, addr, monotonic_now()
                 )
+                admission = path_admission.nonce_admission
+                effective_now = path_admission.effective_now
+                authoritative_role = path_admission.path_role
                 if admission is _DataNonceAdmission.REPLAY:
                     print(
                         "[!] Duplicate secure data nonce from "
@@ -4057,7 +4229,7 @@ async def _secure_server_loop(
                     if (
                         owned_sessions is not None
                         and not state_owner.is_live_session_handle(
-                            session, local_now
+                            session, effective_now
                         )
                     ):
                         owned_sessions.pop(session._session_key, None)
@@ -4067,22 +4239,38 @@ async def _secure_server_loop(
                     )
                     continue
                 if admission is not _DataNonceAdmission.ACCEPTED:
+                    # STALE: session gone, exact epoch no longer live, the
+                    # source is now 'blocked', OR the freshly re-decided
+                    # path role x epoch role x message type is unauthorized
+                    # (e.g. a retired path whose grace expired during
+                    # decrypt -- now 'unknown' -- under a retiring epoch).
+                    # Fail closed: no nonce recorded, no touch, no queue,
+                    # no candidate/challenge, no outbound response.
                     continue
 
+                # From here the AUTHORITATIVE post-decrypt path role governs
+                # ordinary behaviour. `None` == the ordinary active path.
+                effective_off_path_role = (
+                    None if authoritative_role == "active"
+                    else authoritative_role
+                )
+
                 if message_type == SESSION_CLOSE_TYPE:
+                    # Only reachable with `authoritative_role == "active"`
+                    # (the matrix authorizes `close` for no other role).
                     state_owner.close_session(
                         session,
-                        local_now,
+                        effective_now,
                     )
                     continue
 
                 state_owner.touch_session(
                     session,
-                    local_now,
+                    effective_now,
                 )
 
                 if message_type == "ping":
-                    if off_path_role is not None:
+                    if effective_off_path_role is not None:
                         # Prompt 4: an unproved or just-retired path gets NO
                         # ordinary pong. A PING from a new/candidate source
                         # still establishes/refreshes the candidate signal
@@ -4090,7 +4278,7 @@ async def _secure_server_loop(
                         # brand-new or replaced candidate only); a PING from
                         # the just-retired path is late inbound activity
                         # only and opens no reverse candidate.
-                        if off_path_role in ("unknown", "candidate"):
+                        if effective_off_path_role in ("unknown", "candidate"):
                             _process_candidate_path_observation(
                                 state_owner,
                                 session,
@@ -4100,7 +4288,7 @@ async def _secure_server_loop(
                                 sock,
                                 wall_now,
                                 monotonic_now,
-                                local_now,
+                                effective_now,
                             )
                         continue
                     response = build_pong_message(
@@ -4125,15 +4313,20 @@ async def _secure_server_loop(
                     )
                     continue
 
-                if off_path_role in ("unknown", "candidate"):
+                if effective_off_path_role in ("unknown", "candidate"):
                     # Authenticated, replay-admitted NMEA from an unproved
-                    # path: install/replace the single candidate and draw
-                    # the one PATH_CHALLENGE (brand-new / replaced
-                    # candidate only). The NMEA itself still flows to the
-                    # normal ingress/assembler path below under this exact
+                    # path (by the AUTHORITATIVE post-decrypt role):
+                    # install/replace the single candidate and draw the one
+                    # PATH_CHALLENGE (brand-new / replaced candidate only).
+                    # The NMEA itself still flows to the normal
+                    # ingress/assembler path below under this exact
                     # session's own `assembly_namespace` -- candidate
                     # admission is inbound data continuity, not outbound
-                    # authority.
+                    # authority. A straggler whose retired grace expired
+                    # during decrypt reaches here as 'unknown' (only under
+                    # the current epoch -- a retiring-epoch straggler was
+                    # already failed closed above) and legitimately opens a
+                    # fresh reverse candidate.
                     _process_candidate_path_observation(
                         state_owner,
                         session,
@@ -4143,7 +4336,7 @@ async def _secure_server_loop(
                         sock,
                         wall_now,
                         monotonic_now,
-                        local_now,
+                        effective_now,
                     )
 
                 src_for_queue = sec_input_id or station_id or "ANONYMOUS"
@@ -4187,7 +4380,7 @@ async def _secure_server_loop(
                 # that happens to reuse the same raw bytes after this
                 # exact session's own reservation already retired.
                 namespace_lease = state_owner.acquire_namespace_lease(
-                    session, local_now
+                    session, effective_now
                 )
                 if namespace_lease is None:
                     # The session is no longer live (removed concurrently
@@ -4211,8 +4404,11 @@ async def _secure_server_loop(
                     # retirement window elapses. Recording admission time
                     # here lets the processor (core.python_data_plane)
                     # apply its own bounded-backlog/QoS policy, on top of
-                    # (not instead of) the lease above.
-                    admitted_at=local_now,
+                    # (not instead of) the lease above. This is the
+                    # AUTHORITATIVE admission instant from the locked nonce
+                    # transaction, never the stale pre-AEAD `local_now` --
+                    # so frame-age bookkeeping is not backdated.
+                    admitted_at=effective_now,
                     admission_lease=namespace_lease,
                 )
                 if frame is None:

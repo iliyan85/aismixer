@@ -1439,7 +1439,12 @@ def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
     assert stats.sessions_touched == 1
     assert stats.data_nonces_accepted == 1
     assert wall_clock.calls == 1
-    assert monotonic_clock.calls == 1
+    # Two monotonic observations for an admitted DATA packet: one cheap
+    # pre-AEAD sample for lookup / early rejection, and one FRESH
+    # authoritative sample taken immediately before the locked
+    # nonce-admission transaction (which re-decides the deadline-sensitive
+    # path role and epoch role after the expensive AEAD).
+    assert monotonic_clock.calls == 2
 
 
 def test_secure_server_valid_client_close_removes_exact_owned_active_session(
@@ -10315,8 +10320,12 @@ def test_wrong_path_unauthenticable_packet_makes_one_bounded_aead_attempt(
     nonce_seen_calls = _spy_on_state_method(
         monkeypatch, state, "epoch_data_nonce_seen"
     )
+    # Ordinary validated DATA is admitted through the path-aware
+    # authoritative transaction (`admit_epoch_data_nonce_for_path`), which
+    # re-decides the source path role after AEAD; the lower-level
+    # `admit_epoch_data_nonce` is not on this production path.
     admit_calls = _spy_on_state_method(
-        monkeypatch, state, "admit_epoch_data_nonce"
+        monkeypatch, state, "admit_epoch_data_nonce_for_path"
     )
     touch_calls = _spy_on_state_method(monkeypatch, state, "touch_session")
     open_candidate_calls = _spy_on_state_method(
