@@ -60,6 +60,29 @@ REFRESH_ACK_TYPE = "refresh_ack"
 REFRESH_TRANSACTION_ID_BYTES = 32
 REFRESH_RANDOM_BYTES = 32
 
+# Server-side path/session migration and return routability (UDPSEC V2
+# server path migration). Three strict, closed-schema JSON control messages
+# carried inside the existing encrypted DATA channel -- no new outer frame,
+# no protocol-version bump, no negotiation. They authenticate exactly like
+# every other encrypted DATA-channel message (locator/generation AAD
+# binding, per-epoch nonce admission) and carry an opaque server-generated
+# challenge token plus a path-state generation.
+PATH_CHALLENGE_TYPE = "path_challenge"
+PATH_RESPONSE_TYPE = "path_response"
+PATH_ACK_TYPE = "path_ack"
+# 32 random bytes generated with the project's existing secure-random
+# mechanism (`os.urandom`). Encoded canonically for JSON; a malformed,
+# non-canonical, or wrong-length value is rejected at parse time.
+PATH_CHALLENGE_TOKEN_BYTES = 32
+# `path_generation` is a path-state generation counter -- NOT a CryptoEpoch
+# generation. It monotonically distinguishes candidate incarnations within
+# one live `LogicalSession`. Generation 0 means "no candidate has ever
+# existed" and is never transmitted; the first candidate is generation 1.
+# The range is finite and closed: a value outside it fails closed rather
+# than wrapping into an ambiguous incarnation number.
+MIN_PATH_GENERATION = 1
+MAX_PATH_GENERATION = (1 << 32) - 1
+
 UDPSEC_PROTOCOL_VERSION = 2
 SESSION_LOCATOR_BYTES = 16
 EPOCH_SELECTOR_BYTES = 1
@@ -87,6 +110,15 @@ __all__ = (
     "EPOCH_SELECTOR_BYTES",
     "ESTABLISHMENT_EPOCH_GENERATION",
     "MAX_EPOCH_GENERATION",
+    "MAX_PATH_GENERATION",
+    "MIN_PATH_GENERATION",
+    "PATH_ACK_TYPE",
+    "PATH_CHALLENGE_TOKEN_BYTES",
+    "PATH_CHALLENGE_TYPE",
+    "PATH_RESPONSE_TYPE",
+    "PathAck",
+    "PathChallenge",
+    "PathResponse",
     "REFRESH_ACK_TYPE",
     "REFRESH_CONFIRM_TYPE",
     "REFRESH_INIT_TYPE",
@@ -109,6 +141,9 @@ __all__ = (
     "build_data_packet",
     "build_ping_message",
     "build_pong_message",
+    "build_path_ack_message",
+    "build_path_challenge_message",
+    "build_path_response_message",
     "build_refresh_ack_message",
     "build_refresh_confirm_message",
     "build_refresh_init_message",
@@ -121,6 +156,9 @@ __all__ = (
     "is_session_close_message",
     "parse_client_hello_packet",
     "parse_data_packet",
+    "parse_path_ack_message",
+    "parse_path_challenge_message",
+    "parse_path_response_message",
     "parse_refresh_ack_message",
     "parse_refresh_confirm_message",
     "parse_refresh_init_message",
@@ -719,6 +757,204 @@ def parse_refresh_ack_message(message: object) -> RefreshAck:
         station_id=station_id,
         transaction_id=transaction_id,
         next_generation=next_generation,
+        timestamp=timestamp,
+    )
+
+
+#
+# Server-side path migration / return-routability control messages.
+#
+# `path_challenge` (server -> client), `path_response` (client -> server),
+# and `path_ack` (server -> client) are carried inside the existing
+# encrypted DATA channel as strict, closed-schema JSON objects, all three
+# sharing one exact member set:
+#
+#     {"type", "source_id", "challenge_token", "path_generation", "timestamp"}
+#
+# The observed NAT/public candidate address is deliberately NOT carried in
+# any message body: the server already knows the candidate from
+# `recvfrom()`, and return routability is established only when the matching
+# `path_response` actually arrives FROM that candidate. `path_generation` is
+# a path-state generation, never a `CryptoEpoch` generation.
+#
+
+_PATH_MESSAGE_MEMBERS = frozenset(
+    {"type", "source_id", "challenge_token", "path_generation", "timestamp"}
+)
+
+
+def _validate_path_generation(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("path_generation must be an integer")
+    if not MIN_PATH_GENERATION <= value <= MAX_PATH_GENERATION:
+        raise ValueError(
+            "path_generation must be a positive unsigned 32-bit integer"
+        )
+    return value
+
+
+def _validate_path_challenge_token(value: object) -> bytes:
+    normalized = _require_immutable_bytes("challenge_token", value)
+    if len(normalized) != PATH_CHALLENGE_TOKEN_BYTES:
+        raise ValueError(
+            "challenge_token must be exactly "
+            f"{PATH_CHALLENGE_TOKEN_BYTES} bytes"
+        )
+    return normalized
+
+
+def _decode_path_challenge_token_text(value: object) -> bytes:
+    decoded = _decode_base64_text("challenge_token", value)
+    if len(decoded) != PATH_CHALLENGE_TOKEN_BYTES:
+        raise ValueError(
+            "challenge_token must decode to exactly "
+            f"{PATH_CHALLENGE_TOKEN_BYTES} bytes"
+        )
+    return decoded
+
+
+@dataclass(frozen=True, slots=True)
+class PathChallenge:
+    """Structurally validated PATH_CHALLENGE (server -> candidate path)."""
+
+    station_id: str
+    challenge_token: bytes = field(repr=False)
+    path_generation: int
+    timestamp: int
+
+    def __post_init__(self) -> None:
+        _station_id_bytes(self.station_id)
+        _validate_path_challenge_token(self.challenge_token)
+        _validate_path_generation(self.path_generation)
+        _validate_liveness_timestamp(self.timestamp)
+
+
+@dataclass(frozen=True, slots=True)
+class PathResponse:
+    """Structurally validated PATH_RESPONSE (candidate path -> server)."""
+
+    station_id: str
+    challenge_token: bytes = field(repr=False)
+    path_generation: int
+    timestamp: int
+
+    def __post_init__(self) -> None:
+        _station_id_bytes(self.station_id)
+        _validate_path_challenge_token(self.challenge_token)
+        _validate_path_generation(self.path_generation)
+        _validate_liveness_timestamp(self.timestamp)
+
+
+@dataclass(frozen=True, slots=True)
+class PathAck:
+    """Structurally validated PATH_ACK (server -> newly active path)."""
+
+    station_id: str
+    challenge_token: bytes = field(repr=False)
+    path_generation: int
+    timestamp: int
+
+    def __post_init__(self) -> None:
+        _station_id_bytes(self.station_id)
+        _validate_path_challenge_token(self.challenge_token)
+        _validate_path_generation(self.path_generation)
+        _validate_liveness_timestamp(self.timestamp)
+
+
+def _build_path_message(
+    message_type: str,
+    *,
+    station_id: str,
+    challenge_token: bytes,
+    path_generation: int,
+    timestamp: int,
+) -> dict:
+    _station_id_bytes(station_id)
+    _validate_path_challenge_token(challenge_token)
+    _validate_path_generation(path_generation)
+    _validate_liveness_timestamp(timestamp)
+    return {
+        "type": message_type,
+        "source_id": station_id,
+        "challenge_token": _encode_base64(challenge_token).decode("ascii"),
+        "path_generation": path_generation,
+        "timestamp": timestamp,
+    }
+
+
+def _parse_path_message(message: object, *, message_type: str):
+    if not isinstance(message, dict):
+        raise ValueError(f"{message_type} must be a JSON object")
+    if frozenset(message) != _PATH_MESSAGE_MEMBERS:
+        raise ValueError(f"{message_type} has an unexpected member set")
+    if message["type"] != message_type:
+        raise ValueError(f"{message_type} type field mismatch")
+    timestamp = message["timestamp"]
+    _validate_liveness_timestamp(timestamp)
+    return (
+        message["source_id"],
+        _decode_path_challenge_token_text(message["challenge_token"]),
+        _validate_path_generation(message["path_generation"]),
+        timestamp,
+    )
+
+
+def build_path_challenge_message(**kwargs) -> dict:
+    """Build one canonical PATH_CHALLENGE JSON control object."""
+
+    return _build_path_message(PATH_CHALLENGE_TYPE, **kwargs)
+
+
+def build_path_response_message(**kwargs) -> dict:
+    """Build one canonical PATH_RESPONSE JSON control object."""
+
+    return _build_path_message(PATH_RESPONSE_TYPE, **kwargs)
+
+
+def build_path_ack_message(**kwargs) -> dict:
+    """Build one canonical PATH_ACK JSON control object."""
+
+    return _build_path_message(PATH_ACK_TYPE, **kwargs)
+
+
+def parse_path_challenge_message(message: object) -> PathChallenge:
+    """Parse and structurally validate one canonical PATH_CHALLENGE object."""
+
+    station_id, challenge_token, path_generation, timestamp = (
+        _parse_path_message(message, message_type=PATH_CHALLENGE_TYPE)
+    )
+    return PathChallenge(
+        station_id=station_id,
+        challenge_token=challenge_token,
+        path_generation=path_generation,
+        timestamp=timestamp,
+    )
+
+
+def parse_path_response_message(message: object) -> PathResponse:
+    """Parse and structurally validate one canonical PATH_RESPONSE object."""
+
+    station_id, challenge_token, path_generation, timestamp = (
+        _parse_path_message(message, message_type=PATH_RESPONSE_TYPE)
+    )
+    return PathResponse(
+        station_id=station_id,
+        challenge_token=challenge_token,
+        path_generation=path_generation,
+        timestamp=timestamp,
+    )
+
+
+def parse_path_ack_message(message: object) -> PathAck:
+    """Parse and structurally validate one canonical PATH_ACK object."""
+
+    station_id, challenge_token, path_generation, timestamp = (
+        _parse_path_message(message, message_type=PATH_ACK_TYPE)
+    )
+    return PathAck(
+        station_id=station_id,
+        challenge_token=challenge_token,
+        path_generation=path_generation,
         timestamp=timestamp,
     )
 

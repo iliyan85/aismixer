@@ -3277,7 +3277,12 @@ def test_session_state_retains_only_directional_cipher_contexts(
         "generation",
         "transaction_id",
     }
-    assert set(vars(active.path_state)) == {"active_path"}
+    assert set(vars(active.path_state)) == {
+        "active_path",
+        "candidate_path",
+        "retired_path",
+        "path_generation",
+    }
     forbidden_field_fragments = {
         "ephemeral",
         "shared_secret",

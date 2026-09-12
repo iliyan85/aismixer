@@ -13,7 +13,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import constant_time, hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from core.endpoint_display import format_endpoint, format_endpoint_tuple
@@ -52,6 +52,10 @@ from core.udpsec_protocol import (
     DATA_PREFIX,
     ESTABLISHMENT_EPOCH_GENERATION,
     MAX_EPOCH_GENERATION,
+    MAX_PATH_GENERATION,
+    MIN_PATH_GENERATION,
+    PATH_CHALLENGE_TOKEN_BYTES,
+    PATH_RESPONSE_TYPE,
     REFRESH_CONFIRM_TYPE,
     REFRESH_INIT_TYPE,
     SESSION_CLOSE_TYPE,
@@ -61,6 +65,8 @@ from core.udpsec_protocol import (
     ServerHello,
     build_data_aad,
     build_data_packet,
+    build_path_ack_message,
+    build_path_challenge_message,
     build_pong_message,
     build_refresh_ack_message,
     build_refresh_reply_message,
@@ -71,6 +77,7 @@ from core.udpsec_protocol import (
     is_session_close_message,
     parse_client_hello_packet,
     parse_data_packet,
+    parse_path_response_message,
     parse_refresh_confirm_message,
     parse_refresh_init_message,
 )
@@ -104,6 +111,27 @@ PENDING_EPOCH_TTL_SECONDS = 30
 # per-packet plus `run_periodic_maintenance`). The boundary is exact:
 # `age >= cutoff` retires it, matching every other UDPSEC TTL.
 RETIRING_EPOCH_OVERLAP_SECONDS = 5
+# UDPSEC V2 server-side path migration (see BEHAVIORAL_CONTRACT.md
+# section 11). A confirmed `LogicalSession` owns exactly one `active_path`,
+# at most one `candidate_path`, and -- for a short fixed monotonic window
+# immediately after an atomic A -> B active-path migration -- at most one
+# `retired_path`. Both extra slots are bounded per session: there is no
+# unbounded address history and no queue of candidate paths.
+#
+# `PATH_CANDIDATE_TTL_SECONDS` bounds how long an unproved candidate path
+# may sit awaiting its return-routability proof before the server discards
+# it. Duplicate traffic on the same candidate never refreshes this
+# deadline. The boundary is exact: live while `now < deadline`, expired at
+# `now >= deadline`, matching every other UDPSEC TTL.
+PATH_CANDIDATE_TTL_SECONDS = 10.0
+# `RETIRED_PATH_GRACE_SECONDS` is the exact monotonic window during which
+# the immediately-previous active path still admits late in-flight
+# `nmea`/`ping` DATA as the same `LogicalSession` -- never a reverse
+# migration, close, refresh, ordinary pong, or any other path-control
+# state change. It prevents a delayed old-path datagram from immediately
+# flapping the session back. `age >= grace` retires it.
+RETIRED_PATH_GRACE_SECONDS = 5.0
+
 # F3: how often `SecureState.run_periodic_maintenance()` (a small,
 # independent, opt-in background task -- see that method) runs expiry and
 # retirement-purge housekeeping. Not security-relevant on its own (an
@@ -304,6 +332,26 @@ class _DataNonceAdmission(Enum):
     REPLAY = "replay"
     EXHAUSTED = "exhausted"
     STALE = "stale"
+
+
+@dataclass(frozen=True)
+class _PathDataAdmission:
+    """Result of `SecureState.admit_epoch_data_nonce_for_path`.
+
+    `nonce_admission` is the `_DataNonceAdmission` outcome. `path_role`
+    ('active'/'candidate'/'retired'/'blocked'/'unknown' or None) and
+    `epoch_role` ('current'/'retiring'/'pending' or None) are the
+    AUTHORITATIVE roles decided under the owner lock at `effective_now` --
+    a fresh floored monotonic observation taken AFTER the expensive AEAD
+    and message validation, never the stale pre-decrypt sample. Downstream
+    ordinary DATA logic (touch / queue / candidate observation) must use
+    `path_role` and `effective_now`, not the cached pre-crypto role/time.
+    """
+
+    nonce_admission: object
+    path_role: object
+    epoch_role: object
+    effective_now: float
 
 
 class _PendingEpochInstall(Enum):
@@ -574,16 +622,82 @@ def _canonical_active_relation_key(relation_key):
 
 
 @dataclass
-class PathState:
-    """The established session's currently authoritative outbound path.
+class CandidatePath:
+    """The single unproved candidate path a `LogicalSession` may own while a
+    server-side return-routability challenge for a newly observed source
+    path is outstanding.
 
-    Only `active_path` exists in this stage. Candidate/retired path tracking
-    and any path-validation/migration behavior are intentionally NOT
-    implemented yet; this type exists so a later stage can add them without
-    another ownership refactor.
+    A candidate is created only after a DATA frame from a new source path
+    has passed source policy, exact locator/endpoint-token lookup, exactly
+    one AEAD attempt under the exact CURRENT `CryptoEpoch`, semantic
+    validation for an unproved path, and authoritative per-epoch replay
+    admission. It carries the raw sockaddr needed for `sendto`, the
+    canonical `core.sockaddr_identity` identity used for every equality
+    check, the opaque server-minted challenge token `R`, the path-state
+    `path_generation`, its original creation/deadline (never extended by
+    duplicate traffic), and the EXACT `CryptoEpoch` object (and its
+    generation) it was authenticated/opened under. Installing a candidate
+    never changes `active_path`; only a matching PATH_RESPONSE from this
+    exact candidate address commits the migration.
+    """
+
+    sockaddr: object
+    identity: object
+    challenge_token: bytes
+    path_generation: int
+    created_at: float
+    deadline: float
+    epoch: object
+    epoch_generation: int
+
+
+@dataclass
+class RetiredPath:
+    """The single immediately-previous active path a `LogicalSession`
+    retains briefly after an atomic A -> B active-path migration.
+
+    A retired path is NEVER ordinary outbound authority and can never
+    automatically reactivate: during its short fixed monotonic grace it
+    only admits late in-flight `nmea`/`ping` DATA as the same
+    `LogicalSession`, and after the grace it has no special standing at all
+    -- genuinely fresh traffic from that address is simply a new path that
+    must run a fresh candidate/challenge/response cycle. It retains the
+    raw/canonical previous address, the retirement time/deadline, and the
+    `path_generation` of the candidate that displaced it (so a late
+    PATH_RESPONSE for that committed candidate can never be confused with
+    the retired path).
+    """
+
+    sockaddr: object
+    identity: object
+    path_generation: int
+    retired_at: float
+    deadline: float
+
+
+@dataclass
+class PathState:
+    """The established session's authoritative outbound path plus its
+    at-most-one candidate and at-most-one retired path.
+
+    `active_path` is the sole ordinary outbound authority and the sole
+    transport identity ordinary established-session replies use.
+    `candidate_path` (a `CandidatePath`) and `retired_path` (a
+    `RetiredPath`) are each bounded to one per session and are lazily
+    expired at their exact monotonic deadlines. `path_generation` is the
+    monotonic path-state generation counter owned by this session: `0`
+    means no candidate has ever existed, and each new candidate incarnation
+    (including a replacement `C` of an earlier candidate `B`) takes the
+    next value, so a stale candidate's generation can never be reused.
+    Path migration mutates these fields in place -- the `PathState` object
+    itself, like the owning `LogicalSession`, is never replaced by a
+    migration.
     """
 
     active_path: object
+    candidate_path: object = None
+    retired_path: object = None
+    path_generation: int = 0
 
 
 @dataclass
@@ -692,6 +806,12 @@ class SecureStateStats:
     pending_epochs_discarded: int
     retiring_epochs_retired: int
 
+    path_candidates_opened: int
+    path_candidates_replaced: int
+    path_candidates_expired: int
+    path_migrations_committed: int
+    retired_paths_expired: int
+
     current_handshake_replays: int
     peak_handshake_replays: int
     current_sessions: int
@@ -702,6 +822,8 @@ class SecureStateStats:
     peak_data_nonces: int
     current_pending_epochs: int
     current_retiring_epochs: int
+    current_candidate_paths: int
+    current_retired_paths: int
 
 
 class SecureState:
@@ -716,6 +838,8 @@ class SecureState:
         max_pending_sessions=PENDING_SESSION_MAX,
         pending_epoch_ttl=PENDING_EPOCH_TTL_SECONDS,
         retiring_epoch_overlap=RETIRING_EPOCH_OVERLAP_SECONDS,
+        path_candidate_ttl=PATH_CANDIDATE_TTL_SECONDS,
+        retired_path_grace=RETIRED_PATH_GRACE_SECONDS,
         clock=None,
     ):
         # R5/F2: an OPTIONAL authoritative monotonic clock this owner
@@ -768,6 +892,10 @@ class SecureState:
             "pending_epoch_ttl", pending_epoch_ttl)
         self._retiring_epoch_overlap = _validate_positive_ttl(
             "retiring_epoch_overlap", retiring_epoch_overlap)
+        self._path_candidate_ttl = _validate_positive_ttl(
+            "path_candidate_ttl", path_candidate_ttl)
+        self._retired_path_grace = _validate_positive_ttl(
+            "retired_path_grace", retired_path_grace)
 
         # One reentrant lock protects every composite state transaction
         # below (replay admission, pending/active install/replace/remove,
@@ -849,6 +977,23 @@ class SecureState:
         # sessions' transitions, and `run_periodic_maintenance` drains
         # this heap on an otherwise-idle owner.
         self._epoch_transition_heap = []
+        # UDPSEC V2 server path migration deliberately has NO deadline heap.
+        # Unlike a pending epoch (whose creation is rejected while one is
+        # unresolved, so at most one transition object ever exists per
+        # session), a candidate path can be replaced by fresh authenticated
+        # current-epoch traffic at an unbounded rate, and a per-replacement
+        # heap entry would retain one strong record per replacement until
+        # its original deadline arrived -- history-scaled, not
+        # session-scaled. Instead: `PathState` itself is authoritative for
+        # its at-most-one candidate and at-most-one retired record (a
+        # replacement simply overwrites the slot and the old record is
+        # dereferenced); `_expire_session_path_state()` rejects expired
+        # authority lazily in O(1) on every exact-session path operation;
+        # and `cleanup_expired_path_transitions()` does one bounded
+        # O(number of live sessions) sweep from `run_periodic_maintenance`
+        # for the fully-idle case. Total path-housekeeping storage is thus
+        # hard-bounded at two optional records per live session
+        # (<= 2 * SESSION_MAX), independent of transition history.
         # Heap entries are `(deadline, sequence, key)`. `_EndpointSessionKey`
         # and `_EndpointPeerKey` support equality but not ordering, so two
         # entries with an equal `deadline` (routine -- many sessions can
@@ -902,6 +1047,12 @@ class SecureState:
         self._pending_epochs_created = 0
         self._pending_epochs_discarded = 0
         self._retiring_epochs_retired = 0
+
+        self._path_candidates_opened = 0
+        self._path_candidates_replaced = 0
+        self._path_candidates_expired = 0
+        self._path_migrations_committed = 0
+        self._retired_paths_expired = 0
 
         self._current_data_nonces = 0
         self._peak_handshake_replays = 0
@@ -960,6 +1111,11 @@ class SecureState:
                 pending_epochs_created=self._pending_epochs_created,
                 pending_epochs_discarded=self._pending_epochs_discarded,
                 retiring_epochs_retired=self._retiring_epochs_retired,
+                path_candidates_opened=self._path_candidates_opened,
+                path_candidates_replaced=self._path_candidates_replaced,
+                path_candidates_expired=self._path_candidates_expired,
+                path_migrations_committed=self._path_migrations_committed,
+                retired_paths_expired=self._retired_paths_expired,
                 current_handshake_replays=len(self._handshake_replays),
                 peak_handshake_replays=self._peak_handshake_replays,
                 current_sessions=len(self._sessions),
@@ -977,6 +1133,16 @@ class SecureState:
                     1
                     for session in self._sessions.values()
                     if session.retiring_epoch is not None
+                ),
+                current_candidate_paths=sum(
+                    1
+                    for session in self._sessions.values()
+                    if session.path_state.candidate_path is not None
+                ),
+                current_retired_paths=sum(
+                    1
+                    for session in self._sessions.values()
+                    if session.path_state.retired_path is not None
                 ),
             )
 
@@ -1302,6 +1468,45 @@ class SecureState:
                     session.retiring_deadline = None
                     self._retiring_epochs_retired += 1
 
+    def _expire_session_path_state(self, session, now):
+        """Lazily discard this exact session's own expired path state (an
+        unproved candidate past its TTL, a retired path past its grace
+        cutoff). Caller must hold the lock and have already confirmed
+        `session` is the live incarnation. O(1) -- only this session's own
+        two optional `PathState` slots, never a scan of other sessions. An
+        expired record is dropped regardless of physical-reclamation
+        timing; it never authorizes behavior once past its deadline."""
+        path_state = session.path_state
+        candidate = path_state.candidate_path
+        if candidate is not None and candidate.deadline <= now:
+            path_state.candidate_path = None
+            self._path_candidates_expired += 1
+        retired = path_state.retired_path
+        if retired is not None and retired.deadline <= now:
+            path_state.retired_path = None
+            self._retired_paths_expired += 1
+
+    def cleanup_expired_path_transitions(self, now):
+        """Idle physical cleanup for path-state transitions: one bounded
+        sweep discarding every live session's expired candidate path (past
+        its TTL) and expired retired path (past its grace cutoff).
+
+        This is O(number of live sessions) -- hard-bounded by `SESSION_MAX`,
+        with a constant two optional records checked per session -- not
+        O(candidate replacements), because there is no per-transition heap
+        (see `__init__`). It is NOT security-relevant on its own: every
+        exact-session path operation already calls
+        `_expire_session_path_state()` first, so an expired candidate/
+        retired record is refused authority regardless of when this last
+        ran. Its only purpose is reclaiming the two bounded slots on a
+        session that receives no further packets before it idle-expires.
+        Called from `run_periodic_maintenance`; a test may call it
+        directly."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            for session in list(self._sessions.values()):
+                self._expire_session_path_state(session, now)
+
     async def run_periodic_maintenance(
         self,
         interval=IDLE_MAINTENANCE_INTERVAL_SECONDS,
@@ -1347,6 +1552,7 @@ class SecureState:
             self.cleanup_expired_sessions(now)
             self.cleanup_expired_pending_sessions(now)
             self.cleanup_expired_epoch_transitions(now)
+            self.cleanup_expired_path_transitions(now)
 
     def _fresh_session_handle(self):
         """Always mint a new, process-wide-unique LogicalSession-incarnation
@@ -2198,12 +2404,52 @@ class SecureState:
                 self._data_nonce_replays += 1
             return seen
 
+    def _admit_nonce_into_epoch_ledger(
+        self, session, epoch, epoch_role, nonce, now
+    ):
+        """Admit `nonce` into `epoch`'s own replay ledger with the standard
+        REPLAY / EXHAUSTED / ACCEPTED accounting. The caller holds the lock
+        and has already established `epoch_role` via `_session_epoch_role`.
+        EXHAUSTED on the current epoch removes the whole session; on a
+        pending or retiring epoch it discards only that epoch. Returns the
+        `_DataNonceAdmission`, or STALE if a current-epoch removal did not
+        take effect."""
+        admission = epoch.seen_data_nonces.admit(nonce)
+        if admission is _DataNonceAdmission.REPLAY:
+            self._data_nonce_replays += 1
+        elif admission is _DataNonceAdmission.EXHAUSTED:
+            if epoch_role == "current":
+                if not self._remove_exact_session(
+                    session, "nonce_exhausted", now
+                ):
+                    return _DataNonceAdmission.STALE
+            elif epoch_role == "pending":
+                self._discard_one_epoch_nonces(epoch)
+                session.pending_epoch = None
+                self._pending_epochs_discarded += 1
+                self._data_nonce_exhaustions += 1
+            else:  # retiring
+                self._discard_one_epoch_nonces(epoch)
+                session.retiring_epoch = None
+                session.retiring_deadline = None
+                self._retiring_epochs_retired += 1
+                self._data_nonce_exhaustions += 1
+        else:
+            self._account_accepted_data_nonce()
+        return admission
+
     def admit_epoch_data_nonce(self, session, epoch, nonce, now):
-        """Authoritative post-validation nonce admission into the EXACT
-        epoch the caller decrypted under. STALE if that epoch is no longer
-        a live role on `session`. EXHAUSTED on the current epoch is
-        terminal for the whole session (as before); EXHAUSTED on a
-        pending or retiring epoch discards only that epoch."""
+        """Lower-level nonce admission into the EXACT epoch the caller
+        decrypted under, revalidating only session + epoch-object identity
+        (NOT the source path role). STALE if that epoch is no longer a live
+        role on `session`. EXHAUSTED on the current epoch is terminal for
+        the whole session (as before); EXHAUSTED on a pending or retiring
+        epoch discards only that epoch.
+
+        For an ordinary validated DATA packet in `_secure_server_loop`
+        whose deadline-sensitive PATH role must ALSO be re-decided after
+        AEAD, use `admit_epoch_data_nonce_for_path` instead -- this method
+        alone would trust a stale pre-decrypt path role."""
         with self._lock:
             now = self._authoritative_now(now)
             if self._get_live_session_handle(session, now) is None:
@@ -2212,29 +2458,106 @@ class SecureState:
             role = self._session_epoch_role(session, epoch)
             if role is None:
                 return _DataNonceAdmission.STALE
-            admission = epoch.seen_data_nonces.admit(nonce)
-            if admission is _DataNonceAdmission.REPLAY:
-                self._data_nonce_replays += 1
-            elif admission is _DataNonceAdmission.EXHAUSTED:
-                if role == "current":
-                    if not self._remove_exact_session(
-                        session, "nonce_exhausted", now
-                    ):
-                        return _DataNonceAdmission.STALE
-                elif role == "pending":
-                    self._discard_one_epoch_nonces(epoch)
-                    session.pending_epoch = None
-                    self._pending_epochs_discarded += 1
-                    self._data_nonce_exhaustions += 1
-                else:  # retiring
-                    self._discard_one_epoch_nonces(epoch)
-                    session.retiring_epoch = None
-                    session.retiring_deadline = None
-                    self._retiring_epochs_retired += 1
-                    self._data_nonce_exhaustions += 1
-            else:
-                self._account_accepted_data_nonce()
-            return admission
+            return self._admit_nonce_into_epoch_ledger(
+                session, epoch, role, nonce, now
+            )
+
+    @staticmethod
+    def _ordinary_data_path_authorized(path_role, epoch_role, message_type):
+        """The AUTHORITATIVE post-decrypt authorization matrix for an
+        ordinary validated DATA message (`nmea` / `ping` / `close`) under
+        the freshly re-decided path role and epoch role. Mirrors the
+        pre-crypto early-rejection gates but is the decision of record:
+
+          active    : nmea/ping/close, current or retiring epoch
+          candidate : nmea/ping,       current epoch only
+          retired   : nmea/ping,       current or retiring epoch,
+                                       only while the grace is still live
+                                       (the caller expires it first, so a
+                                       just-expired retired path arrives
+                                       here classified 'unknown')
+          unknown   : nmea/ping,       current epoch only
+          blocked   : nothing
+
+        A RETIRING epoch never authorizes `unknown` (or `candidate`)
+        traffic: a straggler whose retired grace has elapsed cannot be
+        admitted under an epoch that is itself only being kept for
+        stragglers."""
+        if message_type not in ("nmea", "ping", SESSION_CLOSE_TYPE):
+            return False
+        if path_role == "active":
+            return epoch_role in ("current", "retiring")
+        if path_role == "retired":
+            return (
+                message_type in ("nmea", "ping")
+                and epoch_role in ("current", "retiring")
+            )
+        if path_role in ("candidate", "unknown"):
+            return message_type in ("nmea", "ping") and epoch_role == "current"
+        return False  # 'blocked' / None / anything else
+
+    def admit_epoch_data_nonce_for_path(
+        self, session, epoch, nonce, message_type, source_sockaddr, now
+    ):
+        """Authoritative, single-locked-transaction admission for an
+        ordinary validated DATA packet (`nmea` / `ping` / `close`) whose
+        deadline-sensitive path role and epoch role must be re-decided
+        AFTER the expensive AEAD and message validation.
+
+        Under ONE owner-lock transaction, at `now` freshly floored through
+        `_authoritative_now`:
+          1. revalidate the exact live `LogicalSession` object;
+          2. expire epoch-transition state;
+          3. expire this session's candidate/retired path state;
+          4. freshly classify the source path against the CURRENT
+             `PathState` ('active'/'candidate'/'retired'/'blocked'/
+             'unknown');
+          5. revalidate the exact `CryptoEpoch` object's live role
+             ('current'/'retiring'/'pending', or None -> STALE);
+          6. enforce path-role x epoch-role x message-type authorization
+             (`_ordinary_data_path_authorized`);
+          7. only if authorized, admit `nonce` into that exact epoch's
+             replay ledger with the existing REPLAY / EXHAUSTED / ACCEPTED
+             accounting;
+          8. return the ACTUALLY authoritative `path_role`, `epoch_role`,
+             and `effective_now` as a `_PathDataAdmission`.
+
+        A `blocked` source, an unauthorized (role x epoch x type)
+        combination, or a `CryptoEpoch` that is no longer a live role
+        returns `nonce_admission = _DataNonceAdmission.STALE` WITHOUT
+        recording the nonce or mutating any unrelated state -- exactly as
+        an equivalent pre-crypto drop would. `PATH_RESPONSE` and the
+        refresh control messages are NOT admitted here (they own their own
+        atomic specialized transactions). Only cheap in-memory work
+        happens under the lock: no AEAD, JSON, signatures, socket I/O, or
+        await."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return _PathDataAdmission(
+                    _DataNonceAdmission.STALE, None, None, now
+                )
+            self._expire_session_epoch_transitions(session, now)
+            self._expire_session_path_state(session, now)
+
+            epoch_role = self._session_epoch_role(session, epoch)
+            if epoch_role is None:
+                return _PathDataAdmission(
+                    _DataNonceAdmission.STALE, None, None, now
+                )
+            path_role = self._classify_source_path(session, source_sockaddr)
+
+            if not self._ordinary_data_path_authorized(
+                path_role, epoch_role, message_type
+            ):
+                return _PathDataAdmission(
+                    _DataNonceAdmission.STALE, path_role, epoch_role, now
+                )
+
+            admission = self._admit_nonce_into_epoch_ledger(
+                session, epoch, epoch_role, nonce, now
+            )
+            return _PathDataAdmission(admission, path_role, epoch_role, now)
 
     def install_pending_epoch(
         self,
@@ -2439,6 +2762,382 @@ class SecureState:
                     None
                     if session.retiring_epoch is None
                     else session.retiring_epoch.generation
+                ),
+            }
+
+    #
+    # UDPSEC V2: server-side path/session migration and return routability.
+    #
+    # All of the following operate on the EXACT `LogicalSession` and
+    # `CandidatePath` OBJECTS the caller resolved -- never re-read from
+    # scratch -- so stale work for a candidate already replaced by a newer
+    # one, or for a session already gone, fails closed rather than acting.
+    # The expensive AEAD/JSON/packet work and every `sendto` happen in
+    # `_secure_server_loop` OUTSIDE this lock; only cheap in-memory
+    # validation and the atomic active-path swap happen here. Path
+    # migration derives no traffic key, runs no ECDHE, and never
+    # promotes/discards/rekeys any `CryptoEpoch`.
+    #
+
+    def _classify_source_path(self, session, source_sockaddr):
+        """Classify `source_sockaddr` against `session`'s CURRENT
+        `PathState` as 'active' / 'candidate' / 'retired' / 'blocked' /
+        'unknown'. The caller holds the lock and has already run
+        `_get_live_session_handle` and `_expire_session_path_state` at the
+        authoritative `now`; this is a pure read/compare -- no expiry, no
+        mutation.
+
+        Precedence: THIS session's own already-existing `active_path`,
+        `candidate_path`, and `retired_path` records are matched first and
+        always win. Only when the source matches none of them is the
+        bounded relation index consulted, and a match there to a DIFFERENT
+        live session on this endpoint token yields 'blocked' -- the source
+        is that sibling's active path, an impossible migration target for
+        this session. Everything else is 'unknown'. A malformed/ambiguous
+        source sockaddr is 'unknown' (fail closed). Equality is structural
+        `core.sockaddr_identity` identity (IPv6 scope significant, flowinfo
+        excluded), exactly as `_structured_paths_match`."""
+        path_state = session.path_state
+        try:
+            identity = normalize_sockaddr(source_sockaddr)
+            if identity == normalize_sockaddr(path_state.active_path):
+                return "active"
+        except MalformedSockaddrError:
+            return "unknown"
+        candidate = path_state.candidate_path
+        if candidate is not None and candidate.identity == identity:
+            return "candidate"
+        retired = path_state.retired_path
+        if retired is not None and retired.identity == identity:
+            return "retired"
+        sibling = self._relation_index.get(
+            _EndpointPeerKey(
+                session._session_key.endpoint_token, identity
+            )
+        )
+        if sibling is not None and sibling != session._session_key:
+            return "blocked"
+        return "unknown"
+
+    def resolve_incoming_path_role(self, session, source_sockaddr, now):
+        """Cheap PRE-CRYPTO classification of a DATA frame's source path
+        against `session`'s live `PathState` -- 'active' / 'candidate' /
+        'retired' / 'blocked' / 'unknown' -- used only for lookup and cheap
+        early rejection (a `blocked` frame is dropped before any AEAD).
+
+        This observation is NOT authoritative for a deadline-sensitive
+        role: it is taken before the expensive AEAD/validation step, so a
+        candidate or retired grace can elapse before the packet is actually
+        admitted. Ordinary validated DATA (`nmea`/`ping`/`close`) is
+        admitted through `admit_epoch_data_nonce_for_path`, which
+        re-classifies the source path (and re-checks the epoch role) at a
+        fresh authoritative monotonic observation inside the same locked
+        nonce-admission transaction and returns the role of record.
+
+        Lazily expires this session's own candidate/retired path state so
+        an already-expired record cannot even be classified as candidate/
+        retired here; a session that is no longer the live incarnation is
+        'unknown' (fail closed)."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return "unknown"
+            self._expire_session_path_state(session, now)
+            return self._classify_source_path(session, source_sockaddr)
+
+    def open_or_replace_candidate_path(
+        self, session, epoch, source_sockaddr, challenge_token, now
+    ):
+        """Install `source_sockaddr` as `session`'s single candidate path,
+        or -- if it is already the candidate on the exact current epoch --
+        report a duplicate without mutating anything. Returns
+        `(candidate_or_None, outcome)` where `outcome` is 'installed' (a
+        brand-new candidate B, a replacement C of an earlier candidate, or
+        a fresh incarnation replacing an epoch-stale same-address candidate
+        -- the caller sends exactly one PATH_CHALLENGE), 'duplicate' (the
+        same candidate address again under the same current epoch -- NO new
+        token, NO deadline extension, NO fresh challenge), or `None` (fail
+        closed).
+
+        Bound to the EXACT current epoch: `epoch` must be
+        `session.current_epoch` (identity). Retiring-epoch traffic can
+        never open or prove a migration. The active path is never treated
+        as a candidate. A newer candidate C advances `path_generation`, so
+        an earlier candidate B's token/generation becomes stale
+        immediately -- there is no queue of candidate paths.
+
+        A candidate whose target relation is already occupied by a
+        DIFFERENT live session on this endpoint token is rejected here (it
+        could never commit -- see `commit_candidate_path` -- so it must not
+        consume the candidate slot or draw a challenge)."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return (None, None)
+            self._expire_session_epoch_transitions(session, now)
+            self._expire_session_path_state(session, now)
+            if session.current_epoch is not epoch:
+                return (None, None)
+            if not isinstance(challenge_token, bytes) or len(
+                challenge_token
+            ) != PATH_CHALLENGE_TOKEN_BYTES:
+                return (None, None)
+            path_state = session.path_state
+            try:
+                identity = normalize_sockaddr(source_sockaddr)
+                if identity == normalize_sockaddr(path_state.active_path):
+                    return (None, None)
+            except MalformedSockaddrError:
+                return (None, None)
+
+            # Finding B (early rejection): a target relation already owned
+            # by a DIFFERENT live session on this endpoint token is an
+            # impossible migration target -- never open/replace a candidate
+            # for it. `_relation_index` is keyed by endpoint token, so this
+            # can only ever fire for a same-endpoint sibling session, and
+            # this session is indexed at its own `active_path` (never at a
+            # candidate address), so an occupant is always a foreign key.
+            target_relation = _EndpointPeerKey(
+                session._session_key.endpoint_token, identity
+            )
+            occupant = self._relation_index.get(target_relation)
+            if occupant is not None and occupant != session._session_key:
+                return (None, None)
+
+            existing = path_state.candidate_path
+            if (
+                existing is not None
+                and existing.identity == identity
+                and existing.epoch is session.current_epoch
+            ):
+                # Duplicate traffic on the SAME candidate under the SAME
+                # (still-current) epoch: keep the exact object / token /
+                # path_generation / deadline unchanged.
+                return (existing, "duplicate")
+            # Finding A: an existing same-address candidate still bound by
+            # object identity to an epoch that is no longer current (an
+            # epoch refresh committed before this candidate proved return
+            # routability) is a STALE incarnation. It is replaced exactly
+            # like a newer different-address candidate -- fresh token, new
+            # path_generation, fresh original deadline, bound to the new
+            # current epoch -- never revived or mutated in place.
+            next_generation = path_state.path_generation + 1
+            if not (
+                MIN_PATH_GENERATION <= next_generation <= MAX_PATH_GENERATION
+            ):
+                # Fail closed rather than wrap into an ambiguous incarnation.
+                return (None, None)
+            replacing = existing is not None
+            candidate = CandidatePath(
+                sockaddr=source_sockaddr,
+                identity=identity,
+                challenge_token=challenge_token,
+                path_generation=next_generation,
+                created_at=now,
+                deadline=now + self._path_candidate_ttl,
+                epoch=session.current_epoch,
+                epoch_generation=session.current_epoch.generation,
+            )
+            path_state.candidate_path = candidate
+            path_state.path_generation = next_generation
+            self._path_candidates_opened += 1
+            if replacing:
+                self._path_candidates_replaced += 1
+            return (candidate, "installed")
+
+    def path_challenge_is_current(self, session, candidate, now):
+        """Short revalidation the caller runs immediately before actually
+        sending a prepared PATH_CHALLENGE: the exact `candidate` object is
+        still `session`'s sole candidate, is not expired, and is still
+        bound to the session's current epoch. A candidate already replaced
+        by a newer one (C) fails here, so stale prepared work never
+        reaches the wire on its behalf."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return False
+            self._expire_session_path_state(session, now)
+            path_state = session.path_state
+            return (
+                path_state.candidate_path is candidate
+                and now < candidate.deadline
+                and candidate.epoch is session.current_epoch
+            )
+
+    def commit_candidate_path(
+        self,
+        session,
+        epoch,
+        source_sockaddr,
+        challenge_token,
+        path_generation,
+        response_nonce,
+        now,
+    ):
+        """The one authoritative A -> B active-path migration transaction.
+        Returns `(committed: bool, retired_path_or_None)`.
+
+        Under the owner lock, revalidate the EXACT live: `LogicalSession`
+        object; `CandidatePath` object/incarnation; that the candidate is
+        not expired at fresh authoritative monotonic time; that the source
+        path structurally equals the candidate; the exact challenge token
+        `R` (constant-time); the exact `path_generation`; that the
+        candidate-bound `CryptoEpoch` is still the session's current epoch
+        and is the exact epoch `epoch` the PATH_RESPONSE authenticated
+        under; and that `response_nonce` passes exact-epoch replay
+        admission. Only then, atomically: capture old active A; make B the
+        sole `active_path`; clear the candidate; install A as the one
+        `retired_path` with a short fixed deadline; keep the same
+        `LogicalSession` and every `CryptoEpoch`/replay/identity value.
+        There is no gap in which both A and B are ordinary outbound
+        authorities, and there is no rollback to A on a lost PATH_ACK."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return (False, None)
+            self._expire_session_epoch_transitions(session, now)
+            self._expire_session_path_state(session, now)
+            path_state = session.path_state
+            candidate = path_state.candidate_path
+            if candidate is None:
+                return (False, None)
+            # Exact candidate-bound epoch must still be the live current
+            # epoch, and must be the exact epoch the response authenticated
+            # under. An epoch refresh that committed first makes the
+            # candidate stale -- it cannot commit under old authority.
+            if self._session_epoch_role(session, epoch) != "current":
+                return (False, None)
+            if candidate.epoch is not session.current_epoch:
+                return (False, None)
+            if candidate.epoch is not epoch:
+                return (False, None)
+            if now >= candidate.deadline:
+                return (False, None)
+            try:
+                source_identity = normalize_sockaddr(source_sockaddr)
+            except MalformedSockaddrError:
+                return (False, None)
+            if candidate.identity != source_identity:
+                return (False, None)
+            if not isinstance(challenge_token, bytes) or not constant_time.bytes_eq(
+                candidate.challenge_token, challenge_token
+            ):
+                return (False, None)
+            if (
+                not isinstance(path_generation, int)
+                or isinstance(path_generation, bool)
+                or path_generation != candidate.path_generation
+            ):
+                return (False, None)
+
+            # Finding B (authoritative re-check under the lock): the
+            # migration target relation must not be occupied by a DIFFERENT
+            # live session on this endpoint token. Occupancy can change
+            # between candidate creation and this proof, so this is checked
+            # here independently of the early rejection in
+            # `open_or_replace_candidate_path`. Fail closed BEFORE the
+            # nonce is consumed and before any state changes: do not touch
+            # `active_path` / `retired_path` / the old A relation mapping /
+            # the foreign B mapping, do not count a migration, do not send
+            # a PATH_ACK, never evict or steal the foreign session's
+            # relation. The stale-but-valid candidate simply remains until
+            # its own (never-extended) deadline.
+            endpoint_token = session._session_key.endpoint_token
+            session_key = session._session_key
+            # `candidate.identity` is the already-normalized canonical form
+            # of `candidate.sockaddr`; a `_canonical_active_relation_key`
+            # key is exactly `_EndpointPeerKey(endpoint_token, identity)`.
+            canonical_new = _EndpointPeerKey(endpoint_token, candidate.identity)
+            occupant = self._relation_index.get(canonical_new)
+            if occupant is not None and occupant != session_key:
+                return (False, None)
+
+            admission = epoch.seen_data_nonces.admit(response_nonce)
+            if admission is _DataNonceAdmission.REPLAY:
+                self._data_nonce_replays += 1
+                return (False, None)
+            if admission is _DataNonceAdmission.EXHAUSTED:
+                if not self._remove_exact_session(
+                    session, "nonce_exhausted", now
+                ):
+                    return (False, None)
+                return (False, None)
+            self._account_accepted_data_nonce()
+
+            # COMMIT -- a pure in-memory swap on the unchanged
+            # `LogicalSession` and `PathState` objects.
+            old_active = path_state.active_path
+            try:
+                canonical_old = _canonical_active_relation_key(
+                    _EndpointPeerKey(endpoint_token, old_active)
+                )
+                retired_identity = normalize_sockaddr(old_active)
+            except MalformedSockaddrError:
+                # `active_path` was validated at install/promotion time and
+                # is only ever replaced by another already-validated
+                # candidate address, so this is unreachable in practice --
+                # fail closed rather than commit a half-updated index. The
+                # nonce was already admitted above; the migration simply
+                # does not commit (exactly like any other post-admission
+                # failure).
+                return (False, None)
+
+            path_state.active_path = candidate.sockaddr
+            path_state.candidate_path = None
+            retired = RetiredPath(
+                sockaddr=old_active,
+                identity=retired_identity,
+                path_generation=candidate.path_generation,
+                retired_at=now,
+                deadline=now + self._retired_path_grace,
+            )
+            path_state.retired_path = retired
+
+            # Keep the bounded relation index one-to-one with the new
+            # active path. `canonical_new` was already verified free of any
+            # foreign live session above (before the nonce was consumed),
+            # so this session is the only possible owner of that relation.
+            if self._relation_index.get(canonical_old) == session_key:
+                del self._relation_index[canonical_old]
+            self._relation_index[canonical_new] = session_key
+
+            self._path_migrations_committed += 1
+            return (True, retired)
+
+    def path_state_snapshot(self, session, now):
+        """Diagnostic/test helper: the live path state of `session` as
+        `{'active', 'candidate', 'retired', 'path_generation'}`, where
+        `candidate`/`retired` are `None` or a small dict. Lazily expires
+        first, so it reflects only records still within their deadlines."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return None
+            self._expire_session_path_state(session, now)
+            path_state = session.path_state
+            candidate = path_state.candidate_path
+            retired = path_state.retired_path
+            return {
+                "active": path_state.active_path,
+                "path_generation": path_state.path_generation,
+                "candidate": (
+                    None
+                    if candidate is None
+                    else {
+                        "sockaddr": candidate.sockaddr,
+                        "path_generation": candidate.path_generation,
+                        "deadline": candidate.deadline,
+                        "epoch_generation": candidate.epoch_generation,
+                    }
+                ),
+                "retired": (
+                    None
+                    if retired is None
+                    else {
+                        "sockaddr": retired.sockaddr,
+                        "path_generation": retired.path_generation,
+                        "deadline": retired.deadline,
+                    }
                 ),
             }
 
@@ -2877,6 +3576,112 @@ def _process_refresh_confirm(
     return (ack_packet, newly_committed)
 
 
+def _process_path_response(
+    state_owner,
+    session,
+    epoch,
+    msg,
+    response_nonce,
+    packet_locator,
+    source_sockaddr,
+    wall_now,
+    now,
+):
+    """Handle one decrypted, current-epoch PATH_RESPONSE from an unproved
+    path. Returns the PATH_ACK DATA packet to send to the newly active
+    path (B), or None.
+
+    `SecureState.commit_candidate_path` performs the exact return-
+    routability revalidation, the per-epoch replay admission, and the
+    atomic A -> B active-path swap under the owner lock; this function only
+    parses the message and, on a committed migration, builds the
+    authenticated PATH_ACK under the (unchanged) current epoch so Major
+    Prompt 5 can later treat it as authenticated evidence of the server
+    commit. A lost PATH_ACK never rolls the server back to A."""
+    try:
+        path_response = parse_path_response_message(msg)
+    except (ValueError, TypeError):
+        return None
+    if path_response.station_id != session.station_id:
+        return None
+
+    committed, _retired = state_owner.commit_candidate_path(
+        session,
+        epoch,
+        source_sockaddr,
+        path_response.challenge_token,
+        path_response.path_generation,
+        response_nonce,
+        now,
+    )
+    if not committed:
+        return None
+
+    ack_message = build_path_ack_message(
+        station_id=session.station_id,
+        challenge_token=path_response.challenge_token,
+        path_generation=path_response.path_generation,
+        timestamp=int(wall_now()),
+    )
+    return encrypt_secure_json_message(
+        session.current_epoch.server_to_client_aesgcm,
+        packet_locator,
+        session.current_epoch.generation,
+        ack_message,
+    )
+
+
+def _process_candidate_path_observation(
+    state_owner,
+    session,
+    epoch,
+    source_sockaddr,
+    packet_locator,
+    sock,
+    wall_now,
+    monotonic_now,
+    now,
+):
+    """Process one authenticated, replay-admitted `nmea`/`ping` observation
+    from an off (non-active) path under the exact current epoch: install or
+    replace the session's single candidate path when required, and -- only
+    for a brand-new, replaced, or epoch-stale-replaced candidate incarnation
+    -- send exactly one encrypted PATH_CHALLENGE to that raw candidate
+    address. Duplicate traffic on an existing current-epoch candidate sends
+    nothing (Prompt 4 issues only the initial challenge; there is no
+    retransmission/liveness protocol here).
+
+    All AEAD/packet work and the `sendto` happen here, outside the
+    `SecureState` lock; a short revalidation immediately before the send
+    ensures a candidate already replaced by a newer one does not draw a
+    challenge from stale work."""
+    candidate, outcome = state_owner.open_or_replace_candidate_path(
+        session,
+        epoch,
+        source_sockaddr,
+        os.urandom(PATH_CHALLENGE_TOKEN_BYTES),
+        now,
+    )
+    if outcome != "installed":
+        return
+    challenge_message = build_path_challenge_message(
+        station_id=session.station_id,
+        challenge_token=candidate.challenge_token,
+        path_generation=candidate.path_generation,
+        timestamp=int(wall_now()),
+    )
+    challenge_packet = encrypt_secure_json_message(
+        candidate.epoch.server_to_client_aesgcm,
+        packet_locator,
+        candidate.epoch_generation,
+        challenge_message,
+    )
+    if state_owner.path_challenge_is_current(
+        session, candidate, monotonic_now()
+    ):
+        sock.sendto(challenge_packet, candidate.sockaddr)
+
+
 async def _secure_server_loop(
     sock,
     queue,
@@ -2935,6 +3740,15 @@ async def _secure_server_loop(
         local_now = monotonic_now()
         state_owner.cleanup_expired_sessions(local_now)
         state_owner.cleanup_expired_pending_sessions(local_now)
+        # Path-state transitions need no per-packet sweep here: a candidate
+        # can be replaced at an unbounded rate but there is only ever one
+        # candidate and one retired record per session (a replacement
+        # overwrites the slot in place), and every exact-session path
+        # operation below already calls `_expire_session_path_state()`
+        # first, so an expired record is refused authority the moment the
+        # session is next touched. The fully-idle case is reclaimed by
+        # `run_periodic_maintenance` -> `cleanup_expired_path_transitions`
+        # (one bounded O(live sessions) sweep).
 
         if data.startswith(CLIENT_HELLO_PREFIX):
             try:
@@ -3168,15 +3982,27 @@ async def _secure_server_loop(
                     # station identity exists.
                     continue
 
-                # No migration in this revision: a locator match from any
-                # path other than the session's currently validated
-                # active_path is dropped before any cryptographic work,
-                # exactly like an unknown locator. An in-session epoch
-                # refresh authorizes no path change.
-                if not _structured_paths_match(
-                    addr, session.path_state.active_path
-                ):
+                # UDPSEC V2 server path migration: a locator match from a
+                # path OTHER than the session's active_path is no longer
+                # dropped outright before crypto. It may be a fresh
+                # candidate source, one already holding the single
+                # candidate slot, or the just-retired previous active path.
+                # `off_path_role` is None for the ordinary active path
+                # (below runs byte-identically to before) and otherwise
+                # 'unknown' / 'candidate' / 'retired'.
+                path_role = state_owner.resolve_incoming_path_role(
+                    session, addr, local_now
+                )
+                if path_role == "blocked":
+                    # Finding B: the source path is the active path of a
+                    # DIFFERENT live session on this endpoint token. This
+                    # session can never migrate there, so the frame is
+                    # dropped before any cryptographic work -- exactly as a
+                    # wrong-path frame was dropped before path migration
+                    # existed. No AEAD, no candidate, no challenge, and the
+                    # foreign session is never touched.
                     continue
+                off_path_role = None if path_role == "active" else path_role
 
                 station_id = session.station_id
 
@@ -3188,6 +4014,17 @@ async def _secure_server_loop(
                     session, epoch_selector, local_now
                 )
                 if epoch is None:
+                    continue
+
+                # Prompt 4 conservative boundary: an unproved path (a fresh
+                # candidate source, or one already holding the candidate
+                # slot) may ONLY ever authenticate under the exact CURRENT
+                # epoch -- retiring-epoch traffic can never open or prove a
+                # migration. A retired path follows normal epoch selection
+                # but is confined to late straggler nmea/ping below.
+                if off_path_role in ("unknown", "candidate") and (
+                    epoch_role != "current"
+                ):
                     continue
 
                 if state_owner.epoch_data_nonce_seen(
@@ -3229,6 +4066,57 @@ async def _secure_server_loop(
                     "ping",
                     SESSION_CLOSE_TYPE,
                 ):
+                    continue
+
+                # Off-path message gate. An unproved or just-retired path
+                # may carry inbound data continuity only; it must NEVER
+                # drive session close, epoch refresh, a path ACK/CHALLENGE
+                # in the wrong direction, or any future/unknown control.
+                # Those fail closed here (the packet's nonce is not
+                # admitted and no unrelated protocol state is mutated).
+                if off_path_role is not None:
+                    if off_path_role == "retired":
+                        _off_path_allowed = ("nmea", "ping")
+                    else:  # 'unknown' / 'candidate'
+                        _off_path_allowed = (
+                            "nmea",
+                            "ping",
+                            PATH_RESPONSE_TYPE,
+                        )
+                    if message_type not in _off_path_allowed:
+                        continue
+
+                if off_path_role is not None and (
+                    message_type == PATH_RESPONSE_TYPE
+                ):
+                    # Return-routability proof from an unproved path. The
+                    # nonce is admitted (and the atomic A -> B commit run)
+                    # inside `commit_candidate_path`, so this branch does
+                    # not fall through to `admit_epoch_data_nonce`. On the
+                    # ordinary active path a `path_response` stays an
+                    # unknown control message (handled below), exactly as
+                    # before.
+                    ack_packet = _process_path_response(
+                        state_owner,
+                        session,
+                        epoch,
+                        msg,
+                        nonce,
+                        packet_locator,
+                        addr,
+                        wall_now,
+                        local_now,
+                    )
+                    if ack_packet is not None:
+                        # After a committed migration `active_path` IS this
+                        # packet's own source (B); the PATH_ACK goes to B.
+                        sock.sendto(
+                            ack_packet, session.path_state.active_path
+                        )
+                        print(
+                            f"[+] Committed UDPSEC path migration for "
+                            f"{station_id} @ {format_endpoint_tuple(addr)}"
+                        )
                     continue
 
                 if message_type == REFRESH_INIT_TYPE:
@@ -3309,9 +4197,25 @@ async def _secure_server_loop(
                     )
                     continue
 
-                admission = state_owner.admit_epoch_data_nonce(
-                    session, epoch, nonce, local_now
+                # P2 TOCTOU fix: the pre-decrypt `off_path_role` / `epoch_role`
+                # above are a CHEAP EARLY-REJECTION optimization only. The
+                # AUTHORITATIVE decision -- fresh authoritative monotonic
+                # time, fresh path-state expiry, fresh path classification,
+                # fresh epoch-role check, the full path x epoch x type
+                # authorization matrix, and the nonce admission -- is one
+                # locked transaction here. A candidate or retired grace that
+                # elapsed during the expensive AEAD is honoured: e.g. an E1
+                # (retiring) straggler from a path whose retired grace just
+                # expired arrives classified 'unknown', and 'unknown +
+                # retiring' is not authorized, so its nonce is never
+                # recorded and nothing is touched/queued. Downstream uses
+                # the RETURNED role and time, never the stale pre-AEAD ones.
+                path_admission = state_owner.admit_epoch_data_nonce_for_path(
+                    session, epoch, nonce, message_type, addr, monotonic_now()
                 )
+                admission = path_admission.nonce_admission
+                effective_now = path_admission.effective_now
+                authoritative_role = path_admission.path_role
                 if admission is _DataNonceAdmission.REPLAY:
                     print(
                         "[!] Duplicate secure data nonce from "
@@ -3325,7 +4229,7 @@ async def _secure_server_loop(
                     if (
                         owned_sessions is not None
                         and not state_owner.is_live_session_handle(
-                            session, local_now
+                            session, effective_now
                         )
                     ):
                         owned_sessions.pop(session._session_key, None)
@@ -3335,21 +4239,58 @@ async def _secure_server_loop(
                     )
                     continue
                 if admission is not _DataNonceAdmission.ACCEPTED:
+                    # STALE: session gone, exact epoch no longer live, the
+                    # source is now 'blocked', OR the freshly re-decided
+                    # path role x epoch role x message type is unauthorized
+                    # (e.g. a retired path whose grace expired during
+                    # decrypt -- now 'unknown' -- under a retiring epoch).
+                    # Fail closed: no nonce recorded, no touch, no queue,
+                    # no candidate/challenge, no outbound response.
                     continue
 
+                # From here the AUTHORITATIVE post-decrypt path role governs
+                # ordinary behaviour. `None` == the ordinary active path.
+                effective_off_path_role = (
+                    None if authoritative_role == "active"
+                    else authoritative_role
+                )
+
                 if message_type == SESSION_CLOSE_TYPE:
+                    # Only reachable with `authoritative_role == "active"`
+                    # (the matrix authorizes `close` for no other role).
                     state_owner.close_session(
                         session,
-                        local_now,
+                        effective_now,
                     )
                     continue
 
                 state_owner.touch_session(
                     session,
-                    local_now,
+                    effective_now,
                 )
 
                 if message_type == "ping":
+                    if effective_off_path_role is not None:
+                        # Prompt 4: an unproved or just-retired path gets NO
+                        # ordinary pong. A PING from a new/candidate source
+                        # still establishes/refreshes the candidate signal
+                        # and draws the single PATH_CHALLENGE (for a
+                        # brand-new or replaced candidate only); a PING from
+                        # the just-retired path is late inbound activity
+                        # only and opens no reverse candidate.
+                        if effective_off_path_role in ("unknown", "candidate"):
+                            _process_candidate_path_observation(
+                                state_owner,
+                                session,
+                                epoch,
+                                addr,
+                                packet_locator,
+                                sock,
+                                wall_now,
+                                monotonic_now,
+                                effective_now,
+                            )
+                        continue
                     response = build_pong_message(
                         station_id,
                         msg["seq"],
@@ -3360,8 +4301,7 @@ async def _secure_server_loop(
                     # SAME epoch the ping arrived on (including a retiring
                     # epoch during the client's own commit uncertainty), so
                     # the client can always decrypt the reply it is waiting
-                    # for. There is no migration in this revision, so
-                    # `active_path` is always the tuple `addr` already has.
+                    # for.
                     sock.sendto(
                         encrypt_secure_json_message(
                             epoch.server_to_client_aesgcm,
@@ -3373,16 +4313,47 @@ async def _secure_server_loop(
                     )
                     continue
 
+                if effective_off_path_role in ("unknown", "candidate"):
+                    # Authenticated, replay-admitted NMEA from an unproved
+                    # path (by the AUTHORITATIVE post-decrypt role):
+                    # install/replace the single candidate and draw the one
+                    # PATH_CHALLENGE (brand-new / replaced candidate only).
+                    # The NMEA itself still flows to the normal
+                    # ingress/assembler path below under this exact
+                    # session's own `assembly_namespace` -- candidate
+                    # admission is inbound data continuity, not outbound
+                    # authority. A straggler whose retired grace expired
+                    # during decrypt reaches here as 'unknown' (only under
+                    # the current epoch -- a retiring-epoch straggler was
+                    # already failed closed above) and legitimately opens a
+                    # fresh reverse candidate.
+                    _process_candidate_path_observation(
+                        state_owner,
+                        session,
+                        epoch,
+                        addr,
+                        packet_locator,
+                        sock,
+                        wall_now,
+                        monotonic_now,
+                        effective_now,
+                    )
+
                 src_for_queue = sec_input_id or station_id or "ANONYMOUS"
                 peer = addr if 'addr' in locals() else None
                 remote_ip = peer[0] if isinstance(
                     peer, tuple) and peer else None
                 # assembly_namespace, not session_handle and not a rendered
-                # remote tuple: two fragments of one multipart message must
-                # group together even across a same-station same-relation
-                # rekey (or, later, a real path migration), while a
-                # different authenticated station or a genuinely different
-                # LogicalSession must never share a namespace.
+                # remote tuple: multipart continuity is owned by the
+                # unchanged `LogicalSession`, never by any one path. Two
+                # fragments of one multipart message group together across
+                # an in-session epoch refresh and across a Prompt 4
+                # candidate / committed active-path migration on the same
+                # `LogicalSession` -- including a fragment from `active_path`
+                # and one from the current-epoch candidate path, or a late
+                # in-flight fragment from the retired path within its grace.
+                # A different authenticated station or a genuinely different
+                # `LogicalSession` must never share a namespace.
                 assembler_key = (
                     f"udpsec-assembly:{session.assembly_namespace.hex()}"
                 )
@@ -3409,7 +4380,7 @@ async def _secure_server_loop(
                 # that happens to reuse the same raw bytes after this
                 # exact session's own reservation already retired.
                 namespace_lease = state_owner.acquire_namespace_lease(
-                    session, local_now
+                    session, effective_now
                 )
                 if namespace_lease is None:
                     # The session is no longer live (removed concurrently
@@ -3433,8 +4404,11 @@ async def _secure_server_loop(
                     # retirement window elapses. Recording admission time
                     # here lets the processor (core.python_data_plane)
                     # apply its own bounded-backlog/QoS policy, on top of
-                    # (not instead of) the lease above.
-                    admitted_at=local_now,
+                    # (not instead of) the lease above. This is the
+                    # AUTHORITATIVE admission instant from the locked nonce
+                    # transaction, never the stale pre-AEAD `local_now` --
+                    # so frame-age bookkeeping is not backdated.
+                    admitted_at=effective_now,
                     admission_lease=namespace_lease,
                 )
                 if frame is None:
