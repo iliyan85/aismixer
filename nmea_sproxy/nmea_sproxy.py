@@ -96,6 +96,8 @@ from core.udpsec_protocol import (  # noqa: E402
     DATA_PREFIX,
     ESTABLISHMENT_EPOCH_GENERATION,
     MAX_EPOCH_GENERATION,
+    PATH_ACK_TYPE,
+    PATH_CHALLENGE_TYPE,
     REFRESH_ACK_TYPE,
     REFRESH_REPLY_TYPE,
     SESSION_CONFIRMATION_SEQUENCE,
@@ -104,6 +106,7 @@ from core.udpsec_protocol import (  # noqa: E402
     build_client_hello_packet,
     build_data_aad,
     build_data_packet,
+    build_path_response_message,
     build_ping_message,
     build_refresh_confirm_message,
     build_refresh_init_message,
@@ -112,6 +115,8 @@ from core.udpsec_protocol import (  # noqa: E402
     is_matching_pong_message,
     is_session_close_message,
     parse_data_packet,
+    parse_path_ack_message,
+    parse_path_challenge_message,
     parse_refresh_ack_message,
     parse_refresh_reply_message,
     parse_server_hello_packet,
@@ -129,6 +134,16 @@ SERVER_PACKET_REFRESH_COMMITTED = "refresh_committed"
 # after the client already derived E2). It advances nothing and, unlike
 # genuine first progress, is NOT fresh peer-liveness evidence.
 SERVER_PACKET_REFRESH_BENIGN = "refresh_benign"
+# An authenticated PATH_ACK matched against a live client-side migration
+# proof (see `_ClientPathMigration`): proof the server is alive and has
+# committed an A -> B path migration for this exact session. Like an
+# accepted pong, it advances `last_authenticated_peer`, and it supersedes
+# the outstanding keepalive ping ONLY when that ping is the exact one that
+# was outstanding at the moment the matching PATH_RESPONSE was sent (never
+# a different, later ping) -- see the path-migration subsection in
+# BEHAVIORAL_CONTRACT.md. It is NOT a lease renewal: session age, refresh
+# deadline, and the normal keepalive schedule are left untouched.
+SERVER_PACKET_PATH_MIGRATED = "path_migrated"
 SESSION_END_PLANNED_REFRESH = "planned_refresh"
 SESSION_END_PROACTIVE_REKEY = "proactive_rekey"
 SESSION_END_PEER_GRACEFUL_CLOSE = "peer_graceful_close"
@@ -152,6 +167,16 @@ REFRESH_TRANSACTION_TIMEOUT_SECONDS = 15.0
 REFRESH_RETRANSMIT_SECONDS = 2.0
 REFRESH_MAX_ATTEMPTS = 6
 REFRESH_RETIRING_WINDOW_SECONDS = 5.0
+# Bounded monotonic lifetime of one client-observed path-migration proof
+# incarnation (BEHAVIORAL_CONTRACT.md's path-migration subsection): the
+# client has no visibility into the server's own `CandidatePath` object, so
+# this is a client-local constant, not an import of the server's
+# `PATH_CANDIDATE_TTL_SECONDS` (defined in the top-level `aismixer_secure`
+# server module, which `nmea_sproxy` must not depend on). It intentionally
+# carries the SAME 10.0s bound: the server itself never keeps an unproved
+# candidate alive past that window, so a client-side proof that outlives it
+# can never be usable server-side either.
+CLIENT_PATH_PROOF_TTL_SECONDS = 10.0
 CONFIG_ENV_VAR = "NMEA_SPROXY_CONFIG"
 DEFAULT_PROCESS_TITLE = "nmea_sproxy"
 SYSTEM_CONFIG_PATH = "/etc/nmea_sproxy/config.yaml"
@@ -1178,6 +1203,195 @@ class _ClientEpochRefresh:
         return committed
 
 
+# Sentinel distinguishing "no live client-side migration proof matched this
+# PATH_ACK" from a legitimate captured `ping_seq_at_response` of `None`
+# (meaning no ping was outstanding when the matching PATH_RESPONSE was
+# sent) -- `None` is valid application data here, so it cannot double as
+# the "no match" signal.
+_NO_PATH_PROOF = object()
+
+
+class _PendingPathProof:
+    """One bounded client-side migration-completion proof incarnation: the
+    exact (generation, token) pair a PATH_RESPONSE was actually sent for,
+    the exact `CryptoEpoch` generation authority it was sent under, its
+    fixed monotonic deadline, whether it has already been consumed by a
+    matching PATH_ACK, and the outstanding keepalive ping sequence (or
+    `None`) observed at the moment the response was sent -- so a later
+    PATH_ACK can supersede that SAME ping's liveness purpose and no other.
+    """
+
+    __slots__ = (
+        "generation",
+        "token",
+        "epoch_generation",
+        "deadline",
+        "ping_seq_at_response",
+        "consumed",
+    )
+
+    def __init__(
+        self, generation, token, epoch_generation, deadline,
+        ping_seq_at_response,
+    ):
+        self.generation = generation
+        self.token = token
+        self.epoch_generation = epoch_generation
+        self.deadline = deadline
+        self.ping_seq_at_response = ping_seq_at_response
+        self.consumed = False
+
+
+class _ClientPathMigration:
+    """The client's bounded, O(1) view of server-side path migration (see
+    BEHAVIORAL_CONTRACT.md's path-migration subsection).
+
+    A greatest-observed-challenge-generation watermark (`generation`,
+    `token`) is session-lifetime state: it survives proof consumption,
+    proof expiry, and in-session `CryptoEpoch` refresh, and is the sole
+    authority for classifying an incoming PATH_CHALLENGE as a genuinely NEW
+    incarnation, a retry/duplicate of the one already known, or a stale/
+    conflicting one that gets no fresh authority.
+
+    At most ONE `_PendingPathProof` is held at a time -- created only after
+    a PATH_RESPONSE for a NEW (or previously send-failed) watermark
+    incarnation is actually sent successfully. Observing a strictly newer
+    challenge immediately invalidates the older proof, even if the new
+    response cannot be sent. A PATH_ACK can only ever be admitted against
+    the watermark's exact live, unconsumed, unexpired, same-epoch proof:
+    historical proof (an old, already-superseded, expired, or
+    already-consumed incarnation) can never grant fresh liveness merely
+    because its PATH_ACK is delivered late.
+
+    A fresh instance is created once per confirmed session (exactly like
+    `_ClientEpochSet` and `_ClientEpochRefresh`), so this state never
+    survives a full re-handshake -- consistent with `path_generation` being
+    scoped to exactly one server-side `LogicalSession`."""
+
+    __slots__ = ("_watermark_generation", "_watermark_token", "_pending")
+
+    def __init__(self):
+        self._watermark_generation = 0
+        self._watermark_token = None
+        self._pending = None
+
+    def on_challenge(
+        self,
+        challenge,
+        epochs,
+        station_id,
+        sock,
+        remote_addr,
+        clock,
+        expected_ping_seq,
+    ):
+        """Handle one authenticated, exact-current-epoch PATH_CHALLENGE.
+
+        A genuinely new (strictly greater than the watermark) generation --
+        or a retry of the watermark's own generation for which no proof has
+        yet been successfully established -- gets exactly one PATH_RESPONSE
+        sent. A newer generation invalidates the older pending proof before
+        sending; only a SUCCESSFUL send establishes the new proof (capturing
+        `expected_ping_seq` as it stood at the moment of that successful
+        send). A duplicate of an already-
+        established incarnation may still be answered, but never moves its
+        deadline, never recaptures its ping sequence, and never revives it
+        if already expired or consumed. A same-generation PATH_CHALLENGE
+        whose token conflicts with the watermark's, or a strictly older
+        generation, gets no response and no state change at all (fail
+        closed). A PATH_CHALLENGE never itself grants liveness -- this
+        method has no return value for `forward_loop` to act on."""
+        generation = challenge.path_generation
+        token = challenge.challenge_token
+        if generation == self._watermark_generation:
+            if not constant_time.bytes_eq(token, self._watermark_token):
+                # Conflicting token content for an already-known
+                # generation: fail closed rather than replace valid
+                # existing proof state with something inconsistent.
+                return
+            establishing = (
+                self._pending is None
+                or self._pending.generation != generation
+            )
+        elif generation > self._watermark_generation:
+            self._watermark_generation = generation
+            self._watermark_token = token
+            # Observation supersedes old proof authority even if this
+            # response fails to send. The watermark still permits a retry.
+            self._pending = None
+            establishing = True
+        else:
+            # Strictly older generation than anything already observed:
+            # no fresh proof authority, fail closed, no response.
+            return
+
+        response_message = build_path_response_message(
+            station_id=station_id,
+            challenge_token=token,
+            path_generation=generation,
+            timestamp=int(time.time()),
+        )
+        try:
+            sock.sendto(
+                encrypt_secure_json_message(
+                    response_message,
+                    epochs.client_to_server_key,
+                    epochs.session_locator,
+                    epochs.generation,
+                ),
+                remote_addr,
+            )
+        except OSError as exc:
+            safe_error = str(exc).encode("ascii", "backslashreplace").decode("ascii")
+            print(f"Path response send error: {safe_error}")
+            return
+        if establishing:
+            now = clock()
+            self._pending = _PendingPathProof(
+                generation,
+                token,
+                epochs.generation,
+                now + CLIENT_PATH_PROOF_TTL_SECONDS,
+                expected_ping_seq,
+            )
+
+    def on_ack(self, ack, epochs, clock):
+        """Admit one authenticated, exact-current-epoch PATH_ACK against the
+        one live pending proof. Requires an exact match on generation,
+        token (constant-time), the current challenge watermark, and the
+        `CryptoEpoch` generation authority the matching PATH_RESPONSE was
+        sent under, plus a fresh monotonic
+        observation strictly before the proof's deadline; the proof is then
+        consumed exactly once and can never match again (replay, or a
+        delayed first delivery after expiry, both fail).
+
+        On success, returns the captured ping sequence, or `None` when no
+        ping was outstanding at the matching PATH_RESPONSE send. The caller
+        must compare this concrete, non-None sequence with the outstanding
+        ping AFTER deadline processing, when applying the ACK's effects.
+        `None` is valid liveness evidence with no ping-clear authority.
+        On any failure to match,
+        returns the `_NO_PATH_PROOF` sentinel and changes nothing."""
+        proof = self._pending
+        if proof is None or proof.consumed:
+            return _NO_PATH_PROOF
+        if proof.generation != self._watermark_generation:
+            return _NO_PATH_PROOF
+        if not constant_time.bytes_eq(proof.token, self._watermark_token):
+            return _NO_PATH_PROOF
+        if proof.generation != ack.path_generation:
+            return _NO_PATH_PROOF
+        if not constant_time.bytes_eq(proof.token, ack.challenge_token):
+            return _NO_PATH_PROOF
+        if proof.epoch_generation != epochs.generation:
+            return _NO_PATH_PROOF
+        now = clock()
+        if now >= proof.deadline:
+            return _NO_PATH_PROOF
+        proof.consumed = True
+        return proof.ping_seq_at_response
+
+
 def encrypt_message_aes_gcm(plaintext, key, aad):
     iv = os.urandom(12)
     encryptor = Cipher(
@@ -1445,6 +1659,106 @@ def _try_handle_refresh_message(
             return SERVER_PACKET_REFRESH_COMMITTED
         return None
     return None
+
+
+def _try_handle_path_message(
+    data,
+    addr,
+    remote_addr,
+    epochs,
+    path_migration,
+    station_id,
+    sock,
+    clock,
+    expected_ping_seq,
+):
+    """Route one server DATA datagram to the client-side path-migration
+    choreography (BEHAVIORAL_CONTRACT.md's path-migration subsection) if it
+    is a PATH_CHALLENGE or PATH_ACK authenticated under the session's exact
+    CURRENT epoch (never a pending or retiring one -- a path migration never
+    promotes/discards/rekeys the `CryptoEpoch`).
+
+    A PATH_CHALLENGE is answered via `_ClientPathMigration.on_challenge`; it
+    carries no liveness effect of its own -- migration is only proof of
+    peer liveness once the server's commit is evidenced by an authenticated
+    PATH_ACK that matches the client's own live migration proof (see
+    `_ClientPathMigration.on_ack`). `expected_ping_seq` is passed through
+    unmodified to capture it into a newly established proof. A matching
+    PATH_ACK returns that proof's captured sequence; the caller must check
+    whether it is still outstanding AFTER deadline processing. A PATH_ACK
+    never touches `session_started_at`, any refresh deadline, or
+    `last_ping_at`/the normal keepalive schedule.
+
+    ``clock`` is a zero-argument monotonic-time source (the same domain as
+    ``forward_loop``'s deadlines).
+
+    Returns a 2-tuple ``(classification, ping_seq_to_clear)``.
+    ``ping_seq_to_clear`` is the captured sequence when ``classification``
+    is ``SERVER_PACKET_PATH_MIGRATED``, or ``None`` if that proof captured
+    no ping. Other classifications always carry ``None``. Classification,
+    not the presence of a sequence, determines the ACK's liveness authority.
+    ``classification`` is ``SERVER_PACKET_PATH_MIGRATED`` (fresh migration-
+    completion evidence matched against a live client-side proof),
+    ``SERVER_PACKET_IGNORED`` (a path message for us that was handled --
+    a PATH_CHALLENGE, or a PATH_ACK that matched no live/unexpired/
+    unconsumed proof -- but has no liveness effect), or ``None`` (not a
+    path message for us, or a forged/malformed/wrong-station one -- the
+    caller falls through to `handle_server_packet`, exactly like
+    `_try_handle_refresh_message`)."""
+    if not remote_addresses_match(addr, remote_addr):
+        return (None, None)
+    try:
+        packet_locator, epoch_selector, _nonce, _ciphertext = parse_data_packet(
+            data
+        )
+    except (TypeError, ValueError):
+        return (None, None)
+    if packet_locator != epochs.session_locator:
+        return (None, None)
+    resolved = epochs.inbound_epoch(epoch_selector, clock())
+    if resolved is None:
+        return (None, None)
+    key, generation = resolved
+    if generation != epochs.generation:
+        return (None, None)
+    try:
+        message = decrypt_secure_json_message(
+            data, key, epochs.session_locator, generation
+        )
+    except Exception:
+        return (None, None)
+    if not isinstance(message, dict):
+        return (None, None)
+    kind = message.get("type")
+    if kind == PATH_CHALLENGE_TYPE:
+        try:
+            challenge = parse_path_challenge_message(message)
+        except (TypeError, ValueError):
+            return (None, None)
+        if challenge.station_id != station_id:
+            return (None, None)
+        path_migration.on_challenge(
+            challenge,
+            epochs,
+            station_id,
+            sock,
+            remote_addr,
+            clock,
+            expected_ping_seq,
+        )
+        return (SERVER_PACKET_IGNORED, None)
+    if kind == PATH_ACK_TYPE:
+        try:
+            ack = parse_path_ack_message(message)
+        except (TypeError, ValueError):
+            return (None, None)
+        if ack.station_id != station_id:
+            return (None, None)
+        outcome = path_migration.on_ack(ack, epochs, clock)
+        if outcome is _NO_PATH_PROOF:
+            return (SERVER_PACKET_IGNORED, None)
+        return (SERVER_PACKET_PATH_MIGRATED, outcome)
+    return (None, None)
 
 
 def session_expiration_reason(
@@ -1920,6 +2234,7 @@ def forward_loop(
         refresh = _ClientEpochRefresh(
             station_private_key, config["station_id"], session_locator
         )
+    path_migration = _ClientPathMigration()
     session_started_at = time.monotonic()
     last_authenticated_peer = session_started_at
     last_ping_at = session_started_at
@@ -2097,25 +2412,43 @@ def forward_loop(
                 # `last_authenticated_peer` is left where it was.
                 result = SERVER_PACKET_IGNORED
             else:
-                try:
-                    _pl, selector, _n, _c = parse_data_packet(response)
-                    resolved = epochs.inbound_epoch(selector, now)
-                except (TypeError, ValueError):
-                    resolved = None
-                if resolved is None:
-                    result = SERVER_PACKET_IGNORED
+                # Capture the outstanding ping when answering a challenge.
+                # For an ACK, carry its proof's concrete sequence through
+                # the deadline re-check: that check may send a new ping,
+                # so only compare sequences when applying the ACK below.
+                path_result, path_ping_seq_to_clear = _try_handle_path_message(
+                    response,
+                    addr,
+                    remote_addr,
+                    epochs,
+                    path_migration,
+                    config["station_id"],
+                    out_sock,
+                    time.monotonic,
+                    expected_ping_seq,
+                )
+                if path_result is not None:
+                    result = path_result
                 else:
-                    reply_key, reply_generation = resolved
-                    result = handle_server_packet(
-                        response,
-                        addr,
-                        remote_addr,
-                        reply_key,
-                        session_locator,
-                        config["station_id"],
-                        expected_ping_seq,
-                        reply_generation,
-                    )
+                    try:
+                        _pl, selector, _n, _c = parse_data_packet(response)
+                        resolved = epochs.inbound_epoch(selector, now)
+                    except (TypeError, ValueError):
+                        resolved = None
+                    if resolved is None:
+                        result = SERVER_PACKET_IGNORED
+                    else:
+                        reply_key, reply_generation = resolved
+                        result = handle_server_packet(
+                            response,
+                            addr,
+                            remote_addr,
+                            reply_key,
+                            session_locator,
+                            config["station_id"],
+                            expected_ping_seq,
+                            reply_generation,
+                        )
             now = time.monotonic()
             deadline_reason = apply_due_deadline(now)
             if deadline_reason is not None:
@@ -2124,6 +2457,40 @@ def forward_loop(
             if result == SERVER_PACKET_AUTHENTICATED:
                 last_authenticated_peer = now
                 expected_ping_seq = None
+            elif result == SERVER_PACKET_PATH_MIGRATED:
+                # Authenticated proof the server is alive and has committed
+                # this session's path migration, matched against the
+                # client's own live migration proof: advances peer
+                # liveness exactly like an accepted pong. It does NOT touch
+                # `last_ping_at`, `session_started_at`, or any refresh
+                # deadline -- this is proof of liveness, not a lease
+                # renewal, and the normal keepalive/refresh schedule stays
+                # on its existing cadence. It supersedes the outstanding
+                # ping ONLY when the proof captured a concrete sequence
+                # that is still outstanding now, at the FINAL admission
+                # check immediately below. A proof that captured no ping
+                # has liveness authority but can never clear a ping created
+                # by that check.
+                print(
+                    "Secure session path migration acknowledged by peer."
+                )
+                # The acknowledgement logging above (and `drive_refresh()`
+                # earlier in this iteration) can itself consume enough time
+                # for a terminal deadline to become due. Take one more
+                # authoritative sample right here, with NO further
+                # potentially blocking work before the state mutation below,
+                # so a deadline that is due AT or BEFORE this exact instant
+                # wins instead of being overrun by stale ACK evidence.
+                fresh_now = time.monotonic()
+                deadline_reason = apply_due_deadline(fresh_now)
+                if deadline_reason is not None:
+                    return deadline_reason
+                last_authenticated_peer = fresh_now
+                if (
+                    path_ping_seq_to_clear is not None
+                    and expected_ping_seq == path_ping_seq_to_clear
+                ):
+                    expected_ping_seq = None
             elif result == SERVER_PACKET_PEER_CLOSE:
                 print("Secure peer closed the current session gracefully.")
                 return SESSION_END_PEER_GRACEFUL_CLOSE

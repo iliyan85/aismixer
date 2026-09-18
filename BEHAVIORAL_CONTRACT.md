@@ -1011,17 +1011,20 @@ field has no freshness semantics and is not compared with wall or monotonic
 time. Ping and pong objects remain open-schema: additional JSON object members
 do not alter validation of the required fields.
 
-On `nmea_sproxy`, only a matching authenticated encrypted pong from the pinned
-remote tuple advances peer liveness. The pong must decrypt under the current
-server-to-client owner, match the configured station identity, and carry the
-exact sequence of the one outstanding ping. No pong is accepted when no ping
-is outstanding. An accepted pong clears that expectation and advances liveness.
-After it is cleared, a duplicate replay has no outstanding sequence to match;
-the sequence is not reused later in that session. Stale or other-sequence pongs
-therefore cannot refresh liveness, and ciphertext from an earlier session
-cannot authenticate under the fresh directional keys. Plaintext, wrong-key,
-wrong-address, wrong-source, malformed, and wrong-sequence packets provide no
-liveness evidence.
+On `nmea_sproxy`, a matching authenticated encrypted pong from the pinned
+remote tuple is the baseline peer-liveness signal; a validated in-session
+epoch-refresh control message (see the epoch-refresh subsection) and a
+migration-proof-matched PATH_ACK (see the path-migration subsection) are the
+only other documented exceptions that also advance peer liveness. The pong
+must decrypt under the current server-to-client owner, match the configured
+station identity, and carry the exact sequence of the one outstanding ping.
+No pong is accepted when no ping is outstanding. An accepted pong clears that
+expectation and advances liveness. After it is cleared, a duplicate replay has
+no outstanding sequence to match; the sequence is not reused later in that
+session. Stale or other-sequence pongs therefore cannot refresh liveness, and
+ciphertext from an earlier session cannot authenticate under the fresh
+directional keys. Plaintext, wrong-key, wrong-address, wrong-source,
+malformed, and wrong-sequence packets provide no liveness evidence.
 
 At a keepalive deadline with no outstanding ping, the proxy sends one encrypted
 ping and retains its expected sequence. It does not overwrite an unresolved
@@ -1376,13 +1379,14 @@ monotonic clock callable (the same domain as `forward_loop`'s deadlines);
 there is no scalar-`now` send path.
 
 The first verified `refresh_reply` and a genuine `refresh_ack` commit
-advance `last_authenticated_peer` (the peer-timeout backstop) but do NOT
-clear an outstanding keepalive `expected_ping_seq`, do not reset the
-outstanding ping sequence / `last_ping_at` / peer timeout, and do not
-extend the transaction deadline; a duplicate control datagram advances
-none of these. Normal keepalive/rekey deadlines remain due on their
-existing schedule. A successful commit reanchors only the client's own
-planned-refresh cadence, never `session.created_at` on the server.
+advance `last_authenticated_peer` and therefore reanchor the peer-timeout
+deadline (`last_authenticated_peer + peer_timeout`); the configured
+`peer_timeout` duration remains unchanged. They do NOT clear an outstanding
+keepalive `expected_ping_seq`, reset `last_ping_at`, or extend the
+transaction deadline; a duplicate control datagram advances none of these.
+Normal keepalive/rekey deadlines remain due on their existing schedule.
+A successful commit also reanchors the client's own planned-refresh
+cadence, never `session.created_at` on the server.
 
 **Epoch-specific replay and receive admission.** Every DATA operation
 retains the EXACT `CryptoEpoch` object it selected for authentication.
@@ -1700,10 +1704,102 @@ retired path with the session, because `PathState` belongs to that exact
 `LogicalSession`; no candidate/retired object survives as authority after
 the session is removed, and stale prepared challenge/ack work cannot
 resurrect it. Namespace leases for candidate and retired NMEA follow the
-same ownership/release rules as active NMEA. This is a server-side
-mechanism only; client-side mobility detection, `path_challenge` response
-choreography, and `path_ack`-driven liveness are a separate later stage,
-and `nmea_sproxy` is unchanged by this stage.
+same ownership/release rules as active NMEA. This subsection describes the
+server-side mechanism; `nmea_sproxy`'s own choreography against it --
+answering `path_challenge`, and treating a committed `path_ack` as
+liveness evidence -- is the next subsection.
+
+### Client-side path-migration choreography (`nmea_sproxy`)
+
+`nmea_sproxy` never decides to migrate, never tracks a candidate the way
+the server does, and never learns its own apparent address -- but it is
+not stateless: it owns one small, bounded, O(1) piece of per-session proof
+state (`_ClientPathMigration`), separate from and independent of session
+age, refresh scheduling, and the normal keepalive clock, that exists
+specifically so a PATH_ACK can only ever be recognised against a
+PATH_CHALLENGE this exact client actually observed and answered.
+
+That state is a greatest-observed-challenge-generation watermark
+(`path_generation` plus its `challenge_token`), which persists for the
+life of the confirmed session -- surviving proof consumption, proof
+expiry, and an in-session `CryptoEpoch` refresh -- plus at most ONE
+pending proof incarnation. A valid strictly newer challenge advances the
+watermark and immediately discards any older pending proof, before trying
+to send its response, even if that send fails.
+
+Both control messages are decrypted through the same per-epoch resolution
+(`_ClientEpochSet.inbound_epoch`) from the same pinned remote tuple as
+`refresh_reply`/`refresh_ack`, and accepted only under the session's exact
+CURRENT epoch (never a pending or retiring one, since migration never
+promotes/discards/rekeys the `CryptoEpoch`):
+
+- `path_challenge`: a strictly newer generation than the watermark -- or a
+  retry of the watermark's own generation for which no proof was yet
+  successfully established -- gets exactly one `path_response` sent,
+  echoing its `challenge_token`/`path_generation` verbatim; only a
+  SUCCESSFUL send opens the one bounded pending proof for that watermark
+  generation. If no proof has yet been established for that incarnation,
+  a failed send leaves none and permits a retry with the same
+  generation/token. The proof's fixed monotonic deadline is anchored exactly
+  once by a fresh clock observation after send completion; its `CryptoEpoch`
+  generation authority and the outstanding keepalive ping
+  sequence (or lack of one) at that exact moment are captured into it. A
+  duplicate of an already-established incarnation may still be answered,
+  but never moves its deadline, never recaptures its ping sequence, and
+  never revives it once expired or consumed; a failed resend leaves that
+  existing proof unchanged. A same-generation challenge whose token
+  conflicts with the watermark's, or a strictly older generation, gets no
+  response and no state change (fail closed). Either way, a PATH_CHALLENGE
+  carries no liveness effect of its own -- it is not yet proof the server
+  has committed anything, only that the server is probing a path.
+- `path_ack`: the server's authenticated evidence of an already-committed
+  A -> B migration for this exact session. It is recognised as fresh
+  migration-completion evidence ONLY when it exactly matches the one live
+  pending proof -- same `path_generation`, same `challenge_token`
+  (constant-time comparison), the exact `CryptoEpoch` generation authority
+  the matching `path_response` was sent under, and a fresh monotonic
+  observation strictly before the proof's deadline. The proof must also
+  match the watermark's generation and token. It is then consumed exactly
+  once: a replay, a duplicate, a PATH_ACK delivered for the first time only
+  after its proof's deadline has already passed,
+  an unseen or superseded generation, a wrong token, or one bound to a
+  since-superseded epoch are all authenticated-but-benign and change nothing.
+  A matched PATH_ACK does not gain final liveness or ping-clear authority
+  merely by passing the post-receipt deadline check: that check, and the
+  `drive_refresh()` and acknowledgement logging that follow it, can
+  themselves consume enough time for a terminal deadline to become due, so
+  a matched PATH_ACK's state effects are gated by one more fresh
+  terminal-deadline admission taken immediately before them, with no
+  further potentially blocking work (no additional send, no additional
+  logging) between that admission and the mutation of
+  `last_authenticated_peer`/`expected_ping_seq`. Any terminal deadline due
+  at that exact final admission point -- `peer_timeout`, planned-refresh,
+  or keepalive/proactive-recovery, exact equality included -- wins outright:
+  the ACK is authenticated-but-benign and neither reanchors liveness nor
+  clears a ping. Its ping-clear authority is the concrete ping sequence
+  captured at the successful `path_response` send, carried unchanged until
+  that final admission passes. It clears an outstanding ping ONLY if the
+  captured sequence is not `None` and that exact sequence is still
+  outstanding at that final admission instant. A proof that captured no
+  ping has no ping-clear authority, but its matched ACK still advances
+  liveness. A different, later ping -- including one created by that same
+  final admission check when it sends a fresh keepalive ping -- is left
+  untouched.
+
+A matched PATH_ACK is proof of liveness, not a lease renewal or a fresh
+session. Because it advances `last_authenticated_peer` -- to the fresh
+monotonic sample taken at its final terminal-deadline admission, never an
+older sample taken before `drive_refresh()` or acknowledgement logging --
+it correspondingly reanchors the `peer_timeout` deadline
+(`last_authenticated_peer + peer_timeout`) forward from that moment,
+exactly as an accepted pong already does; this is the intended, expected
+effect, not something the implementation avoids. What it never does is
+reset `session_started_at`, extend or postpone the planned-refresh
+deadline, or touch `last_ping_at`/restart or delay the normal keepalive
+schedule -- an already-due terminal deadline still wins at that final
+admission, before the ACK's liveness effect is applied. Migration stays
+strictly a transport/session concern: it never pauses, buffers, or
+otherwise touches NMEA/application forwarding.
 
 ## 12. Routing snapshot boundary
 

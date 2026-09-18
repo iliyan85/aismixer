@@ -320,9 +320,37 @@ handshake and fresh directional keys.
 Exact confirmation, nonce admission, exhaustion, and session-transition rules
 are normative in the [Behavioural Contract](../BEHAVIORAL_CONTRACT.md).
 
-NAT works while the server-observed source address and port remain usable and
-stable. Rebinding, changing networks, or changing the source port requires a
-fresh handshake. There is no automatic session migration.
+When the server observes a rebind (a new NAT/CGNAT mapping, or a network
+change) as authenticated current-epoch traffic from the still-valid session,
+it challenges the new path and, once the client's authenticated response
+proves return routability, migrates the session's active path in place --
+no new handshake, locator, keys, or forwarding-loop restart. The client
+answers that challenge and, only after a successful response send,
+remembers a proof for a short bounded window, including the outstanding
+keepalive ping (if any) at that moment. A valid newer challenge immediately
+invalidates the older proof, even if sending the new response fails; a
+retry with the same new generation/token can establish its proof when the
+send succeeds. If the server's authenticated migration acknowledgement
+matches the current live proof, it gains liveness and ping-clear authority
+only at one final, fresh terminal-deadline check taken immediately before
+those effects, with no further blocking work (retransmit sends,
+acknowledgement logging) in between -- so a deadline that becomes due while
+that surrounding work was running still wins outright, exact equality
+included. Once that final check passes, it counts as fresh peer liveness --
+advancing `last_authenticated_peer` (to that same fresh sample, never an
+older one taken before the intervening work) and therefore the
+`peer_timeout` deadline, exactly like an accepted pong -- and clears only
+the concrete ping sequence captured in that proof, and only if that same
+ping is still outstanding at that instant. A proof that captured no ping
+still supplies liveness but cannot clear a later ping, including one just
+sent because its keepalive deadline became due at that same final check.
+This acknowledgement
+never resets the session's age, postpones a planned refresh, or restarts the
+keepalive schedule; it is not a lease renewal in those senses. A rebind the
+server never observes as valid current-epoch traffic from the session (for
+example while it is otherwise idle) still falls back to
+keepalive/peer-timeout detection and a
+fresh handshake.
 
 UDPSEC has no plaintext `NOSESSION`, plaintext reset, downgrade control, or
 automatic fallback to plain UDP. Unauthenticated control-looking datagrams do
@@ -540,8 +568,10 @@ Current operator-visible limits:
 - automatically allocated outbound source port;
 - bounded serial queue that discards the oldest entry when full;
 - process-local, non-durable UDPSEC session and replay state;
-- fresh handshake required after a source-address or source-port tuple change;
-- no automatic UDPSEC session migration.
+- a source-address or source-port tuple change migrates in place only when
+  the server observes it as authenticated current-epoch traffic from the
+  still-valid session; otherwise a fresh handshake is required after
+  keepalive/peer-timeout detection.
 
 UDPSEC provides confidentiality, cryptographic integrity, and peer
 authentication for transport between configured and authenticated endpoints.
