@@ -67,7 +67,6 @@
       "https://github.com/iliyan85/aismixer"
     ],
     "inLanguage": "en",
-    "isAccessibleForFree": true,
     "keywords": ["AIS NMEA 0183", "stream processing", "logical routing", "runtime observability", "aismixerctl", "UDPSEC", "authenticated ECDHE", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
@@ -425,7 +424,7 @@
       <div class="section-heading">
         <p class="eyebrow">UDPSEC lifecycle</p>
         <h2>Authenticated transport with bounded local state</h2>
-        <p class="section-intro">The current source-tree UDPSEC path between <span class="kbd">nmea_sproxy</span> and <span class="kbd">aismixer</span> uses configured long-term P-256 ECDSA identities, signed ephemeral P-256 ECDHE, fresh directional AES-256-GCM keys, and encrypted sequence-zero proof of key possession before the client treats a new session as established.</p>
+        <p class="section-intro">The currently released UDPSEC path between <span class="kbd">nmea_sproxy</span> and <span class="kbd">aismixer</span> uses configured long-term P-256 ECDSA identities, signed ephemeral P-256 ECDHE, fresh directional AES-256-GCM keys, and encrypted sequence-zero proof of key possession before the client treats a new session as established.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="UDPSEC authenticated ECDHE session-establishment flow">
         <div class="pipeline-node">
@@ -539,7 +538,7 @@
       <div class="section-heading">
         <p class="eyebrow">OpenWrt edge deployment</p>
         <h2>Run <span class="kbd">aismixer</span> or <span class="kbd">nmea_sproxy</span> on OpenWrt</h2>
-        <p class="section-intro">The signed AISMixer APK repository for OpenWrt 25.12 currently publishes the <span class="kbd">0.2.1-r1</span> Python/procd package snapshot for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</p>
+        <p class="section-intro">The signed AISMixer APK repository for OpenWrt 25.12 currently publishes the <span class="kbd">0.2.1-r4</span> Python/procd package snapshot for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
         <article class="card">
@@ -591,7 +590,7 @@ vi /etc/aismixer/authorized_keys.yaml
 /etc/init.d/aismixer start
 /etc/init.d/aismixer status
 logread -e aismixer</code></pre>
-      <p class="boundary-note"><strong>Package snapshot.</strong> Published <span class="kbd">0.2.1-r1</span> packages use a pinned source revision and may trail later <span class="kbd">main</span> changes. Check the package revision, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>, and <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">Releases</a> before assuming newer hardening is included.</p>
+      <p class="boundary-note"><strong>Package snapshot.</strong> Published <span class="kbd">0.2.1-r4</span> packages use a pinned source revision and may trail later <span class="kbd">main</span> changes. Check the package revision, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>, and <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">Releases</a> before assuming newer hardening is included.</p>
       <p class="boundary-note"><strong>End-to-end validation.</strong> The <span class="kbd">mips_24kc</span> deployment path has been validated end to end with physical serial AIS ingress, <span class="kbd">nmea_sproxy</span>, authenticated UDPSEC, processing by the <span class="kbd">aismixer</span> service, <span class="kbd">procd</span> service operation, and local runtime control and observability.</p>
       <p class="boundary-note"><strong>Receiver-side endpoint only.</strong> Use <span class="kbd">apk add nmea_sproxy</span> instead of <span class="kbd">apk add aismixer</span> to install the station proxy independently. See the <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>, and <a href="https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment" target="_blank" rel="noopener">OpenWrt Deployment Wiki</a> for complete deployment and trust-provisioning steps.</p>
     </section>

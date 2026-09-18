@@ -3,4 +3,4 @@ description: Platform for receiving, normalizing, deduplicating, tagging, routin
 url: https://aismixer.net
 baseurl: ""
 markdown: kramdown
-source_sync_commit: "32d21333cf376d11e6dbcd55dacc5fa985dd5a22"
+source_sync_commit: "08fd590e51e756b27b0ce76bec3e71a3aad658b7"

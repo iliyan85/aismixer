@@ -67,7 +67,6 @@
       "https://github.com/iliyan85/aismixer"
     ],
     "inLanguage": "ro",
-    "isAccessibleForFree": true,
     "keywords": ["AIS NMEA 0183", "procesarea fluxurilor", "rutare logică", "observabilitate runtime", "aismixerctl", "UDPSEC", "ECDHE autentificat", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
@@ -426,7 +425,7 @@
       <div class="section-heading">
         <p class="eyebrow">Ciclul de viață UDPSEC</p>
         <h2>Transport autentificat cu stare locală limitată</h2>
-        <p class="section-intro">Traseul UDPSEC actual din codul-sursă dintre <span class="kbd">nmea_sproxy</span> și serviciul <span class="kbd">aismixer</span> folosește identități ECDSA P-256 pe termen lung configurate, ECDHE efemer P-256 semnat, chei AES-256-GCM direcționale proaspete și dovada criptată a posesiei cheilor prin confirmarea cu secvența zero înainte ca clientul să considere stabilită o sesiune nouă.</p>
+        <p class="section-intro">Traseul UDPSEC actual din versiunea publicată dintre <span class="kbd">nmea_sproxy</span> și serviciul <span class="kbd">aismixer</span> folosește identități ECDSA P-256 pe termen lung configurate, ECDHE efemer P-256 semnat, chei AES-256-GCM direcționale proaspete și dovada criptată a posesiei cheilor prin confirmarea cu secvența zero înainte ca clientul să considere stabilită o sesiune nouă.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="Fluxul de stabilire a unei sesiuni UDPSEC autentificate">
         <div class="pipeline-node">
@@ -540,7 +539,7 @@
       <div class="section-heading">
         <p class="eyebrow">Implementare OpenWrt la marginea rețelei</p>
         <h2>Rulați serviciul <span class="kbd">aismixer</span> sau serviciul <span class="kbd">nmea_sproxy</span> pe OpenWrt</h2>
-        <p class="section-intro">Depozitul AISMixer APK semnat pentru OpenWrt 25.12 publică versiunea <span class="kbd">0.2.1-r1</span> a pachetelor Python/procd pentru arhitecturile <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</p>
+        <p class="section-intro">Depozitul AISMixer APK semnat pentru OpenWrt 25.12 publică versiunea <span class="kbd">0.2.1-r4</span> a pachetelor Python/procd pentru arhitecturile <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
         <article class="card">
@@ -592,7 +591,7 @@ vi /etc/aismixer/authorized_keys.yaml
 /etc/init.d/aismixer start
 /etc/init.d/aismixer status
 logread -e aismixer</code></pre>
-      <p class="boundary-note"><strong>Versiunea pachetelor.</strong> Pachetele <span class="kbd">0.2.1-r1</span> publicate folosesc o revizie fixată a sursei și pot rămâne în urma modificărilor ulterioare din <span class="kbd">main</span>. Verificați revizia pachetului, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">lista de modificări</a> și <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">versiunile publicate</a> înainte de a presupune că sunt incluse consolidări mai noi.</p>
+      <p class="boundary-note"><strong>Versiunea pachetelor.</strong> Pachetele <span class="kbd">0.2.1-r4</span> publicate folosesc o revizie fixată a sursei și pot rămâne în urma modificărilor ulterioare din <span class="kbd">main</span>. Verificați revizia pachetului, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">lista de modificări</a> și <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">versiunile publicate</a> înainte de a presupune că sunt incluse consolidări mai noi.</p>
       <p class="boundary-note"><strong>Validare cap la cap.</strong> Calea de implementare pentru <span class="kbd">mips_24kc</span> a fost validată cap la cap cu intrare AIS serială fizică, <span class="kbd">nmea_sproxy</span>, UDPSEC autentificat, procesare prin serviciul <span class="kbd">aismixer</span>, funcționarea serviciilor prin <span class="kbd">procd</span>, control local și observabilitate runtime.</p>
       <p class="boundary-note"><strong>Doar punctul terminal de lângă receptor.</strong> Folosiți <span class="kbd">apk add nmea_sproxy</span> în loc de <span class="kbd">apk add aismixer</span> pentru a instala independent proxy-ul de la stație. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> și <a href="https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment" target="_blank" rel="noopener">ghidul de implementare OpenWrt</a> pentru pașii compleți de implementare și configurare a încrederii.</p>
     </section>
