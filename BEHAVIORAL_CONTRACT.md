@@ -1767,38 +1767,57 @@ promotes/discards/rekeys the `CryptoEpoch`):
   A matched PATH_ACK does not gain final liveness or ping-clear authority
   merely by passing the post-receipt deadline check: that check, and the
   `drive_refresh()` and acknowledgement logging that follow it, can
-  themselves consume enough time for a terminal deadline to become due, so
-  a matched PATH_ACK's state effects are gated by one more fresh
-  terminal-deadline admission taken immediately before them, with no
-  further potentially blocking work (no additional send, no additional
-  logging) between that admission and the mutation of
-  `last_authenticated_peer`/`expected_ping_seq`. Any terminal deadline due
-  at that exact final admission point -- `peer_timeout`, planned-refresh,
-  or keepalive/proactive-recovery, exact equality included -- wins outright:
-  the ACK is authenticated-but-benign and neither reanchors liveness nor
-  clears a ping. Its ping-clear authority is the concrete ping sequence
-  captured at the successful `path_response` send, carried unchanged until
-  that final admission passes. It clears an outstanding ping ONLY if the
-  captured sequence is not `None` and that exact sequence is still
-  outstanding at that final admission instant. A proof that captured no
-  ping has no ping-clear authority, but its matched ACK still advances
-  liveness. A different, later ping -- including one created by that same
-  final admission check when it sends a fresh keepalive ping -- is left
-  untouched.
+  themselves consume enough time for a terminal deadline to become due. Its
+  state effects are therefore gated by a bounded, two-phase final admission,
+  never by the ordinary per-iteration deadline helper (which is itself
+  effectful -- it can send a keepalive ping or start an in-session refresh,
+  and either could block past a terminal deadline). Phase one is a
+  side-effect-free terminal classification (`terminal_deadline_reason`): no
+  send, no logging, no refresh start/tick, no mutation, no second clock
+  sample -- pure local comparisons against one already-captured `now`. If it
+  finds a terminal deadline due, that reason wins outright and the ACK gets
+  no effects at all. Otherwise phase two performs AT MOST the one
+  non-terminal maintenance action that is due at that same instant --
+  sending a keepalive ping with none outstanding, or starting/reanchoring a
+  supported in-session planned refresh -- and only then does the
+  implementation take a fresh monotonic sample and run the SAME pure
+  terminal classification again. Any terminal deadline due at that final,
+  post-maintenance classification -- `peer_timeout`, planned-refresh (when
+  in-session refresh is unsupported), or keepalive/proactive-recovery, exact
+  equality included -- still wins outright: the ACK is
+  authenticated-but-benign and neither reanchors liveness nor clears a ping.
+  Between that final classification and the mutation of
+  `last_authenticated_peer`/`expected_ping_seq` there is no further
+  potentially blocking work of any kind. A supported planned refresh that is
+  due at the same instant as unresolved-ping proactive recovery is
+  deliberately classified as non-terminal maintenance, never as a terminal
+  reason, precisely so it can never mask recovery: when both are due at
+  once, proactive recovery wins and the refresh is never even started. Its
+  ping-clear authority is the concrete ping sequence captured at the
+  successful `path_response` send, carried unchanged until that final
+  admission passes. It clears an outstanding ping ONLY if the captured
+  sequence is not `None` and that exact sequence is still outstanding at
+  that final admission instant. A proof that captured no ping has no
+  ping-clear authority, but its matched ACK still advances liveness. A
+  different, later ping -- including one created by that same final
+  admission's own maintenance phase when it sends a fresh keepalive ping --
+  is left untouched.
 
 A matched PATH_ACK is proof of liveness, not a lease renewal or a fresh
 session. Because it advances `last_authenticated_peer` -- to the fresh
-monotonic sample taken at its final terminal-deadline admission, never an
-older sample taken before `drive_refresh()` or acknowledgement logging --
-it correspondingly reanchors the `peer_timeout` deadline
+monotonic sample taken AFTER any due non-terminal maintenance at its final
+terminal-deadline admission, never an older sample taken before that
+maintenance, `drive_refresh()`, or acknowledgement logging -- it
+correspondingly reanchors the `peer_timeout` deadline
 (`last_authenticated_peer + peer_timeout`) forward from that moment,
 exactly as an accepted pong already does; this is the intended, expected
 effect, not something the implementation avoids. What it never does is
-reset `session_started_at`, extend or postpone the planned-refresh
-deadline, or touch `last_ping_at`/restart or delay the normal keepalive
-schedule -- an already-due terminal deadline still wins at that final
-admission, before the ACK's liveness effect is applied. Migration stays
-strictly a transport/session concern: it never pauses, buffers, or
+reset `session_started_at` outside of that admission's own maintenance,
+extend or postpone the planned-refresh deadline, or touch
+`last_ping_at`/restart or delay the normal keepalive schedule beyond that
+same maintenance -- an already-due terminal deadline still wins at that
+final admission, before the ACK's liveness effect is applied. Migration
+stays strictly a transport/session concern: it never pauses, buffers, or
 otherwise touches NMEA/application forwarding.
 
 ## 12. Routing snapshot boundary

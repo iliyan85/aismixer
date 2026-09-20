@@ -1815,6 +1815,95 @@ def session_poll_timeout(
     return max(0.0, min(deadlines) - now)
 
 
+# MP5 corrective round 4 -- HIGH finding: the final PATH_ACK admission gate
+# must be a side-effect-free terminal-deadline decision, never the
+# effectful `apply_due_deadline` (which can itself send a keepalive ping or
+# start an in-session refresh, either of which may block past a terminal
+# deadline). `terminal_deadline_reason` and `nonterminal_due_action` split
+# `session_deadline_action`'s combined classification into a pure terminal
+# half and a pure "what maintenance is due" half so the final admission
+# choreography can: classify (pure) -> maintain at most one due action
+# (effectful, only reachable when nothing terminal applies) -> resample ->
+# classify again (pure) -> mutate, with no blocking work between that last
+# classification and the mutation. See BEHAVIORAL_CONTRACT.md.
+def terminal_deadline_reason(
+    now,
+    session_started_at,
+    last_authenticated_peer,
+    last_ping_at,
+    expected_ping_seq,
+    config,
+    refresh_supported,
+):
+    """Side-effect-free terminal session-deadline classification.
+
+    Performs only local comparisons against already-captured state: no
+    send, no logging, no refresh start/tick, no encryption/keygen/signing,
+    no mutation, no callback, and no second clock sample -- `now` is taken
+    once by the caller and passed in. Returns a terminal `SESSION_END_*`
+    reason, or `None` when nothing terminal is due at `now`.
+
+    A planned refresh that is due but has real in-session refresh support
+    (`refresh_supported`) is deliberately NOT terminal here -- starting it
+    is non-terminal maintenance handled separately by
+    `nonterminal_due_action` -- so a supported planned refresh can never
+    mask a simultaneously-due terminal deadline (peer_timeout or
+    unresolved-ping proactive recovery; recovery wins when both are due at
+    the same `now`). Without refresh support, planned refresh keeps its
+    original terminal priority between peer_timeout and proactive
+    recovery, exactly as `session_expiration_reason` has always ordered
+    it -- that established behavior is unchanged.
+    """
+    if now >= last_authenticated_peer + float(config["peer_timeout"]):
+        return SESSION_END_PEER_TIMEOUT
+    refresh_interval = float(config["session_refresh_interval"])
+    planned_refresh_due = (
+        refresh_interval > 0 and now >= session_started_at + refresh_interval
+    )
+    if planned_refresh_due and not refresh_supported:
+        return SESSION_END_PLANNED_REFRESH
+    if (
+        now >= last_ping_at + float(config["keepalive_interval"])
+        and expected_ping_seq is not None
+    ):
+        return SESSION_END_PROACTIVE_REKEY
+    return None
+
+
+def nonterminal_due_action(
+    now,
+    session_started_at,
+    last_ping_at,
+    expected_ping_seq,
+    config,
+    refresh_supported,
+):
+    """Which non-terminal maintenance action, if any, is due at `now`.
+
+    Only meaningful when `terminal_deadline_reason` has already returned
+    `None` for the SAME `now` and state: a supported planned refresh is
+    due-and-non-terminal only when no terminal deadline also applies, and
+    a keepalive ping is due-with-nothing-outstanding only when the
+    unresolved-ping proactive-recovery check (which is terminal) did not
+    already fire for the same `now`. Returns
+    `SESSION_ACTION_START_EPOCH_REFRESH`, `SESSION_ACTION_SEND_PING`, or
+    `None`. Performs no I/O itself -- the caller executes the action.
+    """
+    refresh_interval = float(config["session_refresh_interval"])
+    if (
+        refresh_interval > 0
+        and now >= session_started_at + refresh_interval
+        and refresh_supported
+    ):
+        return SESSION_ACTION_START_EPOCH_REFRESH
+    if (
+        now >= last_ping_at + float(config["keepalive_interval"])
+        and expected_ping_seq is None
+    ):
+        return SESSION_ACTION_SEND_PING
+    return None
+
+
 def retry_delay_for_reason(reason, config):
     if reason in (
         SESSION_END_PLANNED_REFRESH,
@@ -2303,6 +2392,53 @@ def forward_loop(
             print(f"Secure session invalidated: {action}")
         return action
 
+    def apply_nonterminal_due_action(now):
+        """Perform at most one non-terminal maintenance action due at
+        `now`. For use ONLY immediately after `terminal_deadline_reason(now)`
+        (with this same state) has already returned `None`: by
+        construction the only actions reachable here are starting a
+        supported in-session planned refresh or sending a keepalive ping
+        with none outstanding -- never a terminal `SESSION_END_*` reason.
+        May still return `SESSION_END_SOCKET_ERROR` if the ping send
+        itself fails, exactly as `apply_due_deadline` does."""
+        nonlocal expected_ping_seq, last_ping_at, next_ping_seq
+        nonlocal session_started_at
+
+        action = nonterminal_due_action(
+            now,
+            session_started_at,
+            last_ping_at,
+            expected_ping_seq,
+            config,
+            refresh is not None,
+        )
+        if action == SESSION_ACTION_START_EPOCH_REFRESH:
+            # Reanchor the planned-refresh cadence now (a retry/abandon
+            # backs off by one interval; a commit reanchors again) and
+            # start the transaction if one is not already in flight.
+            session_started_at = now
+            if not refresh.active:
+                refresh.start(epochs, out_sock, remote_addr, time.monotonic)
+            return None
+        if action == SESSION_ACTION_SEND_PING:
+            try:
+                send_ping(
+                    out_sock,
+                    remote_addr,
+                    epochs.client_to_server_key,
+                    session_locator,
+                    config["station_id"],
+                    next_ping_seq,
+                    epochs.generation,
+                )
+            except Exception as e:
+                print(f"❌ Secure ping error: {e}")
+                return SESSION_END_SOCKET_ERROR
+            expected_ping_seq = next_ping_seq
+            next_ping_seq += 1
+            last_ping_at = now
+        return None
+
     def drive_refresh():
         if refresh is not None:
             refresh.tick(epochs, out_sock, remote_addr, time.monotonic)
@@ -2476,16 +2612,46 @@ def forward_loop(
                 )
                 # The acknowledgement logging above (and `drive_refresh()`
                 # earlier in this iteration) can itself consume enough time
-                # for a terminal deadline to become due. Take one more
-                # authoritative sample right here, with NO further
-                # potentially blocking work before the state mutation below,
-                # so a deadline that is due AT or BEFORE this exact instant
-                # wins instead of being overrun by stale ACK evidence.
-                fresh_now = time.monotonic()
-                deadline_reason = apply_due_deadline(fresh_now)
-                if deadline_reason is not None:
-                    return deadline_reason
-                last_authenticated_peer = fresh_now
+                # for a terminal deadline to become due. `apply_due_deadline`
+                # is NOT safe as the final gate here: it can itself send a
+                # keepalive ping or start an in-session refresh, and either
+                # of those can block past a terminal deadline before this
+                # admission's own liveness/ping effects apply. Instead:
+                # classify (pure, no I/O) -> perform at most the one due
+                # non-terminal maintenance action, if any -> resample ->
+                # classify again (pure) -> mutate, with NO further
+                # potentially blocking work between that last classification
+                # and the mutation below.
+                admission_now = time.monotonic()
+                terminal_reason = terminal_deadline_reason(
+                    admission_now,
+                    session_started_at,
+                    last_authenticated_peer,
+                    last_ping_at,
+                    expected_ping_seq,
+                    config,
+                    refresh is not None,
+                )
+                if terminal_reason is not None:
+                    return terminal_reason
+                maintenance_reason = apply_nonterminal_due_action(
+                    admission_now
+                )
+                if maintenance_reason is not None:
+                    return maintenance_reason
+                effect_now = time.monotonic()
+                terminal_reason = terminal_deadline_reason(
+                    effect_now,
+                    session_started_at,
+                    last_authenticated_peer,
+                    last_ping_at,
+                    expected_ping_seq,
+                    config,
+                    refresh is not None,
+                )
+                if terminal_reason is not None:
+                    return terminal_reason
+                last_authenticated_peer = effect_now
                 if (
                     path_ping_seq_to_clear is not None
                     and expected_ping_seq == path_ping_seq_to_clear

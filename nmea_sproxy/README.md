@@ -332,21 +332,33 @@ invalidates the older proof, even if sending the new response fails; a
 retry with the same new generation/token can establish its proof when the
 send succeeds. If the server's authenticated migration acknowledgement
 matches the current live proof, it gains liveness and ping-clear authority
-only at one final, fresh terminal-deadline check taken immediately before
-those effects, with no further blocking work (retransmit sends,
-acknowledgement logging) in between -- so a deadline that becomes due while
-that surrounding work was running still wins outright, exact equality
-included. Once that final check passes, it counts as fresh peer liveness --
-advancing `last_authenticated_peer` (to that same fresh sample, never an
-older one taken before the intervening work) and therefore the
-`peer_timeout` deadline, exactly like an accepted pong -- and clears only
-the concrete ping sequence captured in that proof, and only if that same
-ping is still outstanding at that instant. A proof that captured no ping
-still supplies liveness but cannot clear a later ping, including one just
-sent because its keepalive deadline became due at that same final check.
+only through a bounded, side-effect-free final admission: a pure
+terminal-deadline classification (no send, no logging, no refresh
+start/tick, no mutation) taken immediately before those effects; if nothing
+terminal is due, at most the one non-terminal maintenance action that is
+due at that same instant (sending a keepalive ping with none outstanding,
+or starting a supported in-session refresh); then a fresh clock sample and
+the same pure classification run again, with no further blocking work
+between that second classification and the effects themselves -- so a
+deadline that becomes due while any of that surrounding work (retransmit
+sends, acknowledgement logging, or the maintenance action itself) was
+running still wins outright, exact equality included. A supported planned
+refresh due at the same instant as unresolved-ping recovery is classified
+as non-terminal maintenance, never as a reason to end the session, so it
+can never mask that recovery: recovery wins, and the refresh is not even
+started. Once the final classification passes clean, it counts as fresh
+peer liveness -- advancing `last_authenticated_peer` (to that final
+post-maintenance sample, never an older one taken before it) and therefore
+the `peer_timeout` deadline, exactly like an accepted pong -- and clears
+only the concrete ping sequence captured in that proof, and only if that
+same ping is still outstanding at that instant. A proof that captured no
+ping still supplies liveness but cannot clear a later ping, including one
+just sent by that same final admission's own maintenance because its
+keepalive deadline became due at that instant.
 This acknowledgement
 never resets the session's age, postpones a planned refresh, or restarts the
-keepalive schedule; it is not a lease renewal in those senses. A rebind the
+keepalive schedule beyond that admission's own due maintenance; it is not a
+lease renewal in those senses. A rebind the
 server never observes as valid current-epoch traffic from the session (for
 example while it is otherwise idle) still falls back to
 keepalive/peer-timeout detection and a
