@@ -1820,6 +1820,64 @@ final admission, before the ACK's liveness effect is applied. Migration
 stays strictly a transport/session concern: it never pauses, buffers, or
 otherwise touches NMEA/application forwarding.
 
+### 11.1 Migration x epoch-refresh x lifecycle binding (Major Prompt 6)
+
+Path migration is not timeless authority: a migration transaction (server
+`CandidatePath`, client pending proof) is bound to the exact
+`LogicalSession` incarnation, candidate path/generation, challenge token,
+and `CryptoEpoch`/generation live at the moment it was created, and
+remains valid only while all of those still hold.
+
+1. **Epoch binding.** A candidate records the exact `CryptoEpoch` object it
+   was authenticated under. Migration commit (server `PATH_RESPONSE`) and
+   client ACK admission both require that recorded epoch to still be the
+   live current epoch by object identity, not merely a matching
+   generation number.
+2. **Epoch swap invalidates outstanding authority.** If an in-session
+   epoch refresh commits (E1 -> E2) while a candidate/challenge created
+   under E1 is still outstanding, that candidate is left bound to the
+   now-retiring E1 object -- neither rebound to E2 nor extended -- so its
+   old response can never commit under either the demoted E1 encoding or
+   a re-encryption of the same stale token under E2. It simply lapses at
+   its own unmoved deadline; fresh traffic from the same address opens a
+   brand-new, independently-anchored candidate under the new current
+   epoch, and only that fresh incarnation may migrate the path.
+3. **Migration does not postpone refresh.** A path-migration commit never
+   moves a pending or in-flight refresh transaction's deadline,
+   retransmission cadence, attempt count, or transaction identity.
+4. **Refresh does not reset or extend migration/session lifecycle.** An
+   epoch-refresh commit never resets `path_generation`, extends a live
+   candidate's TTL or a retired path's grace deadline, or grants the
+   session (or an in-flight migration) any generic lease extension;
+   conversely, migration never grants the session a generic lease
+   extension either. Refresh and migration/session-lifecycle timers are
+   independent fields, mutated only by their own transaction.
+5. **Deadlines advance through processing delay.** Candidate TTL and
+   retired-path grace are monotonic-time lifetimes resampled fresh at the
+   authoritative commit/admission point, never a timestamp captured
+   earlier at packet receipt -- queueing, backpressure, or scheduler delay
+   between receipt and commit cannot freeze or extend them, and exact
+   equality at a deadline is treated as expired on both the server and
+   client.
+6. **Terminal session lifecycle wins.** Once a session becomes terminal
+   (idle/peer-timeout expiry, graceful close, nonce-ledger exhaustion of
+   the current epoch, or owner/listener teardown), any in-flight or
+   delayed migration control (a late `PATH_RESPONSE`/`PATH_ACK`) has no
+   authority to resurrect it -- the session, and with it any live
+   candidate/retired-path state, is simply gone.
+7. **Replay/nonce ownership is per-epoch, not per-path.** A migration
+   commit's own `PATH_RESPONSE` nonce is admitted into the same replay
+   ledger as ordinary session traffic for that epoch. Changing the source
+   address via migration never resets or duplicates that ledger: the same
+   ciphertext/nonce pair stays exactly as replay-rejected when represented
+   from the active, candidate, or retired path.
+8. **Shutdown close targets the current active path.** A best-effort
+   graceful close sent during owner/listener shutdown always resolves the
+   destination from the session's current, validated `active_path` at
+   that moment -- never the original establishment tuple, a live
+   candidate, or a retired path -- regardless of whether a refresh is also
+   mid-flight at shutdown time.
+
 ## 12. Routing snapshot boundary
 
 Routing configuration, `RouteDefinition.to`, route errors, status, control

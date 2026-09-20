@@ -4096,6 +4096,15 @@ async def _secure_server_loop(
                     # ordinary active path a `path_response` stays an
                     # unknown control message (handled below), exactly as
                     # before.
+                    #
+                    # MP6 R7: a FRESH `monotonic_now()` reading taken HERE,
+                    # after the expensive AEAD decrypt above -- not the
+                    # stale pre-decrypt `local_now` -- exactly mirroring
+                    # the ordinary-DATA admission below
+                    # (`admit_epoch_data_nonce_for_path`). Queueing/
+                    # backpressure/scheduler delay between receipt and this
+                    # point must not let a candidate that is already
+                    # expired by now still commit.
                     ack_packet = _process_path_response(
                         state_owner,
                         session,
@@ -4105,7 +4114,7 @@ async def _secure_server_loop(
                         packet_locator,
                         addr,
                         wall_now,
-                        local_now,
+                        monotonic_now(),
                     )
                     if ack_packet is not None:
                         # After a committed migration `active_path` IS this
@@ -4122,6 +4131,8 @@ async def _secure_server_loop(
                 if message_type == REFRESH_INIT_TYPE:
                     if epoch_role != "current":
                         continue
+                    # MP6 R7: fresh post-decrypt time, same reasoning as the
+                    # PATH_RESPONSE branch above.
                     reply_packet = _process_refresh_init(
                         state_owner,
                         session,
@@ -4131,7 +4142,7 @@ async def _secure_server_loop(
                         packet_locator,
                         active_server_private_key,
                         wall_now,
-                        local_now,
+                        monotonic_now(),
                     )
                     if reply_packet is not None:
                         sock.sendto(
@@ -4140,6 +4151,8 @@ async def _secure_server_loop(
                     continue
 
                 if message_type == REFRESH_CONFIRM_TYPE:
+                    # MP6 R7: fresh post-decrypt time, same reasoning as the
+                    # PATH_RESPONSE branch above.
                     ack_packet, newly_committed = _process_refresh_confirm(
                         state_owner,
                         session,
@@ -4148,7 +4161,7 @@ async def _secure_server_loop(
                         nonce,
                         packet_locator,
                         wall_now,
-                        local_now,
+                        monotonic_now(),
                     )
                     if ack_packet is not None:
                         sock.sendto(
