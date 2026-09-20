@@ -811,6 +811,13 @@ class SecureStateStats:
     path_candidates_expired: int
     path_migrations_committed: int
     retired_paths_expired: int
+    # MP7 observability -- see BEHAVIORAL_CONTRACT.md section 11.2 for
+    # exact increment semantics. `path_migrations_committed` above already
+    # is the "a PATH_RESPONSE successfully committed migration" counter,
+    # so there is deliberately no separate "migration_responses_accepted".
+    migration_challenges_sent: int
+    migration_invalid_responses: int
+    retired_path_packets_admitted: int
 
     current_handshake_replays: int
     peak_handshake_replays: int
@@ -1053,6 +1060,9 @@ class SecureState:
         self._path_candidates_expired = 0
         self._path_migrations_committed = 0
         self._retired_paths_expired = 0
+        self._migration_challenges_sent = 0
+        self._migration_invalid_responses = 0
+        self._retired_path_packets_admitted = 0
 
         self._current_data_nonces = 0
         self._peak_handshake_replays = 0
@@ -1116,6 +1126,11 @@ class SecureState:
                 path_candidates_expired=self._path_candidates_expired,
                 path_migrations_committed=self._path_migrations_committed,
                 retired_paths_expired=self._retired_paths_expired,
+                migration_challenges_sent=self._migration_challenges_sent,
+                migration_invalid_responses=self._migration_invalid_responses,
+                retired_path_packets_admitted=(
+                    self._retired_path_packets_admitted
+                ),
                 current_handshake_replays=len(self._handshake_replays),
                 peak_handshake_replays=self._peak_handshake_replays,
                 current_sessions=len(self._sessions),
@@ -2557,6 +2572,16 @@ class SecureState:
             admission = self._admit_nonce_into_epoch_ledger(
                 session, epoch, epoch_role, nonce, now
             )
+            # MP7 observability: count exactly a packet authoritatively
+            # ACCEPTED from a still-live retired path -- never a replay,
+            # never an already-expired retired record (that classifies as
+            # 'unknown' above and is refused authorization long before
+            # this point).
+            if (
+                path_role == "retired"
+                and admission is _DataNonceAdmission.ACCEPTED
+            ):
+                self._retired_path_packets_admitted += 1
             return _PathDataAdmission(admission, path_role, epoch_role, now)
 
     def install_pending_epoch(
@@ -2964,6 +2989,17 @@ class SecureState:
                 and candidate.epoch is session.current_epoch
             )
 
+    def record_migration_challenge_sent(self):
+        """MP7 observability: increment `migration_challenges_sent` exactly
+        when a PATH_CHALLENGE datagram has actually been handed
+        successfully to the transport's `sendto()` boundary. The caller
+        (`_process_candidate_path_observation`) only reaches this call
+        after `sendto()` has already returned without raising; a send
+        failure propagates to the caller's own general error handling
+        instead and is deliberately not counted here."""
+        with self._lock:
+            self._migration_challenges_sent += 1
+
     def commit_candidate_path(
         self,
         session,
@@ -2999,36 +3035,50 @@ class SecureState:
             self._expire_session_path_state(session, now)
             path_state = session.path_state
             candidate = path_state.candidate_path
-            if candidate is None:
+
+            # MP7 observability: `migration_invalid_responses` counts a
+            # PATH_RESPONSE that reached this authoritative check but did
+            # not match the exact live candidate authority (no/expired/
+            # stale-epoch candidate, wrong address, wrong token, wrong
+            # generation) -- never a nonce replay/exhaustion (those already
+            # have their own counters below) and never the session-gone or
+            # foreign-relation-occupancy cases (neither is a property of
+            # THIS response). One rejected datagram increments it exactly
+            # once, via this single shared return path.
+            def _reject_invalid_response():
+                self._migration_invalid_responses += 1
                 return (False, None)
+
+            if candidate is None:
+                return _reject_invalid_response()
             # Exact candidate-bound epoch must still be the live current
             # epoch, and must be the exact epoch the response authenticated
             # under. An epoch refresh that committed first makes the
             # candidate stale -- it cannot commit under old authority.
             if self._session_epoch_role(session, epoch) != "current":
-                return (False, None)
+                return _reject_invalid_response()
             if candidate.epoch is not session.current_epoch:
-                return (False, None)
+                return _reject_invalid_response()
             if candidate.epoch is not epoch:
-                return (False, None)
+                return _reject_invalid_response()
             if now >= candidate.deadline:
-                return (False, None)
+                return _reject_invalid_response()
             try:
                 source_identity = normalize_sockaddr(source_sockaddr)
             except MalformedSockaddrError:
-                return (False, None)
+                return _reject_invalid_response()
             if candidate.identity != source_identity:
-                return (False, None)
+                return _reject_invalid_response()
             if not isinstance(challenge_token, bytes) or not constant_time.bytes_eq(
                 candidate.challenge_token, challenge_token
             ):
-                return (False, None)
+                return _reject_invalid_response()
             if (
                 not isinstance(path_generation, int)
                 or isinstance(path_generation, bool)
                 or path_generation != candidate.path_generation
             ):
-                return (False, None)
+                return _reject_invalid_response()
 
             # Finding B (authoritative re-check under the lock): the
             # migration target relation must not be occupied by a DIFFERENT
@@ -3680,6 +3730,7 @@ def _process_candidate_path_observation(
         session, candidate, monotonic_now()
     ):
         sock.sendto(challenge_packet, candidate.sockaddr)
+        state_owner.record_migration_challenge_sent()
 
 
 async def _secure_server_loop(

@@ -1878,6 +1878,89 @@ remains valid only while all of those still hold.
    candidate, or a retired path -- regardless of whether a refresh is also
    mid-flight at shutdown time.
 
+### 11.2 Migration adversarial hardening and observability (Major Prompt 7)
+
+The central security statement: an attacker may cause bounded rejection
+work, but must not gain authority, amplify traffic, or create
+history-scaled state.
+
+1. **Guessed/unknown locator is non-authoritative and non-amplifying.**
+   Session selection is an exact `(endpoint_token, session_locator)`
+   lookup -- never a trial decryption against other sessions' keys, and
+   never a fallback to any other live session. A locator that matches no
+   session is silently dropped before any candidate, nonce, or session
+   state is touched, and produces zero response datagrams regardless of
+   how many distinct locators are guessed.
+2. **Migration requires exact current-epoch authenticated admission.**
+   Migration commit (`commit_candidate_path`) requires the candidate's
+   bound `CryptoEpoch` object to still be the session's live current
+   epoch AND to be the exact epoch object the `PATH_RESPONSE`
+   authenticated under. A pending (not-yet-committed) or retiring
+   (already-superseded) epoch can never authorize a path change --
+   enforced redundantly, at the pre-crypto message-type gate, the
+   off-path epoch-role gate, and the commit-time epoch-identity checks.
+3. **Replay domain is per epoch, not per path.** See 11.1 point 7 --
+   unchanged and re-verified adversarially: a previously-admitted nonce
+   stays rejected from every source path (active, candidate, retired, or
+   an entirely unrelated address), and migration commit never resets or
+   forks the ledger.
+4. **Outer-header/source rewrite only ever proposes a candidate.**
+   Authenticated ciphertext/AAD cannot be forged or altered by an
+   attacker; the only thing a changed outer source address can do is
+   arrive as a new candidate observation, which never gains authority
+   without a matching, exact return-routability proof from that same
+   address.
+5. **Candidate state is strictly one-slot bounded.** At most one live
+   `CandidatePath` per session at all times, regardless of replacement
+   rate; no address/token/deadline history, no candidate-deadline heap,
+   no per-transition timer. Retained migration state is `O(number of live
+   sessions)`, never `O(total migration attempts or replacements)`.
+6. **Stale token/generation/address responses fail closed.** A
+   `PATH_RESPONSE` must match the live candidate's exact address, exact
+   constant-time token, and exact `path_generation`; any mismatch is
+   rejected without mutating the candidate (no deadline refresh, no
+   promotion) and without a reply.
+7. **Cross-listener locator/session isolation.** Session identity is
+   `(endpoint_token, session_locator)`; colliding raw locator bytes
+   across two different endpoint tokens (two listener namespaces sharing
+   one `SecureState`) never select each other's session.
+8. **Source policy precedes migration authority.** The configured
+   `allow_from`/network policy is the first check on every inbound
+   datagram, before any parsing, decrypt, or state work, uniformly for
+   ordinary DATA, `PATH_RESPONSE`, and refresh controls alike.
+9. **Anti-amplification.** Unknown locator, source-policy denial, failed
+   AEAD, replay, and any rejected/stale/invalid migration response all
+   produce zero response datagrams. A legitimate new or replacing
+   candidate observation produces at most one `PATH_CHALLENGE`; duplicate
+   traffic on an already-live candidate produces none.
+10. **No payload/address/token history buffering.** Migration carries no
+    payload queue, no address history, and no token history -- only the
+    single live candidate/retired records already documented in 11.1.
+11. **Migration does not affect session-created/replaced accounting.**
+    Candidate open/replace/expire, migration commit, and retired-path
+    admission never increment `sessions_created`, `sessions_replaced`,
+    `pending_sessions_created`, or `pending_sessions_promoted`.
+12. **Migration counters.** `path_candidates_opened` increments on every
+    successful candidate install (a fresh open OR a replacement);
+    `path_candidates_replaced` is the strict subset of those installs
+    that displaced an existing live candidate; `path_candidates_expired`
+    and `retired_paths_expired` increment when a live record crosses its
+    deadline and is discarded; `path_migrations_committed` increments
+    exactly once per successful atomic active-path commit (this already
+    is the "a response was accepted" counter -- there is no separate
+    `migration_responses_accepted`). Three counters are new in this
+    round: `migration_challenges_sent` increments only when a
+    `PATH_CHALLENGE` datagram is actually handed successfully to the
+    transport's send boundary (a send failure is not counted, and
+    propagates to the caller's general error handling instead);
+    `migration_invalid_responses` increments once for a `PATH_RESPONSE`
+    that reached authoritative validation but did not match the live
+    candidate's address/token/generation/epoch authority (never for a
+    nonce replay or exhaustion, which keep their own existing counters);
+    `retired_path_packets_admitted` increments exactly when a packet is
+    authoritatively admitted from a still-live retired path (never for
+    already-expired retired traffic).
+
 ## 12. Routing snapshot boundary
 
 Routing configuration, `RouteDefinition.to`, route errors, status, control
