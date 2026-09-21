@@ -6,6 +6,24 @@ still change public APIs and configuration behavior as the project matures.
 
 ## [Unreleased]
 
+### Added
+
+- UDPSEC sessions now tolerate the station's externally observed UDP
+  source address changing during an active session — for example, a
+  mobile/cellular station moving between towers or NAT mappings — without
+  dropping the connection or requiring a new authenticated handshake. The
+  server authenticates the new address through a bounded
+  challenge/response exchange before treating it as authoritative, and
+  the whole exchange rides on the existing session's own encryption key
+  and replay protection; a station that never changes address sees no
+  behavioral difference. This has been validated end to end, including
+  its interaction with the existing in-session key-refresh feature and
+  with multi-part AIS sentence reassembly across an address change, using
+  a test harness that drives the real client and server network loops
+  together. Adds `migration_challenges_sent`, `migration_invalid_responses`,
+  and `retired_path_packets_admitted` to the local secure-state runtime
+  statistics for observability into this new behavior.
+
 ### Changed
 
 - Normalizes deployment, operational, package, security, CLI/help, and

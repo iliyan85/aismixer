@@ -1961,6 +1961,101 @@ history-scaled state.
     authoritatively admitted from a still-live retired path (never for
     already-expired retired traffic).
 
+### 11.3 End-to-end mobile-path continuity (Major Prompt 8)
+
+Everything above (11, 11.1, 11.2) is proven at the unit/integration level,
+against `SecureState`/`_secure_server_loop` directly or through the
+scripted client-loop harness. This section is the closing, end-to-end
+statement: the same guarantees hold when the REAL `nmea_sproxy.forward_loop()`
+client and the REAL `aismixer_secure._secure_server_loop()` server are
+driven together through actual wire packets across a simulated NAT/CGNAT
+path change, exactly as a real mobile station experiences it.
+
+1. **One continuous logical session survives an external address
+   change.** A single authenticated `nmea_sproxy` client, talking through
+   one logical socket, keeps the SAME server-side `LogicalSession` object
+   -- same `session_locator`, `session_handle`, `assembly_namespace`,
+   `station_id`, and `created_at` -- before, during, and after its
+   externally observed source tuple changes from A to B. `sessions_created`
+   and `sessions_replaced` never move because of a path change alone.
+2. **Cryptographic continuity survives the path change.** The active
+   `CryptoEpoch` object (and its generation) is unaffected by path
+   migration alone; an epoch only changes when a genuinely independent
+   in-session refresh commits, never as a side effect of a candidate
+   opening, a challenge/response exchange, or a commit.
+3. **Replay-ledger continuity survives the path change.** The exact same
+   per-epoch nonce ledger object keeps rejecting a previously-admitted
+   nonce after migration, regardless of which address (old, new, or a
+   third, unrelated one) it is replayed from.
+4. **Multipart assembly continuity survives the path change.** Two
+   fragments of one AIVDM multipart group -- one forwarded while the
+   active path was still A, the other after the same session's active
+   path became B -- key into the assembler under the identical
+   `udpsec-assembly:<assembly_namespace.hex()>` string and complete as one
+   group, because grouping is owned by the unchanged `LogicalSession`, not
+   by any one path.
+5. **The new path becomes authoritative only after bounded, authenticated
+   return-routability validation**, end to end through the real wire
+   choreography: an off-path observation opens at most one candidate and
+   draws at most one `PATH_CHALLENGE`; only a matching, current-epoch,
+   correctly source-addressed `PATH_RESPONSE` commits the candidate as
+   `active_path`, retiring the previous active path with a bounded grace
+   window. A lost `PATH_CHALLENGE`, lost `PATH_RESPONSE`, or lost
+   `PATH_ACK` each recover through the protocol's own existing mechanisms
+   (a fresh off-path observation re-opens/re-challenges; the server's own
+   commit is unaffected by whether its ACK is ever delivered) -- never
+   through any retry/history state added by this closure.
+6. **Rapid, repeated mobility stays strictly one-candidate/one-retired
+   bounded.** A -> B -> C in quick succession never accumulates a
+   candidate queue or an address history; each new candidate observation
+   replaces whatever candidate slot is already held, `path_generation` is
+   strictly monotonic across the replacements, and `current_candidate_paths`
+   / `current_retired_paths` never exceed 1.
+7. **Migration and an outstanding keepalive ping compose correctly (H1).**
+   A migration's return-routability proof captures whichever ping is
+   genuinely outstanding at the moment the matching `PATH_RESPONSE` is
+   sent; a successful `PATH_ACK` clears exactly that captured sequence
+   without resetting or perturbing the ordinary keepalive cadence.
+8. **A proof that captured no outstanding ping never fabricates
+   liveness (H2).** When a candidate's `PATH_RESPONSE` is sent with no
+   ping outstanding, its captured sequence is `None`; a later `PATH_ACK`
+   matching that proof is valid migration evidence but confers no
+   ping-clearing authority, so a ping that becomes due afterward is a
+   genuinely new one and is never silently cleared by the earlier ACK.
+9. **Migration and in-session epoch refresh are fully decoupled
+   transactions.** A migration completing immediately before a planned
+   refresh, or while a refresh transaction is genuinely still pending
+   (its `REFRESH_CONFIRM` undelivered), never blocks, corrupts, or
+   silently completes the other: refresh state (`pending_epoch`,
+   `transaction_id`, `deadline`) is untouched by a concurrent path commit,
+   and a stuck refresh's own retry -- excluded from off-path admission by
+   design (11's message-type gate) -- resolves independently once its
+   path is the active one, with no cross-transaction side effect either
+   way.
+10. **A stale, epoch-bound candidate cannot outlive its epoch.** A
+    candidate opened and left unanswered under epoch E1 confers no
+    authority once an independent refresh commits E2 as current: the
+    stale candidate's own epoch binding no longer satisfies the
+    current-epoch requirement, and a fresh, genuine mobility event is
+    proven to open and commit its own clean candidate under E2,
+    unaffected by the abandoned E1 incarnation.
+11. **No hidden re-handshake.** Across every scenario in this section, no
+    `ClientHello`/`ServerHello` byte pattern ever appears on the simulated
+    wire in either direction after the initial confirmed session is
+    established, and `sessions_created`, `sessions_replaced`,
+    `pending_sessions_created`, and `pending_sessions_promoted` stay fixed
+    -- migration and refresh are both provably in-session transactions,
+    never a disguised reconnect.
+12. **End-to-end migration counter semantics have no double counting.**
+    Observed strictly through the real wire exchange, `path_candidates_opened`,
+    `migration_challenges_sent`, and `path_migrations_committed` each move
+    by exactly one per genuine candidate/challenge/commit; a spurious
+    `PATH_RESPONSE` with no live candidate behind it increments only
+    `migration_invalid_responses`; a genuinely late, honest packet on a
+    still-live retired path increments only `retired_path_packets_admitted`;
+    and none of this ever perturbs `sessions_created`, `sessions_replaced`,
+    or the other ordinary session-lifecycle counters.
+
 ## 12. Routing snapshot boundary
 
 Routing configuration, `RouteDefinition.to`, route errors, status, control
