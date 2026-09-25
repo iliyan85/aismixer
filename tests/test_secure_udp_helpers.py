@@ -1429,11 +1429,17 @@ def test_secure_server_replies_with_encrypted_pong_for_valid_ping(monkeypatch):
             secure.build_data_aad(response_locator, 0),
         )
     assert response_addr == addr
+    # Field diagnostics (see BEHAVIORAL_CONTRACT.md's field-diagnostics
+    # addendum): an admitted PING's PONG additively carries the exact
+    # inbound recvfrom() source and the session's current
+    # active_path_generation (0 -- no migration has committed yet).
     assert pong == {
         "type": "pong",
         "seq": 123,
         "timestamp": 2020,
         "source_id": "boat_001",
+        "observed_endpoint": {"ip": "127.0.0.1", "port": 50123},
+        "active_path_generation": 0,
     }
     assert session.last_seen == 1010.0
     assert stats.sessions_touched == 1
@@ -8332,6 +8338,11 @@ def test_d66_valid_confirmation_promotes_and_sends_directional_pong(
     assert len(fake_socket.sent) == 1
     response_packet, response_addr = fake_socket.sent[0]
     assert response_addr == addr
+    # Field diagnostics (see BEHAVIORAL_CONTRACT.md's field-diagnostics
+    # addendum): the seq=0 confirmation PONG additively carries the same
+    # observed-endpoint/active_path_generation diagnostics as an ordinary
+    # PONG -- active_path_generation is 0 since this LogicalSession was
+    # just confirmed and has never migrated.
     assert _d66_decrypt_json(
         secure,
         response_packet,
@@ -8341,6 +8352,8 @@ def test_d66_valid_confirmation_promotes_and_sends_directional_pong(
         "seq": secure.SESSION_CONFIRMATION_SEQUENCE,
         "timestamp": 1001,
         "source_id": "boat_001",
+        "observed_endpoint": {"ip": "127.0.0.1", "port": 51070},
+        "active_path_generation": 0,
     }
     with pytest.raises(InvalidTag):
         _d66_decrypt_json(

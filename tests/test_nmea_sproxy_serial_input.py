@@ -857,7 +857,15 @@ def test_forward_loop_prints_sparse_heartbeat_with_session_state(
     assert captured.out.count("Runtime:") == 1
     assert "input=udp output=udpsec" in captured.out
     assert "forwarded=1 messages" in captured.out
-    assert "session=up" in captured.out
+    # Field diagnostics (see BEHAVIORAL_CONTRACT.md's field-diagnostics
+    # addendum): the old low-information "session=up/down" suffix is
+    # replaced by a short locator label, epoch, real peer-liveness state,
+    # and an observed-endpoint display ("unknown" here -- this fake
+    # session/server never sent any diagnostics).
+    assert "session=03030303" in captured.out
+    assert "epoch=0" in captured.out
+    assert "peer=alive" in captured.out
+    assert "observed=unknown" in captured.out
 
 
 def test_forward_loop_stats_persist_across_successive_sessions(monkeypatch):

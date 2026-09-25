@@ -1270,8 +1270,44 @@ async def main(
                                     )
                         _load_secure_state().close(shutdown_now)
 
-def _raise_keyboard_interrupt_for_sigterm(_signum, _frame):
+def _raise_keyboard_interrupt():
     raise KeyboardInterrupt
+
+
+# The running event loop that already has a SIGTERM KeyboardInterrupt
+# scheduled (see `_raise_keyboard_interrupt_for_sigterm`).
+_sigterm_interrupt_loop = None
+
+
+def _raise_keyboard_interrupt_for_sigterm(_signum, _frame):
+    """Turn SIGTERM into KeyboardInterrupt -- raised only where it is safe.
+
+    CPython runs this on the main thread between two arbitrary bytecodes.
+    Raising there can abandon any lock or half-done state transition the
+    interrupted code was in -- e.g. inside `threading.Condition.__enter__`
+    after its lock was acquired, or inside asyncio's own bookkeeping -- and
+    shutdown can then hang on it. So while an event loop is running on this
+    thread (the service's, from `asyncio.run(main())`), the handler raises
+    nothing here: it schedules the KeyboardInterrupt as a loop callback,
+    once per loop. The loop raises it between two callbacks, where no task
+    step, lock or transition is in progress, and `asyncio.run()` then tears
+    down exactly as before: every task is cancelled at its await point, the
+    service's `finally` cleanup runs, and the KeyboardInterrupt propagates
+    out of `run_service()`. Scheduling also wakes a loop idle in its
+    selector, so delivery waits at most for the callback now running. A
+    repeated SIGTERM on the same loop schedules nothing more, so it cannot
+    cut that cleanup short.
+
+    With no running loop (before the service loop starts or after it
+    stops, when no service code runs) it raises immediately, as before."""
+    global _sigterm_interrupt_loop
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        raise KeyboardInterrupt from None
+    if loop is not _sigterm_interrupt_loop:
+        _sigterm_interrupt_loop = loop
+        loop.call_soon_threadsafe(_raise_keyboard_interrupt)
 
 
 def run_service():

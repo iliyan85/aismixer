@@ -1711,13 +1711,17 @@ liveness evidence -- is the next subsection.
 
 ### Client-side path-migration choreography (`nmea_sproxy`)
 
-`nmea_sproxy` never decides to migrate, never tracks a candidate the way
-the server does, and never learns its own apparent address -- but it is
-not stateless: it owns one small, bounded, O(1) piece of per-session proof
-state (`_ClientPathMigration`), separate from and independent of session
-age, refresh scheduling, and the normal keepalive clock, that exists
-specifically so a PATH_ACK can only ever be recognised against a
-PATH_CHALLENGE this exact client actually observed and answered.
+`nmea_sproxy` never decides to migrate and never tracks a candidate the way
+the server does. It does receive the server-observed public IP address and
+UDP port of its own traffic -- the `observed_endpoint` in authenticated
+confirmation and ordinary PONGs (11.4) -- but only as display data: it
+cannot initiate or decide a server-side migration from it, and no
+diagnostic value ever controls admission, liveness, epoch, timeout, or path
+authorization. Nor is it stateless: it owns one small, bounded, O(1) piece
+of per-session proof state (`_ClientPathMigration`), separate from and
+independent of session age, refresh scheduling, and the normal keepalive
+clock, that exists specifically so a PATH_ACK can only ever be recognised
+against a PATH_CHALLENGE this exact client actually observed and answered.
 
 That state is a greatest-observed-challenge-generation watermark
 (`path_generation` plus its `challenge_token`), which persists for the
@@ -2055,6 +2059,148 @@ path change, exactly as a real mobile station experiences it.
     still-live retired path increments only `retired_path_packets_admitted`;
     and none of this ever perturbs `sessions_created`, `sessions_replaced`,
     or the other ordinary session-lifecycle counters.
+
+### 11.4 UDPSEC field diagnostics (field-diagnostics addendum)
+
+Observability only, for watching real mobile path behaviour in the field.
+Nothing here selects a path, proves return routability, admits a nonce,
+decides liveness, changes an epoch or a deadline, adds a packet type, or
+changes the wire version: every item below displays or logs decisions
+already made under 11-11.3. These diagnostics do not by themselves fix any
+connectivity failure.
+
+Three different numbers must not be confused:
+
+- a candidate's `path_generation` (11): the per-session candidate
+  incarnation counter carried in `PATH_CHALLENGE`/`PATH_RESPONSE`/
+  `PATH_ACK`; it advances on every candidate open or replacement,
+  including candidates that expire without committing;
+- `active_path_generation`: the `path_generation` of the candidate that
+  last WON a commit for this `LogicalSession` -- `0` until the first
+  commit. A new full handshake starts a new session at `0`; an in-session
+  epoch refresh leaves it unchanged;
+- the cryptographic epoch generation (the client's `epoch=`): the traffic-
+  key generation of "In-session authenticated epoch refresh", unrelated to
+  either.
+
+1. **PONG diagnostic members (server).** Every authenticated PONG -- the
+   confirmation PONG (`seq` 0) and each ordinary PONG -- carries two
+   optional, additive members inside its authenticated ciphertext:
+   `observed_endpoint` `{"ip": <canonical IPv4/IPv6 text>, "port": <int>}`,
+   the exact `recvfrom()` source of the admitted PING it answers
+   (normalized by the same helper used for path identity, so IPv6
+   flowinfo/scope is never mistaken for the port), and
+   `active_path_generation` as defined above. If that source cannot be
+   represented safely, both are omitted and the PONG is otherwise
+   unchanged. No new message, frame, reply, or round trip; PONG
+   destinations and epochs are unchanged (11), so `observed_endpoint` may
+   name a different address than the one the PONG is sent to.
+2. **Client validation and acceptance (`nmea_sproxy`).** The members are
+   read only from a PONG the client already accepted under the ordinary
+   criteria (pinned server address, current locator, authenticated
+   decrypt under an allowed epoch, expected ping sequence) or from the
+   handshake's confirmation PONG. A malformed, out-of-range, or absent
+   member is treated as absent (`ip` must be a valid address string,
+   `port` an integer 0-65535, `active_path_generation` an integer
+   0-2^32-1) and never raises or gains authority. Per confirmed session the
+   client keeps one accepted observation (endpoint, its generation,
+   receipt time) and a generation floor:
+   - a generation-aware observation is accepted only at or above both the
+     floor and the last accepted generation (equal refreshes it; lower is
+     stale and ignored), so a late PONG never rolls the display back;
+   - an unversioned observation (endpoint without a generation, e.g. from
+     an older server) is accepted only while nothing generation-aware has
+     been accepted and the floor is still 0;
+   - the floor rises to a `PATH_ACK`'s `path_generation` only after that
+     ACK passed the forward loop's final admission, and never falls; an
+     observation below the floor stays displayed but marked `last-known`
+     until a PONG at or above the floor arrives;
+   - the confirmation PONG seeds the first observation, so generation 0
+     is visible on the first heartbeat;
+   - the state is created per confirmed session: a full re-handshake
+     starts it empty; an in-session epoch refresh leaves it untouched.
+3. **Client status line.** The sparse heartbeat (every 60 s, independent
+   of traffic rate) prints, for UDPSEC output,
+   `session=<8-hex locator label> epoch=<E> peer=alive|dead
+   observed=<endpoint> path_gen=<G> [last-known] [age=<N>s]`.
+   `observed` uses `ipv4:port` / `ipv6.port`. `path_gen` is the
+   `active_path_generation` of the SAME accepted PONG as `observed` and
+   shares its `last-known` marker. `age` counts seconds on the client's
+   monotonic clock (never server time): for an ordinary PONG, from when
+   the client accepted that PONG; for the confirmation PONG seeded into a
+   new session's display, from when `forward_loop()` began for that
+   session, which can be later than the confirmation PONG's actual
+   receipt. With no observation the line ends
+   `observed=unknown path_gen=unknown`; an
+   unversioned observation shows `path_gen=unknown` -- never a default 0,
+   never the floor, never a candidate's generation. `peer` is the local
+   `peer_timeout` state, not a server confirmation. Plain-UDP output
+   prints no session suffix, as before. Across a migration A -> B, for
+   example: `observed=192.0.2.10:41000 path_gen=0 age=4s`, then (ACK
+   admitted, no newer PONG yet) `observed=192.0.2.10:41000 path_gen=0
+   last-known age=7s`, then `observed=198.51.100.20:42000 path_gen=1
+   age=3s`.
+4. **Version compatibility.** An older server sends neither member: the
+   client shows `observed=unknown path_gen=unknown`. An older client
+   ignores the additive members (its PONG matching tolerates them).
+5. **Server migration-lifecycle log lines.** Each real transition --
+   candidate `OPENED`/`REPLACED`/`EXPIRED`, retired path `EXPIRED`,
+   migration `COMMITTED` -- enqueues exactly one immutable diagnostic
+   snapshot; if it is delivered, it becomes one line such as
+   `[+] Path migration COMMITTED for <station> session=<8 hex>
+   old=<endpoint> new=<endpoint> generation=<G>`, never containing keys,
+   nonces, tokens, or signatures. The enqueue is O(1), inside the
+   transition's own locked decision: no formatting, sink/stdout I/O,
+   wait on output, or aggregate session scan on the packet path. Each
+   `SecureState` owner has one bounded queue (256 events; on overflow the
+   oldest is dropped and counted) and at most one live consumer thread,
+   started and stopped by the owner's maintenance task, which formats and
+   writes the lines straight to the stdout file descriptor, making at most
+   3 write attempts per event on `OSError`. A worker whose start or exit
+   cannot be proven is kept, never replaced (diagnostics then stay off for
+   that owner). Stopping is bounded (1 s, with a 0.5 s best-effort flush);
+   closing the owner is terminal. Delivery is best-effort, not
+   exactly-once: a queued event can be evicted on overflow, fail
+   terminally after its bounded write attempts (or at once on any other
+   error) and be counted undeliverable, or be discarded as still queued
+   when the owner stops or closes. The accounting
+   `published == delivered + dropped_overflow + undeliverable +
+   dropped_on_shutdown + queued + in_flight` is exact, but an interrupted
+   write can be counted undeliverable although it was written.
+   `flush()` is a test hook, never called by the service; it consumes only
+   as the sole consumer (never beside a worker or another flush).
+6. **Handshake noise.** During a handshake, a delayed DATA datagram of an
+   earlier session arriving from the pinned server address is skipped
+   silently, still within the same handshake deadline; a malformed
+   ServerHello-shaped datagram still warns and fails closed.
+7. **Server SIGTERM delivery (`aismixer`).** A single ordinary SIGTERM
+   arriving while the asyncio service loop is running is not raised where
+   it lands: aismixer's handler schedules one KeyboardInterrupt as a loop
+   callback, raised between two callbacks -- never inside a lock or state
+   transition of diagnostics, packet processing, or asyncio.
+   `asyncio.run()` then cancels every task at its await point, the normal
+   shutdown cleanup runs (listener close messages as described in 11,
+   `SecureState.close()`), and `run_service()` still ends in
+   KeyboardInterrupt. Scheduling also wakes an idle loop, so delivery
+   waits at most for the callback now running. A repeated SIGTERM while
+   THAT SAME loop is still running schedules no extra callback. Whenever
+   no loop is running -- before the service loop starts, after it stops,
+   and in the narrow gaps of `asyncio.run()`'s own teardown between its
+   loop runs (for example after the first KeyboardInterrupt has left the
+   loop and before task cancellation starts running) -- the handler
+   raises immediately, as before, so a repeated SIGTERM landing in such a
+   gap can interrupt the cleanup and skip `main()`'s `finally`. This gap
+   was reproduced with a substituted `main()`, not in a complete
+   real-`main()` process. Only a single SIGTERM is covered: repeated
+   SIGTERM, or a double Ctrl+C, is not promised safe across the whole
+   `asyncio.run()` lifetime. Also not solved: a callback that blocks
+   indefinitely (e.g. a write into a full stdout pipe) delays delivery
+   until it returns, and the service manager's stop timeout/SIGKILL
+   remains the bound; a second Ctrl+C under `asyncio.run()`, or any other
+   handler that raises, can still interrupt arbitrary code (measured on
+   Windows CPython 3.14, it can then leave even a plain lock held); a
+   stuck shutdown needs SIGKILL. `nmea_sproxy` keeps its own SIGTERM
+   handler, which still raises KeyboardInterrupt immediately.
 
 ## 12. Routing snapshot boundary
 

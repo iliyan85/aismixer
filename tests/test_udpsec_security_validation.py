@@ -3282,6 +3282,10 @@ def test_session_state_retains_only_directional_cipher_contexts(
         "candidate_path",
         "retired_path",
         "path_generation",
+        # Field-diagnostics addendum (see BEHAVIORAL_CONTRACT.md): the
+        # committed-migration generation label, diagnostic/display-only --
+        # never path selection, proof, replay, TTL, or eligibility state.
+        "active_path_generation",
     }
     forbidden_field_fragments = {
         "ephemeral",

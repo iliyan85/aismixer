@@ -4,6 +4,7 @@ from pathlib import Path
 import socket
 import yaml
 import os
+import ipaddress
 import math
 import signal
 import time
@@ -96,6 +97,7 @@ from core.udpsec_protocol import (  # noqa: E402
     DATA_PREFIX,
     ESTABLISHMENT_EPOCH_GENERATION,
     MAX_EPOCH_GENERATION,
+    MAX_PATH_GENERATION,
     PATH_ACK_TYPE,
     PATH_CHALLENGE_TYPE,
     REFRESH_ACK_TYPE,
@@ -684,10 +686,22 @@ class ConfirmedUdpsecSession:
 
     The locator is a process-local lookup hint bound into every DATA
     packet's AEAD associated data -- it is not itself credential material,
-    so it is kept named and typed distinctly from `SessionKeyMaterial`."""
+    so it is kept named and typed distinctly from `SessionKeyMaterial`.
+
+    `observed_endpoint`/`active_path_generation` are the optional
+    field-diagnostics this exact confirmation PONG (seq=0) carried, if
+    any (see BEHAVIORAL_CONTRACT.md's field-diagnostics addendum and
+    `_ClientObservedEndpoint`): `None` for either means the server did not
+    include diagnostics (an old server, or a malformed/omitted member),
+    never that the observed address is somehow known-absent. Display-only
+    -- `forward_loop` seeds `_ClientObservedEndpoint` from these so the
+    confirmation-time observation is not silently discarded, but neither
+    field ever participates in liveness or migration decisions."""
 
     session_locator: bytes
     key_material: SessionKeyMaterial
+    observed_endpoint: object = None
+    active_path_generation: object = None
 
 
 class _ClientEpochSet:
@@ -1392,6 +1406,189 @@ class _ClientPathMigration:
         return proof.ping_seq_at_response
 
 
+class _ClientObservedEndpoint:
+    """Client-side O(1) anti-stale view of the server's last authenticated
+    report of this station's `observed_endpoint`/`active_path_generation`
+    (see BEHAVIORAL_CONTRACT.md's field-diagnostics addendum). Diagnostic/
+    display state only: it never participates in liveness, migration, or
+    session-lifecycle decisions -- only `_ClientPathMigration` and the
+    ordinary pong/ack checks in `forward_loop` do that.
+
+    A fresh instance is created once per confirmed session (exactly like
+    `_ClientPathMigration`), so it never survives a full re-handshake; it
+    is untouched by an in-session `CryptoEpoch` refresh, so it survives
+    one exactly like `_ClientPathMigration`'s watermark does.
+
+    `observe_pong` admits an endpoint only from a PONG the caller has
+    ALREADY accepted under the ordinary liveness criteria (pinned address,
+    current locator, authenticated decrypt under an allowed epoch,
+    matching expected ping sequence). `raise_floor` is called only after a
+    PATH_ACK has passed the forward-loop's full final terminal-deadline
+    admission -- never merely on parsing or matching a proof -- so a
+    failed/expired/stale ACK never gains diagnostic authority either."""
+
+    __slots__ = (
+        "_endpoint",
+        "_generation",
+        "_generation_aware",
+        "_observed_at",
+        "_floor",
+        "_last_known",
+    )
+
+    def __init__(self):
+        self._endpoint = None
+        self._generation = 0
+        self._generation_aware = False
+        self._observed_at = None
+        self._floor = 0
+        self._last_known = False
+
+    def observe_pong(self, endpoint, generation, now):
+        """Admit one already-authenticated PONG's optional diagnostics.
+
+        `generation` is `None` for a PONG with no (or an invalid)
+        `active_path_generation` member -- an unversioned observation can
+        fill an otherwise-unknown display ONLY while the diagnostic floor
+        is still zero (no PATH_ACK has ever been finally admitted for this
+        session) AND no generation-aware observation has been accepted yet.
+        Once EITHER of those has happened, an unversioned PONG carries no
+        proof it postdates the known migration, so it is rejected outright
+        -- endpoint, observed-at timestamp, last-known flag, accepted
+        generation, and floor are all left exactly as they were. This is
+        what stops a late/duplicate unversioned observation from an old-
+        style server (or a legitimate one on an old code path) from
+        silently clearing a correct 'last-known' marker after a real
+        migration the floor has already recorded. A generation-aware
+        observation is accepted only at or above both the floor and the
+        last accepted generation (equal refreshes; lower is stale and
+        rejected) -- so a late, out-of-order PONG from before a committed
+        migration can never roll the display back."""
+        if endpoint is None:
+            return
+        if generation is None:
+            if self._generation_aware or self._floor > 0:
+                return
+            self._endpoint = endpoint
+            self._observed_at = now
+            self._last_known = False
+            return
+        if generation < self._floor:
+            return
+        if self._generation_aware and generation < self._generation:
+            return
+        self._endpoint = endpoint
+        self._generation = generation
+        self._generation_aware = True
+        self._observed_at = now
+        self._last_known = False
+
+    def raise_floor(self, generation):
+        """Raise the diagnostic minimum accepted generation to a PATH_ACK's
+        acknowledged `path_generation`, and mark any existing observation
+        predating it 'last-known' until a matching/newer authenticated
+        PONG arrives. The floor itself never moves backwards."""
+        if generation is None or generation <= self._floor:
+            return
+        self._floor = generation
+        if self._endpoint is not None and (
+            not self._generation_aware or self._generation < generation
+        ):
+            self._last_known = True
+
+    def display(self, now):
+        """Return `(endpoint_or_None, age_seconds_or_None, last_known)` for
+        the sparse heartbeat. Age is measured from the monotonic receipt
+        time recorded by `observe_pong`, never the sender's wall clock --
+        the client cannot know the server's CURRENT public tuple once a
+        PATH_ACK or all newer PONGs are lost, only how stale its last
+        observation is."""
+        if self._endpoint is None:
+            return (None, None, False)
+        age = None if self._observed_at is None else max(0.0, now - self._observed_at)
+        return (self._endpoint, age, self._last_known)
+
+    def display_path_generation(self):
+        """The `active_path_generation` carried by the SAME accepted PONG
+        whose endpoint `display()` shows (and so sharing its last-known
+        marker), or `None` -- shown as 'unknown' -- when nothing is
+        displayed or that PONG was unversioned (old server). Read-only. It
+        is never the PATH_ACK floor, a candidate's `path_generation`, or a
+        default 0: `observe_pong` sets endpoint and generation together, and
+        an unversioned PONG is admitted only while nothing generation-aware
+        has been."""
+        if self._endpoint is None or not self._generation_aware:
+            return None
+        return self._generation
+
+
+def _parse_pong_diagnostics(message):
+    """Validate and extract one PONG's optional `observed_endpoint`/
+    `active_path_generation` diagnostic members (see
+    BEHAVIORAL_CONTRACT.md's field-diagnostics addendum).
+
+    A malformed, out-of-range, or absent member is simply treated as not
+    present -- these are informational display data only and must never
+    gain authority over the caller's ordinary liveness/migration decisions
+    regardless of content."""
+    endpoint = None
+    raw_endpoint = message.get("observed_endpoint") if isinstance(message, dict) else None
+    if isinstance(raw_endpoint, dict):
+        ip = raw_endpoint.get("ip")
+        port = raw_endpoint.get("port")
+        if isinstance(ip, str) and type(port) is int and 0 <= port <= 65535:
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                ip = None
+            if ip is not None:
+                endpoint = (ip, port)
+
+    generation = None
+    if isinstance(message, dict):
+        raw_generation = message.get("active_path_generation")
+        if type(raw_generation) is int and 0 <= raw_generation <= MAX_PATH_GENERATION:
+            generation = raw_generation
+    return (endpoint, generation)
+
+
+def _extract_pong_diagnostics(data, key, session_locator, epoch_generation):
+    """Best-effort re-extraction of a PONG's optional diagnostic members,
+    for a datagram the caller has ALREADY authenticated (via
+    `handle_server_packet`) under this exact key/locator/epoch. Not itself
+    an admission path -- decryption failing here (which should not happen
+    for an already-authenticated datagram) simply yields no diagnostics."""
+    try:
+        message = decrypt_secure_json_message(
+            data, key, session_locator, epoch_generation
+        )
+    except Exception:
+        return (None, None)
+    return _parse_pong_diagnostics(message)
+
+
+def _extract_authenticated_ack_generation(response, epochs):
+    """Best-effort re-extraction of an already-matched PATH_ACK's
+    `path_generation` -- a pre-existing wire field of the migration
+    protocol itself (see BEHAVIORAL_CONTRACT.md's path-migration
+    subsection), not a new diagnostic member -- for use only as the
+    diagnostic generation floor. Not itself an admission path: called only
+    after `_try_handle_path_message` has already classified this exact
+    datagram as `SERVER_PACKET_PATH_MIGRATED` under the session's exact
+    current epoch."""
+    try:
+        message = decrypt_secure_json_message(
+            response,
+            epochs.server_to_client_key,
+            epochs.session_locator,
+            epochs.generation,
+        )
+        ack = parse_path_ack_message(message)
+    except Exception:
+        return None
+    return ack.path_generation
+
+
 def encrypt_message_aes_gcm(plaintext, key, aad):
     iv = os.urandom(12)
     encryptor = Cipher(
@@ -1926,6 +2123,10 @@ def _coerce_input_adapter(local_input, ingress_policy=None):
 
 
 HEARTBEAT_INTERVAL_SECONDS = 60.0
+# Sparse heartbeat display: how many leading hex characters of the current
+# session locator to show as a short, non-secret correlation label (see
+# `print_forwarding_heartbeat`). Never used as actual session identity.
+_SESSION_LABEL_HEX_LENGTH = 8
 
 
 class ForwardingStats:
@@ -1989,11 +2190,40 @@ def _format_bytes_compact(byte_count):
     return f"{value:.2f}TiB"
 
 
-def print_forwarding_heartbeat(input_adapter, output_label, stats, *, session_up=None):
+def print_forwarding_heartbeat(
+    input_adapter,
+    output_label,
+    stats,
+    *,
+    session_up=None,
+    session_locator=None,
+    epoch_generation=None,
+    observed_endpoint=None,
+    observed_age=None,
+    observed_last_known=False,
+    observed_path_generation=None,
+):
     """Print a sparse, traffic-rate-independent forwarding summary.
 
-    Sourced entirely from existing adapter/stats state; performs no
-    separate accounting of its own.
+    Sourced entirely from existing adapter/stats state plus (for UDPSEC)
+    the caller's already-computed session/liveness/diagnostic values --
+    performs no separate accounting or protocol decisions of its own.
+
+    ``session_up`` continues to mean exactly what it always has: whether
+    the local ``peer_timeout`` deadline has not yet expired, never that
+    the server has independently confirmed real-time reachability. It
+    gates the whole UDPSEC status suffix (``None`` -- the plain-UDP output
+    case -- prints no suffix at all, exactly as before). ``session_locator``
+    renders as a short non-secret display prefix only, never as identity.
+    ``observed_endpoint`` is an optional ``(ip, port)`` tuple rendered via
+    the shared ``ipv4:port`` / ``ipv6.port`` display convention
+    (`core.endpoint_display.format_endpoint`); ``None`` prints
+    ``observed=unknown``. ``observed_path_generation`` is that same
+    observation's server-reported ``active_path_generation`` (the last
+    committed path migration, 0 before any), printed as ``path_gen=N``
+    right after it and covered by the same ``last-known`` marker; ``None``
+    prints ``path_gen=unknown``, never 0. It is unrelated to ``epoch=``,
+    the traffic-key generation.
     """
     input_label = "serial" if isinstance(input_adapter, SerialInputAdapter) else "udp"
     line = (
@@ -2002,7 +2232,25 @@ def print_forwarding_heartbeat(input_adapter, output_label, stats, *, session_up
         f"{_format_bytes_compact(stats.bytes)}"
     )
     if session_up is not None:
-        line += f" session={'up' if session_up else 'down'}"
+        if session_locator is not None:
+            line += f" session={session_locator.hex()[:_SESSION_LABEL_HEX_LENGTH]}"
+        if epoch_generation is not None:
+            line += f" epoch={epoch_generation}"
+        line += f" peer={'alive' if session_up else 'dead'}"
+        path_generation = (
+            "unknown" if observed_path_generation is None else observed_path_generation
+        )
+        if observed_endpoint is not None:
+            line += (
+                f" observed={format_endpoint(observed_endpoint[0], observed_endpoint[1])}"
+                f" path_gen={path_generation}"
+            )
+            if observed_last_known:
+                line += " last-known"
+            if observed_age is not None:
+                line += f" age={int(observed_age)}s"
+        else:
+            line += " observed=unknown path_gen=unknown"
     print(line)
 
 
@@ -2157,6 +2405,18 @@ def perform_handshake(
             if not remote_addresses_match(addr, remote_addr):
                 continue
 
+            if response.startswith(DATA_PREFIX):
+                # A delayed encrypted DATA datagram from an old session
+                # (this socket is reused across handshakes) arriving from
+                # the pinned server address is definitely not
+                # ServerHello-shaped -- skip it silently rather than
+                # invoking full ServerHello parsing and printing a
+                # misleading "invalid format" warning. Still bounded by
+                # the SAME fixed handshake deadline; a genuinely malformed
+                # ServerHello-shaped packet still falls through to the
+                # warning below.
+                continue
+
             try:
                 server_hello = parse_server_hello_packet(response)
                 server_ephemeral_public_key = parse_ephemeral_public_key(
@@ -2273,9 +2533,17 @@ def perform_handshake(
                     return None
 
                 print("Mutual ECDHE session confirmed.")
+                observed_endpoint, active_path_generation = _extract_pong_diagnostics(
+                    confirmation,
+                    session_key_material.server_to_client_key,
+                    session_locator,
+                    ESTABLISHMENT_EPOCH_GENERATION,
+                )
                 return ConfirmedUdpsecSession(
                     session_locator=session_locator,
                     key_material=session_key_material,
+                    observed_endpoint=observed_endpoint,
+                    active_path_generation=active_path_generation,
                 )
     finally:
         if settimeout:
@@ -2324,7 +2592,18 @@ def forward_loop(
             station_private_key, config["station_id"], session_locator
         )
     path_migration = _ClientPathMigration()
+    observed_endpoint = _ClientObservedEndpoint()
     session_started_at = time.monotonic()
+    # Carry the confirmation PONG's (seq=0) diagnostics -- if any -- into
+    # this freshly confirmed session's runtime display rather than
+    # discarding them; `session_started_at` is used as the receipt time
+    # since perform_handshake() does not thread through the exact
+    # monotonic instant it decrypted that confirmation.
+    observed_endpoint.observe_pong(
+        confirmed_session.observed_endpoint,
+        confirmed_session.active_path_generation,
+        session_started_at,
+    )
     last_authenticated_peer = session_started_at
     last_ping_at = session_started_at
     expected_ping_seq = None
@@ -2451,12 +2730,23 @@ def forward_loop(
         drive_refresh()
 
         if stats.is_heartbeat_due(now):
+            display_endpoint, display_age, display_last_known = (
+                observed_endpoint.display(now)
+            )
             print_forwarding_heartbeat(
                 input_adapter,
                 UDPSEC_OUTPUT_TYPE,
                 stats,
                 session_up=(
                     now < last_authenticated_peer + float(config["peer_timeout"])
+                ),
+                session_locator=session_locator,
+                epoch_generation=epochs.generation,
+                observed_endpoint=display_endpoint,
+                observed_age=display_age,
+                observed_last_known=display_last_known,
+                observed_path_generation=(
+                    observed_endpoint.display_path_generation()
                 ),
             )
             stats.reschedule_heartbeat(now)
@@ -2593,6 +2883,12 @@ def forward_loop(
             if result == SERVER_PACKET_AUTHENTICATED:
                 last_authenticated_peer = now
                 expected_ping_seq = None
+                # Diagnostic-only: admit this already-accepted PONG's
+                # optional observed-endpoint/generation members, if any.
+                pong_endpoint, pong_generation = _extract_pong_diagnostics(
+                    response, reply_key, session_locator, reply_generation
+                )
+                observed_endpoint.observe_pong(pong_endpoint, pong_generation, now)
             elif result == SERVER_PACKET_PATH_MIGRATED:
                 # Authenticated proof the server is alive and has committed
                 # this session's path migration, matched against the
@@ -2652,6 +2948,16 @@ def forward_loop(
                 if terminal_reason is not None:
                     return terminal_reason
                 last_authenticated_peer = effect_now
+                # Diagnostic-only: this PATH_ACK has now fully passed the
+                # existing final terminal-deadline admission above (its
+                # real completion effect is already granted), so its
+                # acknowledged path_generation may raise the diagnostic
+                # floor. A parsed-but-not-finally-admitted ACK never
+                # reaches this line (every terminal_reason branch above
+                # returns first).
+                observed_endpoint.raise_floor(
+                    _extract_authenticated_ack_generation(response, epochs)
+                )
                 if (
                     path_ping_seq_to_clear is not None
                     and expected_ping_seq == path_ping_seq_to_clear

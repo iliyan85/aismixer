@@ -5,6 +5,7 @@ import binascii
 import heapq
 import itertools
 import json
+import sys
 import threading
 import time
 import weakref
@@ -142,6 +143,33 @@ RETIRED_PATH_GRACE_SECONDS = 5.0
 # before their memory is reclaimed on a listener that receives no
 # packets at all.
 IDLE_MAINTENANCE_INTERVAL_SECONDS = 30.0
+
+# Field-diagnostics addendum: sparse migration-lifecycle log lines
+# (candidate OPENED/REPLACED/EXPIRED, retired path EXPIRED, migration
+# COMMITTED) never touch stdout on the packet path. Each state transition
+# enqueues one immutable snapshot into a bounded per-owner queue; one
+# off-event-loop consumer thread formats and writes them (see
+# `_MigrationDiagnosticOutput`). Internal constants, not operator config.
+#
+# Hard queue bound, independent of live-session count and traffic history.
+# On overflow the OLDEST queued event is discarded (the most recent
+# migration history is the most useful to an operator) and counted.
+MIGRATION_DIAGNOSTIC_QUEUE_CAPACITY = 256
+# Total write attempts per event for a transient `OSError` (immediate
+# retries, no sleep) before the event is counted undeliverable and dropped.
+MIGRATION_DIAGNOSTIC_WRITE_ATTEMPTS = 3
+# Bounded best-effort flush of still-queued events when the consumer stops,
+# and the bound on how long stopping waits for the consumer thread.
+MIGRATION_DIAGNOSTIC_SHUTDOWN_FLUSH_SECONDS = 0.5
+MIGRATION_DIAGNOSTIC_STOP_JOIN_SECONDS = 1.0
+# Longest an idle consumer sleeps before re-checking its queue and stop
+# flag. A safety net only: every publish() and stop() also wakes it at once;
+# this bounds the effect of a wake-up lost to an interrupted caller.
+MIGRATION_DIAGNOSTIC_IDLE_POLL_SECONDS = 0.5
+# Poll step for the two waits a CALLER thread performs (stop()'s wait for a
+# worker's start proof, and the wait_idle() test hook): see
+# `_MigrationDiagnosticOutput` for why these never wait on a Condition/Event.
+_MIGRATION_DIAGNOSTIC_WAIT_POLL_SECONDS = 0.002
 
 _HANDSHAKE_REPLAY_LABEL = b"HANDSHAKE-REPLAY"
 
@@ -698,6 +726,15 @@ class PathState:
     candidate_path: object = None
     retired_path: object = None
     path_generation: int = 0
+    # Field-diagnostics addendum (see BEHAVIORAL_CONTRACT.md): the
+    # `path_generation` of the candidate that last WON a migration commit,
+    # never the raw candidate-incarnation counter above (which also
+    # advances on a candidate that opens/replaces/expires without ever
+    # committing). `0` means "still the confirmation-time active path, no
+    # migration has ever committed for this exact `LogicalSession`".
+    # Diagnostic/display-only: never read for path selection, proof
+    # validation, replay, TTLs, or migration eligibility.
+    active_path_generation: int = 0
 
 
 @dataclass
@@ -831,6 +868,602 @@ class SecureStateStats:
     current_retiring_epochs: int
     current_candidate_paths: int
     current_retired_paths: int
+
+
+@dataclass(frozen=True)
+class MigrationDiagnosticStats:
+    """O(1) counters for one owner's migration-diagnostic output channel
+    (see `_MigrationDiagnosticOutput`). At every instant
+
+        published == delivered + dropped_overflow + undeliverable
+                     + dropped_on_shutdown + queued + in_flight
+
+    `write_errors` counts failed write ATTEMPTS (a retried event can
+    contribute more than one). `consumer_running` means the worker is alive
+    AND accepting work; `worker_alive` is True for any live worker thread,
+    including one that was asked to stop but is still blocked in a write,
+    and for a worker whose exit is uncertain (it is never reported gone
+    without proof). `worker_starting` is True while a worker is reserved
+    whose start is not yet PROVEN -- e.g. after `Thread.start()` was
+    interrupted by a signal; a native thread may or may not exist.
+    `worker_exit_uncertain` is True while a `join()`/`is_alive()` probe of
+    the reserved worker is in progress or was interrupted; after an
+    interrupted probe (e.g. SIGTERM during `stop()`'s join) it stays True
+    for good and the reservation is never released. `closed` is the
+    terminal state: no worker can ever start again. `flushing` is True while
+    a `flush()` test-hook call owns consumption (no worker can start
+    meanwhile)."""
+
+    published: int
+    delivered: int
+    dropped_overflow: int
+    write_errors: int
+    undeliverable: int
+    dropped_on_shutdown: int
+    queued: int
+    in_flight: int
+    consumer_running: bool
+    worker_alive: bool
+    worker_starting: bool
+    worker_exit_uncertain: bool
+    closed: bool
+    flushing: bool
+
+
+def _write_migration_diagnostic_line(line):
+    """Default diagnostic sink, called only by the consumer thread (or the
+    `flush()` test hook), never by packet processing.
+
+    Writes the complete UTF-8 line straight to the current stdout FILE
+    DESCRIPTOR with `os.write`, bypassing Python's buffered `sys.stdout`
+    object. This matters because a write blocked on a full OS pipe would
+    otherwise HOLD that object's internal buffer lock, which every legacy
+    synchronous `print()` on the event loop must also take -- stalling
+    packet handling even though this worker is off-loop. `fileno()` does
+    not take that lock. The worker may itself block in `os.write`; that
+    blocks only this one worker.
+
+    A stream with no OS descriptor (an in-memory capture, for instance) is
+    written through its own `write()`; such a stream is not Python's
+    fd-backed buffered stdout. Consequence of bypassing the buffer: these
+    lines are not ordered with legacy output still sitting in a buffered
+    `sys.stdout` (production launchers use `python -u`)."""
+    stream = sys.stdout
+    try:
+        fd = stream.fileno()
+    except (AttributeError, ValueError):
+        stream.write(line + "\n")
+        stream.flush()
+        return
+    view = memoryview((line + "\n").encode("utf-8", "backslashreplace"))
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("diagnostic write made no progress")
+        view = view[written:]
+
+
+def _format_migration_diagnostic(event):
+    """Render one queued snapshot. Runs in the consumer, never on the packet
+    path, so a malformed snapshot can only make ITS OWN event undeliverable.
+    Snapshots never contain keys, nonces, challenge tokens, or signatures."""
+    kind = event[0]
+    station_id = event[1]
+    locator_label = event[2].hex()[:8]
+    if kind in ("candidate_opened", "candidate_replaced"):
+        _kind, _station, _locator, active, candidate, generation = event
+        label = "OPENED" if kind == "candidate_opened" else "REPLACED"
+        return (
+            f"[+] Path candidate {label} for {station_id} "
+            f"session={locator_label} "
+            f"active={format_endpoint_tuple(active)} "
+            f"candidate={format_endpoint_tuple(candidate)} "
+            f"generation={generation}"
+        )
+    if kind == "candidate_expired":
+        _kind, _station, _locator, candidate, generation = event
+        return (
+            f"[+] Path candidate EXPIRED for {station_id} "
+            f"session={locator_label} "
+            f"candidate={format_endpoint_tuple(candidate)} "
+            f"generation={generation}"
+        )
+    if kind == "retired_expired":
+        _kind, _station, _locator, retired, generation = event
+        return (
+            f"[+] Retired path EXPIRED for {station_id} "
+            f"session={locator_label} "
+            f"retired={format_endpoint_tuple(retired)} "
+            f"generation={generation}"
+        )
+    if kind == "migration_committed":
+        _kind, _station, _locator, old, new, generation = event
+        return (
+            f"[+] Path migration COMMITTED for {station_id} "
+            f"session={locator_label} "
+            f"old={format_endpoint_tuple(old)} new={format_endpoint_tuple(new)} "
+            f"generation={generation}"
+        )
+    raise ValueError(f"unknown migration diagnostic event kind: {kind!r}")
+
+
+class _MigrationDiagnosticOutput:
+    """Bounded, failure-isolated output channel for one `SecureState`
+    owner's migration-lifecycle diagnostics.
+
+    Producers call `publish()` from inside the exact locked state
+    transition. It is O(1), never formats, never performs I/O, never waits
+    on output, and only takes the queue lock (held by every party solely for
+    O(1) queue/counter/ownership updates, never across a write, a join or a
+    wait). The worker never takes the owner lock, so a slow or broken stdout
+    can neither delay nor raise into packet processing.
+
+    Lifecycle -- at most ONE live worker thread per owner, ever, including
+    a worker that was asked to stop but is still blocked inside a write,
+    and one whose start was interrupted:
+
+        idle --start()--> starting --(start PROVEN)--> running
+        running --stop()--> stopping --(thread exits)--> idle
+        starting --(Thread.start() raised RuntimeError)--> idle
+          any state --close()--> closed (terminal; no worker can start)
+
+    `_worker` is reserved BEFORE `Thread.start()` is called. The start
+    PROOF, `_worker_proven`, is recorded by `start()` once `Thread.start()`
+    has returned, or by the worker itself as the first action of `_run` --
+    both only after Thread's own started flag is set, i.e. once `join()` is
+    permitted and a completed `is_alive()` is exact. Until then,
+    `is_alive()` being False proves nothing: an asynchronous exception can
+    interrupt `Thread.start()` before OR after the native thread was
+    created, and the two are indistinguishable from outside.
+    So an unproven reservation is never joined, never reaped and never
+    replaced; it is released only on `Thread.start()`'s documented
+    creation failure (RuntimeError). A proven worker is reaped only once
+    OBSERVED dead, by the next `start()`/`stop()`. A stop that times out
+    keeps ownership. The worker never clears `_worker` itself, so a
+    late-exiting thread cannot erase a newer one (and no newer one can
+    exist while it lives).
+
+    Death is observed only through a COMPLETED probe. On CPython 3.12,
+    `Thread.join()`/`is_alive()` interrupted by a signal handler's
+    exception can mark a still-running thread stopped for good (its
+    bpo-45274 handler releases the live thread's own state lock), after
+    which `is_alive()` is False while the native thread runs on. So every
+    probe of the reserved worker raises `_thread_probes` BEFORE the call
+    and lowers it only after the call returns normally: an interrupted
+    probe leaves it raised forever, and a raised count forbids reaping.
+    That reservation is then retained until process exit (fail-closed:
+    diagnostics stay off for this owner); no later probe, stop(), close(),
+    start() or maintenance can clear it.
+
+    Asynchronous exceptions. aismixer's production SIGTERM handler never
+    raises while the service's event loop runs (it schedules the
+    KeyboardInterrupt as a loop callback), and every call into this class
+    runs on that loop or on the worker -- so in the service none of these
+    methods is ever interrupted. As defense in depth against an exception
+    raised by some signal handler anyway (for example a second Ctrl+C under
+    asyncio.run(), or a caller that installs a raising handler): CPython
+    runs Python signal handlers only on the main thread -- at a function
+    entry, after a call returns, on a backward jump, or out of an
+    interrupted blocking call -- so this class
+      * takes every lock as a plain `threading.Lock` in a `with`
+        statement, and never uses `threading.Condition`/`Event` on a caller
+        thread: their `__enter__`/`__exit__`/`set`/`wait` are Python
+        functions, so a handler could raise after the underlying acquire
+        or before the release and strand the lock (the audited failure).
+        Where `with` enters a C lock inside one instruction (BEFORE_WITH,
+        through CPython 3.13; measured on 3.12) there is no such point, and
+        an interrupted blocking acquire acquires nothing. (CPython 3.14 calls
+        `__enter__` through an ordinary call that is followed by such a
+        point outside the protected block; there, as for every lock in the
+        process -- the owner's own RLock included -- only the non-raising
+        production handler protects);
+      * lets a caller wait only in a bounded `Thread.join()` (see the
+        probe rule above) or by polling under the lock (stop()'s wait for
+        start proof, wait_idle()); the idle worker sleeps on
+        `_wakeup`, a lock used as a binary semaphore that any thread may
+        release, with a timeout that re-checks even if a wake-up was lost;
+      * updates each counter immediately before the ONE call that commits
+        the matching queue change, so any such point leaves the accounting
+        identity intact (see `MigrationDiagnosticStats`);
+      * lets `flush()` consume only as the sole consumer, and makes giving
+        that role back impossible to skip (see `flush()`).
+    Every lifecycle transition is otherwise a few attribute stores inside
+    the locks, so an interrupt leaves it done or not done, and always
+    ownership-preserving. An interrupted call may be incomplete (e.g. a
+    `close()` interrupted before it takes effect); calling it again
+    completes it. Exceptions are always propagated, never swallowed.
+
+    Locks: the lifecycle lock serializes start/stop/close admission and
+    covers `thread.start()`. Order: lifecycle -> queue, and owner -> queue
+    (publish). Nothing takes another lock while holding the queue lock, and
+    no lock is held across a join, a wait for start proof, or a write.
+
+    Delivery is best-effort: an event is written at most
+    `MIGRATION_DIAGNOSTIC_WRITE_ATTEMPTS` times on `OSError`; any other
+    ordinary exception makes that one event undeliverable. Failures are
+    contained per event and only counted (see `stats()`), never logged back
+    to the same stream. External output is not exactly-once: a write that
+    was interrupted, or that completed just before an interrupt, is counted
+    undeliverable although part or all of its line may have been written."""
+
+    def __init__(self, capacity=MIGRATION_DIAGNOSTIC_QUEUE_CAPACITY):
+        self._capacity = capacity
+        self._events = deque()
+        # Queue/counter/ownership lock and start/stop/close admission lock:
+        # plain `threading.Lock`s, only ever entered with `with`.
+        self._lock = threading.Lock()
+        self._lifecycle = threading.Lock()
+        # Idle-worker wake-up used as a binary semaphore: LOCKED means no
+        # wake-up is pending. Any thread releases it (`_wake`); only the
+        # worker acquires it, with a timeout.
+        self._wakeup = threading.Lock()
+        self._wakeup.acquire()
+        self._worker = None
+        self._worker_proven = False
+        # `join()`/`is_alive()` probes of the reserved worker that have
+        # begun but not returned normally; see the class docstring.
+        self._thread_probes = 0
+        self._accepting = False
+        self._closed = False
+        self._in_flight = 0
+        # `flush()` test-hook consumption: the owning call's token, and
+        # whether that call has an event in flight.
+        self._flush_owner = None
+        self._flush_in_flight = False
+        self.sink = _write_migration_diagnostic_line
+        self._published = 0
+        self._delivered = 0
+        self._dropped_overflow = 0
+        self._write_errors = 0
+        self._undeliverable = 0
+        self._dropped_on_shutdown = 0
+
+    def publish(self, event):
+        # Each counter is updated immediately BEFORE the one call that
+        # commits its matching queue change, so an interrupt at that call's
+        # return (this runs on the event-loop thread) leaves the accounting
+        # identity intact.
+        with self._lock:
+            if self._closed:
+                self._published += 1
+                self._dropped_on_shutdown += 1
+                return
+            if len(self._events) >= self._capacity:
+                self._dropped_overflow += 1
+                self._events.popleft()
+            self._published += 1
+            self._events.append(event)
+        self._wake()
+
+    def _wake(self):
+        if self._wakeup.locked():
+            try:
+                self._wakeup.release()
+            except RuntimeError:
+                pass  # another caller just released it: a wake-up is pending
+
+    def _worker_reapable(self):
+        # Caller holds the queue lock and `_worker` is not None. Only a
+        # PROVEN-started worker that is observed dead by a COMPLETED probe,
+        # with no probe of it pending or interrupted, may be released.
+        return (
+            not self._thread_probes
+            and self._worker_proven
+            and not self._probe_alive()
+        )
+
+    def _probe_alive(self):
+        # Caller holds the queue lock and `_worker` is not None. If
+        # `is_alive()` is interrupted, the count is never lowered again.
+        self._thread_probes += 1
+        alive = self._worker.is_alive()
+        self._thread_probes -= 1
+        return alive
+
+    def _settle_interrupted_flush(self):
+        # Caller holds the queue lock. A `flush()` whose settling of its
+        # in-flight event was interrupted (a blocked, contended acquire in
+        # `_finish`) still gave up consumption on its way out, leaving that
+        # event marked. It is settled here, exactly once, as undeliverable
+        # (whether it was written is unknown).
+        if self._flush_in_flight and self._flush_owner is None:
+            self._flush_in_flight = False
+            self._undeliverable += 1
+            self._in_flight -= 1
+
+    def start(self):
+        """Start the worker. Returns True only if a NEW worker thread was
+        started; False if the owner is closed, a `flush()` owns
+        consumption, or a worker is still reserved (running, stopping,
+        blocked in a write, or with an unproven start). A failure to create
+        a thread (RuntimeError) is swallowed -- diagnostics must never take
+        the service down; events then stay bounded in the queue.
+
+        Any other exception out of `Thread.start()` -- such as a
+        KeyboardInterrupt raised by a signal handler -- is propagated
+        unchanged, and the reservation is KEPT: a native thread may already
+        exist without its started flag being visible yet. If it does, it
+        proves its own start (see `_run`) and is then owned and stoppable
+        like any worker; if it never existed, the reservation stays
+        unproven and this owner's worker stays off (fail-closed)."""
+        with self._lifecycle:
+            with self._lock:
+                self._settle_interrupted_flush()
+                if self._closed or self._flush_owner is not None:
+                    return False
+                if self._worker is not None:
+                    if not self._worker_reapable():
+                        return False
+                    self._worker = None
+                    self._worker_proven = False
+                thread = threading.Thread(
+                    target=self._run,
+                    name="udpsec-migration-diagnostics",
+                    daemon=True,
+                )
+                self._worker = thread
+                self._worker_proven = False
+                self._accepting = True
+            try:
+                thread.start()
+            except RuntimeError:
+                # Thread.start()'s documented failure: the native thread
+                # could not be created. Release the reservation unless the
+                # worker has meanwhile proven otherwise.
+                with self._lock:
+                    if self._worker is thread and not self._worker_proven:
+                        self._worker = None
+                        self._accepting = False
+                return False
+            with self._lock:
+                if self._worker is thread:
+                    self._worker_proven = True
+            return True
+
+    def stop(self, timeout=MIGRATION_DIAGNOSTIC_STOP_JOIN_SECONDS):
+        """Ask the worker to finish its current event, make one bounded
+        best-effort flush of what is queued, and exit; wait at most
+        `timeout` seconds in total. Returns True once the worker reserved
+        when `stop()` was called has PROVABLY exited (or none was
+        reserved); a later `start()` may of course start a new one.
+
+        Never joins a worker whose start is unproven: it first waits --
+        within the same `timeout`, holding no lock -- for that worker's own
+        start proof. If after `timeout` the worker is still alive (e.g.
+        blocked in a write) or its start is still unproven (e.g. its
+        `Thread.start()` was interrupted and no thread has appeared), the
+        queued events are counted `dropped_on_shutdown`, ownership is KEPT
+        (so `start()` keeps refusing), and False is returned. A blocked OS
+        write cannot be cancelled; the daemon thread exits on its own once
+        the write returns. Idempotent.
+
+        If the join itself is interrupted by an exception the exception
+        propagates and this worker's exit becomes permanently uncertain: it
+        is never reaped (see the class docstring)."""
+        deadline = time.monotonic() + timeout
+        with self._lifecycle:
+            with self._lock:
+                worker = self._worker
+                if worker is None:
+                    return True
+                self._accepting = False
+        self._wake()
+        if worker is not threading.current_thread() and self._await_start_proof(
+            worker, deadline
+        ):
+            # Mark the join BEFORE entering it; unmark only after it returns
+            # normally. Skip it if `worker` was reaped already.
+            with self._lock:
+                probing = self._worker is worker
+                if probing:
+                    self._thread_probes += 1
+            if probing:
+                worker.join(max(0.0, deadline - time.monotonic()))
+                with self._lock:
+                    self._thread_probes -= 1
+        with self._lifecycle:
+            with self._lock:
+                if self._worker is not worker:
+                    return True  # already reaped: proven started, then dead
+                if self._worker_reapable():
+                    self._worker = None
+                    self._worker_proven = False
+                    return True
+                self._dropped_on_shutdown += len(self._events)
+                self._events.clear()
+                return False
+
+    def _await_start_proof(self, worker, deadline):
+        # True once `worker` is proven started (or already reaped); False
+        # at `deadline`. Polls, holding no lock between checks.
+        while True:
+            with self._lock:
+                if self._worker is not worker or self._worker_proven:
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(remaining, _MIGRATION_DIAGNOSTIC_WAIT_POLL_SECONDS))
+
+    def close(self, timeout=MIGRATION_DIAGNOSTIC_STOP_JOIN_SECONDS):
+        """Terminal: atomically forbid any future `start()` (including a
+        late one from maintenance), then `stop()`. Once no worker remains,
+        anything still queued can never be delivered and is counted
+        `dropped_on_shutdown`; later publishes are counted the same way.
+        Bounded by `timeout`; idempotent. Returns `stop()`'s result: False
+        means a worker is still alive or its start is still unproven -- a
+        worker that proves its start later finds the owner closed and not
+        accepting, flushes within its bounded shutdown budget, and exits."""
+        with self._lifecycle:
+            with self._lock:
+                self._closed = True
+                self._settle_interrupted_flush()
+        stopped = self.stop(timeout)
+        if stopped:
+            with self._lock:
+                self._dropped_on_shutdown += len(self._events)
+                self._events.clear()
+        return stopped
+
+    def flush(self):
+        """Test hook: deliver on the CALLING thread the events queued at
+        call time, as the SOLE consumer -- only while no worker is reserved
+        (or the reserved one is proven dead) and no other `flush()` is
+        running; `start()` refuses while a flush owns consumption. So at
+        most one event is ever in flight and sink writes never overlap.
+        Never call from packet processing. Returns how many events were
+        handled (0 if this call could not become the consumer)."""
+        token = object()
+        handled = 0
+        try:
+            with self._lock:
+                self._settle_interrupted_flush()
+                if self._flush_owner is not None or (
+                    self._worker is not None and not self._worker_reapable()
+                ):
+                    return 0
+                self._flush_owner = token
+                budget = len(self._events)
+            while handled < budget:
+                with self._lock:
+                    if not self._events:
+                        break
+                    # Marked in flight BEFORE the one call that removes it.
+                    self._in_flight += 1
+                    self._flush_in_flight = True
+                    event = self._events.popleft()
+                self._finish(event)
+                handled += 1
+            return handled
+        finally:
+            # Give consumption back with ONE plain store and no lock: once
+            # this `finally` is entered nothing before the store can be
+            # interrupted, so ownership is never left stale. While it is
+            # set, only this call ever writes the slot.
+            if self._flush_owner is token:
+                self._flush_owner = None
+
+    def wait_idle(self, timeout):
+        """Wait up to `timeout` seconds for the queue to be empty with no
+        event in flight. Returns whether it became idle."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                self._settle_interrupted_flush()
+                if not self._events and self._in_flight == 0:
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(remaining, _MIGRATION_DIAGNOSTIC_WAIT_POLL_SECONDS))
+
+    def stats(self):
+        with self._lock:
+            self._settle_interrupted_flush()
+            worker = self._worker
+            uncertain = worker is not None and self._thread_probes > 0
+            if worker is None:
+                alive = False
+            elif uncertain:
+                alive = True  # never inferred from an untrustworthy probe
+            else:
+                alive = self._probe_alive()
+            return MigrationDiagnosticStats(
+                published=self._published,
+                delivered=self._delivered,
+                dropped_overflow=self._dropped_overflow,
+                write_errors=self._write_errors,
+                undeliverable=self._undeliverable,
+                dropped_on_shutdown=self._dropped_on_shutdown,
+                queued=len(self._events),
+                in_flight=self._in_flight,
+                consumer_running=alive and self._accepting,
+                worker_alive=alive,
+                worker_starting=worker is not None and not self._worker_proven,
+                worker_exit_uncertain=uncertain,
+                closed=self._closed,
+                flushing=self._flush_owner is not None,
+            )
+
+    def _finish(self, event):
+        # The event's terminal counter, the in-flight decrement and the
+        # flush in-flight mark are applied in ONE critical section, so
+        # `stats()` never observes an event counted twice (or not at all).
+        # (The mark is only ever set by `flush()`; no worker runs while a
+        # flush owns consumption.)
+        delivered = False
+        try:
+            delivered = self._deliver(event)
+        finally:
+            with self._lock:
+                if delivered:
+                    self._delivered += 1
+                else:
+                    self._undeliverable += 1
+                self._in_flight -= 1
+                self._flush_in_flight = False
+
+    def _deliver(self, event):
+        """Format and write one event; returns whether it was written."""
+        try:
+            line = _format_migration_diagnostic(event)
+        except Exception:
+            return False
+        for _attempt in range(MIGRATION_DIAGNOSTIC_WRITE_ATTEMPTS):
+            try:
+                self.sink(line)
+            except OSError:
+                with self._lock:
+                    self._write_errors += 1
+                continue
+            except Exception:
+                with self._lock:
+                    self._write_errors += 1
+                return False
+            return True
+        return False
+
+    def _run(self):
+        # Start proof: `run()` executes only after Thread's own started
+        # flag is set, so from here `join()` is permitted and a completed
+        # `is_alive()` is exact for this thread. The worker thread never
+        # runs signal handlers.
+        with self._lock:
+            if self._worker is not threading.current_thread():
+                # Defensive; reachable only if Thread.start() raised
+                # RuntimeError although a native thread was created (not
+                # a documented outcome): never consume unowned.
+                return
+            self._worker_proven = True
+        # `_accepting` only ever becomes True in `start()`, which refuses
+        # while this thread is reserved -- so once it is False here, it
+        # stays False for this thread's lifetime.
+        while True:
+            with self._lock:
+                if not self._accepting:
+                    break
+                event = None
+                if self._events:
+                    self._in_flight += 1
+                    event = self._events.popleft()
+            if event is None:
+                self._wakeup.acquire(
+                    timeout=MIGRATION_DIAGNOSTIC_IDLE_POLL_SECONDS
+                )
+                continue
+            self._finish(event)
+        deadline = time.monotonic() + MIGRATION_DIAGNOSTIC_SHUTDOWN_FLUSH_SECONDS
+        while True:
+            with self._lock:
+                if not self._events:
+                    return
+                if time.monotonic() >= deadline:
+                    self._dropped_on_shutdown += len(self._events)
+                    self._events.clear()
+                    return
+                self._in_flight += 1
+                event = self._events.popleft()
+            self._finish(event)
 
 
 class SecureState:
@@ -1063,6 +1696,11 @@ class SecureState:
         self._migration_challenges_sent = 0
         self._migration_invalid_responses = 0
         self._retired_path_packets_admitted = 0
+
+        # Field-diagnostics addendum: bounded, failure-isolated output
+        # channel for migration-lifecycle log lines. Constructing it starts
+        # no thread; see `_MigrationDiagnosticOutput`.
+        self.migration_diagnostics = _MigrationDiagnosticOutput()
 
         self._current_data_nonces = 0
         self._peak_handshake_replays = 0
@@ -1490,16 +2128,44 @@ class SecureState:
         `session` is the live incarnation. O(1) -- only this session's own
         two optional `PathState` slots, never a scan of other sessions. An
         expired record is dropped regardless of physical-reclamation
-        timing; it never authorizes behavior once past its deadline."""
+        timing; it never authorizes behavior once past its deadline.
+
+        This is the sole place candidate/retired-path records are
+        physically discarded, so it also publishes the one diagnostic
+        EXPIRED event per discarded record, whichever caller (pre-crypto
+        role classification, authoritative admission, candidate install,
+        challenge revalidation, PATH_RESPONSE commit, snapshot, or idle
+        maintenance) first crosses the deadline. A discarded slot is
+        `None` afterwards, so no later call can publish it again. The
+        publish is an O(1) nonblocking enqueue (see
+        `_MigrationDiagnosticOutput`) -- no output happens here."""
         path_state = session.path_state
         candidate = path_state.candidate_path
         if candidate is not None and candidate.deadline <= now:
             path_state.candidate_path = None
             self._path_candidates_expired += 1
+            self.migration_diagnostics.publish(
+                (
+                    "candidate_expired",
+                    session.station_id,
+                    session._session_key.session_locator,
+                    candidate.sockaddr,
+                    candidate.path_generation,
+                )
+            )
         retired = path_state.retired_path
         if retired is not None and retired.deadline <= now:
             path_state.retired_path = None
             self._retired_paths_expired += 1
+            self.migration_diagnostics.publish(
+                (
+                    "retired_expired",
+                    session.station_id,
+                    session._session_key.session_locator,
+                    retired.sockaddr,
+                    retired.path_generation,
+                )
+            )
 
     def cleanup_expired_path_transitions(self, now):
         """Idle physical cleanup for path-state transitions: one bounded
@@ -1559,15 +2225,24 @@ class SecureState:
         any other owner's maintenance task, and this method does not
         start, own, or need to know about any listener socket. Runs
         until cancelled.
+
+        Field-diagnostics addendum: being the one supervised task per
+        owner, it also owns the lifetime of this owner's single
+        migration-diagnostic consumer thread -- started (idempotently) on
+        entry and stopped, with a bounded flush/join, when this task ends.
         """
         monotonic_now = time.monotonic if self._clock is None else self._clock
-        while True:
-            await asyncio.sleep(interval)
-            now = monotonic_now()
-            self.cleanup_expired_sessions(now)
-            self.cleanup_expired_pending_sessions(now)
-            self.cleanup_expired_epoch_transitions(now)
-            self.cleanup_expired_path_transitions(now)
+        self.migration_diagnostics.start()
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                now = monotonic_now()
+                self.cleanup_expired_sessions(now)
+                self.cleanup_expired_pending_sessions(now)
+                self.cleanup_expired_epoch_transitions(now)
+                self.cleanup_expired_path_transitions(now)
+        finally:
+            self.migration_diagnostics.stop()
 
     def _fresh_session_handle(self):
         """Always mint a new, process-wide-unique LogicalSession-incarnation
@@ -2108,18 +2783,22 @@ class SecureState:
         other removal.
         """
         with self._lock:
-            if self._closed:
-                return
-            now = self._authoritative_now(now)
-            for session_key in list(self._sessions.keys()):
-                self._remove_session(session_key, "closed", now)
-            for relation_key in list(self._pending_sessions.keys()):
-                self._remove_pending_session(relation_key, "closed")
-            self._handshake_replays.discard_all()
-            self._session_expiry_heap.clear()
-            self._pending_expiry_heap.clear()
-            self._epoch_transition_heap.clear()
-            self._closed = True
+            if not self._closed:
+                now = self._authoritative_now(now)
+                for session_key in list(self._sessions.keys()):
+                    self._remove_session(session_key, "closed", now)
+                for relation_key in list(self._pending_sessions.keys()):
+                    self._remove_pending_session(relation_key, "closed")
+                self._handshake_replays.discard_all()
+                self._session_expiry_heap.clear()
+                self._pending_expiry_heap.clear()
+                self._epoch_transition_heap.clear()
+                self._closed = True
+        # Field-diagnostics addendum: owner closure is terminal for its
+        # diagnostic worker too -- no later start() (e.g. from a late
+        # maintenance entry) can create one. Outside the owner lock;
+        # bounded; idempotent.
+        self.migration_diagnostics.close()
 
     def promote_pending_session(self, pending, now):
         relation_key = pending._relation_key
@@ -2876,13 +3555,19 @@ class SecureState:
         """Install `source_sockaddr` as `session`'s single candidate path,
         or -- if it is already the candidate on the exact current epoch --
         report a duplicate without mutating anything. Returns
-        `(candidate_or_None, outcome)` where `outcome` is 'installed' (a
-        brand-new candidate B, a replacement C of an earlier candidate, or
-        a fresh incarnation replacing an epoch-stale same-address candidate
-        -- the caller sends exactly one PATH_CHALLENGE), 'duplicate' (the
-        same candidate address again under the same current epoch -- NO new
-        token, NO deadline extension, NO fresh challenge), or `None` (fail
-        closed).
+        `(candidate_or_None, outcome, replaced)` where `outcome` is
+        'installed' (a brand-new candidate B, a replacement C of an earlier
+        candidate, or a fresh incarnation replacing an epoch-stale
+        same-address candidate -- the caller sends exactly one
+        PATH_CHALLENGE), 'duplicate' (the same candidate address again
+        under the same current epoch -- NO new token, NO deadline
+        extension, NO fresh challenge), or `None` (fail closed). `replaced`
+        is `True`/`False` only when `outcome == 'installed'` (whether this
+        install displaced an already-live candidate, read from the exact
+        same locked decision this call already made -- never inferred from
+        a separate counter read) and `None` otherwise. An install also
+        publishes the matching OPENED/REPLACED diagnostic event from that
+        same decision.
 
         Bound to the EXACT current epoch: `epoch` must be
         `session.current_epoch` (identity). Retiring-epoch traffic can
@@ -2898,22 +3583,22 @@ class SecureState:
         with self._lock:
             now = self._authoritative_now(now)
             if self._get_live_session_handle(session, now) is None:
-                return (None, None)
+                return (None, None, None)
             self._expire_session_epoch_transitions(session, now)
             self._expire_session_path_state(session, now)
             if session.current_epoch is not epoch:
-                return (None, None)
+                return (None, None, None)
             if not isinstance(challenge_token, bytes) or len(
                 challenge_token
             ) != PATH_CHALLENGE_TOKEN_BYTES:
-                return (None, None)
+                return (None, None, None)
             path_state = session.path_state
             try:
                 identity = normalize_sockaddr(source_sockaddr)
                 if identity == normalize_sockaddr(path_state.active_path):
-                    return (None, None)
+                    return (None, None, None)
             except MalformedSockaddrError:
-                return (None, None)
+                return (None, None, None)
 
             # Finding B (early rejection): a target relation already owned
             # by a DIFFERENT live session on this endpoint token is an
@@ -2927,7 +3612,7 @@ class SecureState:
             )
             occupant = self._relation_index.get(target_relation)
             if occupant is not None and occupant != session._session_key:
-                return (None, None)
+                return (None, None, None)
 
             existing = path_state.candidate_path
             if (
@@ -2938,7 +3623,7 @@ class SecureState:
                 # Duplicate traffic on the SAME candidate under the SAME
                 # (still-current) epoch: keep the exact object / token /
                 # path_generation / deadline unchanged.
-                return (existing, "duplicate")
+                return (existing, "duplicate", None)
             # Finding A: an existing same-address candidate still bound by
             # object identity to an epoch that is no longer current (an
             # epoch refresh committed before this candidate proved return
@@ -2951,7 +3636,7 @@ class SecureState:
                 MIN_PATH_GENERATION <= next_generation <= MAX_PATH_GENERATION
             ):
                 # Fail closed rather than wrap into an ambiguous incarnation.
-                return (None, None)
+                return (None, None, None)
             replacing = existing is not None
             candidate = CandidatePath(
                 sockaddr=source_sockaddr,
@@ -2968,7 +3653,19 @@ class SecureState:
             self._path_candidates_opened += 1
             if replacing:
                 self._path_candidates_replaced += 1
-            return (candidate, "installed")
+            # Field-diagnostics: snapshot OPENED/REPLACED from this exact
+            # locked decision (O(1) nonblocking enqueue; no output here).
+            self.migration_diagnostics.publish(
+                (
+                    "candidate_replaced" if replacing else "candidate_opened",
+                    session.station_id,
+                    session._session_key.session_locator,
+                    path_state.active_path,
+                    source_sockaddr,
+                    next_generation,
+                )
+            )
+            return (candidate, "installed", replacing)
 
     def path_challenge_is_current(self, session, candidate, now):
         """Short revalidation the caller runs immediately before actually
@@ -3134,6 +3831,10 @@ class SecureState:
 
             path_state.active_path = candidate.sockaddr
             path_state.candidate_path = None
+            # Field-diagnostics addendum: label the now-active path with the
+            # generation that actually won, never a candidate generation
+            # that opened/replaced/expired without committing.
+            path_state.active_path_generation = candidate.path_generation
             retired = RetiredPath(
                 sockaddr=old_active,
                 identity=retired_identity,
@@ -3152,6 +3853,19 @@ class SecureState:
             self._relation_index[canonical_new] = session_key
 
             self._path_migrations_committed += 1
+            # Field-diagnostics: snapshot COMMITTED from this exact commit
+            # (O(1) nonblocking enqueue; no output here, so nothing can
+            # delay or suppress the PATH_ACK the caller sends next).
+            self.migration_diagnostics.publish(
+                (
+                    "migration_committed",
+                    session.station_id,
+                    session._session_key.session_locator,
+                    old_active,
+                    candidate.sockaddr,
+                    candidate.path_generation,
+                )
+            )
             return (True, retired)
 
     def path_state_snapshot(self, session, now):
@@ -3170,6 +3884,7 @@ class SecureState:
             return {
                 "active": path_state.active_path,
                 "path_generation": path_state.path_generation,
+                "active_path_generation": path_state.active_path_generation,
                 "candidate": (
                     None
                     if candidate is None
@@ -3235,6 +3950,31 @@ def build_handshake_replay_key(
     ):
         _update_replay_digest(digest, field)
     return digest.finalize()
+
+
+def _pong_diagnostics(addr, active_path_generation):
+    """Optional additive PONG diagnostic members (see
+    BEHAVIORAL_CONTRACT.md's field-diagnostics addendum): the exact
+    inbound `recvfrom()` source of the admitted PING this PONG answers,
+    and the session's current `active_path_generation` label.
+
+    Display-only wire data, never authority: `addr`'s IPv4/IPv6 family,
+    canonical IP text, and integer UDP port come from
+    `core.sockaddr_identity.normalize_sockaddr` -- the same helper used
+    for all path-identity comparisons -- so flowinfo/scope are never
+    confused with the port. If `addr` cannot be represented safely,
+    diagnostics are omitted entirely; the ordinary PONG is never affected
+    by this function's outcome. Extends the existing PONG payload only --
+    no new frame, message, or round trip.
+    """
+    try:
+        identity = normalize_sockaddr(addr)
+    except MalformedSockaddrError:
+        return {}
+    return {
+        "observed_endpoint": {"ip": identity.ip, "port": identity.port},
+        "active_path_generation": active_path_generation,
+    }
 
 
 def encrypt_secure_json_message(
@@ -3705,7 +4445,11 @@ def _process_candidate_path_observation(
     `SecureState` lock; a short revalidation immediately before the send
     ensures a candidate already replaced by a newer one does not draw a
     challenge from stale work."""
-    candidate, outcome = state_owner.open_or_replace_candidate_path(
+    # OPENED/REPLACED (and any lazily EXPIRED record) diagnostics are
+    # published inside the locked state transitions themselves as O(1)
+    # nonblocking enqueues; nothing on this path performs output, so no
+    # diagnostic work can sit between the final revalidation and `sendto`.
+    candidate, outcome, _replaced = state_owner.open_or_replace_candidate_path(
         session,
         epoch,
         source_sockaddr,
@@ -3999,6 +4743,11 @@ async def _secure_server_loop(
                         session.station_id,
                         SESSION_CONFIRMATION_SEQUENCE,
                         int(wall_now()),
+                    )
+                    response.update(
+                        _pong_diagnostics(
+                            addr, session.path_state.active_path_generation
+                        )
                     )
                     # Pending-confirmation traffic is still tuple-bound:
                     # this reply belongs to the handshake transaction, so
@@ -4359,6 +5108,11 @@ async def _secure_server_loop(
                         station_id,
                         msg["seq"],
                         int(wall_now()),
+                    )
+                    response.update(
+                        _pong_diagnostics(
+                            addr, session.path_state.active_path_generation
+                        )
                     )
                     # Established-session traffic addresses the session's
                     # authoritative outbound path. The pong is sent under the

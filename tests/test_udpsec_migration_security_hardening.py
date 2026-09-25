@@ -381,11 +381,16 @@ def test_a6_high_candidate_churn_retains_o1_state(env):
         # across the whole loop, so every iteration is a genuine
         # replacement (never a same-address "duplicate").
         addr = (f"198.51.{(i // 250) % 250}.{(i % 250) + 1}", 40000 + i)
-        candidate, outcome = state.open_or_replace_candidate_path(
+        candidate, outcome, replaced = state.open_or_replace_candidate_path(
             session, epoch, addr, os.urandom(p.PATH_CHALLENGE_TOKEN_BYTES),
             1000.0 + i,
         )
         assert outcome == "installed"
+        # F1 field-diagnostics correction: `replaced` is read straight off
+        # this same locked call's own decision (i == 0 is the session's
+        # first-ever candidate; every later iteration genuinely displaces
+        # the previous live one -- see the loop comment above).
+        assert replaced is (i > 0)
         last_candidate = candidate
         # exactly one live candidate object at all times.
         assert session.path_state.candidate_path is last_candidate
@@ -938,20 +943,21 @@ def test_k_path_generation_boundary_fails_closed_without_wrap(env):
     epoch = session.current_epoch
 
     session.path_state.path_generation = p.MAX_PATH_GENERATION - 1
-    candidate, outcome = state.open_or_replace_candidate_path(
+    candidate, outcome, replaced = state.open_or_replace_candidate_path(
         session, epoch, ADDR_B, os.urandom(p.PATH_CHALLENGE_TOKEN_BYTES),
         1000.0,
     )
     assert outcome == "installed"
+    assert replaced is False
     assert candidate.path_generation == p.MAX_PATH_GENERATION
     assert session.path_state.path_generation == p.MAX_PATH_GENERATION
 
     # one more legitimate replacement must fail closed rather than wrap.
-    candidate2, outcome2 = state.open_or_replace_candidate_path(
+    candidate2, outcome2, replaced2 = state.open_or_replace_candidate_path(
         session, epoch, ADDR_C, os.urandom(p.PATH_CHALLENGE_TOKEN_BYTES),
         1001.0,
     )
-    assert (candidate2, outcome2) == (None, None)
+    assert (candidate2, outcome2, replaced2) == (None, None, None)
     assert session.path_state.candidate_path is candidate  # unchanged
     assert session.path_state.path_generation == p.MAX_PATH_GENERATION
 
