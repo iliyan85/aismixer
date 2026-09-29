@@ -1036,7 +1036,9 @@ handshake attempt. A failure of that attempt returns to normal
 ultimate fallback and retains priority when its deadline is reached. With the
 defaults `keepalive_interval: 30` and `peer_timeout: 90`, the first ping is due
 at about 30 seconds and an unanswered ping normally selects proactive rekey at
-about 60 seconds, before the 90-second timeout.
+about 60 seconds, before the 90-second timeout. This single-shot rule is the
+current behaviour; the recovery targets that are planned to replace it are
+recorded, not guaranteed, in 11.5.
 
 Forwarding-loop deadlines use monotonic time and become due at equality. When
 deadlines coincide, deterministic priority is `peer_timeout`, then the planned
@@ -2201,6 +2203,28 @@ Three different numbers must not be confused:
    Windows CPython 3.14, it can then leave even a plain lock held); a
    stuck shutdown needs SIGKILL. `nmea_sproxy` keeps its own SIGTERM
    handler, which still raises KeyboardInterrupt immediately.
+
+### 11.5 Recovery baseline cross-reference (MP0)
+
+Three distinct recovery mechanisms exist and must not be conflated:
+
+1. **Keepalive/liveness recovery**: how the client treats missing
+   authenticated liveness evidence on an unchanged path. Today this is the
+   single-shot unresolved-ping rule above, which ends in proactive rekey.
+2. **Path migration**: server-driven return-routability validation of a
+   changed tuple (the path-migration subsections and 11.1-11.3). It keeps the
+   same `LogicalSession`.
+3. **Full-establishment fallback**: a fresh signed ECDHE handshake that
+   creates a new `LogicalSession` (new locator, epoch 0, `path_gen` 0).
+
+`tests/udpsec_recovery/UDPSEC_V2_RECOVERY_BASELINE.md` records the current
+behaviour of all three against the IPv6 and IPv4/CGNAT field evidence. It
+defines FUTURE ACCEPTANCE TARGETS for MP1 (client liveness recovery: staged,
+bounded, no wire change) and MP2 (bounded path-migration recovery). Those
+targets are not current guarantees. Until MP1 or MP2 changes them, section 11
+above remains the normative behaviour, including the single-shot keepalive
+rule and the resolution of due deadlines before poll-ready packets. The
+targets are encoded as strict-xfail acceptance tests next to that baseline.
 
 ## 12. Routing snapshot boundary
 
