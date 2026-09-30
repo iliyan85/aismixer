@@ -132,6 +132,19 @@ PATH_CANDIDATE_TTL_SECONDS = 10.0
 # state change. It prevents a delayed old-path datagram from immediately
 # flapping the session back. `age >= grace` retires it.
 RETIRED_PATH_GRACE_SECONDS = 5.0
+# MP2 bounded PATH_CHALLENGE retransmission (see BEHAVIORAL_CONTRACT.md
+# section 11). One live candidate incarnation may send its SAME challenge
+# -- same token, path_generation and candidate address, freshly encrypted
+# every time -- at most `PATH_CHALLENGE_MAX_SENDS` times in total (the
+# initial send included). Each retry is due one
+# `PATH_CHALLENGE_RETRY_INTERVAL_SECONDS` after the previous attempt ended
+# and is sent only while `now < deadline`; the candidate's fixed deadline is
+# never moved. With the 10 s TTL the attempts fall at about t0, t0+2, t0+4
+# and t0+6. A retry is delivery, never authority: it creates no candidate,
+# token, generation, deadline or replay state. Internal constants, not
+# operator config.
+PATH_CHALLENGE_RETRY_INTERVAL_SECONDS = 2.0
+PATH_CHALLENGE_MAX_SENDS = 4
 
 # F3: how often `SecureState.run_periodic_maintenance()` (a small,
 # independent, opt-in background task -- see that method) runs expiry and
@@ -667,6 +680,14 @@ class CandidatePath:
     generation) it was authenticated/opened under. Installing a candidate
     never changes `active_path`; only a matching PATH_RESPONSE from this
     exact candidate address commits the migration.
+
+    MP2: `challenge_sends` counts the PATH_CHALLENGE attempts already
+    admitted for this incarnation (at most `PATH_CHALLENGE_MAX_SENDS`), and
+    `next_challenge_at` is the monotonic instant the next retry of the same
+    challenge is due, or `None` when none is scheduled (before the initial
+    attempt ends, while an attempt is in flight, or once no further attempt
+    fits before `deadline`). Neither ever changes the token, generation,
+    address or deadline.
     """
 
     sockaddr: object
@@ -677,6 +698,20 @@ class CandidatePath:
     deadline: float
     epoch: object
     epoch_generation: int
+    challenge_sends: int = 0
+    next_challenge_at: object = None
+
+
+@dataclass(frozen=True)
+class _PathChallengeSend:
+    """One PATH_CHALLENGE retry admitted under the owner lock by
+    `SecureState.claim_due_path_challenge_retries`: the exact
+    `LogicalSession` and `CandidatePath` incarnation it belongs to. The
+    token, generation, destination and epoch come from that candidate,
+    whose fields never change after install."""
+
+    session: object
+    candidate: object
 
 
 @dataclass
@@ -853,6 +888,10 @@ class SecureStateStats:
     # is the "a PATH_RESPONSE successfully committed migration" counter,
     # so there is deliberately no separate "migration_responses_accepted".
     migration_challenges_sent: int
+    # MP2: the subset of `migration_challenges_sent` that were retries of an
+    # already-sent challenge (same candidate incarnation), so initial sends
+    # = migration_challenges_sent - migration_challenge_retries_sent.
+    migration_challenge_retries_sent: int
     migration_invalid_responses: int
     retired_path_packets_admitted: int
 
@@ -982,6 +1021,15 @@ def _format_migration_diagnostic(event):
             f"[+] Path migration COMMITTED for {station_id} "
             f"session={locator_label} "
             f"old={format_endpoint_tuple(old)} new={format_endpoint_tuple(new)} "
+            f"generation={generation}"
+        )
+    if kind == "challenge_retried":
+        _kind, _station, _locator, candidate, generation, attempt, cap, sent = event
+        status = "" if sent else " send FAILED"
+        return (
+            f"[{'+' if sent else '!'}] Path challenge RETRY {attempt}/{cap}{status} "
+            f"for {station_id} session={locator_label} "
+            f"candidate={format_endpoint_tuple(candidate)} "
             f"generation={generation}"
         )
     raise ValueError(f"unknown migration diagnostic event kind: {kind!r}")
@@ -1694,8 +1742,16 @@ class SecureState:
         self._path_migrations_committed = 0
         self._retired_paths_expired = 0
         self._migration_challenges_sent = 0
+        self._migration_challenge_retries_sent = 0
         self._migration_invalid_responses = 0
         self._retired_path_packets_admitted = 0
+        # MP2: the session keys whose live candidate has a PATH_CHALLENGE
+        # retry scheduled, so each listener's retry pass visits only those
+        # (filtered by its own endpoint token) instead of every session.
+        # At most one entry per live session; an entry is dropped as soon as
+        # its candidate is replaced, committed, expired or exhausted, or its
+        # session is removed.
+        self._path_challenge_retry_keys = set()
 
         # Field-diagnostics addendum: bounded, failure-isolated output
         # channel for migration-lifecycle log lines. Constructing it starts
@@ -1765,6 +1821,9 @@ class SecureState:
                 path_migrations_committed=self._path_migrations_committed,
                 retired_paths_expired=self._retired_paths_expired,
                 migration_challenges_sent=self._migration_challenges_sent,
+                migration_challenge_retries_sent=(
+                    self._migration_challenge_retries_sent
+                ),
                 migration_invalid_responses=self._migration_invalid_responses,
                 retired_path_packets_admitted=(
                     self._retired_path_packets_admitted
@@ -1869,6 +1928,8 @@ class SecureState:
         del self._sessions[session_key]
         if self._relation_index.get(relation_key) == session_key:
             del self._relation_index[relation_key]
+        # MP2: a removed session's candidate can never be retried.
+        self._path_challenge_retry_keys.discard(session_key)
         self._discard_session_nonces(session)
         # session_handle has exactly one owner for its whole life and is
         # released immediately. assembly_namespace may still be claimed by
@@ -2143,6 +2204,8 @@ class SecureState:
         candidate = path_state.candidate_path
         if candidate is not None and candidate.deadline <= now:
             path_state.candidate_path = None
+            candidate.next_challenge_at = None
+            self._path_challenge_retry_keys.discard(session._session_key)
             self._path_candidates_expired += 1
             self.migration_diagnostics.publish(
                 (
@@ -3648,6 +3711,11 @@ class SecureState:
                 epoch=session.current_epoch,
                 epoch_generation=session.current_epoch.generation,
             )
+            if existing is not None:
+                # MP2: the displaced incarnation's retry schedule dies with
+                # it; the new one schedules its own after its initial send.
+                existing.next_challenge_at = None
+            self._path_challenge_retry_keys.discard(session._session_key)
             path_state.candidate_path = candidate
             path_state.path_generation = next_generation
             self._path_candidates_opened += 1
@@ -3686,16 +3754,149 @@ class SecureState:
                 and candidate.epoch is session.current_epoch
             )
 
-    def record_migration_challenge_sent(self):
-        """MP7 observability: increment `migration_challenges_sent` exactly
-        when a PATH_CHALLENGE datagram has actually been handed
-        successfully to the transport's `sendto()` boundary. The caller
-        (`_process_candidate_path_observation`) only reaches this call
-        after `sendto()` has already returned without raising; a send
-        failure propagates to the caller's own general error handling
-        instead and is deliberately not counted here."""
+    def admit_initial_path_challenge(self, session, candidate, now):
+        """Revalidate a freshly installed `candidate` immediately before its
+        initial PATH_CHALLENGE is sent (exactly as `path_challenge_is_current`)
+        and charge that first attempt to its MP2 budget. Returns `False`
+        -- send nothing -- when the candidate is no longer the live current
+        incarnation or its initial attempt was already admitted."""
         with self._lock:
-            self._migration_challenges_sent += 1
+            now = self._authoritative_now(now)
+            if self._get_live_session_handle(session, now) is None:
+                return False
+            self._expire_session_path_state(session, now)
+            if not (
+                session.path_state.candidate_path is candidate
+                and now < candidate.deadline
+                and candidate.epoch is session.current_epoch
+                and candidate.challenge_sends == 0
+            ):
+                return False
+            candidate.challenge_sends = 1
+            candidate.next_challenge_at = None
+            return True
+
+    def claim_due_path_challenge_retries(self, endpoint_token, now):
+        """MP2 retry pass, phase one: under the lock, find every live
+        candidate on this listener's `endpoint_token` whose next retry is
+        due at `now` (strictly before its fixed deadline, within its send
+        budget, still bound to the current epoch), charge the attempt to its
+        budget, mark it in flight, and capture the immutable send authority.
+        Returns `_PathChallengeSend` records for the caller to encrypt
+        freshly and send OUTSIDE the lock, then report through
+        `finish_path_challenge_attempt`. Visits only the indexed sessions
+        with a scheduled retry; creates no candidate, token, generation or
+        deadline."""
+        claims = []
+        with self._lock:
+            now = self._authoritative_now(now)
+            for session_key in list(self._path_challenge_retry_keys):
+                if session_key.endpoint_token != endpoint_token:
+                    continue
+                session = self._sessions.get(session_key)
+                if (
+                    session is None
+                    or self._get_live_session_handle(session, now) is None
+                ):
+                    self._path_challenge_retry_keys.discard(session_key)
+                    continue
+                self._expire_session_path_state(session, now)
+                candidate = session.path_state.candidate_path
+                if (
+                    candidate is None
+                    or candidate.next_challenge_at is None
+                    or candidate.epoch is not session.current_epoch
+                    or candidate.challenge_sends >= PATH_CHALLENGE_MAX_SENDS
+                ):
+                    if candidate is not None:
+                        candidate.next_challenge_at = None
+                    self._path_challenge_retry_keys.discard(session_key)
+                    continue
+                if now < candidate.next_challenge_at:
+                    continue
+                candidate.challenge_sends += 1
+                candidate.next_challenge_at = None
+                self._path_challenge_retry_keys.discard(session_key)
+                claims.append(
+                    _PathChallengeSend(session=session, candidate=candidate)
+                )
+        return claims
+
+    def finish_path_challenge_attempt(self, session, candidate, outcome, now):
+        """Report one admitted PATH_CHALLENGE attempt on `candidate`
+        (`outcome` is 'sent', 'failed' -- `sendto` raised -- or 'skipped' --
+        the final revalidation refused it) and, while the candidate is still
+        the live current incarnation, schedule its next retry one
+        `PATH_CHALLENGE_RETRY_INTERVAL_SECONDS` after this fresh
+        post-attempt `now`: only within the send budget and only strictly
+        before the fixed deadline, which is never moved. A failed send has
+        already consumed its attempt. Returns `True` when a retry is now
+        scheduled.
+
+        `migration_challenges_sent` (MP7) still counts exactly the
+        challenges handed successfully to `sendto()`; a retry among them
+        also counts in `migration_challenge_retries_sent`."""
+        with self._lock:
+            now = self._authoritative_now(now)
+            retry = candidate.challenge_sends > 1
+            if outcome == "sent":
+                self._migration_challenges_sent += 1
+                if retry:
+                    self._migration_challenge_retries_sent += 1
+            if retry and outcome in ("sent", "failed"):
+                self.migration_diagnostics.publish(
+                    (
+                        "challenge_retried",
+                        session.station_id,
+                        session._session_key.session_locator,
+                        candidate.sockaddr,
+                        candidate.path_generation,
+                        candidate.challenge_sends,
+                        PATH_CHALLENGE_MAX_SENDS,
+                        outcome == "sent",
+                    )
+                )
+            if self._get_live_session_handle(session, now) is None:
+                return False
+            self._expire_session_path_state(session, now)
+            if (
+                session.path_state.candidate_path is not candidate
+                or candidate.epoch is not session.current_epoch
+            ):
+                return False
+            next_at = now + PATH_CHALLENGE_RETRY_INTERVAL_SECONDS
+            if (
+                candidate.challenge_sends >= PATH_CHALLENGE_MAX_SENDS
+                or next_at >= candidate.deadline
+            ):
+                candidate.next_challenge_at = None
+                self._path_challenge_retry_keys.discard(session._session_key)
+                return False
+            candidate.next_challenge_at = next_at
+            self._path_challenge_retry_keys.add(session._session_key)
+            return True
+
+    def next_path_challenge_retry_at(self, endpoint_token):
+        """The earliest monotonic instant a PATH_CHALLENGE retry is due on
+        this listener's `endpoint_token`, or `None` when none is scheduled.
+        Visits only the indexed sessions and drops entries that no longer
+        schedule anything."""
+        earliest = None
+        with self._lock:
+            for session_key in list(self._path_challenge_retry_keys):
+                if session_key.endpoint_token != endpoint_token:
+                    continue
+                session = self._sessions.get(session_key)
+                candidate = (
+                    None if session is None else session.path_state.candidate_path
+                )
+                due = None if candidate is None else candidate.next_challenge_at
+                if due is None:
+                    self._path_challenge_retry_keys.discard(session_key)
+                    continue
+                if earliest is None or due < earliest:
+                    earliest = due
+        return earliest
 
     def commit_candidate_path(
         self,
@@ -3831,6 +4032,9 @@ class SecureState:
 
             path_state.active_path = candidate.sockaddr
             path_state.candidate_path = None
+            # MP2: a committed candidate is never retried.
+            candidate.next_challenge_at = None
+            self._path_challenge_retry_keys.discard(session_key)
             # Field-diagnostics addendum: label the now-active path with the
             # generation that actually won, never a candidate generation
             # that opened/replaced/expired without committing.
@@ -4431,20 +4635,25 @@ def _process_candidate_path_observation(
     wall_now,
     monotonic_now,
     now,
+    retry_wakeup=None,
 ):
     """Process one authenticated, replay-admitted `nmea`/`ping` observation
     from an off (non-active) path under the exact current epoch: install or
     replace the session's single candidate path when required, and -- only
     for a brand-new, replaced, or epoch-stale-replaced candidate incarnation
-    -- send exactly one encrypted PATH_CHALLENGE to that raw candidate
+    -- send the initial encrypted PATH_CHALLENGE to that raw candidate
     address. Duplicate traffic on an existing current-epoch candidate sends
-    nothing (Prompt 4 issues only the initial challenge; there is no
-    retransmission/liveness protocol here).
+    nothing and never resets that incarnation's retry budget or deadline.
+    MP2: retries of the same challenge are sent by the listener's own retry
+    pass (`_send_due_path_challenge_retries`); `retry_wakeup`, when given,
+    is called once the first retry is scheduled.
 
     All AEAD/packet work and the `sendto` happen here, outside the
     `SecureState` lock; a short revalidation immediately before the send
     ensures a candidate already replaced by a newer one does not draw a
-    challenge from stale work."""
+    challenge from stale work. A failed initial send still propagates to
+    the caller, as before MP2, after its attempt was charged to the budget
+    and the first retry scheduled."""
     # OPENED/REPLACED (and any lazily EXPIRED record) diagnostics are
     # published inside the locked state transitions themselves as O(1)
     # nonblocking enqueues; nothing on this path performs output, so no
@@ -4458,23 +4667,140 @@ def _process_candidate_path_observation(
     )
     if outcome != "installed":
         return
-    challenge_message = build_path_challenge_message(
-        station_id=session.station_id,
-        challenge_token=candidate.challenge_token,
-        path_generation=candidate.path_generation,
-        timestamp=int(wall_now()),
+    challenge_packet = _build_path_challenge_packet(
+        session.station_id, candidate, packet_locator, wall_now
     )
-    challenge_packet = encrypt_secure_json_message(
-        candidate.epoch.server_to_client_aesgcm,
-        packet_locator,
-        candidate.epoch_generation,
-        challenge_message,
-    )
-    if state_owner.path_challenge_is_current(
+    if not state_owner.admit_initial_path_challenge(
         session, candidate, monotonic_now()
     ):
+        return
+    send_outcome = "failed"
+    try:
         sock.sendto(challenge_packet, candidate.sockaddr)
-        state_owner.record_migration_challenge_sent()
+        send_outcome = "sent"
+    finally:
+        if (
+            state_owner.finish_path_challenge_attempt(
+                session, candidate, send_outcome, monotonic_now()
+            )
+            and retry_wakeup is not None
+        ):
+            retry_wakeup()
+
+
+def _build_path_challenge_packet(station_id, candidate, session_locator, wall_now):
+    """Encrypt `candidate`'s PATH_CHALLENGE -- its own token and
+    path_generation, under the exact epoch it was opened with -- with a
+    fresh AEAD nonce. Every attempt, initial or retry, builds a new
+    datagram; ciphertext is never cached or resent."""
+    return encrypt_secure_json_message(
+        candidate.epoch.server_to_client_aesgcm,
+        session_locator,
+        candidate.epoch_generation,
+        build_path_challenge_message(
+            station_id=station_id,
+            challenge_token=candidate.challenge_token,
+            path_generation=candidate.path_generation,
+            timestamp=int(wall_now()),
+        ),
+    )
+
+
+def _send_due_path_challenge_retries(
+    state_owner, endpoint_token, sock, wall_now, monotonic_now
+):
+    """MP2 retry pass for ONE listener: send every PATH_CHALLENGE retry due
+    on `endpoint_token` now. Each retry admitted by
+    `SecureState.claim_due_path_challenge_retries` is freshly encrypted
+    outside the lock, revalidated immediately before `sendto`, and reported
+    through `finish_path_challenge_attempt`, which schedules the next one.
+    A failing `sendto` is contained: the attempt stays consumed and any next
+    retry is one full interval later, so a broken path can never drive a
+    busy retry. Returns the number of challenges handed to `sendto`."""
+    sent = 0
+    for claim in state_owner.claim_due_path_challenge_retries(
+        endpoint_token, monotonic_now()
+    ):
+        session, candidate = claim.session, claim.candidate
+        packet = _build_path_challenge_packet(
+            session.station_id,
+            candidate,
+            session._session_key.session_locator,
+            wall_now,
+        )
+        outcome = "skipped"
+        if state_owner.path_challenge_is_current(
+            session, candidate, monotonic_now()
+        ):
+            try:
+                sock.sendto(packet, candidate.sockaddr)
+            except OSError:
+                outcome = "failed"
+            else:
+                outcome = "sent"
+                sent += 1
+        state_owner.finish_path_challenge_attempt(
+            session, candidate, outcome, monotonic_now()
+        )
+    return sent
+
+
+async def _wait_for_path_challenge_retry(wakeup, timeout):
+    """Wait until `wakeup` is set or `timeout` seconds pass (`None`: no
+    limit). MP3: a loop timer sets `wakeup` at the timeout, so this only
+    ever awaits the Event itself and a `Task.cancel()` always ends it.
+    Deliberately not `asyncio.wait_for`: before Python 3.12 it returns
+    normally -- losing the cancellation -- when the Event is set in the
+    same loop turn the driver is cancelled (CPython gh-86296), which would
+    let a stopped listener's driver run another retry pass and outlive it."""
+    timer = None
+    if timeout is not None:
+        timer = asyncio.get_running_loop().call_later(timeout, wakeup.set)
+    try:
+        await wakeup.wait()
+    finally:
+        if timer is not None:
+            timer.cancel()
+
+
+async def _run_path_challenge_retries(
+    sock,
+    endpoint_token,
+    state_owner,
+    wakeup,
+    *,
+    wall_clock=None,
+    monotonic_clock=None,
+    wait=None,
+):
+    """MP2: one listener's PATH_CHALLENGE retry driver. `secure_server`
+    runs it next to that listener's receive loop and cancels it -- and
+    waits for it to end -- before the listener's sessions and socket are
+    closed. Its only await is `wait`, so a cancellation lands there, never
+    inside a retry pass (claim -> build -> revalidate -> sendto is one
+    synchronous call). It waits until the earliest
+    retry due on this listener (`SecureState.next_path_challenge_retry_at`)
+    -- or until `wakeup` reports a newly scheduled one -- and then runs
+    `_send_due_path_challenge_retries`. It keeps no state of its own and,
+    with nothing scheduled, simply waits. An unexpected error stops only
+    this driver, after one log line: the listener keeps receiving, and its
+    candidates fall back to the pre-MP2 single challenge."""
+    wall_now = time.time if wall_clock is None else wall_clock
+    monotonic_now = time.monotonic if monotonic_clock is None else monotonic_clock
+    wait = _wait_for_path_challenge_retry if wait is None else wait
+    try:
+        while True:
+            wakeup.clear()
+            _send_due_path_challenge_retries(
+                state_owner, endpoint_token, sock, wall_now, monotonic_now
+            )
+            due = state_owner.next_path_challenge_retry_at(endpoint_token)
+            timeout = None if due is None else max(0.0, due - monotonic_now())
+            await wait(wakeup, timeout)
+    except Exception as e:
+        print(
+            f"[!] PATH_CHALLENGE retry driver stopped: {type(e).__name__}: {e}"
+        )
 
 
 async def _secure_server_loop(
@@ -4494,6 +4820,7 @@ async def _secure_server_loop(
     server_private_key=None,
     owned_sessions=None,
     owned_pending_sessions=None,
+    path_challenge_retry_wakeup=None,
 ):
     active_server_private_key = _require_prepared_server_private_key(
         server_private_key
@@ -5102,6 +5429,7 @@ async def _secure_server_loop(
                                 wall_now,
                                 monotonic_now,
                                 effective_now,
+                                retry_wakeup=path_challenge_retry_wakeup,
                             )
                         continue
                     response = build_pong_message(
@@ -5155,6 +5483,7 @@ async def _secure_server_loop(
                         wall_now,
                         monotonic_now,
                         effective_now,
+                        retry_wakeup=path_challenge_retry_wakeup,
                     )
 
                 src_for_queue = sec_input_id or station_id or "ANONYMOUS"
@@ -5301,7 +5630,21 @@ async def secure_server(
     # removed state alive.
     owned_sessions = weakref.WeakValueDictionary()
     owned_pending_sessions = weakref.WeakValueDictionary()
+    retry_task = None
     try:
+        # MP2: this listener's own PATH_CHALLENGE retry driver, woken
+        # whenever a new candidate schedules its first retry.
+        retry_wakeup = asyncio.Event()
+        retry_task = asyncio.create_task(
+            _run_path_challenge_retries(
+                sock,
+                endpoint_token,
+                state_owner,
+                retry_wakeup,
+                wall_clock=wall_clock,
+                monotonic_clock=monotonic_clock,
+            )
+        )
         await _secure_server_loop(
             sock,
             queue,
@@ -5318,22 +5661,35 @@ async def secure_server(
             server_private_key=server_private_key,
             owned_sessions=owned_sessions,
             owned_pending_sessions=owned_pending_sessions,
+            path_challenge_retry_wakeup=retry_wakeup.set,
         )
     finally:
         try:
-            close_owned_sessions(
-                sock,
-                state_owner,
-                owned_sessions,
-                wall_clock=wall_clock,
-                monotonic_clock=monotonic_clock,
-            )
+            if retry_task is not None:
+                # Stop retries before this listener's sessions and socket
+                # are closed: no PATH_CHALLENGE can leave once shutdown
+                # begins. `cancel()` only requests it, so wait until the
+                # driver has actually ended (one loop turn: it can only be
+                # parked in its wait) and retrieve its outcome. A
+                # cancellation of THIS task while waiting still propagates,
+                # after the cleanup below; the original exception is kept.
+                retry_task.cancel()
+                await asyncio.gather(retry_task, return_exceptions=True)
         finally:
             try:
-                close_owned_pending_sessions(
+                close_owned_sessions(
+                    sock,
                     state_owner,
-                    owned_pending_sessions,
+                    owned_sessions,
+                    wall_clock=wall_clock,
                     monotonic_clock=monotonic_clock,
                 )
             finally:
-                sock.close()
+                try:
+                    close_owned_pending_sessions(
+                        state_owner,
+                        owned_pending_sessions,
+                        monotonic_clock=monotonic_clock,
+                    )
+                finally:
+                    sock.close()

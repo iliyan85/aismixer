@@ -7311,6 +7311,7 @@ def test_secure_state_stats_start_at_zero_and_are_frozen_snapshots(monkeypatch):
         "path_migrations_committed",
         "retired_paths_expired",
         "migration_challenges_sent",
+        "migration_challenge_retries_sent",
         "migration_invalid_responses",
         "retired_path_packets_admitted",
         "current_handshake_replays",

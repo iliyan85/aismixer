@@ -65,6 +65,21 @@ def drop_every(kind, min_seq=0):
     return hook
 
 
+def drop_challenges_of_generation(generation):
+    """Drop every PATH_CHALLENGE -- the initial send and each MP2 retry --
+    of the one candidate incarnation with this `path_generation`."""
+
+    def hook(message, t, lab):
+        if not message or message.get("type") != "path_challenge":
+            return False
+        if message.get("path_generation") != generation:
+            return False
+        lab.log("fault", f"dropped path_challenge generation {generation}")
+        return True
+
+    return hook
+
+
 def hold_once(kind, seconds, seq=None):
     """Delay the first `kind` message by `seconds` extra."""
     state = {"done": False}
@@ -395,6 +410,18 @@ def b11_canonical_sockaddr(monkeypatch):
     return lab.run_client(until=T0 + 200.0)
 
 
+def b12_every_attempt_of_one_incarnation_lost(monkeypatch):
+    """MP2: A->B at 1045; every PATH_CHALLENGE of the first candidate
+    incarnation -- its initial send and all of its retries -- is lost. That
+    incarnation spends its whole budget and expires at its unchanged
+    deadline; later authenticated traffic from B opens a new incarnation,
+    which commits."""
+    lab = Lab("B12_MP2_all_attempts_of_one_incarnation_lost", monkeypatch)
+    lab.remap(1045.0, ADDR_B)
+    lab.drop_s2c = drop_challenges_of_generation(1)
+    return lab.run_client(until=T0 + 200.0)
+
+
 # --------------------------------------------------------------- C: terminal
 
 
@@ -483,6 +510,7 @@ SCENARIOS = {
         Scenario("B8", "T10b", "B", "A->B->C with late old-path packet", b8_rapid_a_b_c),
         Scenario("B10", "T10a", "B", "flap A->B->A during challenge", b10_flap_during_challenge),
         Scenario("B11", "T12", "B", "canonical sockaddr (flowinfo vs port)", b11_canonical_sockaddr),
+        Scenario("B12", None, "B", "every challenge attempt of one incarnation lost", b12_every_attempt_of_one_incarnation_lost),
         Scenario("C1", None, "C", "6 min local Wi-Fi loss, same tuple", c1_long_local_network_loss),
         Scenario("C2", None, "C", "6 min loss, new CGNAT port", c2_long_loss_new_cgnat_port),
         Scenario("C3", None, "C", "242 s silent blackhole", c3_server_unreachable_beyond_bounds),

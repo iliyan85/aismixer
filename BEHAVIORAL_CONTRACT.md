@@ -1678,7 +1678,8 @@ existing `assembly_namespace` (so a multipart message may span the active
 and candidate paths), but the candidate has no outbound authority: an
 ordinary `pong` still goes only to `active_path`, refresh/close/path
 control still resolve only through the active-path authority, and the
-candidate receives only the one bounded `path_challenge`. Fail-closed for
+candidate receives only its own bounded `path_challenge` attempts (see
+"Bounded PATH_CHALLENGE retransmission" below). Fail-closed for
 unproved-path attempts at any other state-changing control (session close,
 epoch refresh INIT/CONFIRM, a path ACK/CHALLENGE in the wrong direction,
 future/unknown types): they mutate no unrelated protocol state.
@@ -1686,13 +1687,13 @@ future/unknown types): they mutate no unrelated protocol state.
 **Candidate creation/replacement.** On the first eligible authenticated
 current-epoch packet from a new path B, the server mints a fresh `R`,
 allocates the next `path_generation`, installs `Candidate(B, R, generation,
-now + PATH_CANDIDATE_TTL_SECONDS, current epoch)`, and sends exactly one
+now + PATH_CANDIDATE_TTL_SECONDS, current epoch)`, and sends its initial
 `path_challenge` to B. More eligible traffic from the SAME candidate,
 under the SAME still-current epoch, keeps the identical
-object/token/generation/deadline and sends nothing further (Prompt 4
-issues only the initial challenge; there is no retransmission or liveness
-protocol here). Eligible current-epoch DATA from a DIFFERENT new path C
-while B is candidate replaces B outright: fresh token, advanced
+object/token/generation/deadline, sends nothing, and never resets that
+incarnation's retry budget or schedule; only the bounded retransmission
+below ever resends the challenge. Eligible current-epoch DATA from a
+DIFFERENT new path C while B is candidate replaces B outright: fresh token, advanced
 `path_generation`, same `LogicalSession`/current epoch; B's token and
 generation are stale immediately and a late `path_response` from B does
 nothing. This is "newer candidate replaces older", not a queue.
@@ -1710,9 +1711,62 @@ DIFFERENT live session on this endpoint token is not created at all (it
 could never commit -- see below), and no `path_challenge` is sent.
 
 All AEAD/JSON/packet work and every `sendto` happen outside the state-owner
-lock; a short revalidation immediately before the challenge send ensures a
-candidate already replaced by a newer one draws no challenge from stale
+lock; a short revalidation immediately before every challenge send (initial
+or retry) ensures a candidate already replaced by a newer one, committed,
+expired, or left behind by an epoch refresh draws no challenge from stale
 work.
+
+**Bounded PATH_CHALLENGE retransmission (MP2).** One live candidate
+incarnation may send its SAME challenge -- the same token `R`,
+`path_generation`, candidate address and epoch, freshly encrypted with a
+new AEAD nonce every time, never a cached datagram -- at most
+`PATH_CHALLENGE_MAX_SENDS` (4) times in total, the initial send included.
+Each retry is due `PATH_CHALLENGE_RETRY_INTERVAL_SECONDS` (2 s) after the
+previous attempt ended, measured from a fresh monotonic observation taken
+after that attempt, and is sent only while `now < deadline`. The fixed
+candidate deadline is never moved: not by a retry, not by a failed send,
+not by duplicate traffic. A retry is never scheduled for an instant at or
+after the deadline, and a due retry reached at the deadline is not sent
+(expiry wins at equality). With the 10 s TTL the attempts fall at about
+t0, t0 + 2, t0 + 4 and t0 + 6, leaving at least 4 s for the last round
+trip. A failed OS send consumes its attempt: the next retry, if any, comes
+one full interval later, never immediately. Once the budget is spent the
+candidate stays valid until its unchanged deadline -- a delayed matching
+`path_response` still commits -- and nothing re-arms it: duplicate traffic
+does not reset the budget, and only a genuinely new incarnation (a
+replacement, or new traffic after expiry) gets a fresh token, generation,
+deadline and budget. Commit, replacement, expiry, an epoch refresh that
+leaves the candidate bound to a non-current epoch, and removal of the
+session each cancel the candidate's pending retries at once.
+
+Retry is delivery, never authority. It creates no candidate, token,
+generation, deadline, replay or session state; it needs no new message
+type, wire format, version or configuration; and a retry can exist only
+for a candidate the existing authenticated, replay-admitted,
+current-epoch gate already installed, so unknown-locator, unauthenticated,
+wrong-epoch or replayed traffic can never create or reset retry state. The
+unchanged client answers a duplicate challenge with a fresh
+`path_response` and never extends or revives its proof for it, and a
+challenge (retry or not) is never client liveness evidence. Each
+candidate's retry state is two O(1) fields (`challenge_sends`,
+`next_challenge_at`); each state owner additionally indexes the session
+keys whose candidate has a retry scheduled -- at most one entry per live
+session, dropped at every cancellation above -- and each listener runs one
+retry driver (`secure_server`'s `_run_path_challenge_retries`) that sleeps
+until its own earliest due retry or until a new candidate schedules one,
+then claims every due retry under the lock (charging the attempt and
+capturing its authority), encrypts and sends outside the lock after a final
+revalidation, and reports each attempt back, which schedules the next.
+`secure_server` cancels that driver and waits until it has actually ended
+before it closes the listener's sessions and socket (MP3). A retry pass --
+claim, encrypt, final revalidation, `sendto`, report -- is one synchronous
+call, so the driver's only suspension point is its wait between passes,
+where the cancellation always lands; that wait does not use
+`asyncio.wait_for`, whose pre-3.12 form can lose a cancellation that races
+a wakeup. The driver therefore ends within one loop turn and no challenge
+can leave after shutdown begins, on every supported Python. Bounds per
+incarnation: state O(1), at most one challenge per retry interval, at most
+`PATH_CHALLENGE_MAX_SENDS` challenges in total.
 
 **Return-routability proof and atomic commit.** Server acceptance of a
 `path_response` requires ALL of: the exact live `LogicalSession` object;
@@ -1984,8 +2038,10 @@ history-scaled state.
 5. **Candidate state is strictly one-slot bounded.** At most one live
    `CandidatePath` per session at all times, regardless of replacement
    rate; no address/token/deadline history, no candidate-deadline heap,
-   no per-transition timer. Retained migration state is `O(number of live
-   sessions)`, never `O(total migration attempts or replacements)`.
+   no per-candidate or per-transition timer (MP2's challenge retry
+   schedule is two O(1) fields on the one live candidate, served by one
+   retry driver per listener). Retained migration state is `O(number of
+   live sessions)`, never `O(total migration attempts or replacements)`.
 6. **Stale token/generation/address responses fail closed.** A
    `PATH_RESPONSE` must match the live candidate's exact address, exact
    constant-time token, and exact `path_generation`; any mismatch is
@@ -2021,9 +2077,13 @@ history-scaled state.
     is the "a response was accepted" counter -- there is no separate
     `migration_responses_accepted`). Three counters are new in this
     round: `migration_challenges_sent` increments only when a
-    `PATH_CHALLENGE` datagram is actually handed successfully to the
-    transport's send boundary (a send failure is not counted, and
-    propagates to the caller's general error handling instead);
+    `PATH_CHALLENGE` datagram -- initial or MP2 retry -- is actually handed
+    successfully to the transport's send boundary (a send failure is not
+    counted: a failed initial send propagates to the caller's general
+    error handling as before, a failed retry is contained and consumes its
+    attempt), and MP2's `migration_challenge_retries_sent` counts the
+    retries among them, so initial sends = `migration_challenges_sent` -
+    `migration_challenge_retries_sent`;
     `migration_invalid_responses` increments once for a `PATH_RESPONSE`
     that reached authoritative validation but did not match the live
     candidate's address/token/generation/epoch authority (never for a
@@ -2067,15 +2127,17 @@ path change, exactly as a real mobile station experiences it.
    by any one path.
 5. **The new path becomes authoritative only after bounded, authenticated
    return-routability validation**, end to end through the real wire
-   choreography: an off-path observation opens at most one candidate and
-   draws at most one `PATH_CHALLENGE`; only a matching, current-epoch,
-   correctly source-addressed `PATH_RESPONSE` commits the candidate as
+   choreography: an off-path observation opens at most one candidate,
+   which draws at most `PATH_CHALLENGE_MAX_SENDS` attempts of its one
+   `PATH_CHALLENGE` (MP2); only a matching, current-epoch, correctly
+   source-addressed `PATH_RESPONSE` commits the candidate as
    `active_path`, retiring the previous active path with a bounded grace
-   window. A lost `PATH_CHALLENGE`, lost `PATH_RESPONSE`, or lost
-   `PATH_ACK` each recover through the protocol's own existing mechanisms
-   (a fresh off-path observation re-opens/re-challenges; the server's own
-   commit is unaffected by whether its ACK is ever delivered) -- never
-   through any retry/history state added by this closure.
+   window. A lost `PATH_CHALLENGE` or `PATH_RESPONSE` is recovered first
+   by that same incarnation's bounded retries (MP2) and, only if all of
+   them are lost, by a fresh off-path observation after its expiry; a lost
+   `PATH_ACK` is recovered by the protocol's existing mechanisms (the
+   server's own commit is unaffected by whether its ACK is ever delivered)
+   -- never through history state.
 6. **Rapid, repeated mobility stays strictly one-candidate/one-retired
    bounded.** A -> B -> C in quick succession never accumulates a
    candidate queue or an address history; each new candidate observation
@@ -2120,7 +2182,8 @@ path change, exactly as a real mobile station experiences it.
 12. **End-to-end migration counter semantics have no double counting.**
     Observed strictly through the real wire exchange, `path_candidates_opened`,
     `migration_challenges_sent`, and `path_migrations_committed` each move
-    by exactly one per genuine candidate/challenge/commit; a spurious
+    by exactly one per genuine candidate / challenge datagram (initial or
+    MP2 retry) / commit; a spurious
     `PATH_RESPONSE` with no live candidate behind it increments only
     `migration_invalid_responses`; a genuinely late, honest packet on a
     still-live retired path increments only `retired_path_packets_admitted`;
@@ -2213,8 +2276,10 @@ Three different numbers must not be confused:
    ignores the additive members (its PONG matching tolerates them).
 5. **Server migration-lifecycle log lines.** Each real transition --
    candidate `OPENED`/`REPLACED`/`EXPIRED`, retired path `EXPIRED`,
-   migration `COMMITTED` -- enqueues exactly one immutable diagnostic
-   snapshot; if it is delivered, it becomes one line such as
+   migration `COMMITTED`, and each MP2 challenge retry attempt (`Path
+   challenge RETRY <n>/<max>`, or `... send FAILED`) -- enqueues exactly
+   one immutable diagnostic snapshot; if it is delivered, it becomes one
+   line such as
    `[+] Path migration COMMITTED for <station> session=<8 hex>
    old=<endpoint> new=<endpoint> generation=<G>`, never containing keys,
    nonces, tokens, or signatures. The enqueue is O(1), inside the
@@ -2270,7 +2335,7 @@ Three different numbers must not be confused:
    stuck shutdown needs SIGKILL. `nmea_sproxy` keeps its own SIGTERM
    handler, which still raises KeyboardInterrupt immediately.
 
-### 11.5 Recovery baseline cross-reference (MP0, MP1)
+### 11.5 Recovery baseline cross-reference (MP0, MP1, MP2, MP3)
 
 Three distinct recovery mechanisms exist and must not be conflated:
 
@@ -2281,7 +2346,8 @@ Three distinct recovery mechanisms exist and must not be conflated:
    `peer_timeout` bound after the last authenticated evidence ends it.
 2. **Path migration**: server-driven return-routability validation of a
    changed tuple (the path-migration subsections and 11.1-11.3). It keeps the
-   same `LogicalSession`.
+   same `LogicalSession`. Since MP2 one candidate incarnation retransmits
+   its same challenge a bounded number of times before its fixed expiry.
 3. **Full-establishment fallback**: a fresh signed ECDHE handshake that
    creates a new `LogicalSession` (new locator, epoch 0, `path_gen` 0).
 
@@ -2292,9 +2358,42 @@ bounded, evidence before verdict, transient network errors inside the
 liveness bound; no wire, server, or configuration change) is implemented as
 specified in section 11 above. Its acceptance tests and exact policy pins,
 next to that baseline, are ordinary tests. MP2 (bounded path-migration
-recovery) remains a FUTURE target recorded there, not a current guarantee:
-until MP2 changes it, one PATH_CHALLENGE per candidate incarnation (11.3)
-remains the normative behaviour.
+recovery: bounded PATH_CHALLENGE retransmission within one candidate
+incarnation; no wire, client, or configuration change) is implemented as
+specified in the server path-migration subsection above; its policy pins and
+scenario tests are ordinary tests too.
+
+MP3 (liveness x migration x epoch/lifecycle composition) adds no mechanism,
+message, wire, client, or configuration change; it fixes how the MP1 and MP2
+mechanisms compose (`tests/test_udpsec_mp3_integration.py`):
+
+- **Retry x epoch refresh.** A candidate's retries carry only the authority
+  of the exact epoch it opened under. A refresh commit that makes that epoch
+  non-current stops them whether it lands before the claim, between the
+  claim and the send (the final revalidation refuses), or right after a
+  completed send (the next claim drops the stale schedule; at most one empty
+  wake-up). A retry is never re-encrypted under the new epoch, and the
+  refresh itself changes no candidate, token, `path_generation`, deadline,
+  replay ledger, or `LogicalSession` identity; only new current-epoch
+  traffic opens a new incarnation.
+- **Retry/expiry x terminal liveness.** Expiry wins at equality for a late
+  retry pass. On the client, server-side migration state never alters the
+  MP1 terminal rule: a proof-matched `path_ack` readable at or before the
+  verdict instant is ordinary evidence (evidence before verdict); one
+  readable later is ignored by the fresh handshake or the new session and
+  revives nothing. A `path_response` the client sent while alive but that
+  reaches the server after the client's verdict may still commit the old
+  server session to that path while the candidate is live and the path is
+  unowned; the fresh establishment then replaces it at that relation, and
+  once the fresh session owns the path the old commit is refused. Old-session
+  challenges reaching the new session are inert.
+- **Listener shutdown.** As in the MP2 paragraph above: the driver has ended
+  before any listener cleanup, the listener's original exception or
+  cancellation still propagates, and the socket closes exactly once.
+- **Load.** A retry may run late, never early; lateness only reduces how
+  many attempts fit before the fixed deadline, and a retry that would run at
+  or after it is omitted. Each listener's driver claims and sends only its
+  own endpoint token's retries, through its own socket.
 
 ## 12. Routing snapshot boundary
 

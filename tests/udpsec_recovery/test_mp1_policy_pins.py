@@ -1,4 +1,4 @@
-"""MP1 (and pre-MP2) policy pins: the CURRENT behaviour, exactly.
+"""MP1 policy pins: the CURRENT client liveness behaviour, exactly.
 
 MP1 replaced the pre-MP1 single-shot keepalive policy (one unanswered ping
 ended the session at its keepalive deadline). These tests pin the MP1
@@ -17,8 +17,8 @@ client liveness policy with its exact constants and cadence:
 They are NOT invariants. They exist so that any change of this policy is
 deliberate, and they record the MP1 outcome of every scenario whose
 pre-MP1 outcome MP0 pinned (UDPSEC_V2_RECOVERY_BASELINE.md, section 6).
-The pre-MP2 migration pins at the end are unchanged from MP0; MP2 replaces
-them.
+The pre-MP2 migration pins that used to follow them were inverted by MP2
+into test_mp2_policy_pins.py.
 """
 
 import pytest
@@ -330,25 +330,3 @@ def test_mp1_long_local_loss_keeps_input_paused_while_probing(monkeypatch):
     assert lab.hello_times() == pytest.approx([T0, reachable_attempt])
     assert last.confirmed_at == pytest.approx(reachable_attempt + TWO_RTT)
     assert _lost(lab) == ["000006"]
-
-
-# ------------------------------------------------------------- pre-MP2 pins
-
-
-@pytest.mark.parametrize("scenario_id", ["B1", "B2", "B2b", "B3", "B4", "B10"])
-def test_pre_mp2_one_path_challenge_per_candidate_incarnation(monkeypatch, scenario_id):
-    lab = run(scenario_id, monkeypatch)
-    stats = lab.state.stats()
-    assert stats.migration_challenges_sent == stats.path_candidates_opened
-
-
-@pytest.mark.parametrize("scenario_id", ["B2", "B3"])
-def test_pre_mp2_lost_challenge_or_response_waits_for_candidate_expiry(
-    monkeypatch, scenario_id
-):
-    lab = run(scenario_id, monkeypatch)
-    challenges = lab.sent("s2c", "path_challenge")
-    assert len(challenges) == 2
-    assert challenges[1].t - challenges[0].t >= lab.secure.PATH_CANDIDATE_TTL_SECONDS
-    ack = lab.first_sent("s2c", "path_ack")
-    assert ack.t - challenges[0].t == pytest.approx(10.1)

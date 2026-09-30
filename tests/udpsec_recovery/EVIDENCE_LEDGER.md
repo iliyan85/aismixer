@@ -1,4 +1,4 @@
-# UDPSEC V2 Recovery Evidence Ledger (MP0, updated by MP1)
+# UDPSEC V2 Recovery Evidence Ledger (MP0, updated by MP1, MP2 and MP3)
 
 Purpose: let every future independent gate (Astra Gate A and Gate B,
 baseline section 11) start from classified evidence instead of re-auditing
@@ -8,7 +8,12 @@ is the client-only delta on top of `71a47894`. Section 1.1 is the pre-MP1
 record and keeps its Fable/MP0 evidence. Section 1.3 is MP1's own claims.
 Astra Gate A has since audited them (section 8): the audited design is
 accepted, and the F1-F3 corrections are IMPLEMENTER-REPORTED ONLY until the
-Astra corrective recheck.
+Astra corrective recheck. MP1 was then committed as `aa41b782`. MP2 is the
+server-side delta on top of `aa41b782`: its claims (section 2.2) are
+IMPLEMENTER-REPORTED ONLY; no independent gate has audited them. MP3 is the
+integration closure in the same working tree: its claims (section 2.3),
+including one lifecycle correction to `aismixer_secure.py`, are
+IMPLEMENTER-REPORTED ONLY until Astra Gate B.
 
 Evidence classes (as required by MP0):
 
@@ -79,7 +84,9 @@ Pointers name functions in the MP1 `nmea_sproxy/nmea_sproxy.py`.
 | E-P8 | No wire, server, configuration-schema, crypto, AAD, transcript or migration change, and no new message type or version. | CODE (production diff: `nmea_sproxy/nmea_sproxy.py` only); PROJECT TEST (`tests/test_udpsec_protocol.py` wire pins; L10 guard) | `git diff 71a47894 --stat` | any production diff outside that file |
 | E-P9 | The new log lines (liveness suspect, liveness recovered, transient failure, path usable again) are observational only. Nothing logged feeds back into liveness, admission or timing, and the lines carry errno text only (ASCII-escaped), never key material. | CODE | `note_transient_failure`, `note_send_success`, `retransmit_ping`, `resolve_ping` | log text changes |
 
-## 2. Current migration behaviour
+## 2. Migration behaviour
+
+### 2.0 Pre-MP2 claims (line numbers are the baseline's)
 
 | ID | Claim | Classes | Pointer | Re-verify when |
 |---|---|---|---|---|
@@ -88,6 +95,43 @@ Pointers name functions in the MP1 `nmea_sproxy/nmea_sproxy.py`.
 | E-M3 | A lost CHALLENGE or RESPONSE is recovered by candidate expiry and re-open (+10.1 s); a lost ACK by the next PONG; no rekey in any case. | PROJECT TEST (e2e `test_06/07/08`); FABLE (T09a/a7/b/c); IMPL (MP0 B2-B4) | contract 11.3 item 5 | MP2 |
 | E-M4 | A ping from an unproved or retired path gets no PONG. | CODE; PROJECT TEST (`test_candidate_nmea_shares_assembly_namespace_and_gets_no_pong`); FABLE | `aismixer_secure.py:5085-5106` | server ping branch changes |
 | E-M5 | Flap, rapid A→B→C, stale-epoch candidate, refresh × migration ordering and canonical sockaddr all keep one session with no rekey. | PROJECT TEST (matrix B6-B11); FABLE (T10a/b, T11a/b/c, T12); IMPL (MP0 B-invariants) | matrix B rows | server migration or refresh changes |
+
+### 2.1 Status of the pre-MP2 claims after MP2
+
+| ID | Status after MP2 |
+|---|---|
+| E-M1 | HOLDS: commit preservation is untouched. |
+| E-M2 | PARTLY SUPERSEDED by E-N1: an incarnation now sends up to 4 attempts of its one challenge. The 10 s TTL, never extended, still holds. |
+| E-M3 | PARTLY SUPERSEDED by E-N1: a lost challenge or response is now recovered by a same-incarnation retry about 2 s later (lab B2, B2b, B3). Candidate expiry and re-open remain the fallback when every attempt is lost (lab B12). A lost ACK is unchanged. |
+| E-M4 | HOLDS: server ping handling is untouched. |
+| E-M5 | HOLDS: the B invariants are green, unchanged. |
+
+### 2.2 MP2 claims
+
+Pointers name code in the MP2 `aismixer_secure.py`.
+
+| ID | Claim | Classes | Pointer | Re-verify when |
+|---|---|---|---|---|
+| E-N1 | One live candidate incarnation sends its SAME challenge -- same token, `path_generation`, address and epoch, a fresh encryption each time -- at most `PATH_CHALLENGE_MAX_SENDS` = 4 times in total, the initial send included. Each retry comes at least `PATH_CHALLENGE_RETRY_INTERVAL_SECONDS` = 2 s after the previous attempt ended and only while `now < deadline`; the deadline is never moved. A failed send consumes its attempt and schedules the next one interval later. | CODE; IMPL (MP2-B2, B3, B4, B6, B8, B9, B11; `test_mp2_policy_pins.py`; mutations M1-M4, M6) | `claim_due_path_challenge_retries`, `finish_path_challenge_attempt`, `_build_path_challenge_packet`, `_send_due_path_challenge_retries` | any change to the retry helpers or candidate lifecycle |
+| E-N2 | Commit, replacement, expiry, an epoch refresh that strands the candidate, and session removal each cancel pending retries at once. A retry claim reads only the session's live candidate, and a final revalidation right before `sendto` refuses a candidate replaced in between. | CODE; IMPL (MP2-B5, B7, B10; `test_mp2_b7_a_replacement_between_claim_and_send_is_never_sent`; `test_retry_never_crosses_an_epoch_refresh`; lab B6b; mutation M5) | `commit_candidate_path`, `open_or_replace_candidate_path`, `_expire_session_path_state`, `_remove_session`, `path_challenge_is_current` | same |
+| E-N3 | Anti-amplification. Retry state exists only for a candidate installed by the unchanged authenticated, replay-admitted, current-epoch gate. Unknown-locator, forged, wrong-epoch and replayed traffic cannot create, reset or extend it. Challenges go only to the candidate address: at most 4 per incarnation, at most one per 2 s. Duplicate traffic never resets the budget. | CODE; IMPL (`test_unknown_locator_forged_or_replayed_traffic_schedules_no_retry`, MP2-B8, `test_retry_passes_create_no_candidates_and_state_stays_bounded`, `test_a_retry_pass_serves_only_its_own_listener`) | candidate gate (unchanged) + retry index | gate or retry changes |
+| E-N4 | Bounds. STATE: two O(1) fields per candidate, plus a per-owner index of session keys with a scheduled retry, at most one entry per live session. RATE: at most one challenge per 2 s per candidate. COUNT: at most 4 per incarnation. No history, no heap, no per-candidate task or timer; one retry driver per listener. | CODE; IMPL | `CandidatePath`, `_path_challenge_retry_keys`, `_run_path_challenge_retries` | same |
+| E-N5 | Driver lifecycle. `secure_server` runs one `_run_path_challenge_retries` per listener. It waits exactly until the earliest due retry, or until a new candidate schedules one (no polling), and is cancelled before the listener's sessions and socket are closed. An unexpected error stops only the driver, after one log line; the listener falls back to single challenges. | CODE; IMPL (`test_retry_driver_waits_exactly_until_the_next_due_retry`, `test_retry_driver_stops_quietly_on_an_unexpected_error`, `test_secure_server_owns_and_cancels_its_retry_driver`) | `secure_server`, `_run_path_challenge_retries` | listener lifecycle changes |
+| E-N6 | No wire, version, AAD, crypto, transcript, client or configuration change. The unchanged client answers a duplicate challenge with a fresh response and never extends or revives its proof for it; a challenge is never client liveness evidence. | CODE (production diff: `aismixer_secure.py` only); IMPL (MP2-B3 with the real `_ClientPathMigration`; the lab B2, B2b, B3 pins; the MP1 recovery suite) | git diff | any client or wire change |
+| E-N7 | Observability. `migration_challenges_sent` counts every challenge handed to `sendto`, initial or retry; `migration_challenge_retries_sent` counts the retries among them. Each retry attempt emits one `Path challenge RETRY n/4` diagnostic, or `... send FAILED`, which never contains the token. | CODE; IMPL (MP2-B1, B9; `test_retry_diagnostic_line_carries_no_challenge_token`; pins) | `finish_path_challenge_attempt`, `_format_migration_diagnostic` | stats or diagnostics changes |
+
+### 2.3 MP3 claims
+
+Tests are in `tests/test_udpsec_mp3_integration.py` (`test_mp3_c<N>…`);
+outcomes per candidate are in baseline section 11.4.
+
+| ID | Claim | Classes | Pointer | Re-verify when |
+|---|---|---|---|---|
+| E-I1 | Retry × epoch refresh (C1). A refresh commit that makes a candidate's epoch non-current stops its retries wherever it lands: before the claim, between claim and build, between build and the final revalidation, or right after a completed send (then one empty wake-up drops the stale schedule). A claimed retry is sealed only under its own epoch and never re-encrypted under the new one. The refresh changes no candidate, token, generation, deadline, old-epoch replay ledger or `LogicalSession` identity. Held on the MP2 code without change. | CODE; IMPL (C1A, C1B ×2, C1C, C1D ×3; mutation M1) | `claim_due_path_challenge_retries`, `path_challenge_is_current`, `admit_refresh_confirm` | retry, revalidation or refresh-commit changes |
+| E-I2 | Retry/expiry × terminal liveness (C2). Expiry wins at equality for a late retry pass, and a retry that would fall on the deadline is never scheduled. Against the real client: a proof-matched PATH_ACK readable 10 ms before, or exactly at, the MP1 verdict keeps the session; 10 ms after, it is ignored by the fresh handshake and revives nothing. The terminated session sends nothing more, and old-session challenges reaching the new session draw no response. A late PATH_RESPONSE commits the old server session only while its candidate is live and the path is unowned; the fresh establishment then replaces it, and once the fresh session owns the path the commit is refused. No client change. Held on the MP2 code without change. | CODE; IMPL (C2A ×3; lab C2B, C2C ×2, C2D ×3; mutations M3a, M3b) | `_expire_session_path_state`, `finish_path_challenge_attempt`, `commit_candidate_path`, client `liveness_verdict`, `drain_available_datagrams`, `_ClientPathMigration` | liveness, expiry or commit changes |
+| E-I3 | Shutdown with an admitted retry (C3). A retry pass (claim, build, final revalidation, `sendto`, report) is one synchronous call, and the driver's only await is its wait, so a cancellation never lands inside a pass. Listener teardown forced into any window of an admitted retry sends no challenge (final revalidation, or a closed socket). DEFECT FOUND AND CORRECTED: on the MP2 code `secure_server` only requested the driver's cancellation, so the driver was still running when the listener's sessions and socket closed (E-N5's "cancelled before" held only as a request). Under pre-3.12 `asyncio.wait_for`, a cancellation racing a wakeup was lost: the driver ran one more pass after the socket closed and then waited forever. Now `secure_server` awaits the driver's end before any cleanup, and the driver waits on its Event with a loop timer instead of `asyncio.wait_for`. The listener's exception or cancellation still propagates, and the socket closes once. | CODE; IMPL (C3A-C3D, C3C structure, C3E ×4 with native and pre-3.12 `wait_for` semantics, the wait-helper race and timer tests, the driver-failure policy test; mutations M2, M2b) | `secure_server`, `_wait_for_path_challenge_retry`, `_run_path_challenge_retries` | listener lifecycle or driver wait changes |
+| E-I4 | Driver under load (C4). A retry runs late, never early; lateness only reduces how many attempts fit before the fixed deadline, and one that would run at or after it is omitted. Under a real busy event loop and a second, heavily churning listener on the same `SecureState`: no starvation, no busy loop, constant task count, retry index ≤ live sessions, and each driver claims and sends only its own endpoint token's retries through its own socket. Held on the MP2 code without change. | CODE; IMPL (C4A, C4B, the lateness model ×4; mutation M4) | `_run_path_challenge_retries`, `claim_due_path_challenge_retries` | driver or index changes |
+| E-I5 | MP3 changes no wire, message, version, AAD, crypto, client, configuration, TTL, retry interval or send cap. | CODE (production diff: `aismixer_secure.py` only; the MP3 hunks are in `secure_server` and `_wait_for_path_challenge_retry`) | git diff | any further production change |
 
 ## 3. Security invariants (must not regress)
 
@@ -111,6 +155,7 @@ Pointers name functions in the MP1 `nmea_sproxy/nmea_sproxy.py`.
 | E-F2 | IPv4/CGNAT run: the public tuple was stable over long intervals (`90.154.211.195:54654`); re-establishments still occurred; `path_gen` stayed 0. | FIELD OBSERVATION (operator report in the MP0 instruction; no logs supplied) | baseline 4.2 |
 | E-F3 | Wi-Fi-loss experiment: `Errno 101` handshake send errors every 5 s; afterwards a fresh session with the same public IPv4 and CGNAT port 54654→54104. | FIELD OBSERVATION; mechanism reproduced as IMPL (MP0 C1/C2) | baseline 4.3 |
 | E-F4 | Which packet was lost, and for how long, in any field event; server-side NMEA loss in the field. | NOT YET VERIFIED (not identifiable from the data) | Fable 5.2, worksheet section 11 |
+| E-F5 | MP1 road run, after `aa41b782`: one logical session survived the whole run; one keepalive exchange needed one retransmission and recovered in-session; the server-observed public IP and port were unchanged and `path_gen` stayed 0. A same-tuple liveness event (class A), not a migration. Which packet was lost is unknown. | FIELD OBSERVATION (operator report in the MP2 instruction; no logs supplied) | baseline 4.5 |
 
 ## 5. Test and environment provenance
 
@@ -130,6 +175,10 @@ Pointers name functions in the MP1 `nmea_sproxy/nmea_sproxy.py`.
 | E-T12 | The pre-MP1 comparison numbers for scenarios MP1 added or re-measured (A4, A4b, A5e, A7, A9b, A10b, A11, A11b, C1, C3, C3b, C5) come from one run of the MP1 lab against the pre-MP1 `nmea_sproxy.py` in that scratch extraction. | IMPLEMENTER-REPORTED ONLY |
 | E-T13 | F1-F3 corrective tests: the two new regressions pass on the corrected code. Against the pre-correction `nmea_sproxy.py` (a scratch copy), the F1 regression fails exactly at Astra's reproduction (second retry at 65, one second after the delayed first retry at 64). The F2 accounting regression passes on both, because it pins documented behaviour, not a code change. | IMPLEMENTER-REPORTED ONLY (until the Astra corrective recheck) |
 | E-T14 | Final micro-correction (`start_ping` post-attempt anchor). `test_slow_initial_ping_send_cannot_compress_first_retry_spacing` passes: 3.5, 5.5, 7.5, …, 19.5, and `proactive_rekey` at 20.0. Against the pre-micro-correction `nmea_sproxy.py` (a scratch copy) it fails at Astra's reproduction: initial attempt 3.5, first retry 4.0. `tests/udpsec_recovery` 145 passed. The proxy `forward_loop` test files passed 837 with 8 skipped, after updating the pinned first-retry expectation of G1/G2 in `test_udpsec_client_path_migration.py` (baseline 11.2). | IMPLEMENTER-REPORTED ONLY (until the final Astra micro-recheck) |
+| E-T15 | MP2 results, Windows 11 Pro 10.0.26200 (CPython 3.14.7, pytest 9.1.1, cryptography 50.0.1, PyYAML 6.0.3). Before any production edit, the pre-MP2 characterization passed: the 8 pre-MP2 pin cases and 187 migration and invariant tests. With MP2: the MP2 unit, pin and consistency tests 45 passed; the migration suites 205 passed; `tests/udpsec_recovery` 154 passed; the UDPSEC/server slice 1633 passed with 8 skipped (POSIX-only SIGTERM tests); one full suite 3930 passed with 37 skipped (platform skips only). No second OS. | IMPLEMENTER-REPORTED ONLY |
+| E-T16 | MP2 mutations, each run on a scratch copy outside the repository and restored afterwards, each killed. M1 (a retry extends the expiry) and M4 (the send cap is ignored): `test_mp2_b4_all_attempts_lost_…`. M2 (a retry mints a new token) and M3 (a retry mints a new generation): `test_mp2_b2_lost_first_challenge_…`. M5 (the pre-send revalidation is removed, so a candidate superseded between claim and send is retried): `test_mp2_b7_a_replacement_between_claim_and_send_is_never_sent`. M6 (cached ciphertext resent): `test_mp2_b11_every_attempt_is_a_fresh_encryption`. | IMPLEMENTER-REPORTED ONLY |
+| E-T17 | MP3 results, Windows 11 Pro 10.0.26300 (CPython 3.14.7, pytest 9.1.1, cryptography 50.0.1, PyYAML 6.0.3). Before any production edit, on the MP2 code: the MP3 module ran 31 passed and 5 failed, all C3E (the 4 listener-shutdown cases: driver still running at session and socket close, and never ending under pre-3.12 `wait_for` semantics; plus the pre-3.12 wait-helper race). With the MP3 correction: the MP3 module 36 passed; with the MP2 retry module 59 passed; the migration suites (retry, client migration, mobile e2e) 96 passed; `tests/udpsec_recovery` 154 passed; the refresh and lifecycle slice (refresh, refresh protocol, secure helpers, `test_aismixer_secure.py`, migration lifecycle races, path migration, runtime supervision) 672 passed; the broad UDPSEC slice 1823 passed with 8 skipped (POSIX-only SIGTERM tests); one full suite 3966 passed with 37 skipped (platform skips only). No second OS; no Python 3.11 interpreter was available. | IMPLEMENTER-REPORTED ONLY |
+| E-T18 | MP3 mutations, each applied to the working `aismixer_secure.py` by a scratch script, run, and restored byte-exact (sha256 checked before and after), each killed. M1 (final revalidation removed): C1B ×2 and C3D ×2. M2 (the termination wait removed): C3E ×4. M2b (the wait kept, the pre-MP3 `wait_for` helper restored): the pre-3.12 C3E cases, where a PATH_CHALLENGE leaves after shutdown began and shutdown never finishes, and the pre-3.12 wait-helper race. M3a (a candidate expires only after its deadline): C2A ×2 on expiry state; the wire stayed clean because the final revalidation is strict. M3b (M3a, and the final revalidation admits equality): C2A ×2, with a challenge sent exactly at the deadline. M4 (the claim ignores the endpoint token): C4B. | IMPLEMENTER-REPORTED ONLY |
 
 ## 6. Ingested artifacts (full hashes)
 

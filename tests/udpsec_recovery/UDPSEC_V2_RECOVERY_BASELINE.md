@@ -1,12 +1,12 @@
-# UDPSEC V2 Recovery Baseline and Acceptance Contract (MP0, updated by MP1)
+# UDPSEC V2 Recovery Baseline and Acceptance Contract (MP0, updated by MP1, MP2 and MP3)
 
 | | |
 |---|---|
-| Status | MP0 baseline (tests and documentation) plus MP1 client liveness recovery. Astra Gate A: NEEDS CORRECTION BEFORE MP2 (three LOW findings, no BLOCKER/HIGH; the core design accepted). F1-F3 corrected in one corrective iteration (section 11.2). The Astra corrective recheck accepted F2, F3 and the `retransmit_ping` part of F1. The remaining `start_ping` part of F1 is corrected in a final micro-correction, implementer-verified and awaiting the final Astra micro-recheck. MP1 changed one production file, `nmea_sproxy/nmea_sproxy.py`. |
-| Branch / commits | `main`. Pre-MP1 production baseline `de513674fabf2ee594d0f08f10ddbdf87267a352` (2026-09-25, "feat(udpsec): add authenticated field diagnostics for mobile path migration"), unchanged by MP0. MP0 committed as `71a47894264105531b0d873b09d0520ba90e15eb`. MP1 is the working-tree delta on top of `71a47894`. |
-| Written | MP0 2026-09-29; MP1 update 2026-09-29; Gate A corrective iteration 2026-09-30 |
-| Serves the next instruction | Final Astra micro-recheck of the `start_ping` anchor only (section 11.2); then MP1 road validation; then MP2. |
-| Normative behaviour | `BEHAVIORAL_CONTRACT.md` section 11, rewritten by MP1 (see its 11.5). This file adds no guarantee beyond it. |
+| Status | MP0 baseline (tests and documentation). MP1 client liveness recovery: complete, after Astra Gate A and its corrections (section 11.2); committed as `aa41b782` and road-validated for its Class-A target (section 4.5). MP2 bounded path-migration recovery: implemented as a server-side working-tree delta on `aa41b782`, implementer-verified, not yet independently audited (section 11.3). MP3 liveness × migration × epoch/lifecycle integration: the four MP3 candidates are covered by deterministic integration tests; one lifecycle defect (C3, listener shutdown) was found and corrected (section 11.4). MP2 and MP3 together change one production file, `aismixer_secure.py`. |
+| Branch / commits | `main`. Pre-MP1 production baseline `de513674fabf2ee594d0f08f10ddbdf87267a352` (2026-09-25, "feat(udpsec): add authenticated field diagnostics for mobile path migration"), unchanged by MP0. MP0 committed as `71a47894264105531b0d873b09d0520ba90e15eb`. MP1 committed as `aa41b7820e953e747d4763a3167945351b0c77e5` ("feat(udpsec): add bounded client liveness recovery"). MP2 and MP3 are one working-tree delta on top of `aa41b782`. |
+| Written | MP0 2026-09-29; MP1 update 2026-09-29; Gate A corrective iteration 2026-09-30; MP2 update 2026-09-30; MP3 update 2026-09-30 |
+| Serves the next instruction | Astra Gate B on the MP2 + MP3 delta (handoff in section 11.5). |
+| Normative behaviour | `BEHAVIORAL_CONTRACT.md` section 11, rewritten by MP1 and extended by MP2 and MP3 (see its 11.5). This file adds no guarantee beyond it. |
 
 Companion files in this directory:
 
@@ -17,7 +17,10 @@ Companion files in this directory:
 | `harness/lab.py`, `harness/scenarios.py`, `harness/expect.py` | Deterministic lab: repository port of the Fable harness. |
 | `test_recovery_invariants.py` | Ordinary tests that must keep passing through MP1 and MP2. They passed unchanged through MP1. |
 | `test_mp1_liveness_acceptance.py` | MP1 acceptance tests MP1-L1..L12. MP0 wrote L1-L8 as `xfail(strict=True, raises=AssertionError)`; MP1 removed the markers without changing an assertion and added L4d, L7b, L8b, L11a, L11b and L12. |
-| `test_mp1_policy_pins.py` | Exact pins of the MP1 policy (constants, cadence, every scenario MP0 pinned) plus the unchanged pre-MP2 pins. Replaces MP0's `test_pre_mp1_policy_pins.py`. MP2 replaces the pre-MP2 pins. |
+| `test_mp1_policy_pins.py` | Exact pins of the MP1 policy (constants, cadence, every scenario MP0 pinned). Replaces MP0's `test_pre_mp1_policy_pins.py`. The pre-MP2 pins that used to live here were inverted by MP2 into `test_mp2_policy_pins.py`. |
+| `test_mp2_policy_pins.py` | Exact pins of the MP2 policy on the lab (constants; challenges per incarnation; same-incarnation recovery of a lost challenge or response; exhaustion then expiry; retries to a path the client left). |
+| `../test_udpsec_path_challenge_retry.py` | MP2 scenario tests MP2-B1..MP2-B11 at unit level, plus anti-amplification, the epoch boundary, the retry driver and `secure_server` ownership of it. |
+| `../test_udpsec_mp3_integration.py` | MP3 integration and race tests MP3-C1A..C4B (section 11.4): retry × epoch refresh, retry/expiry × the client's terminal verdict (on the lab), listener shutdown with an admitted retry, and the retry driver under real event-loop and multi-listener load. |
 | `test_mp1_liveness_units.py` | Unit tests for MP1 mechanisms that no lab scenario isolates (pure helpers, drain bound, evidence drained after a stall, errno classification, input pause, counting). |
 | `test_baseline_consistency.py` | Keeps the matrix, the harness catalogue and the acceptance tests consistent; forbids xfail markers in the acceptance module. |
 
@@ -105,7 +108,10 @@ last row.
 | Client-to-server NMEA delivery | not observable by the client | — | L9 |
 | ICMP-derived receive error (`ECONNRESET`/`ECONNREFUSED` on `recvfrom`; MP1) | no | no | MP1 `receive_datagram`; scenario A11b |
 
-## 3. Current migration behaviour (pre-MP2)
+## 3. Pre-MP2 migration behaviour (baseline)
+
+The facts of the pre-MP2 server. MP2 (section 7.2) replaced M2 and the
+lost CHALLENGE/RESPONSE part of M7; M1 and M3-M6 still hold unchanged.
 
 | # | Fact | Where |
 |---|---|---|
@@ -171,6 +177,17 @@ No old-session traffic ever arrived from the new tuple, so no candidate could
 exist. The server-observed CGNAT port is the NAT's mapping. It is not
 necessarily the Raspberry Pi's local UDP source port (L8 keeps the local port;
 the NAT chose a new public one). Reproduced as C1/C2.
+
+### 4.5 MP1 road run (after MP1 was committed as `aa41b782`)
+
+Operator report in the MP2 instruction; no logs supplied.
+
+- One logical session survived the entire road run.
+- One keepalive exchange needed one retransmission and then recovered inside the same session.
+- The server-observed public IP address and port stayed unchanged, and `path_gen` stayed 0.
+
+Classification: a same-tuple liveness event (class A), recovered as MP1
+intends, not a migration event. Which packet was lost is unknown.
 
 ### 4.4 Consequence
 
@@ -302,16 +319,24 @@ Regression boundary for MP1: `_ClientPathMigration`, `_ClientEpochRefresh`,
 `_ClientObservedEndpoint`, `perform_handshake` and all server code stay
 unchanged unless a failing acceptance test proves otherwise.
 
-### 7.2 MP2 — bounded path-migration recovery (contract)
+### 7.2 MP2 — bounded path-migration recovery (contract; implemented)
 
 - Bounded PATH_CHALLENGE retransmission for an existing candidate incarnation (same token and generation), with a per-incarnation cap.
+  - **MP2:** `PATH_CHALLENGE_MAX_SENDS = 4` total attempts (initial included), `PATH_CHALLENGE_RETRY_INTERVAL_SECONDS = 2.0`, each retry anchored after the previous attempt ended; nominally t0, t0+2, t0+4, t0+6 inside the 10 s TTL. Same token, generation, address and epoch; a fresh encryption every time. Tests: MP2-B2, B3, B11; `test_mp2_policy_pins.py`.
 - No unbounded candidate history: still one candidate and one retired record per session.
+  - **MP2:** two O(1) fields per candidate (`challenge_sends`, `next_challenge_at`) and a per-owner index of session keys with a scheduled retry, at most one entry per live session. No history, heap or per-candidate timer.
 - No reply or amplification toward unknown or unproved traffic beyond the capped challenges. Replays are still refused before any candidate is created.
+  - **MP2:** retry state exists only for a candidate the unchanged authenticated, replay-admitted, current-epoch gate installed; at most 4 challenges per incarnation, at most one per 2 s, only to the candidate address. Tests: the anti-amplification tests.
 - The candidate TTL stays finite. A retry never extends a candidate's authority or TTL.
+  - **MP2:** the deadline is set once at install and never moved; no retry is scheduled or sent at or after it. Tests: MP2-B4, B6, B8, B9; mutation M1.
 - No epoch change, no session identity change, no replay-ledger reset, no wire change by default. The current client already answers duplicate challenges (`1292-1370`).
+  - **MP2:** confirmed. `nmea_sproxy` is unchanged; the client answers the duplicate with a fresh response and never extends its proof (MP2-B3). A candidate left on a non-current epoch is never retried (`test_retry_never_crosses_an_epoch_refresh`, lab B6b).
 - Migration and liveness retry never race into contradictory terminal decisions.
+  - **MP2:** a challenge retry is not liveness evidence and triggers no rekey; the MP1 recovery suite stays green. Deeper composition is listed for MP3 (section 11.3).
 - Pre-MP2 pins to replace: `test_pre_mp2_one_path_challenge_per_candidate_incarnation`, `test_pre_mp2_lost_challenge_or_response_waits_for_candidate_expiry`.
+  - **MP2:** inverted into `test_mp2_policy_pins.py` (section 9.2).
 - Guards to keep: `test_b_tuple_change_keeps_one_logical_session`, `test_b1_…`, `test_b8_…`, `test_b11_…`.
+  - **MP2:** unchanged and passing.
 
 ### 7.3 Open decisions (explicitly NOT decided by MP0) and MP1's decisions
 
@@ -413,6 +438,18 @@ Every assertion change is listed. Tests not listed here are unchanged.
 | `test_proxy_planned_or_proactive_rekey_does_not_wait_reconnect_delay`, `test_udpsec_main_proactive_rekey_is_immediate_then_failure_backs_off`, e2e `test_01_…`, `test_03_…`, `tests/test_udpsec_field_diagnostics.py` (the three section 9 tests), `test_e2e_matched_ack_without_ping_clear_authority_still_reanchors_liveness` | D | Unchanged and passing. The retry mapping is unchanged, and the teardowns and the evidence rules they rely on still hold. |
 | this directory: `test_pre_mp1_policy_pins.py` (deleted), `test_mp1_liveness_acceptance.py`, `test_baseline_consistency.py`, `harness/` | A | Each pre-MP1 pin is replaced or inverted by an exact MP1 pin in `test_mp1_policy_pins.py`; the pre-MP2 pins moved there unchanged. The 10 strict-xfail markers were removed with their assertions unchanged, and 6 acceptance tests were added. The consistency test now forbids xfail markers. Lab: a due-but-unread serial line is no longer a `select` wake event (needed once MP1 pauses input), plus the `receive_error_at` fault and scenarios A5e, A9b, A10b, A11b. |
 
+### 9.2 MP2 disposition of the existing tests
+
+| Test | What changed and why |
+|---|---|
+| `test_mp1_policy_pins.py` :: `test_pre_mp2_one_path_challenge_per_candidate_incarnation`, `test_pre_mp2_lost_challenge_or_response_waits_for_candidate_expiry` | Inverted, not deleted. They became `test_mp2_challenges_per_incarnation_are_bounded_and_identical` and `test_mp2_lost_challenge_or_response_recovers_in_the_same_incarnation` in `test_mp2_policy_pins.py`. Challenges sent is now initial sends + retries, and a lost challenge or response now commits the SAME incarnation about 8 s earlier. |
+| `test_secure_udp_helpers.py` :: `test_secure_state_stats_start_at_zero_and_are_frozen_snapshots` | The pinned `SecureStateStats` field set gains `migration_challenge_retries_sent`. |
+| `harness/lab.py`, `harness/scenarios.py`, `test_baseline_consistency.py`, `SCENARIO_MATRIX.md` | The lab runs the production retry pass at its exact due instants and gains scenario B12 (every attempt of one incarnation lost). The consistency checks accept MP2 provenance and require an implementing test for every `MP2-B<N>` the matrix names. |
+
+No other existing test changed. The existing migration suites and every
+real-socket test drive `_secure_server_loop` directly, without a retry
+driver, so pre-MP2 timing is unchanged there.
+
 ## 10. Roadmap
 
 | Phase | Scope | Constraints | Exit |
@@ -426,6 +463,16 @@ Status: the MP1 exit criteria were met, implementer-run (section 9.1; the
 test results are in the MP1 report). Gate A then ran and returned NEEDS
 CORRECTION BEFORE MP2 with three LOW findings, corrected in section 11.2.
 Next is the **Astra corrective recheck** of F1-F3 only, then **MP2**.
+
+MP2 status (2026-09-30): its exit criteria are met, implementer-run
+(section 9.2; test results in the MP2 report). The pre-MP2 pins are replaced
+by bounded-retransmission and anti-amplification tests, and the B guards are
+green. Next is MP3 / Gate-B preparation (section 11.3).
+
+MP3 status (2026-09-30): its exit criteria are met, implementer-run. The four
+MP3 candidates are covered by closure tests (section 11.4); C3 found one
+bounded lifecycle defect, corrected in two hunks of `aismixer_secure.py`.
+MP1 and MP2 suites stay green. Next is **Astra Gate B** (section 11.5).
 
 One finding does not automatically create one new major prompt. Minor findings
 are batched into the current corrective round of the phase that owns them.
@@ -519,7 +566,39 @@ No other production hunk changed after Gate A. The corrective delta is limited t
 - F3: the README wording matches the implementation.
 - Tests to run: the two regressions above, `python -m pytest tests/udpsec_recovery`, and `git diff --check`.
 
-## 12. NOT VERIFIED boundaries, harness provenance and fidelity limits
+### 11.3 MP2 handoff material for MP3 / Gate B (Gate B not requested yet)
+
+Gate B comes after MP3, or once the owner declares MP3 unnecessary. Prepared
+material:
+
+- **Baseline:** `aa41b7820e953e747d4763a3167945351b0c77e5` (MP1 committed).
+- **Delta:** the MP2 working tree.
+- **Production file changed:** `aismixer_secure.py` only.
+  - New constants: `PATH_CHALLENGE_RETRY_INTERVAL_SECONDS`, `PATH_CHALLENGE_MAX_SENDS`.
+  - New `CandidatePath` fields: `challenge_sends`, `next_challenge_at`. New record `_PathChallengeSend`. New stat: `SecureStateStats.migration_challenge_retries_sent`.
+  - New `SecureState` methods: `admit_initial_path_challenge`, `claim_due_path_challenge_retries`, `finish_path_challenge_attempt`, `next_path_challenge_retry_at`. They replace `record_migration_challenge_sent`.
+  - Cancellation added in `_expire_session_path_state`, `open_or_replace_candidate_path`, `commit_candidate_path` and `_remove_session`.
+  - Module functions: `_build_path_challenge_packet`, `_send_due_path_challenge_retries`, `_run_path_challenge_retries`, `_wait_for_path_challenge_retry`; the `challenge_retried` diagnostic.
+  - `_process_candidate_path_observation`: the initial attempt is charged and schedules the first retry.
+  - `_secure_server_loop`: new optional `path_challenge_retry_wakeup` argument.
+  - `secure_server`: owns and cancels the listener's retry driver.
+- **Unchanged and carried forward:** the client, wire, version, AAD, crypto, handshake transcript, replay ledger, candidate TTL, commit transaction, PATH_ACK semantics, and configuration schema and defaults.
+- **Carried-forward invariants:**
+  - one candidate and one retired record per session;
+  - commit preserves the `LogicalSession`, `CryptoEpoch`, replay ledger and `assembly_namespace`;
+  - an unproved-path ping gets no PONG;
+  - the unknown-locator silent drop and replay refusal happen before any candidate exists;
+  - the D1-D10 security rows.
+- **Migration retry tests:**
+  - `tests/test_udpsec_path_challenge_retry.py`;
+  - `tests/udpsec_recovery/test_mp2_policy_pins.py`;
+  - the existing migration suites (`test_udpsec_path_migration.py`, `test_udpsec_migration_security_hardening.py`, `test_udpsec_migration_lifecycle_races.py`, `test_udpsec_mobile_path_e2e.py`, `test_udpsec_client_path_migration.py`);
+  - `python -m pytest tests/udpsec_recovery`.
+- **MP3_CANDIDATES** (genuine cross-mechanism races, not required for MP2 correctness):
+  1. A retry due exactly as an in-session epoch refresh commits. The refresh makes the candidate epoch-stale and it is simply not retried. Still to prove: the composition when the refresh commits between claim and send, under a real multi-listener load.
+  2. Retry and candidate expiry at equality versus the client's MP1 terminal-liveness verdict at the same instant (A10-class timing).
+  3. Shutdown while a retry attempt is admitted but not yet sent. The driver is cancelled first and cannot send after `secure_server` begins closing. Still to prove: an end-to-end SIGTERM / supervisor test.
+  4. Retry-driver scheduling latency under heavy listener load. A retry can be late, never early; lateness only means fewer attempts fit before expiry.
 
 Not verified by MP0 (and not claimed):
 - Which packet was lost, or for how long, in any field event.
@@ -528,6 +607,11 @@ Not verified by MP0 (and not claimed):
 - A real IPv4 CGNAT mapping lifetime.
 - Hello-flood CPU cost, nonce exhaustion under load, multi-listener collisions beyond the existing tests.
 - Anything about MP1/MP2 implementations (the xfails prove only that current code fails them; a scratch satisfiability probe is in the ledger).
+
+Not verified by MP2 (and not claimed):
+- Any independent review of the MP2 delta: every MP2 result is implementer-run.
+- The production retry driver on real sockets and a real event loop under load. The lab runs the same retry pass at exact fake instants, and the driver itself is unit-tested with a scripted wait.
+- Field evidence of a real tuple change needing a challenge retry.
 
 Not verified by MP1 (and not claimed):
 - Any independent review of the MP1 delta: every MP1 result is implementer-run until Gate A.
@@ -561,28 +645,89 @@ Fidelity limits:
 - Serial-like input without the 256-line drop-oldest queue.
 - `time.monotonic`/`time.time`/`select.select` are patched process-wide during a test.
 
+### 11.4 MP3 — liveness × migration × epoch/lifecycle integration outcomes
+
+Tests: `tests/test_udpsec_mp3_integration.py`. Real `SecureState`, the real
+retry pass and driver, the real epoch-refresh helpers, the lab's real client
+and server, and real asyncio cancellation. Monkeypatches only place a race
+between claim, build, final revalidation and `sendto`. Results are in the
+ledger (E-T17, E-T18).
+
+| MP3 candidate | Cases | Outcome |
+|---|---|---|
+| C1 retry × epoch refresh | C1A refresh commits before the claim. C1B refresh commits between claim and build, or between build and the final revalidation. C1C retry sent, then refresh at the same instant. C1D the three orders at one exact instant. | **COVERED / NO PRODUCTION CHANGE.** No stale challenge reaches the wire after the commit. A claimed retry sealed under G0 is discarded by the final revalidation and never re-encrypted under G1. A send completed before the commit is the last one; one empty wake-up drops the stale schedule. The refresh changes no candidate, token, generation, deadline, G0 replay ledger or `LogicalSession` identity. Only new G1 traffic opens a new incarnation. |
+| C2 retry/expiry × terminal liveness | C2A retry pass woken exactly at the deadline, or 1 ms before; a retry that would fall on the deadline is never scheduled. C2B (lab) terminal verdict while the server candidate is live; its later retries reach the new session. C2C (lab) PATH_ACK readable 10 ms before, or exactly at, the verdict. C2D (lab) PATH_ACK 10 ms after the verdict; a late PATH_RESPONSE reaching the server before the fresh ClientHello, or after the fresh session is confirmed. | **COVERED / NO PRODUCTION CHANGE.** Expiry wins at equality. With ping#1 outstanding, MP1's verdict is `proactive_rekey` (immediate fresh establishment). MP1 evidence-before-verdict decides the boundary unchanged: an ACK readable at the verdict instant is credited, one 10 ms later is not. Nothing is resurrected: the terminated session sends nothing more, late ACKs are read and ignored by the new handshake, and stale retries reaching the new session draw no response. A late proof either commits the old server session to B before the fresh session owns B, which the fresh establishment then replaces (`sessions_replaced` 1), or is refused once the fresh session owns B. |
+| C3 shutdown with an admitted retry | C3A/B/C listener teardown forced after the claim, after the build, or after the final revalidation. C3D session removed after the claim or build, socket open. C3C structure: the pass is synchronous and the driver has one await. C3E the real `secure_server`, stopped by a listener error or a parent cancel in the loop turn a candidate wakes the driver, with native and pre-3.12 `asyncio.wait_for` semantics; the wait helper's cancellation race and timer hygiene; the driver-failure policy. | **DEFECT FOUND / CORRECTED.** C3A-D were already safe (final revalidation; closed socket). C3E failed on the MP2 code. `secure_server` only requested cancellation, so the driver was still running when the listener's sessions and socket closed. With pre-3.12 `asyncio.wait_for` semantics (Python 3.11: Debian 12, Raspberry Pi OS 12, OpenWrt 23.05/24.10), a cancellation racing a wakeup was lost: the driver ran one more retry pass after the socket closed (it found no sessions and sent nothing) and then waited forever. |
+| C4 driver under load | C4A 8 busy callback sources of 2 ms each. C4B two listeners on one `SecureState`: listener 1 with 8 retrying candidates, 8 churned candidates and 4 busy sources; listener 2 with one candidate. A deterministic lateness model: 0, 0.5, 1.5 and 4 s late. | **COVERED / NO PRODUCTION CHANGE.** Never early, never at or after expiry, spacing ≥ the interval, ≤ 4 attempts, constant task count, retry index ≤ sessions, bounded passes, per-listener isolation (claims, socket, address). Measured at a 1/20 time scale (0.1 s interval, 0.5 s TTL): C4A 38-48 ms late per retry, C4B quiet listener 20-27 ms, worst heavy-listener candidate < 10 ms; all 4 attempts fit in every run. Lateness model: 0 s → 4 attempts; 0.5 s → 4; 1.5 s → 3 (the 4th omitted, expiry on time); 4 s → 2. |
+
+**The C3 correction** (the MP3 production delta; `aismixer_secure.py` only):
+1. `secure_server`'s `finally`: after `retry_task.cancel()` it now awaits
+   `asyncio.gather(retry_task, return_exceptions=True)` before it closes the
+   listener's sessions, pending sessions and socket. The cleanup stays in a
+   nested `finally`, so a cancellation of the listener itself during that
+   wait still propagates after the cleanup, and an original listener
+   exception is preserved.
+2. `_wait_for_path_challenge_retry`: waits on the Event directly, with a
+   `loop.call_later(timeout, wakeup.set)` timer cancelled on exit, instead of
+   `asyncio.wait_for`. A cancellation then always ends it on every Python
+   version. Change 1 alone would be unsafe on 3.11: the lost cancellation
+   would let the driver run a pass while the sessions are still live (a
+   PATH_CHALLENGE after shutdown began) and then block shutdown (mutation
+   M2b).
+
+No wire, message, client, configuration, TTL, interval, cap or scheduling
+change.
+
+Not verified by MP3 (and not claimed):
+- A real Python 3.11 interpreter. The pre-3.12 `wait_for` behaviour is an in-test transcription of CPython 3.8-3.11 `wait_for`; only CPython 3.14 was available, without network access.
+- A real OS SIGTERM through `aismixer.main()` and `_supervise_named_tasks` down to `secure_server`; the tests cancel the listener task directly.
+- Real sockets under real network load. The C4 runs use a real event loop and real monotonic time, with in-memory sockets at a 1/20 time scale.
+- The revalidation → `sendto` window against a mutation from another thread. It is protected by event-loop atomicity, not by the lock; no production code mutates session, epoch or candidate state off the event-loop thread.
+- Any independent review: every MP3 result is implementer-run.
+
+### 11.5 Gate B handoff (MP2 + MP3)
+
+Audit THIS EXACT DELTA against THIS EXACT carried-forward baseline:
+- **Baseline:** `aa41b7820e953e747d4763a3167945351b0c77e5` (MP1 committed; Gate A accepted; MP1 road FIELD PASS, section 4.5).
+- **Delta:** the MP2 + MP3 working tree, or the commit that records it. Production: `aismixer_secure.py` only.
+  - MP2 hunks: section 11.3.
+  - MP3 hunks: `secure_server` (termination wait before cleanup, nested `finally`); `_wait_for_path_challenge_retry` (Event plus loop timer instead of `asyncio.wait_for`); the `_run_path_challenge_retries` docstring.
+- **Carried forward, not to re-audit:** MP1 as accepted by Gate A (liveness, R4 evidence-before-verdict, PATH_ACK authority, A11 transient errors, terminal recovery); the client; wire, version, AAD, crypto and transcript; the replay ledger; the candidate TTL; the commit transaction; the configuration.
+- **Carried-forward MP2 invariants:** section 7.2 and the MP2 paragraph of `BEHAVIORAL_CONTRACT.md` section 11.
+- **MP3 outcomes (section 11.4):** C1 COVERED / NO PRODUCTION CHANGE; C2 COVERED / NO PRODUCTION CHANGE; C3 DEFECT FOUND / CORRECTED; C4 COVERED / NO PRODUCTION CHANGE.
+- **Focus, in priority order:**
+  1. Candidate retry authority and amplification bounds: the claim gate, the budget, the fixed deadline, the retry index.
+  2. Stale candidate and stale epoch prevention: the claim and the final revalidation (C1).
+  3. Retry-driver lifecycle and shutdown: the MP3 correction and its cancellation semantics across Python versions (C3).
+  4. The liveness × migration terminal boundary (C2); no client change.
+  5. Multi-listener isolation: the endpoint-token filter (C4B).
+  6. No wire, client or configuration drift (`git diff`).
+- **Critical slices to rerun:** `tests/test_udpsec_mp3_integration.py`, `tests/test_udpsec_path_challenge_retry.py`, `python -m pytest tests/udpsec_recovery`, `tests/test_udpsec_path_migration.py`, `tests/test_udpsec_client_path_migration.py`, `tests/test_udpsec_mobile_path_e2e.py`, `tests/test_udpsec_migration_lifecycle_races.py`, `tests/test_aismixer_secure.py`, `tests/test_secure_udp_helpers.py`.
+- **Remaining UNVERIFIED:** the "Not verified by MP2" list after section 11.3 and the "Not verified by MP3" list above.
+
 ## 13. Fable scenario → phase mapping
 
-| Fable | MP0 ID | Class | Phase that changes the outcome | MP0 artefact | MP1 artefact |
-|---|---|---|---|---|---|
-| T01 | A1 | A | none (guard) | invariant | invariant (unchanged) |
-| T02, T03, T04 | A2, A3, A4 | A | MP1 | pin + xfail L1, L2, L3 | acceptance L1, L2, L3 + MP1 pin |
-| T04b | A4b | A/C | MP1 (bound-dependent) | pin; PLANNED | MP1 pin (recovers in session) |
-| T05a | A5a | A | none (guard) | invariant | invariant (unchanged) |
-| T05b, T05c | A5b, A5c | A | MP1 | pin + xfail L4a, L4c | acceptance L4a, L4c + MP1 pins |
-| — | A5d | A | MP1 (R4) | pin + xfail L4b | acceptance L4b + MP1 pin |
-| — | A5e | A/C | MP1 (R4 item 4) | — | acceptance L4d + MP1 pin |
-| T06a | A7 | A | MP1 | pin + xfail L6 | acceptance L6, L12 + MP1 pin |
-| T06b | C3b | C | none (guard) | invariant | invariant + MP1 pin (trade-off) |
-| T07 | A6 | A | MP1 | pin + xfail L5 | acceptance L5 + MP1 pin |
-| T08 | B1 | B | none (guard) | invariant | invariant (unchanged) |
-| T09a, T09a7, T09b | B2, B2b, B3 | B | MP2 (latency) | invariant + pre-MP2 pin | unchanged |
-| T09c | B4 | B | none (guard) | invariant | unchanged |
-| T09d | A10 / B5 | A/B | MP1 (outcome), MP3 (composition under MP2 timing) | pin + xfail L8 | acceptance L8 + MP1 pin; A10b: acceptance L8b |
-| T10a, T10b | B10, B8 | B | none (guard); MP2 counts | invariant (+ pre-MP2 pin for T10a) | unchanged |
-| T11a, T11b, T11c | B7, B6a, B6b | B | none (guard); MP3 composition | invariant | unchanged |
-| T12 | B11 | B | none (guard) | invariant | unchanged |
-| T13 a-j | D1-D7, C4 | D | none (guard) | existing tests + C4 invariant | unchanged |
-| T14 | A9 | A | MP1 | pin + xfail L7 | acceptance L7 + MP1 pin; A9b: acceptance L7b |
-| T16 | C5 | C | MP1 (detection-time trade-off) | pin + guard | guard + MP1 pin (trade-off) |
-| — | A11, A11b | A/C | MP1 (7.3 decision) | pin (A11) | acceptance L11a, L11b + MP1 pins |
+| Fable | MP0 ID | Class | Phase that changes the outcome | MP0 artefact | MP1 artefact | MP2 artefact |
+|---|---|---|---|---|---|---|
+| T01 | A1 | A | none (guard) | invariant | invariant (unchanged) | unchanged |
+| T02, T03, T04 | A2, A3, A4 | A | MP1 | pin + xfail L1, L2, L3 | acceptance L1, L2, L3 + MP1 pin | unchanged |
+| T04b | A4b | A/C | MP1 (bound-dependent) | pin; PLANNED | MP1 pin (recovers in session) | unchanged |
+| T05a | A5a | A | none (guard) | invariant | invariant (unchanged) | unchanged |
+| T05b, T05c | A5b, A5c | A | MP1 | pin + xfail L4a, L4c | acceptance L4a, L4c + MP1 pins | unchanged |
+| — | A5d | A | MP1 (R4) | pin + xfail L4b | acceptance L4b + MP1 pin | unchanged |
+| — | A5e | A/C | MP1 (R4 item 4) | — | acceptance L4d + MP1 pin | unchanged |
+| T06a | A7 | A | MP1 | pin + xfail L6 | acceptance L6, L12 + MP1 pin | unchanged |
+| T06b | C3b | C | none (guard) | invariant | invariant + MP1 pin (trade-off) | unchanged |
+| T07 | A6 | A | MP1 | pin + xfail L5 | acceptance L5 + MP1 pin | unchanged |
+| T08 | B1 | B | none (guard) | invariant | invariant (unchanged) | MP2 pin (commit before the first retry) |
+| T09a, T09a7, T09b | B2, B2b, B3 | B | MP2 (latency) | invariant + pre-MP2 pin | unchanged | MP2 pins (same-incarnation retry) + MP2-B2/B3 tests |
+| T09c | B4 | B | none (guard) | invariant | unchanged | MP2 pin (no retry) |
+| T09d | A10 / B5 | A/B | MP1 (outcome), MP3 (composition under MP2 timing) | pin + xfail L8 | acceptance L8 + MP1 pin; A10b: acceptance L8b | unchanged |
+| T10a, T10b | B10, B8 | B | none (guard); MP2 counts | invariant (+ pre-MP2 pin for T10a) | unchanged | MP2 pin (B10: bounded retries to a left path) |
+| T11a, T11b, T11c | B7, B6a, B6b | B | none (guard); MP3 composition | invariant | unchanged | unchanged (B6b: epoch-stale candidate never retried) |
+| T12 | B11 | B | none (guard) | invariant | unchanged | unchanged |
+| T13 a-j | D1-D7, C4 | D | none (guard) | existing tests + C4 invariant | unchanged | unchanged |
+| T14 | A9 | A | MP1 | pin + xfail L7 | acceptance L7 + MP1 pin; A9b: acceptance L7b | unchanged |
+| T16 | C5 | C | MP1 (detection-time trade-off) | pin + guard | guard + MP1 pin (trade-off) | unchanged |
+| — | A11, A11b | A/C | MP1 (7.3 decision) | pin (A11) | acceptance L11a, L11b + MP1 pins | unchanged |
+| — | B12 | B | MP2 | — | — | MP2 pin + MP2-B4 tests |

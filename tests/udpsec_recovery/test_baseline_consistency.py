@@ -19,8 +19,10 @@ REPO = HERE.parents[1]
 MATRIX = (HERE / "SCENARIO_MATRIX.md").read_text(encoding="utf-8")
 ID_PATTERN = re.compile(r"^[ABCD]\d+[a-z]?$")
 REQUIREMENT = re.compile(r"MP1-L\d+[a-z]?")
+MP2_REQUIREMENT = re.compile(r"MP2-B(\d+)")
+MP2_TESTS = REPO / "tests" / "test_udpsec_path_challenge_retry.py"
 # Provenance tags meaning "executed by the repository lab".
-LAB_PROVENANCE = {"MP0", "MP1"}
+LAB_PROVENANCE = {"MP0", "MP1", "MP2"}
 # Matrix rows tested by the lab without a scenario of their own.
 DERIVED_MP0_ROWS = {"A8": "A3", "C4": "C3", "D7": "C3", "D8": "B1", "D9": "all"}
 # MP1 requirements guarded by ordinary tests outside the acceptance module.
@@ -106,6 +108,22 @@ def test_matrix_requirements_match_the_acceptance_tests():
     for requirement in GUARD_REQUIREMENTS:
         assert requirement in named, requirement
         assert requirement in inspect.getsource(invariants), requirement
+
+
+def test_mp2_requirements_named_in_the_matrix_have_tests():
+    """Every MP2-B<N> scenario the matrix names is implemented by at least
+    one `test_mp2_b<N>_` test in the MP2 test module, and a row naming one
+    carries MP2 provenance."""
+    source = MP2_TESTS.read_text(encoding="utf-8")
+    implemented = set(re.findall(r"^def test_mp2_b(\d+)_", source, re.M))
+    named = set()
+    for scenario_id, row in _matrix_rows().items():
+        found = set(MP2_REQUIREMENT.findall(row["Target"]))
+        if found:
+            assert "MP2" in _provenance(row), scenario_id
+        named |= found
+    assert named, "the matrix names no MP2 requirement"
+    assert named <= implemented, sorted(named - implemented)
 
 
 def test_mp1_acceptance_tests_carry_no_xfail_marker():

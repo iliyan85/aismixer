@@ -22,6 +22,11 @@ Fidelity limits (also recorded in UDPSEC_V2_RECOVERY_BASELINE.md):
   not exercised (a drift guard checks the replicated call order);
 * the server runs one datagram per `asyncio.run()` with a fake
   `sock_recvfrom`; its maintenance task never runs (lazy expiry only);
+* the listener's MP2 PATH_CHALLENGE retry driver (an asyncio task in
+  `secure_server`) is replaced by running the same production retry pass,
+  `_send_due_path_challenge_retries`, at the exact fake instant its
+  earliest retry falls due (a datagram due at the same instant goes
+  first);
 * `time.monotonic`, `time.time` and `select.select` are patched
   process-wide for the test's duration through pytest's `monkeypatch`;
 * the one-way delay is constant, loss is decided at send time, the server
@@ -781,21 +786,43 @@ class Lab:
         self._inbox.append([deliver_at, self._seq, data, packet])
 
     def _pump(self):
-        """Fire due scheduled actions, then run the real server over every
-        client datagram whose delivery time has arrived, in order."""
+        """Fire due scheduled actions, then, in time order, run the real
+        server over every client datagram whose delivery time has arrived
+        and the real MP2 PATH_CHALLENGE retry pass whenever one of its
+        retries is due (a datagram due at the same instant goes first)."""
         for entry in self._scheduled:
             if not entry[2] and self.clock.now >= entry[0]:
                 entry[2] = True
                 entry[1](self)
         while True:
             due = [e for e in self._pending_c2s if e[0] <= self.clock.now]
-            if not due:
+            retry_at = self._server_retry_at()
+            if retry_at is not None and retry_at > self.clock.now:
+                retry_at = None
+            if not due and retry_at is None:
                 return
             due.sort(key=lambda e: (e[0], e[1]))
-            first = due[0]
-            self._pending_c2s.remove(first)
-            for reply, dest in self._feed_server([(first[2], first[3])]):
-                self._server_send(reply, dest)
+            if due and (retry_at is None or due[0][0] <= retry_at):
+                first = due[0]
+                self._pending_c2s.remove(first)
+                for reply, dest in self._feed_server([(first[2], first[3])]):
+                    self._server_send(reply, dest)
+            else:
+                self._run_server_retries()
+
+    def _server_retry_at(self):
+        return self.state.next_path_challenge_retry_at(self.endpoint_token)
+
+    def _run_server_retries(self):
+        """Stands in for the listener's retry task (`secure_server` runs
+        `_run_path_challenge_retries`): the same production retry pass,
+        invoked at the exact fake instant its earliest retry falls due."""
+        fake_socket = _FakeSecureSocket()
+        self.secure._send_due_path_challenge_retries(
+            self.state, self.endpoint_token, fake_socket, self.clock.wall, self.clock
+        )
+        for reply, dest in fake_socket.sent:
+            self._server_send(reply, dest)
 
     def _inbox_due(self):
         return any(entry[0] <= self.clock.now for entry in self._inbox)
@@ -812,6 +839,9 @@ class Lab:
     def _next_event_time(self, include_input=True):
         candidates = [e[0] for e in self._pending_c2s] + [e[0] for e in self._inbox]
         candidates += [e[0] for e in self._scheduled if not e[2]]
+        retry_at = self._server_retry_at()
+        if retry_at is not None:
+            candidates.append(retry_at)
         # A serial-like line wakes the fake select only when it is produced
         # (a future instant). A line already due but not read -- the client
         # has paused reading input -- is no wake event: a real serial
