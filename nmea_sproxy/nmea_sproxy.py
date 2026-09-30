@@ -1,5 +1,6 @@
 import argparse
 from dataclasses import dataclass, field
+import errno
 from pathlib import Path
 import socket
 import yaml
@@ -152,6 +153,9 @@ SESSION_END_PEER_GRACEFUL_CLOSE = "peer_graceful_close"
 SESSION_END_PEER_TIMEOUT = "peer_timeout"
 SESSION_END_SOCKET_ERROR = "socket_error"
 SESSION_ACTION_SEND_PING = "send_ping"
+# Retransmit the ONE outstanding logical keepalive ping: same sequence,
+# freshly encrypted under a fresh AEAD nonce (never a cached datagram).
+SESSION_ACTION_RETRY_PING = "retry_ping"
 SESSION_ACTION_START_EPOCH_REFRESH = "start_epoch_refresh"
 HANDSHAKE_FAILURE = "handshake_failure"
 
@@ -179,6 +183,53 @@ REFRESH_RETIRING_WINDOW_SECONDS = 5.0
 # candidate alive past that window, so a client-side proof that outlives it
 # can never be usable server-side either.
 CLIENT_PATH_PROOF_TTL_SECONDS = 10.0
+# UDPSEC V2 client liveness recovery (BEHAVIORAL_CONTRACT.md section 11).
+# A keepalive ping still unanswered when its keepalive deadline arrives is
+# retransmitted -- same sequence, fresh AEAD nonce -- every
+# min(KEEPALIVE_RETRY_INTERVAL_SECONDS, keepalive_interval) seconds, each
+# retry at least that long after the previous transmission attempt. The
+# session ends only when `peer_timeout` has passed since the last accepted
+# authenticated liveness evidence. State is O(1) and the rate is at most one
+# keepalive transmission per retry interval, each answered 1:1 by the
+# server when reachable. The count of one episode depends on the case: at
+# most ceil((peer_timeout - keepalive_interval) / retry interval) in an
+# ordinary keepalive-only episode (12 with the defaults, 7 in the steady
+# state); more when a transient local send failure brings retries forward
+# (A11 reprobe) before the same bound; and no finite count while other
+# qualifying evidence keeps renewing liveness (A9b).
+KEEPALIVE_RETRY_INTERVAL_SECONDS = 5.0
+# Before a terminal liveness verdict, at most this many datagrams that are
+# already readable on the session socket are received and processed
+# (evidence before verdict). Finite and independent of the peer's send rate.
+EVIDENCE_DRAIN_MAX_DATAGRAMS = 16
+# Transient network conditions on the confirmed session's socket: they stay
+# inside the liveness envelope above instead of ending the session. Other
+# socket errors (bad descriptor, invalid argument, ...) remain terminal.
+_TRANSIENT_NETWORK_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, name, None)
+        for name in (
+            "ENETUNREACH",
+            "EHOSTUNREACH",
+            "ENETDOWN",
+            "EHOSTDOWN",
+            "EADDRNOTAVAIL",
+            "ENOBUFS",
+            "ECONNREFUSED",
+            "ECONNRESET",
+            "WSAENETUNREACH",
+            "WSAEHOSTUNREACH",
+            "WSAENETDOWN",
+            "WSAEHOSTDOWN",
+            "WSAEADDRNOTAVAIL",
+            "WSAENOBUFS",
+            "WSAECONNREFUSED",
+            "WSAECONNRESET",
+        )
+    )
+    if code is not None
+)
 CONFIG_ENV_VAR = "NMEA_SPROXY_CONFIG"
 DEFAULT_PROCESS_TITLE = "nmea_sproxy"
 SYSTEM_CONFIG_PATH = "/etc/nmea_sproxy/config.yaml"
@@ -1972,6 +2023,61 @@ def session_expiration_reason(
     return None
 
 
+def liveness_verdict(now, last_authenticated_peer, expected_ping_seq, config):
+    """Terminal liveness classification, or `None`.
+
+    The only terminal liveness bound is `peer_timeout` after the last
+    accepted authenticated liveness evidence; equality is due. A missed
+    keepalive is never terminal by itself -- its ping is retransmitted (see
+    `keepalive_action`). When the bound is reached while a keepalive probe
+    is still outstanding (the client kept probing and nothing answered) the
+    reason is `SESSION_END_PROACTIVE_REKEY`, an immediate fresh
+    authenticated establishment; with no probe outstanding (only possible
+    when `keepalive_interval >= peer_timeout`) it is
+    `SESSION_END_PEER_TIMEOUT`, which waits `reconnect_delay`.
+    """
+    if now >= last_authenticated_peer + float(config["peer_timeout"]):
+        if expected_ping_seq is not None:
+            return SESSION_END_PROACTIVE_REKEY
+        return SESSION_END_PEER_TIMEOUT
+    return None
+
+
+def keepalive_retry_interval(config):
+    """Cadence of retransmissions of one unanswered keepalive ping."""
+    return min(
+        KEEPALIVE_RETRY_INTERVAL_SECONDS, float(config["keepalive_interval"])
+    )
+
+
+def keepalive_action(
+    now,
+    last_ping_at,
+    expected_ping_seq,
+    config,
+    ping_retry_at=None,
+):
+    """Which keepalive action, if any, is due at `now`; never terminal.
+
+    With no ping outstanding, a new ping is due `keepalive_interval` after
+    the last ping transmission (`SESSION_ACTION_SEND_PING`). With a ping
+    outstanding, a retransmission of that SAME logical ping is due at
+    `ping_retry_at` (`SESSION_ACTION_RETRY_PING`): first the ping's own
+    keepalive deadline, then every `keepalive_retry_interval(config)`.
+    `ping_retry_at=None` means that keepalive deadline
+    (`last_ping_at + keepalive_interval`).
+    """
+    if expected_ping_seq is None:
+        if now >= last_ping_at + float(config["keepalive_interval"]):
+            return SESSION_ACTION_SEND_PING
+        return None
+    if ping_retry_at is None:
+        ping_retry_at = last_ping_at + float(config["keepalive_interval"])
+    if now >= ping_retry_at:
+        return SESSION_ACTION_RETRY_PING
+    return None
+
+
 def session_deadline_action(
     now,
     session_started_at,
@@ -1979,20 +2085,24 @@ def session_deadline_action(
     last_ping_at,
     expected_ping_seq,
     config,
+    ping_retry_at=None,
 ):
-    expiration_reason = session_expiration_reason(
-        now,
-        session_started_at,
-        last_authenticated_peer,
-        config,
+    """Combined deadline classification in deterministic priority order:
+    the terminal liveness verdict (`liveness_verdict`), then a due planned
+    session refresh (`SESSION_END_PLANNED_REFRESH`; `forward_loop` runs it
+    as an in-session epoch refresh when it holds the keys), then the
+    keepalive action (`keepalive_action`)."""
+    verdict = liveness_verdict(
+        now, last_authenticated_peer, expected_ping_seq, config
     )
-    if expiration_reason is not None:
-        return expiration_reason
-    if now >= last_ping_at + float(config["keepalive_interval"]):
-        if expected_ping_seq is not None:
-            return SESSION_END_PROACTIVE_REKEY
-        return SESSION_ACTION_SEND_PING
-    return None
+    if verdict is not None:
+        return verdict
+    refresh_interval = float(config["session_refresh_interval"])
+    if refresh_interval > 0 and now >= session_started_at + refresh_interval:
+        return SESSION_END_PLANNED_REFRESH
+    return keepalive_action(
+        now, last_ping_at, expected_ping_seq, config, ping_retry_at
+    )
 
 
 def session_poll_timeout(
@@ -2001,9 +2111,14 @@ def session_poll_timeout(
     last_authenticated_peer,
     last_ping_at,
     config,
+    ping_retry_at=None,
 ):
     deadlines = [
-        last_ping_at + float(config["keepalive_interval"]),
+        (
+            last_ping_at + float(config["keepalive_interval"])
+            if ping_retry_at is None
+            else ping_retry_at
+        ),
         last_authenticated_peer + float(config["peer_timeout"]),
     ]
     refresh_interval = float(config["session_refresh_interval"])
@@ -2012,22 +2127,18 @@ def session_poll_timeout(
     return max(0.0, min(deadlines) - now)
 
 
-# MP5 corrective round 4 -- HIGH finding: the final PATH_ACK admission gate
-# must be a side-effect-free terminal-deadline decision, never the
-# effectful `apply_due_deadline` (which can itself send a keepalive ping or
-# start an in-session refresh, either of which may block past a terminal
-# deadline). `terminal_deadline_reason` and `nonterminal_due_action` split
+# `terminal_deadline_reason` and `nonterminal_due_action` split
 # `session_deadline_action`'s combined classification into a pure terminal
-# half and a pure "what maintenance is due" half so the final admission
-# choreography can: classify (pure) -> maintain at most one due action
-# (effectful, only reachable when nothing terminal applies) -> resample ->
-# classify again (pure) -> mutate, with no blocking work between that last
-# classification and the mutation. See BEHAVIORAL_CONTRACT.md.
+# half and a pure "what maintenance is due" half (introduced by MP5 for its
+# PATH_ACK admission gate). `forward_loop` relies on the terminal half being
+# side-effect free: before a terminal liveness verdict it classifies,
+# drains already-readable evidence, resamples the clock and classifies
+# again, and only when nothing terminal applies does it perform at most one
+# due non-terminal action. See BEHAVIORAL_CONTRACT.md section 11.
 def terminal_deadline_reason(
     now,
     session_started_at,
     last_authenticated_peer,
-    last_ping_at,
     expected_ping_seq,
     config,
     refresh_supported,
@@ -2040,30 +2151,28 @@ def terminal_deadline_reason(
     once by the caller and passed in. Returns a terminal `SESSION_END_*`
     reason, or `None` when nothing terminal is due at `now`.
 
-    A planned refresh that is due but has real in-session refresh support
+    The terminal liveness verdict (`liveness_verdict`) comes first. A
+    planned refresh that is due but has real in-session refresh support
     (`refresh_supported`) is deliberately NOT terminal here -- starting it
-    is non-terminal maintenance handled separately by
-    `nonterminal_due_action` -- so a supported planned refresh can never
-    mask a simultaneously-due terminal deadline (peer_timeout or
-    unresolved-ping proactive recovery; recovery wins when both are due at
-    the same `now`). Without refresh support, planned refresh keeps its
-    original terminal priority between peer_timeout and proactive
-    recovery, exactly as `session_expiration_reason` has always ordered
-    it -- that established behavior is unchanged.
+    is non-terminal maintenance (`nonterminal_due_action`) -- so it can
+    never mask a simultaneously-due liveness verdict. Without refresh
+    support, a due planned refresh is terminal after the liveness verdict.
+
+    `forward_loop` takes this verdict only after crediting every
+    authenticated datagram it has already read, and after a bounded drain
+    of datagrams already readable (evidence before verdict).
     """
-    if now >= last_authenticated_peer + float(config["peer_timeout"]):
-        return SESSION_END_PEER_TIMEOUT
+    verdict = liveness_verdict(
+        now, last_authenticated_peer, expected_ping_seq, config
+    )
+    if verdict is not None:
+        return verdict
     refresh_interval = float(config["session_refresh_interval"])
     planned_refresh_due = (
         refresh_interval > 0 and now >= session_started_at + refresh_interval
     )
     if planned_refresh_due and not refresh_supported:
         return SESSION_END_PLANNED_REFRESH
-    if (
-        now >= last_ping_at + float(config["keepalive_interval"])
-        and expected_ping_seq is not None
-    ):
-        return SESSION_END_PROACTIVE_REKEY
     return None
 
 
@@ -2074,17 +2183,16 @@ def nonterminal_due_action(
     expected_ping_seq,
     config,
     refresh_supported,
+    ping_retry_at=None,
 ):
     """Which non-terminal maintenance action, if any, is due at `now`.
 
-    Only meaningful when `terminal_deadline_reason` has already returned
-    `None` for the SAME `now` and state: a supported planned refresh is
-    due-and-non-terminal only when no terminal deadline also applies, and
-    a keepalive ping is due-with-nothing-outstanding only when the
-    unresolved-ping proactive-recovery check (which is terminal) did not
-    already fire for the same `now`. Returns
-    `SESSION_ACTION_START_EPOCH_REFRESH`, `SESSION_ACTION_SEND_PING`, or
-    `None`. Performs no I/O itself -- the caller executes the action.
+    Only meaningful after `terminal_deadline_reason` returned `None` for
+    the SAME `now` and state. A supported due planned refresh comes first
+    (`SESSION_ACTION_START_EPOCH_REFRESH`), then the keepalive action
+    (`SESSION_ACTION_SEND_PING` or `SESSION_ACTION_RETRY_PING`, see
+    `keepalive_action`). Performs no I/O itself -- the caller executes the
+    action.
     """
     refresh_interval = float(config["session_refresh_interval"])
     if (
@@ -2093,12 +2201,20 @@ def nonterminal_due_action(
         and refresh_supported
     ):
         return SESSION_ACTION_START_EPOCH_REFRESH
-    if (
-        now >= last_ping_at + float(config["keepalive_interval"])
-        and expected_ping_seq is None
-    ):
-        return SESSION_ACTION_SEND_PING
-    return None
+    return keepalive_action(
+        now, last_ping_at, expected_ping_seq, config, ping_retry_at
+    )
+
+
+def is_transient_network_error(exc):
+    """Whether a socket error on the confirmed session's socket is a
+    transient network condition (no route, interface down, source address
+    gone, buffer pressure, or an ICMP-derived refusal/reset). Such errors
+    stay inside the liveness envelope. ICMP-derived errors are also
+    unauthenticated, so they must not decide liveness either way."""
+    if isinstance(exc, (ConnectionRefusedError, ConnectionResetError)):
+        return True
+    return isinstance(exc, OSError) and exc.errno in _TRANSIENT_NETWORK_ERRNOS
 
 
 def retry_delay_for_reason(reason, config):
@@ -2285,7 +2401,11 @@ def forward_input_payload(data, send_sentence, stats=None):
     for clean_line in iter_forwardable_nmea_sentences(data):
         if not clean_line:
             continue
-        send_sentence(clean_line)
+        # A sender that reports False dropped the sentence (a transient
+        # local send failure inside a confirmed UDPSEC session); it is not
+        # counted as forwarded. Senders returning None keep counting.
+        if send_sentence(clean_line) is False:
+            continue
         if stats is not None:
             stats.record_forwarded(clean_line)
 
@@ -2577,6 +2697,21 @@ def forward_loop(
     put, and only the traffic-key epoch changes. Without them, a planned
     refresh falls back to ending the loop with ``SESSION_END_PLANNED_REFRESH``
     for a fresh establishment handshake, exactly as before.
+
+    Liveness (BEHAVIORAL_CONTRACT.md section 11): one logical keepalive
+    ping is outstanding at a time; if it is still unanswered at its
+    keepalive deadline it is retransmitted -- same sequence, fresh AEAD
+    nonce -- every ``keepalive_retry_interval(config)`` seconds. The loop
+    ends for liveness only when ``peer_timeout`` has passed since the last
+    accepted authenticated evidence (``liveness_verdict``). Evidence comes
+    before the verdict: every datagram read is credited when it is read,
+    before any deadline is serviced, and a terminal liveness verdict is
+    preceded by a bounded, non-blocking drain of datagrams already readable.
+    A transient network error on the session socket (``ENETUNREACH`` and
+    similar) does not end the session: the affected datagram is dropped --
+    NMEA is never buffered or replayed -- and reading local input pauses
+    for one retry interval, so the input adapter's own bounded queue holds
+    new lines meanwhile.
     """
     input_adapter = _coerce_input_adapter(local_input, ingress_policy)
     session_locator = confirmed_session.session_locator
@@ -2608,80 +2743,311 @@ def forward_loop(
     last_ping_at = session_started_at
     expected_ping_seq = None
     next_ping_seq = 1
+    # Liveness recovery state, O(1) per session: when the outstanding
+    # logical ping is next retransmitted, and how often it has been sent.
+    ping_retry_at = None
+    ping_transmissions = 0
+    retry_interval = keepalive_retry_interval(config)
+    # Transient local network failures: reading local input pauses until
+    # `send_paused_until`; `transient_failures` counts one episode's errors.
+    send_paused_until = None
+    transient_failures = 0
     stats = ForwardingStats() if stats is None else stats
-    send_sentence = lambda clean_line: send_udpsec_nmea_sentence(
-        clean_line,
-        out_sock,
-        config,
-        epochs.client_to_server_key,
-        session_locator,
-        remote_addr,
-        epochs.generation,
-    )
 
-    def apply_due_deadline(now):
-        nonlocal expected_ping_seq, last_ping_at, next_ping_seq
+    def note_transient_failure(operation, exc, *, pause_input):
+        nonlocal send_paused_until, transient_failures
+        if transient_failures == 0:
+            safe_error = str(exc).encode("ascii", "backslashreplace").decode("ascii")
+            print(
+                f"Secure {operation} failed transiently ({safe_error}); "
+                "keeping the session within its liveness bound."
+            )
+        transient_failures += 1
+        if pause_input:
+            send_paused_until = time.monotonic() + retry_interval
+
+    def note_send_success():
+        nonlocal transient_failures, send_paused_until
+        # Any successful send proves the local path usable again.
+        send_paused_until = None
+        if transient_failures:
+            print(
+                "Secure session network path usable again after "
+                f"{transient_failures} transient failure(s)."
+            )
+            transient_failures = 0
+
+    def send_sentence(clean_line):
+        try:
+            send_udpsec_nmea_sentence(
+                clean_line,
+                out_sock,
+                config,
+                epochs.client_to_server_key,
+                session_locator,
+                remote_addr,
+                epochs.generation,
+            )
+        except OSError as exc:
+            if not is_transient_network_error(exc):
+                raise
+            # Dropped: NMEA is never buffered or replayed.
+            note_transient_failure("NMEA send", exc, pause_input=True)
+            return False
+        note_send_success()
+        return True
+
+    def transmit_ping(seq):
+        # Every transmission -- first or retransmission -- is a fresh
+        # encryption of the ping under the CURRENT epoch, hence a fresh
+        # AEAD nonce; ciphertext is never cached or resent.
+        try:
+            send_ping(
+                out_sock,
+                remote_addr,
+                epochs.client_to_server_key,
+                session_locator,
+                config["station_id"],
+                seq,
+                epochs.generation,
+            )
+        except OSError as exc:
+            if not is_transient_network_error(exc):
+                print(f"❌ Secure ping error: {exc}")
+                return SESSION_END_SOCKET_ERROR
+            note_transient_failure("keepalive send", exc, pause_input=True)
+            return None
+        except Exception as exc:
+            print(f"❌ Secure ping error: {exc}")
+            return SESSION_END_SOCKET_ERROR
+        note_send_success()
+        return None
+
+    def start_ping():
+        nonlocal expected_ping_seq, next_ping_seq, last_ping_at
+        nonlocal ping_retry_at, ping_transmissions
+        expected_ping_seq = next_ping_seq
+        next_ping_seq += 1
+        ping_transmissions = 1
+        outcome = transmit_ping(expected_ping_seq)
+        # Anchored like `retransmit_ping`: at a fresh sample taken after the
+        # attempt, so a slow encryption or send cannot shorten the wait for
+        # the first retry below keepalive_interval.
+        attempted_at = time.monotonic()
+        last_ping_at = attempted_at
+        ping_retry_at = attempted_at + float(config["keepalive_interval"])
+        return outcome
+
+    def retransmit_ping():
+        nonlocal last_ping_at, ping_retry_at, ping_transmissions
+        if ping_transmissions == 1:
+            print(
+                "Secure session liveness suspect: keepalive ping "
+                f"#{expected_ping_seq} not answered yet; retransmitting it "
+                "(same sequence, fresh nonce) until peer_timeout."
+            )
+        ping_transmissions += 1
+        outcome = transmit_ping(expected_ping_seq)
+        # Anchor the next retry to this attempt with a fresh sample taken
+        # after it -- never to an instant sampled before the log line above
+        # or the send itself -- so slow console output or a slow send can
+        # never bring the next retransmission closer than retry_interval.
+        attempted_at = time.monotonic()
+        last_ping_at = attempted_at
+        ping_retry_at = attempted_at + retry_interval
+        return outcome
+
+    def resolve_ping():
+        nonlocal expected_ping_seq, ping_retry_at, ping_transmissions
+        if ping_transmissions > 1:
+            print(
+                "Secure session liveness recovered: keepalive ping "
+                f"#{expected_ping_seq} answered after "
+                f"{ping_transmissions - 1} retransmission(s)."
+            )
+        expected_ping_seq = None
+        ping_retry_at = None
+        ping_transmissions = 0
+
+    def receive_datagram():
+        """Receive ONE datagram the caller saw readable and credit it at
+        once: authenticated evidence takes effect as of the monotonic
+        instant it was read, before any deadline is serviced. Returns a
+        terminal `SESSION_END_*` reason or `None`."""
+        nonlocal last_authenticated_peer, session_started_at
+        try:
+            response, addr = out_sock.recvfrom(8192)
+        except OSError as exc:
+            if is_transient_network_error(exc):
+                # e.g. an ICMP-derived reset: unauthenticated, so it can
+                # neither prove nor disprove liveness.
+                note_transient_failure("receive", exc, pause_input=False)
+                return None
+            print(f"❌ Secure peer receive error: {exc}")
+            return SESSION_END_SOCKET_ERROR
+        except Exception as exc:
+            print(f"❌ Secure peer receive error: {exc}")
+            return SESSION_END_SOCKET_ERROR
+
+        now = time.monotonic()
+        refresh_result = _try_handle_refresh_message(
+            response,
+            addr,
+            remote_addr,
+            epochs,
+            refresh,
+            config["station_id"],
+            server_identity_public_key,
+            out_sock,
+            time.monotonic,
+        )
+        if refresh_result == SERVER_PACKET_REFRESH_COMMITTED:
+            print(
+                "Secure epoch refresh committed; continuing on the new "
+                "epoch without a new session."
+            )
+            last_authenticated_peer = now
+            # Reanchor the planned-refresh cadence from the commit.
+            session_started_at = now
+            return None
+        if refresh_result == SERVER_PACKET_REFRESH_PROGRESS:
+            last_authenticated_peer = now
+            return None
+        if refresh_result == SERVER_PACKET_REFRESH_BENIGN:
+            # Authenticated, handled, but only a duplicate of evidence
+            # already consumed -- explicitly NOT fresh peer liveness, so
+            # `last_authenticated_peer` is left where it was.
+            return None
+
+        # Capture the outstanding logical ping when answering a challenge;
+        # a matching ACK returns the sequence its proof captured.
+        path_result, path_ping_seq_to_clear = _try_handle_path_message(
+            response,
+            addr,
+            remote_addr,
+            epochs,
+            path_migration,
+            config["station_id"],
+            out_sock,
+            time.monotonic,
+            expected_ping_seq,
+        )
+        if path_result == SERVER_PACKET_PATH_MIGRATED:
+            # Authenticated proof the server is alive and has committed
+            # this session's path migration, matched against the client's
+            # own live migration proof: advances peer liveness exactly like
+            # an accepted pong, as of the instant it was read. It does NOT
+            # touch `last_ping_at`, `session_started_at`, or any refresh
+            # deadline -- this is proof of liveness, not a lease renewal.
+            # It resolves the outstanding ping ONLY when the proof captured
+            # a concrete sequence that is still the outstanding one; a
+            # proof that captured no ping has liveness authority but can
+            # never resolve a ping.
+            last_authenticated_peer = now
+            if (
+                path_ping_seq_to_clear is not None
+                and expected_ping_seq == path_ping_seq_to_clear
+            ):
+                resolve_ping()
+            # Diagnostic-only: a matched, admitted PATH_ACK may raise the
+            # display floor to its acknowledged path_generation.
+            observed_endpoint.raise_floor(
+                _extract_authenticated_ack_generation(response, epochs)
+            )
+            print("Secure session path migration acknowledged by peer.")
+            return None
+        if path_result is not None:
+            return None
+
+        try:
+            _pl, selector, _n, _c = parse_data_packet(response)
+            resolved = epochs.inbound_epoch(selector, now)
+        except (TypeError, ValueError):
+            resolved = None
+        if resolved is None:
+            return None
+        reply_key, reply_generation = resolved
+        result = handle_server_packet(
+            response,
+            addr,
+            remote_addr,
+            reply_key,
+            session_locator,
+            config["station_id"],
+            expected_ping_seq,
+            reply_generation,
+        )
+        if result == SERVER_PACKET_AUTHENTICATED:
+            last_authenticated_peer = now
+            resolve_ping()
+            # Diagnostic-only: admit this already-accepted PONG's optional
+            # observed-endpoint/generation members, if any.
+            pong_endpoint, pong_generation = _extract_pong_diagnostics(
+                response, reply_key, session_locator, reply_generation
+            )
+            observed_endpoint.observe_pong(pong_endpoint, pong_generation, now)
+            return None
+        if result == SERVER_PACKET_PEER_CLOSE:
+            print("Secure peer closed the current session gracefully.")
+            return SESSION_END_PEER_GRACEFUL_CLOSE
+        return None
+
+    def drain_available_datagrams():
+        """Evidence before verdict: receive and credit, without blocking,
+        at most EVIDENCE_DRAIN_MAX_DATAGRAMS datagrams that are already
+        readable. Returns a terminal reason (peer close, socket error) or
+        `None`; it never waits for traffic that has not arrived."""
+        for _ in range(EVIDENCE_DRAIN_MAX_DATAGRAMS):
+            try:
+                ready, _, _ = select.select([out_sock], [], [], 0)
+            except Exception as e:
+                print(f"❌ Forwarding error: {e}")
+                return SESSION_END_SOCKET_ERROR
+            if out_sock not in ready:
+                return None
+            outcome = receive_datagram()
+            if outcome is not None:
+                return outcome
+        return None
+
+    def service_deadlines(now):
+        """Take the terminal verdict due at `now`, if any, or else perform
+        at most one due non-terminal action (planned refresh start, new
+        keepalive ping, or retransmission of the outstanding one)."""
         nonlocal session_started_at
-
-        action = session_deadline_action(
+        reason = terminal_deadline_reason(
             now,
             session_started_at,
             last_authenticated_peer,
-            last_ping_at,
             expected_ping_seq,
             config,
+            refresh is not None,
         )
-        if action == SESSION_ACTION_SEND_PING:
-            try:
-                send_ping(
-                    out_sock,
-                    remote_addr,
-                    epochs.client_to_server_key,
-                    session_locator,
-                    config["station_id"],
-                    next_ping_seq,
-                    epochs.generation,
-                )
-            except Exception as e:
-                print(f"❌ Secure ping error: {e}")
-                return SESSION_END_SOCKET_ERROR
-            expected_ping_seq = next_ping_seq
-            next_ping_seq += 1
-            last_ping_at = now
-            return None
-        if action == SESSION_END_PROACTIVE_REKEY:
+        if reason in (SESSION_END_PEER_TIMEOUT, SESSION_END_PROACTIVE_REKEY):
+            outcome = drain_available_datagrams()
+            if outcome is not None:
+                return outcome
+            now = time.monotonic()
+            reason = terminal_deadline_reason(
+                now,
+                session_started_at,
+                last_authenticated_peer,
+                expected_ping_seq,
+                config,
+                refresh is not None,
+            )
+        if reason == SESSION_END_PROACTIVE_REKEY:
             print(
                 "Secure session liveness unresolved; "
                 "starting authenticated re-handshake."
             )
-            return action
-        if action == SESSION_END_PLANNED_REFRESH:
-            if refresh is None:
-                print("Secure session planned refresh due.")
-                return action
-            # True in-session epoch refresh: do NOT end the loop. Reanchor
-            # the planned-refresh cadence now (a retry/abandon backs off by
-            # one interval; a commit reanchors again) and start the
-            # transaction if one is not already in flight.
-            session_started_at = now
-            if not refresh.active:
-                refresh.start(epochs, out_sock, remote_addr, time.monotonic)
-            return None
-        if action is not None:
-            print(f"Secure session invalidated: {action}")
-        return action
-
-    def apply_nonterminal_due_action(now):
-        """Perform at most one non-terminal maintenance action due at
-        `now`. For use ONLY immediately after `terminal_deadline_reason(now)`
-        (with this same state) has already returned `None`: by
-        construction the only actions reachable here are starting a
-        supported in-session planned refresh or sending a keepalive ping
-        with none outstanding -- never a terminal `SESSION_END_*` reason.
-        May still return `SESSION_END_SOCKET_ERROR` if the ping send
-        itself fails, exactly as `apply_due_deadline` does."""
-        nonlocal expected_ping_seq, last_ping_at, next_ping_seq
-        nonlocal session_started_at
+            return reason
+        if reason == SESSION_END_PLANNED_REFRESH:
+            print("Secure session planned refresh due.")
+            return reason
+        if reason is not None:
+            print(f"Secure session invalidated: {reason}")
+            return reason
 
         action = nonterminal_due_action(
             now,
@@ -2690,32 +3056,21 @@ def forward_loop(
             expected_ping_seq,
             config,
             refresh is not None,
+            ping_retry_at,
         )
         if action == SESSION_ACTION_START_EPOCH_REFRESH:
-            # Reanchor the planned-refresh cadence now (a retry/abandon
-            # backs off by one interval; a commit reanchors again) and
-            # start the transaction if one is not already in flight.
+            # True in-session epoch refresh: do NOT end the loop. Reanchor
+            # the planned-refresh cadence now (a retry/abandon backs off by
+            # one interval; a commit reanchors again) and start the
+            # transaction if one is not already in flight.
             session_started_at = now
             if not refresh.active:
                 refresh.start(epochs, out_sock, remote_addr, time.monotonic)
             return None
         if action == SESSION_ACTION_SEND_PING:
-            try:
-                send_ping(
-                    out_sock,
-                    remote_addr,
-                    epochs.client_to_server_key,
-                    session_locator,
-                    config["station_id"],
-                    next_ping_seq,
-                    epochs.generation,
-                )
-            except Exception as e:
-                print(f"❌ Secure ping error: {e}")
-                return SESSION_END_SOCKET_ERROR
-            expected_ping_seq = next_ping_seq
-            next_ping_seq += 1
-            last_ping_at = now
+            return start_ping()
+        if action == SESSION_ACTION_RETRY_PING:
+            return retransmit_ping()
         return None
 
     def drive_refresh():
@@ -2724,7 +3079,7 @@ def forward_loop(
 
     while True:
         now = time.monotonic()
-        deadline_reason = apply_due_deadline(now)
+        deadline_reason = service_deadlines(now)
         if deadline_reason is not None:
             return deadline_reason
         drive_refresh()
@@ -2751,34 +3106,58 @@ def forward_loop(
             )
             stats.reschedule_heartbeat(now)
 
-        try:
-            forward_pending_input(
-                input_adapter,
-                send_sentence,
-                stats,
+        now = time.monotonic()
+        if send_paused_until is not None and now >= send_paused_until:
+            # The pause after a transient local send failure is over. Probe
+            # the path with one keepalive transmission -- the outstanding
+            # logical ping again, or a new one -- before reading local input,
+            # so no NMEA line is spent probing a path that is still down.
+            # A failed probe pauses again: at most one probe per interval.
+            send_paused_until = None
+            probe_reason = (
+                start_ping()
+                if expected_ping_seq is None
+                else retransmit_ping()
             )
-        except Exception as e:
-            print(f"❌ Forwarding error: {e}")
-            return SESSION_END_SOCKET_ERROR
-
-        input_sockets = input_adapter.selectable_sockets()
-        input_poll_interval = input_adapter.poll_interval()
-        readable_sockets = input_sockets + [out_sock]
+            if probe_reason is not None:
+                return probe_reason
+        if send_paused_until is None:
+            try:
+                forward_pending_input(
+                    input_adapter,
+                    send_sentence,
+                    stats,
+                )
+            except Exception as e:
+                print(f"❌ Forwarding error: {e}")
+                return SESSION_END_SOCKET_ERROR
 
         now = time.monotonic()
-        deadline_reason = apply_due_deadline(now)
+        deadline_reason = service_deadlines(now)
         if deadline_reason is not None:
             return deadline_reason
         drive_refresh()
+
+        # While input is paused after a transient send failure, local input
+        # stays unread in the adapter's own bounded queue, and input sockets
+        # stay out of select so a readable input cannot spin the loop; the
+        # wait is bounded by the end of the pause instead.
+        paused = send_paused_until is not None
+        input_sockets = [] if paused else input_adapter.selectable_sockets()
+        input_poll_interval = input_adapter.poll_interval()
+        readable_sockets = input_sockets + [out_sock]
         poll_timeout = session_poll_timeout(
             now,
             session_started_at,
             last_authenticated_peer,
             last_ping_at,
             config,
+            ping_retry_at,
         )
         if input_poll_interval is not None:
             poll_timeout = min(poll_timeout, input_poll_interval)
+        if paused:
+            poll_timeout = min(poll_timeout, max(0.0, send_paused_until - now))
         # Bound the wait so the heartbeat cadence is explicit rather than
         # merely incidental to keepalive/session wakeups.
         poll_timeout = min(poll_timeout, stats.heartbeat_remaining(now))
@@ -2795,180 +3174,20 @@ def forward_loop(
             print(f"❌ Forwarding error: {e}")
             return SESSION_END_SOCKET_ERROR
 
-        now = time.monotonic()
-        deadline_reason = apply_due_deadline(now)
+        # Evidence before verdict: a datagram readable now is credited
+        # before any deadline that is also due now is serviced.
+        if out_sock in readable:
+            receive_reason = receive_datagram()
+            if receive_reason is not None:
+                return receive_reason
+
+        deadline_reason = service_deadlines(time.monotonic())
         if deadline_reason is not None:
             return deadline_reason
         drive_refresh()
 
-        if out_sock in readable:
-            try:
-                response, addr = out_sock.recvfrom(8192)
-            except Exception as e:
-                print(f"❌ Secure peer receive error: {e}")
-                return SESSION_END_SOCKET_ERROR
-
-            now = time.monotonic()
-            refresh_result = _try_handle_refresh_message(
-                response,
-                addr,
-                remote_addr,
-                epochs,
-                refresh,
-                config["station_id"],
-                server_identity_public_key,
-                out_sock,
-                time.monotonic,
-            )
-            if refresh_result == SERVER_PACKET_REFRESH_COMMITTED:
-                print(
-                    "Secure epoch refresh committed; continuing on the new "
-                    "epoch without a new session."
-                )
-                last_authenticated_peer = now
-                # Reanchor the planned-refresh cadence from the commit.
-                session_started_at = now
-                result = SERVER_PACKET_IGNORED
-            elif refresh_result == SERVER_PACKET_REFRESH_PROGRESS:
-                last_authenticated_peer = now
-                result = SERVER_PACKET_IGNORED
-            elif refresh_result == SERVER_PACKET_REFRESH_BENIGN:
-                # Authenticated, handled, but only a duplicate of evidence
-                # already consumed -- explicitly NOT fresh peer liveness, so
-                # `last_authenticated_peer` is left where it was.
-                result = SERVER_PACKET_IGNORED
-            else:
-                # Capture the outstanding ping when answering a challenge.
-                # For an ACK, carry its proof's concrete sequence through
-                # the deadline re-check: that check may send a new ping,
-                # so only compare sequences when applying the ACK below.
-                path_result, path_ping_seq_to_clear = _try_handle_path_message(
-                    response,
-                    addr,
-                    remote_addr,
-                    epochs,
-                    path_migration,
-                    config["station_id"],
-                    out_sock,
-                    time.monotonic,
-                    expected_ping_seq,
-                )
-                if path_result is not None:
-                    result = path_result
-                else:
-                    try:
-                        _pl, selector, _n, _c = parse_data_packet(response)
-                        resolved = epochs.inbound_epoch(selector, now)
-                    except (TypeError, ValueError):
-                        resolved = None
-                    if resolved is None:
-                        result = SERVER_PACKET_IGNORED
-                    else:
-                        reply_key, reply_generation = resolved
-                        result = handle_server_packet(
-                            response,
-                            addr,
-                            remote_addr,
-                            reply_key,
-                            session_locator,
-                            config["station_id"],
-                            expected_ping_seq,
-                            reply_generation,
-                        )
-            now = time.monotonic()
-            deadline_reason = apply_due_deadline(now)
-            if deadline_reason is not None:
-                return deadline_reason
-            drive_refresh()
-            if result == SERVER_PACKET_AUTHENTICATED:
-                last_authenticated_peer = now
-                expected_ping_seq = None
-                # Diagnostic-only: admit this already-accepted PONG's
-                # optional observed-endpoint/generation members, if any.
-                pong_endpoint, pong_generation = _extract_pong_diagnostics(
-                    response, reply_key, session_locator, reply_generation
-                )
-                observed_endpoint.observe_pong(pong_endpoint, pong_generation, now)
-            elif result == SERVER_PACKET_PATH_MIGRATED:
-                # Authenticated proof the server is alive and has committed
-                # this session's path migration, matched against the
-                # client's own live migration proof: advances peer
-                # liveness exactly like an accepted pong. It does NOT touch
-                # `last_ping_at`, `session_started_at`, or any refresh
-                # deadline -- this is proof of liveness, not a lease
-                # renewal, and the normal keepalive/refresh schedule stays
-                # on its existing cadence. It supersedes the outstanding
-                # ping ONLY when the proof captured a concrete sequence
-                # that is still outstanding now, at the FINAL admission
-                # check immediately below. A proof that captured no ping
-                # has liveness authority but can never clear a ping created
-                # by that check.
-                print(
-                    "Secure session path migration acknowledged by peer."
-                )
-                # The acknowledgement logging above (and `drive_refresh()`
-                # earlier in this iteration) can itself consume enough time
-                # for a terminal deadline to become due. `apply_due_deadline`
-                # is NOT safe as the final gate here: it can itself send a
-                # keepalive ping or start an in-session refresh, and either
-                # of those can block past a terminal deadline before this
-                # admission's own liveness/ping effects apply. Instead:
-                # classify (pure, no I/O) -> perform at most the one due
-                # non-terminal maintenance action, if any -> resample ->
-                # classify again (pure) -> mutate, with NO further
-                # potentially blocking work between that last classification
-                # and the mutation below.
-                admission_now = time.monotonic()
-                terminal_reason = terminal_deadline_reason(
-                    admission_now,
-                    session_started_at,
-                    last_authenticated_peer,
-                    last_ping_at,
-                    expected_ping_seq,
-                    config,
-                    refresh is not None,
-                )
-                if terminal_reason is not None:
-                    return terminal_reason
-                maintenance_reason = apply_nonterminal_due_action(
-                    admission_now
-                )
-                if maintenance_reason is not None:
-                    return maintenance_reason
-                effect_now = time.monotonic()
-                terminal_reason = terminal_deadline_reason(
-                    effect_now,
-                    session_started_at,
-                    last_authenticated_peer,
-                    last_ping_at,
-                    expected_ping_seq,
-                    config,
-                    refresh is not None,
-                )
-                if terminal_reason is not None:
-                    return terminal_reason
-                last_authenticated_peer = effect_now
-                # Diagnostic-only: this PATH_ACK has now fully passed the
-                # existing final terminal-deadline admission above (its
-                # real completion effect is already granted), so its
-                # acknowledged path_generation may raise the diagnostic
-                # floor. A parsed-but-not-finally-admitted ACK never
-                # reaches this line (every terminal_reason branch above
-                # returns first).
-                observed_endpoint.raise_floor(
-                    _extract_authenticated_ack_generation(response, epochs)
-                )
-                if (
-                    path_ping_seq_to_clear is not None
-                    and expected_ping_seq == path_ping_seq_to_clear
-                ):
-                    expected_ping_seq = None
-            elif result == SERVER_PACKET_PEER_CLOSE:
-                print("Secure peer closed the current session gracefully.")
-                return SESSION_END_PEER_GRACEFUL_CLOSE
-
         for ready_socket in input_sockets:
-            if ready_socket not in readable:
+            if ready_socket not in readable or send_paused_until is not None:
                 continue
             try:
                 for data in input_adapter.read_ready(ready_socket):

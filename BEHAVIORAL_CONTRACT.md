@@ -1027,34 +1027,97 @@ directional keys. Plaintext, wrong-key, wrong-address, wrong-source,
 malformed, and wrong-sequence packets provide no liveness evidence.
 
 At a keepalive deadline with no outstanding ping, the proxy sends one encrypted
-ping and retains its expected sequence. It does not overwrite an unresolved
-expectation with later ping sequences. If that expectation is still unresolved
-when the next keepalive deadline is reached, the proxy ends the local forwarding
-loop with a proactive-rekey reason and immediately makes one fresh signed ECDHE
-handshake attempt. A failure of that attempt returns to normal
-`reconnect_delay`; it cannot create a busy retry loop. `peer_timeout` remains an
-ultimate fallback and retains priority when its deadline is reached. With the
-defaults `keepalive_interval: 30` and `peer_timeout: 90`, the first ping is due
-at about 30 seconds and an unanswered ping normally selects proactive rekey at
-about 60 seconds, before the 90-second timeout. This single-shot rule is the
-current behaviour; the recovery targets that are planned to replace it are
-recorded, not guaranteed, in 11.5.
+ping and retains its expected sequence. At most one logical ping is
+outstanding at a time, and it is never overwritten with a later sequence. If
+it is still unanswered at its own keepalive deadline (`keepalive_interval`
+after it was sent), the proxy retransmits the SAME logical ping -- same
+sequence, freshly encrypted under the current epoch with a fresh AEAD nonce,
+never a cached datagram -- and then again every `min(5 s,
+keepalive_interval)` (`KEEPALIVE_RETRY_INTERVAL_SECONDS`) until it is
+answered. Each next retry is scheduled from a fresh monotonic observation
+taken after the previous transmission attempt, so slow logging or a slow
+send can never bring two transmissions of the ping closer than one retry
+interval. A missed keepalive deadline is therefore never terminal by itself.
+The retry state is O(1) per session (the next retry instant and a
+transmission count), the proxy sends at most one keepalive transmission per
+retry interval, and the server answers every admitted active-path ping 1:1
+with a PONG echoing its sequence, so recovery needs no wire, schema, server,
+or configuration change. The first retransmission of an episode logs
+"liveness suspect"; a PONG that answers a retransmitted ping logs "liveness
+recovered". Those lines, like every diagnostic, are observational only:
+nothing logged or displayed feeds back into liveness, admission, or timing.
 
-Forwarding-loop deadlines use monotonic time and become due at equality. When
-deadlines coincide, deterministic priority is `peer_timeout`, then the planned
-session-refresh action (start an in-session epoch refresh transaction, or --
-if the loop was not given the station/server keys -- end the loop with a
-planned-refresh reason for a fresh establishment handshake), then the
-keepalive action: proactive rekey for an unresolved ping or a new ping when
-none is outstanding. A due deadline is resolved before poll-ready packets, so
-a matching pong must be fully authenticated and accepted before its boundary
-to refresh liveness or prevent proactive rekey. The planned-refresh action
-does not end the loop when an epoch refresh is available; the transaction
-runs alongside normal forwarding and its own retransmit/timeout deadline
-additionally bounds the poll wait. Deadline checks use fresh monotonic
-observations. After any pending local-input forwarding, the final poll
-timeout is recomputed from another fresh monotonic observation immediately
-before `select()`.
+The only terminal liveness bound is `peer_timeout` after the last accepted
+authenticated liveness evidence (`last_authenticated_peer + peer_timeout`,
+due at equality). When it is reached while a keepalive ping is outstanding --
+the proxy kept probing and nothing authenticated answered -- the proxy ends
+the local forwarding loop with a proactive-rekey reason and immediately makes
+one fresh signed ECDHE handshake attempt. When no ping is outstanding
+(possible only when `keepalive_interval >= peer_timeout`) the reason is
+`peer_timeout`, which waits `reconnect_delay` first. A failure of the fresh
+attempt returns to normal `reconnect_delay`; it cannot create a busy retry
+loop. Other authenticated evidence (a first refresh reply, a refresh commit,
+a matched PATH_ACK; see their subsections) advances `last_authenticated_peer`
+and so postpones that bound, but does not answer the ping, which keeps being
+retransmitted at the retry cadence while it is outstanding. With the defaults
+`keepalive_interval: 30` and `peer_timeout: 90`, a lost PING or PONG costs
+one retransmission about 60 seconds after the last evidence, answered one
+round trip later in the same session. With no answer at all the session ends
+90 seconds after the last evidence. How many retransmissions an episode
+takes depends on the case, and no single ceiling covers them all:
+
+- in an ordinary keepalive-only episode (no transient local send failure,
+  no other evidence) at most ceil((peer_timeout - keepalive_interval) /
+  retry interval): 12 with the defaults, 7 in the steady state where the
+  last evidence is the previous PONG;
+- a transient local send failure while the ping is outstanding brings
+  retransmissions forward through the reprobe described below; they stay
+  at most one per retry interval and the session still ends at the same
+  bound, but more of them fit before it (for example 17 with the defaults
+  when the last evidence arrives together with the ping and the failure
+  immediately follows it);
+- while other qualifying evidence keeps advancing `last_authenticated_peer`,
+  the ping keeps being retransmitted and one episode has no finite
+  retransmission count, although its state stays O(1) and its rate stays
+  at most one transmission per retry interval.
+
+Before MP1 a single unanswered ping ended the session at its keepalive
+deadline, about 60 seconds after the last evidence (11.5).
+
+Forwarding-loop deadlines use monotonic time and become due at equality.
+Evidence comes before verdict. A datagram is credited at the monotonic
+instant it is read: the loop receives a readable session-socket datagram
+before it services the deadlines due at that instant, and applies each
+liveness effect (a matching PONG, a first refresh reply or a refresh commit,
+a matched PATH_ACK) as of that read instant, independent of how long its
+processing, logging, or any later maintenance takes. Before a terminal
+liveness verdict the loop performs a bounded, non-blocking drain: it
+receives and processes at most `EVIDENCE_DRAIN_MAX_DATAGRAMS` (16)
+datagrams that are already readable (`select()` with a zero timeout; it
+never waits for traffic that has not arrived), then takes a fresh monotonic
+observation and classifies again. The drain bound is fixed and independent
+of the peer's send rate, so an unauthenticated flood costs only bounded work
+and cannot postpone the verdict. Evidence that becomes readable only after
+the drain has no effect on that verdict, and without authenticated evidence
+the drain never extends the session. Before MP1 a due deadline was resolved
+before poll-ready packets, so a matching PONG readable at its boundary lost;
+this ordering supersedes that rule.
+
+When deadlines coincide, deterministic priority is the terminal liveness
+verdict, then the planned session-refresh action (start an in-session epoch
+refresh transaction, or -- if the loop was not given the station/server keys
+-- end the loop with a planned-refresh reason for a fresh establishment
+handshake), then the keepalive action: a retransmission of the outstanding
+ping, or a new ping when none is outstanding. One deadline check performs at
+most one non-terminal action. A supported planned refresh is non-terminal
+maintenance, so it can never mask a simultaneously due liveness verdict: when
+both are due at once the verdict wins and the refresh is not started. The
+planned-refresh action does not end the loop when an epoch refresh is
+available; the transaction runs alongside normal forwarding and its own
+retransmit/timeout deadline additionally bounds the poll wait. Deadline
+checks use fresh monotonic observations. After any pending local-input
+forwarding, the final poll timeout is recomputed from another fresh
+monotonic observation immediately before `select()`.
 
 Timing values must be finite integer or float values, excluding booleans and
 numeric strings. UDPSEC requires `keepalive_interval > 0`,
@@ -1064,10 +1127,10 @@ refresh. These constraints are independent: there is no cross-field ordering
 or ratio requirement. Plain UDP shares only the `reconnect_delay >= 0`
 validation; the other three fields are UDPSEC-only.
 
-Proactive recovery (an unanswered keepalive ping) reuses the normal signed
-ClientHello, authenticated ServerHello, directional ECDHE-derived traffic
-keys, and encrypted sequence-zero confirmation for a genuine fresh
-establishment -- it adds no reset, probe, or separate recovery protocol,
+Proactive recovery (the liveness bound reached while a keepalive ping is
+outstanding) reuses the normal signed ClientHello, authenticated
+ServerHello, directional ECDHE-derived traffic keys, and encrypted
+sequence-zero confirmation for a genuine fresh establishment -- it adds no reset, probe, or separate recovery protocol,
 generates fresh ephemeral ECDHE material, installs or replaces only pending
 state (the old active server session stays usable while confirmation is
 pending, failed confirmation does not destroy it, and successful
@@ -1081,6 +1144,32 @@ planned-refresh transaction start are immediate; peer graceful close,
 `peer_timeout`, handshake failure, local forwarding failure, and socket
 failure use `reconnect_delay`. No NMEA payload is buffered or replayed as
 part of any recovery or refresh path.
+
+A transient network error on the confirmed session's socket does not end the
+session by itself; it stays inside the liveness bound above. Transient means
+no route or a network or host down (`ENETUNREACH`, `EHOSTUNREACH`,
+`ENETDOWN`, `EHOSTDOWN`), a vanished source address (`EADDRNOTAVAIL`),
+buffer pressure (`ENOBUFS`), or an ICMP-derived refusal or reset
+(`ECONNREFUSED`, `ECONNRESET`), including the Windows `WSAE*` equivalents.
+Any other socket error remains terminal (`socket_error`, then
+`reconnect_delay`). An NMEA sentence whose send fails transiently is
+dropped: it is not counted as forwarded and is never buffered, retried, or
+replayed. Reading local input then pauses for one retry interval, so lines
+not yet read wait in the input adapter's own bounded queue (the serial
+adapter's drop-oldest queue, or the UDP input socket's receive buffer)
+instead of meeting the failing interface. Lines already read in the same
+batch are still attempted one by one -- each is sent or dropped, none is
+held back. While paused, input sockets are not offered
+to `select()` and each wait ends no later than the end of the pause. When
+the pause ends, one keepalive transmission -- the outstanding ping again, or
+a new ping -- probes the path before any input is read. A failed probe
+pauses again, so a failing interface sees at most one probe per retry
+interval, and any successful send ends the pause. A transient receive error
+is reported and otherwise ignored: like any ICMP signal it is
+unauthenticated, so it neither proves nor disproves liveness. The first
+transient failure of an episode and the first successful send after it are
+each logged once. A long outage still ends at the liveness bound and then
+follows the fresh-establishment path with its normal backoff.
 
 A pending session is promoted only when a DATA packet decrypts under its
 client-to-server AES-GCM owner and decodes to a confirmation ping. Confirmation
@@ -1321,9 +1410,9 @@ forwarding continues under E1 while E2 is pending; after the client
 receives the `refresh_ack` it switches sending to E2. A planned
 `session_refresh_interval` now triggers this epoch refresh instead of a
 fresh establishment handshake; `session_refresh_interval = 0` still
-disables planned refresh, and proactive rekey on an unanswered keepalive
-ping still performs a genuine fresh-establishment handshake for real
-liveness failure.
+disables planned refresh, and proactive rekey at the liveness bound (see
+the keepalive rules above) still performs a genuine fresh-establishment
+handshake for real liveness failure.
 
 The client caches the two canonical control messages (`refresh_init` and,
 once E2 is derived, `refresh_confirm`) -- never their ciphertext -- and
@@ -1381,14 +1470,15 @@ monotonic clock callable (the same domain as `forward_loop`'s deadlines);
 there is no scalar-`now` send path.
 
 The first verified `refresh_reply` and a genuine `refresh_ack` commit
-advance `last_authenticated_peer` and therefore reanchor the peer-timeout
-deadline (`last_authenticated_peer + peer_timeout`); the configured
-`peer_timeout` duration remains unchanged. They do NOT clear an outstanding
-keepalive `expected_ping_seq`, reset `last_ping_at`, or extend the
-transaction deadline; a duplicate control datagram advances none of these.
-Normal keepalive/rekey deadlines remain due on their existing schedule.
-A successful commit also reanchors the client's own planned-refresh
-cadence, never `session.created_at` on the server.
+advance `last_authenticated_peer`, as of the instant the datagram was read,
+and therefore reanchor the liveness bound (`last_authenticated_peer +
+peer_timeout`); the configured `peer_timeout` duration remains unchanged,
+and no terminal liveness verdict can contradict that evidence. They do NOT
+clear an outstanding keepalive `expected_ping_seq`, reset `last_ping_at`,
+change that ping's retransmission schedule, or extend the transaction
+deadline; a duplicate control datagram advances none of these. A successful
+commit also reanchors the client's own planned-refresh cadence, never
+`session.created_at` on the server.
 
 **Epoch-specific replay and receive admission.** Every DATA operation
 retains the EXACT `CryptoEpoch` object it selected for authentication.
@@ -1770,61 +1860,36 @@ promotes/discards/rekeys the `CryptoEpoch`):
   after its proof's deadline has already passed,
   an unseen or superseded generation, a wrong token, or one bound to a
   since-superseded epoch are all authenticated-but-benign and change nothing.
-  A matched PATH_ACK does not gain final liveness or ping-clear authority
-  merely by passing the post-receipt deadline check: that check, and the
-  `drive_refresh()` and acknowledgement logging that follow it, can
-  themselves consume enough time for a terminal deadline to become due. Its
-  state effects are therefore gated by a bounded, two-phase final admission,
-  never by the ordinary per-iteration deadline helper (which is itself
-  effectful -- it can send a keepalive ping or start an in-session refresh,
-  and either could block past a terminal deadline). Phase one is a
-  side-effect-free terminal classification (`terminal_deadline_reason`): no
-  send, no logging, no refresh start/tick, no mutation, no second clock
-  sample -- pure local comparisons against one already-captured `now`. If it
-  finds a terminal deadline due, that reason wins outright and the ACK gets
-  no effects at all. Otherwise phase two performs AT MOST the one
-  non-terminal maintenance action that is due at that same instant --
-  sending a keepalive ping with none outstanding, or starting/reanchoring a
-  supported in-session planned refresh -- and only then does the
-  implementation take a fresh monotonic sample and run the SAME pure
-  terminal classification again. Any terminal deadline due at that final,
-  post-maintenance classification -- `peer_timeout`, planned-refresh (when
-  in-session refresh is unsupported), or keepalive/proactive-recovery, exact
-  equality included -- still wins outright: the ACK is
-  authenticated-but-benign and neither reanchors liveness nor clears a ping.
-  Between that final classification and the mutation of
-  `last_authenticated_peer`/`expected_ping_seq` there is no further
-  potentially blocking work of any kind. A supported planned refresh that is
-  due at the same instant as unresolved-ping proactive recovery is
-  deliberately classified as non-terminal maintenance, never as a terminal
-  reason, precisely so it can never mask recovery: when both are due at
-  once, proactive recovery wins and the refresh is never even started. Its
-  ping-clear authority is the concrete ping sequence captured at the
-  successful `path_response` send, carried unchanged until that final
-  admission passes. It clears an outstanding ping ONLY if the captured
-  sequence is not `None` and that exact sequence is still outstanding at
-  that final admission instant. A proof that captured no ping has no
-  ping-clear authority, but its matched ACK still advances liveness. A
-  different, later ping -- including one created by that same final
-  admission's own maintenance phase when it sends a fresh keepalive ping --
-  is left untouched.
+  A matched PATH_ACK takes effect as of the monotonic instant it was read,
+  before the loop services any deadline due at that instant and
+  independently of how long its matching, `drive_refresh()`, and the
+  acknowledgement logging take afterwards (evidence before verdict; see the
+  forwarding-loop ordering rules in this section). Its ping-clear authority
+  is the concrete ping sequence captured at the successful `path_response`
+  send, carried unchanged until the ACK is applied. It clears the outstanding
+  ping ONLY if the captured sequence is not `None` and that exact sequence is
+  still the outstanding one when the ACK is applied. A proof that captured no
+  ping has no ping-clear authority, but its matched ACK still advances
+  liveness. A different, later ping -- including a keepalive ping sent after
+  the ACK was read -- is left untouched and is retransmitted on its own
+  schedule until it is answered or the liveness bound is reached. Before
+  MP1, the ACK's effects were gated by a two-phase final admission in which
+  any terminal deadline due at the ACK, or crossed by its own processing,
+  won outright. With staged liveness the only terminal liveness deadline is
+  the `peer_timeout` bound, and a matched ACK counts from its read instant.
 
 A matched PATH_ACK is proof of liveness, not a lease renewal or a fresh
-session. Because it advances `last_authenticated_peer` -- to the fresh
-monotonic sample taken AFTER any due non-terminal maintenance at its final
-terminal-deadline admission, never an older sample taken before that
-maintenance, `drive_refresh()`, or acknowledgement logging -- it
-correspondingly reanchors the `peer_timeout` deadline
+session. Because it advances `last_authenticated_peer` -- to the monotonic
+instant the ACK was read, never a later sample taken after its processing,
+`drive_refresh()`, acknowledgement logging, or any maintenance -- it
+correspondingly reanchors the `peer_timeout` bound
 (`last_authenticated_peer + peer_timeout`) forward from that moment,
 exactly as an accepted pong already does; this is the intended, expected
 effect, not something the implementation avoids. What it never does is
-reset `session_started_at` outside of that admission's own maintenance,
-extend or postpone the planned-refresh deadline, or touch
-`last_ping_at`/restart or delay the normal keepalive schedule beyond that
-same maintenance -- an already-due terminal deadline still wins at that
-final admission, before the ACK's liveness effect is applied. Migration
-stays strictly a transport/session concern: it never pauses, buffers, or
-otherwise touches NMEA/application forwarding.
+reset `session_started_at`, extend or postpone the planned-refresh
+deadline, or touch `last_ping_at`/restart or delay the normal keepalive
+schedule. Migration stays strictly a transport/session concern: it never
+pauses, buffers, or otherwise touches NMEA/application forwarding.
 
 ### 11.1 Migration x epoch-refresh x lifecycle binding (Major Prompt 6)
 
@@ -2113,8 +2178,9 @@ Three different numbers must not be confused:
    - an unversioned observation (endpoint without a generation, e.g. from
      an older server) is accepted only while nothing generation-aware has
      been accepted and the floor is still 0;
-   - the floor rises to a `PATH_ACK`'s `path_generation` only after that
-     ACK passed the forward loop's final admission, and never falls; an
+   - the floor rises to a `PATH_ACK`'s `path_generation` only after the
+     forward loop accepted that ACK as a matched PATH_ACK, and never
+     falls; an
      observation below the floor stays displayed but marked `last-known`
      until a PONG at or above the floor arrives;
    - the confirmation PONG seeds the first observation, so generation 0
@@ -2204,27 +2270,31 @@ Three different numbers must not be confused:
    stuck shutdown needs SIGKILL. `nmea_sproxy` keeps its own SIGTERM
    handler, which still raises KeyboardInterrupt immediately.
 
-### 11.5 Recovery baseline cross-reference (MP0)
+### 11.5 Recovery baseline cross-reference (MP0, MP1)
 
 Three distinct recovery mechanisms exist and must not be conflated:
 
 1. **Keepalive/liveness recovery**: how the client treats missing
-   authenticated liveness evidence on an unchanged path. Today this is the
-   single-shot unresolved-ping rule above, which ends in proactive rekey.
+   authenticated liveness evidence on an unchanged path. Since MP1 this is
+   the staged rule above: the unanswered ping is retransmitted (same
+   sequence, fresh nonce) inside the same `LogicalSession`, and only the
+   `peer_timeout` bound after the last authenticated evidence ends it.
 2. **Path migration**: server-driven return-routability validation of a
    changed tuple (the path-migration subsections and 11.1-11.3). It keeps the
    same `LogicalSession`.
 3. **Full-establishment fallback**: a fresh signed ECDHE handshake that
    creates a new `LogicalSession` (new locator, epoch 0, `path_gen` 0).
 
-`tests/udpsec_recovery/UDPSEC_V2_RECOVERY_BASELINE.md` records the current
-behaviour of all three against the IPv6 and IPv4/CGNAT field evidence. It
-defines FUTURE ACCEPTANCE TARGETS for MP1 (client liveness recovery: staged,
-bounded, no wire change) and MP2 (bounded path-migration recovery). Those
-targets are not current guarantees. Until MP1 or MP2 changes them, section 11
-above remains the normative behaviour, including the single-shot keepalive
-rule and the resolution of due deadlines before poll-ready packets. The
-targets are encoded as strict-xfail acceptance tests next to that baseline.
+`tests/udpsec_recovery/UDPSEC_V2_RECOVERY_BASELINE.md` records the pre-MP1
+behaviour of all three against the IPv6 and IPv4/CGNAT field evidence, and
+the MP1 outcome of every scenario. MP1 (client liveness recovery: staged,
+bounded, evidence before verdict, transient network errors inside the
+liveness bound; no wire, server, or configuration change) is implemented as
+specified in section 11 above. Its acceptance tests and exact policy pins,
+next to that baseline, are ordinary tests. MP2 (bounded path-migration
+recovery) remains a FUTURE target recorded there, not a current guarantee:
+until MP2 changes it, one PATH_CHALLENGE per candidate incarnation (11.3)
+remains the normative behaviour.
 
 ## 12. Routing snapshot boundary
 

@@ -1181,7 +1181,9 @@ def test_e2e_migration_reanchors_peer_timeout_but_not_keepalive_or_refresh(
     monkeypatch.setattr(proxy.time, "time", lambda: 1000)
 
     def fake_select(r, w, x, t):
-        clock["t"] += 0.25
+        # A zero-timeout poll (the pre-verdict evidence drain) is
+        # non-blocking and consumes no time.
+        clock["t"] += min(0.25, t)
         return ([s for s in r if getattr(s, "inbox", None)], [], [])
 
     monkeypatch.setattr(proxy.select, "select", fake_select)
@@ -1503,11 +1505,15 @@ def test_e2e_superseded_ack_after_response_send_failure_cannot_delay_recovery(
     ]
     reason, ended_at, pings, received = _run_scripted_path_loop(
         proxy, keys, monkeypatch, events, fail_response_generation=2,
+        config_overrides={"peer_timeout": 20},
     )
     assert len(received) == 3
-    assert pings == [(5.0, 1)]
+    # The superseded ACK is benign: no liveness credit and no ping clear.
+    # Ping #1 is retransmitted (same sequence) and the session ends exactly
+    # peer_timeout after its start -- not peer_timeout after the ACK (t=8).
+    assert pings == [(5.0, 1), (10.0, 1), (15.0, 1)]
     assert reason == proxy.SESSION_END_PROACTIVE_REKEY
-    assert ended_at == pytest.approx(10.0)
+    assert ended_at == pytest.approx(20.0)
 
 
 def test_e2e_ack_crossing_keepalive_deadline_cannot_erase_new_ping(
@@ -1520,11 +1526,19 @@ def test_e2e_ack_crossing_keepalive_deadline_cannot_erase_new_ping(
     ]
     reason, ended_at, pings, received = _run_scripted_path_loop(
         proxy, keys, monkeypatch, events,
+        config_overrides={"peer_timeout": 20},
     )
     assert len(received) == 2
-    assert pings == [(5.01, 1)]
+    # The ACK (its proof captured no ping) is credited when its receive
+    # completes at t=5.01; only then is the due keepalive serviced, sending
+    # ping #1, which that ACK can never resolve: ping #1 is retransmitted
+    # until peer_timeout after the ACK.
+    assert [seq for _when, seq in pings] == [1, 1, 1, 1]
+    assert [when for when, _seq in pings] == pytest.approx(
+        [5.01, 10.01, 15.01, 20.01]
+    )
     assert reason == proxy.SESSION_END_PROACTIVE_REKEY
-    assert ended_at == pytest.approx(10.01)
+    assert ended_at == pytest.approx(25.01)
 
 
 def test_e2e_ack_cannot_clear_ping_after_captured_ping_was_resolved(
@@ -1542,11 +1556,18 @@ def test_e2e_ack_cannot_clear_ping_after_captured_ping_was_resolved(
     ]
     reason, ended_at, pings, received = _run_scripted_path_loop(
         proxy, keys, monkeypatch, events,
+        config_overrides={"peer_timeout": 20},
     )
     assert len(received) == 3
-    assert pings == [(5.0, 1), (10.0, 2)]
+    # Ping #1 was resolved by its pong at t=7; the ACK's proof captured ping
+    # #1, so it cannot resolve ping #2 -- which is retransmitted until
+    # peer_timeout after the ACK's liveness credit (t=11).
+    assert [seq for _when, seq in pings] == [1, 2, 2, 2, 2, 2]
+    assert [when for when, _seq in pings] == pytest.approx(
+        [5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
+    )
     assert reason == proxy.SESSION_END_PROACTIVE_REKEY
-    assert ended_at == pytest.approx(15.0)
+    assert ended_at == pytest.approx(31.0)
 
 
 def test_e2e_matched_ack_without_ping_clear_authority_still_reanchors_liveness(
@@ -1568,23 +1589,31 @@ def test_e2e_matched_ack_without_ping_clear_authority_still_reanchors_liveness(
 
 
 @pytest.mark.parametrize(
-    "config_overrides,challenge_at,deadline,expected_reason",
+    "config_overrides,challenge_at,deadline,expected_reason,expected_end",
     [
         (
             {"keepalive_interval": 100, "peer_timeout": 5},
-            1.0, 5.0, "peer_timeout",
+            1.0, 5.0, "peer_timeout", 10.0,
         ),
         (
             {"keepalive_interval": 100, "session_refresh_interval": 5},
-            1.0, 5.0, "planned_refresh",
+            1.0, 5.0, "planned_refresh", 5.0,
         ),
-        ({}, 6.0, 10.0, "proactive_rekey"),
+        ({"peer_timeout": 20}, 6.0, 10.0, "proactive_rekey", 30.0),
     ],
 )
-def test_e2e_terminal_deadline_wins_when_ack_receive_reaches_equality(
+def test_e2e_ack_receive_reaching_a_deadline_is_credited_before_the_verdict(
     proxy, keys, monkeypatch, config_overrides, challenge_at, deadline,
-    expected_reason,
+    expected_reason, expected_end,
 ):
+    """MP1 evidence before verdict (replaces MP5's "terminal deadline wins
+    when the ACK receive reaches equality"). The ACK becomes readable just
+    before a deadline and its receive completes exactly at it; it is
+    credited first -- liveness reanchored at that instant, and in the last
+    case its captured ping #1 resolved -- and only then is the deadline
+    serviced. A liveness deadline is therefore no longer due, but a planned
+    refresh without in-session refresh support still ends the session at
+    equality: liveness evidence never postpones it."""
     token = os.urandom(32)
     events = [
         (
@@ -1601,16 +1630,21 @@ def test_e2e_terminal_deadline_wins_when_ack_receive_reaches_equality(
     )
     assert len(received) == 2  # ACK was received before the terminal recheck.
     assert reason == expected_reason
-    assert ended_at == pytest.approx(deadline)
+    assert ended_at == pytest.approx(expected_end)
 
 
 # --------------------------------------------------------------------------
-# F. MP5 corrective round 3 -- HIGH finding: a matched PATH_ACK's liveness/
-# ping-clear effects must be gated by a FRESH terminal-deadline admission
-# taken immediately before those effects, not by the earlier post-receipt
-# check alone. `drive_refresh()` and acknowledgement logging sit between the
-# two and can themselves consume enough time for a terminal deadline to
-# become due; that deadline must still win.
+# F. PATH_ACK admission vs. work that crosses a deadline. MP5 corrective
+# round 3 gated a matched PATH_ACK's effects behind a fresh terminal-
+# deadline check taken after the refresh retransmission / logging that
+# followed its receipt (deadline first). MP1 replaced that ordering with
+# evidence before verdict (BEHAVIORAL_CONTRACT.md section 11): the ACK's
+# effects apply at the instant it was read, before any deadline is
+# serviced, so later work in the same iteration can neither cancel nor
+# extend them. These tests keep MP5's crossing timelines and pin the MP1
+# outcome. The proof rules (token, generation, watermark, epoch, proof
+# deadline, single consumption, captured-sequence ping authority) are
+# unchanged and covered above.
 # --------------------------------------------------------------------------
 
 
@@ -1626,16 +1660,17 @@ def _station_keypair():
     return station_private_key, station_private_key.public_key()
 
 
-def test_e2e_refresh_retransmit_crossing_proactive_recovery_deadline_wins(
+def test_e2e_ack_credit_survives_refresh_retransmit_crossing_the_ping_deadline(
     proxy, keys, monkeypatch
 ):
-    """Regression 1: a matched PATH_ACK is admitted (post-receipt deadline
-    check passes) just before the unresolved-ping proactive-recovery
-    deadline, but the very next `drive_refresh()` call performs a real
-    retransmission whose mocked transport advances the clock past that
-    deadline. The proactive-recovery reason must win: the ACK must NOT
-    clear ping #1 and must NOT reanchor liveness, so no ping #2 ever
-    results from the stale effect."""
+    """Regression 1 (MP1 outcome): a matched PATH_ACK is read at t=9.0,
+    just before ping #1's keepalive deadline (t=10.0), and the very next
+    `drive_refresh()` call performs a real retransmission whose mocked
+    transport advances the clock to t=10.5. The ACK was credited when it
+    was read: it resolved its captured ping #1 and reanchored liveness at
+    t=9.0, so ping #2 follows on the normal cadence and the session ends
+    peer_timeout after the ACK -- the crossing neither cancels nor extends
+    that credit."""
     station_private_key, server_identity_public_key = _station_keypair()
     token = os.urandom(32)
 
@@ -1666,7 +1701,7 @@ def test_e2e_refresh_retransmit_crossing_proactive_recovery_deadline_wins(
         proxy, keys, monkeypatch, events,
         config_overrides={
             "keepalive_interval": 5,
-            "peer_timeout": 1000,
+            "peer_timeout": 20,
             "session_refresh_interval": 3,
         },
         station_private_key=station_private_key,
@@ -1675,23 +1710,23 @@ def test_e2e_refresh_retransmit_crossing_proactive_recovery_deadline_wins(
     )
     assert triggered["done"], "the scripted refresh retransmission never fired"
     assert len(received) == 2
-    assert reason == proxy.SESSION_END_PROACTIVE_REKEY, (
-        f"reason={reason!r}; a refresh retransmission crossing the "
-        "recovery deadline during ACK admission must still terminate the "
-        "session via proactive recovery"
+    assert pings[:2] == [(5.0, 1), (10.5, 2)], (
+        "the ACK read at t=9.0 resolved its captured ping #1, so ping #2 "
+        "is sent once the keepalive is serviced after the crossing"
     )
-    assert pings == [(5.0, 1)], (
-        "no ping #2 may be sent -- the ACK must not have cleared ping #1 "
-        "after the recovery deadline came due"
-    )
-    assert ended_at == pytest.approx(10.5)
+    assert {seq for _when, seq in pings[1:]} == {2}
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
+    assert ended_at == pytest.approx(29.0)  # ACK credit (9.0) + peer_timeout
 
 
-def test_e2e_refresh_retransmit_crossing_peer_timeout_wins(proxy, keys, monkeypatch):
-    """Regression 2: same shape as regression 1, but the terminal deadline
-    crossed by the retransmission's send is `peer_timeout`, not the
-    proactive-recovery/keepalive deadline. `peer_timeout` must win and the
-    ACK must not reanchor liveness."""
+def test_e2e_ack_credit_survives_refresh_retransmit_crossing_peer_timeout(
+    proxy, keys, monkeypatch
+):
+    """Regression 2 (MP1 outcome): same shape as regression 1, but the
+    deadline the retransmission's send crosses is the original
+    `peer_timeout` (t=10.0). The ACK read at t=9.0 already reanchored
+    liveness, so that deadline is no longer due: the session ends exactly
+    peer_timeout after the ACK instead."""
     station_private_key, server_identity_public_key = _station_keypair()
     token = os.urandom(32)
 
@@ -1723,23 +1758,21 @@ def test_e2e_refresh_retransmit_crossing_peer_timeout_wins(proxy, keys, monkeypa
     )
     assert triggered["done"], "the scripted refresh retransmission never fired"
     assert len(received) == 2
-    assert reason == proxy.SESSION_END_PEER_TIMEOUT, (
-        f"reason={reason!r}; a refresh retransmission crossing peer_timeout "
-        "during ACK admission must still terminate the session via "
-        "peer_timeout, not be masked by a stale ACK reanchor"
-    )
+    assert reason == proxy.SESSION_END_PEER_TIMEOUT
     assert pings == []
-    assert ended_at == pytest.approx(10.5)
+    assert ended_at == pytest.approx(19.0)  # ACK credit (9.0) + peer_timeout
 
 
-def test_e2e_ack_logging_crossing_proactive_recovery_deadline_wins(
+def test_e2e_ack_credit_survives_its_logging_crossing_the_ping_deadline(
     proxy, keys, monkeypatch
 ):
-    """Regression 3: refresh disabled entirely (no station keys, so
-    `drive_refresh()` is always a no-op) -- the acknowledgement *logging*
-    itself is the thing that consumes enough (mocked) time to cross the
-    proactive-recovery deadline between the post-receipt check and the
-    final admission. The deadline must still win."""
+    """Regression 3 (MP1 outcome): refresh disabled entirely (no station
+    keys, so `drive_refresh()` is always a no-op) -- the acknowledgement
+    *logging* itself consumes enough (mocked) time to cross ping #1's
+    keepalive deadline (t=10.0). The ACK was credited when read at t=9.9,
+    before that logging: ping #1 is resolved, ping #2 follows once the
+    keepalive is serviced at t=10.1, and the session ends peer_timeout
+    after the ACK."""
     token = os.urandom(32)
     clock = {"t": 0.0}  # the SAME dict the loop's `time.monotonic` reads
 
@@ -1765,31 +1798,26 @@ def test_e2e_ack_logging_crossing_proactive_recovery_deadline_wins(
         proxy, keys, monkeypatch, events,
         config_overrides={
             "keepalive_interval": 5,
-            "peer_timeout": 1000,
+            "peer_timeout": 20,
         },
         clock=clock,
     )
     assert triggered["done"], "the scripted acknowledgement log line never fired"
     assert len(received) == 2
-    assert reason == proxy.SESSION_END_PROACTIVE_REKEY, (
-        f"reason={reason!r}; acknowledgement logging crossing the recovery "
-        "deadline during ACK admission must still terminate the session "
-        "via proactive recovery"
-    )
-    assert pings == [(5.0, 1)], (
-        "no ping #2 may be sent -- the ACK must not have cleared ping #1 "
-        "after the recovery deadline came due"
-    )
-    assert ended_at == pytest.approx(10.1)
+    assert pings[:2] == [(5.0, 1), (10.1, 2)]
+    assert {seq for _when, seq in pings[1:]} == {2}
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
+    assert ended_at == pytest.approx(29.9)  # ACK credit (9.9) + peer_timeout
 
 
-def test_e2e_final_admission_exact_equality_rejects_ack_effects(
+def test_e2e_ack_credit_survives_work_landing_exactly_on_peer_timeout(
     proxy, keys, monkeypatch
 ):
-    """Regression 4: the FINAL fresh admission (not the earlier post-receipt
-    check) lands at EXACT equality with `peer_timeout`. Exact equality is
-    terminal: the deadline must still win, with no ACK liveness/ping
-    mutation."""
+    """Regression 4 (MP1 outcome): the refresh retransmission after the ACK
+    lands the clock EXACTLY on the original `peer_timeout` deadline
+    (t=10.0). The ACK read at t=9.0 already reanchored liveness, so that
+    instant is no longer a deadline; equality stays terminal at the
+    reanchored bound, where the session ends exactly."""
     station_private_key, server_identity_public_key = _station_keypair()
     token = os.urandom(32)
 
@@ -1820,31 +1848,24 @@ def test_e2e_final_admission_exact_equality_rejects_ack_effects(
         on_send=on_send,
     )
     assert triggered["done"], "the scripted refresh retransmission never fired"
-    assert reason == proxy.SESSION_END_PEER_TIMEOUT, (
-        f"reason={reason!r}; now == peer_timeout deadline at the final "
-        "admission must still be treated as due (equality is terminal)"
-    )
+    assert reason == proxy.SESSION_END_PEER_TIMEOUT
     assert pings == []
-    assert ended_at == pytest.approx(10.0)
+    assert ended_at == 9.0 + 10  # reanchored bound; equality is terminal
 
 
 def test_e2e_control_ack_still_clears_ping_and_reanchors_liveness(
     proxy, keys, monkeypatch
 ):
-    """Regression 5 (control): when nothing crosses a deadline between the
-    post-receipt check and the final admission, a matched PATH_ACK still
-    works exactly as before -- it clears the concrete matching ping AND
-    reanchors liveness to that admission's fresh sample.
+    """Regression 5 (control): a matched PATH_ACK clears the concrete
+    matching ping AND reanchors liveness to the instant it was read.
 
-    `peer_timeout=12` is chosen so the two effects are jointly observable
-    in the final session-end reason: if the ping were NOT cleared, the
-    session would end via proactive recovery at t=10 (ping #2 never sent).
-    If liveness were NOT reanchored to the ACK's fresh admission time
-    (t=6.5), `peer_timeout` would fire at t=12 -- before the next
-    keepalive/proactive-recovery deadline at t=15. Only when BOTH effects
-    apply correctly does the session survive to send ping #2 at t=10 and
-    then end via proactive recovery at t=15 (peer_timeout reanchored to
-    6.5 + 12 = 18.5, well past 15).
+    `peer_timeout=12` makes both effects jointly observable: if ping #1
+    were NOT cleared it would be retransmitted at t=10 instead of ping #2
+    being sent; if liveness were NOT reanchored to the ACK (t=6.5), the
+    session would end at t=12. With both effects, ping #2 goes out at t=10,
+    is retransmitted at its keepalive deadline t=15, and the session ends
+    at the reanchored bound 6.5 + 12 = 18.5 (MP1: an unanswered ping is
+    retransmitted until peer_timeout rather than ending the session).
     """
     token = os.urandom(32)
     events = [
@@ -1859,41 +1880,42 @@ def test_e2e_control_ack_still_clears_ping_and_reanchors_liveness(
         },
     )
     assert len(received) == 2
-    assert reason == proxy.SESSION_END_PROACTIVE_REKEY, (
-        f"reason={reason!r}; a valid pre-deadline ACK must clear ping #1 "
-        "(enabling ping #2) and reanchor peer_timeout forward, so the "
-        "session should survive past an unreanchored t=12 peer_timeout "
-        "and instead end via the unanswered ping #2's recovery at t=15"
-    )
-    assert pings == [(5.0, 1), (10.0, 2)], (
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
+    assert pings == [(5.0, 1), (10.0, 2), (15.0, 2)], (
         "ping #2 must be sent on the normal cadence -- proof the ACK "
-        "cleared ping #1"
+        "cleared ping #1 -- and then retransmitted, never replaced"
     )
-    assert ended_at == pytest.approx(15.0)
+    assert ended_at == pytest.approx(18.5)
 
 
 # --------------------------------------------------------------------------
-# G. MP5 corrective round 4 -- HIGH finding: `apply_due_deadline()` is not a
-# side-effect-free final admission gate. It can itself send a keepalive
-# ping or start an in-session refresh, and either of those non-terminal
-# maintenance actions can block past a terminal session deadline BEFORE the
-# final PATH_ACK liveness/ping-clear effects are applied. The fix splits
-# the final gate into a pure `terminal_deadline_reason()` classification,
-# at most one due non-terminal maintenance action, a fresh resample, and a
-# final pure classification with no blocking work before the mutation.
+# G. PATH_ACK admission vs. maintenance work. MP5 corrective round 4 found
+# that the effectful per-iteration deadline helper could send a keepalive
+# ping or start an in-session refresh -- work that can block past a
+# terminal deadline -- between an ACK's receipt and its effects, and split
+# the gate into pure classification, at most one maintenance action, a
+# fresh resample and a final pure classification. Under MP1 (evidence
+# before verdict) an ACK's effects apply at the instant it was read, with
+# no maintenance or other work in between, so that hazard cannot arise.
+# Maintenance runs only afterwards, in ordinary deadline servicing, and the
+# pure `terminal_deadline_reason()` / `nonterminal_due_action()` split
+# still keeps every terminal verdict free of blocking work. These tests
+# keep the round-4 timelines and pin the MP1 outcome.
 # --------------------------------------------------------------------------
 
 
-def test_e2e_final_maintenance_ping_send_crosses_peer_timeout(
+def test_e2e_ack_credit_survives_maintenance_ping_send_crossing_peer_timeout(
     proxy, keys, monkeypatch
 ):
-    """Regression 1 (Confirmed Failure A): at the final admission sample a
-    keepalive ping is due with nothing outstanding, so the non-terminal
-    maintenance phase sends it -- but the mocked send itself advances the
-    clock past `peer_timeout`. The post-maintenance pure terminal check
-    must catch this: the session ends via `peer_timeout`, and the ACK gets
-    no liveness effect (it must not reanchor using the stale
-    pre-maintenance sample)."""
+    """Regression 1 (MP1 outcome): the ACK is read at t=8.9 and credited
+    then; its logging advances the clock to t=9.0, where a keepalive ping
+    is due, and that ping's mocked send advances the clock to t=10.5,
+    past the original `peer_timeout` (t=10.0). The ACK credit already
+    moved that bound to 18.9, so the session survives. The new ping (its
+    proof captured none, so the ACK cannot resolve it) stays outstanding:
+    its first retry is anchored at the completed send attempt (10.5 + 9 =
+    19.5), after the verdict, so the session ends at t=18.9 with that ping
+    still unanswered."""
     token = os.urandom(32)
     clock = {"t": 0.0}
 
@@ -1937,24 +1959,23 @@ def test_e2e_final_maintenance_ping_send_crosses_peer_timeout(
     assert log_triggered["done"], "the scripted acknowledgement log line never fired"
     assert send_triggered["done"], "the scripted maintenance ping send never fired"
     assert len(received) == 2
-    assert reason == proxy.SESSION_END_PEER_TIMEOUT, (
-        f"reason={reason!r}; a maintenance ping send that itself crosses "
-        "peer_timeout during final ACK admission must still terminate the "
-        "session via peer_timeout, not be masked by a stale ACK reanchor"
-    )
     assert pings == [(9.0, 1)], (
-        "exactly one maintenance-created ping must have been sent, at the "
-        "admission sample, and no second ping (the loop must have ended)"
+        "one logical ping, created after the ACK and never resolved by the "
+        "captured-None ACK; its first retry (19.5, keepalive_interval after "
+        "the completed send attempt) falls after the verdict"
     )
-    assert ended_at == pytest.approx(10.5)
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
+    assert ended_at == pytest.approx(18.9)  # ACK credit (8.9) + peer_timeout
 
 
-def test_e2e_final_maintenance_ping_send_lands_exactly_on_peer_timeout(
+def test_e2e_ack_credit_survives_maintenance_ping_send_landing_on_peer_timeout(
     proxy, keys, monkeypatch
 ):
-    """Regression 2: same shape as regression 1, but the maintenance send
-    lands at EXACT equality with the `peer_timeout` deadline. Equality is
-    terminal (`>=`, not `>`)."""
+    """Regression 2 (MP1 outcome): same shape as regression 1, but the
+    maintenance ping's send lands EXACTLY on the original `peer_timeout`
+    deadline (t=10.0). That instant is no longer a deadline once the ACK
+    read at t=8.9 is credited; the outcome matches regression 1 (the first
+    retry would be due at 10.0 + 9 = 19.0, after the 18.9 verdict)."""
     token = os.urandom(32)
     clock = {"t": 0.0}
 
@@ -1997,22 +2018,19 @@ def test_e2e_final_maintenance_ping_send_lands_exactly_on_peer_timeout(
     )
     assert log_triggered["done"]
     assert send_triggered["done"]
-    assert reason == proxy.SESSION_END_PEER_TIMEOUT, (
-        f"reason={reason!r}; now == peer_timeout at the post-maintenance "
-        "final check must still be treated as due"
-    )
     assert pings == [(9.0, 1)]
-    assert ended_at == pytest.approx(10.0)
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
+    assert ended_at == pytest.approx(18.9)
 
 
-def test_e2e_final_maintenance_refresh_start_crosses_peer_timeout(
+def test_e2e_ack_credit_survives_maintenance_refresh_start_crossing_peer_timeout(
     proxy, keys, monkeypatch
 ):
-    """Regression 3 (Confirmed Failure B): planned in-session refresh
-    becomes due only at the final admission sample (no terminal deadline
-    yet due), so the non-terminal maintenance phase starts it -- but
-    `refresh.start()`'s own send advances the clock past `peer_timeout`.
-    The post-maintenance pure terminal check must catch this."""
+    """Regression 3 (MP1 outcome): after the ACK is read (t=8.9) and
+    credited, a planned in-session refresh becomes due at t=9.0 and
+    `refresh.start()`'s own send advances the clock to t=10.5, past the
+    original `peer_timeout` (t=10.0). The credited ACK already moved that
+    bound to 18.9, where the session ends."""
     station_private_key, server_identity_public_key = _station_keypair()
     token = os.urandom(32)
     clock = {"t": 0.0}
@@ -2058,25 +2076,21 @@ def test_e2e_final_maintenance_refresh_start_crosses_peer_timeout(
     )
     assert log_triggered["done"], "the scripted acknowledgement log line never fired"
     assert send_triggered["done"], "the scripted refresh-start send never fired"
-    assert reason == proxy.SESSION_END_PEER_TIMEOUT, (
-        f"reason={reason!r}; a refresh-start send that itself crosses "
-        "peer_timeout during final ACK admission must still terminate the "
-        "session via peer_timeout"
-    )
+    assert reason == proxy.SESSION_END_PEER_TIMEOUT
     assert pings == []
-    assert ended_at == pytest.approx(10.5)
+    assert ended_at == pytest.approx(18.9)  # ACK credit (8.9) + peer_timeout
 
 
-def test_e2e_final_maintenance_refresh_start_crosses_proactive_recovery(
+def test_e2e_ack_credit_survives_maintenance_refresh_start_crossing_the_ping_deadline(
     proxy, keys, monkeypatch
 ):
-    """Regression 4: ping #1 is outstanding (captured by an earlier
-    challenge) and its unresolved-ping recovery deadline is approaching,
-    but not yet due at the final admission sample. Planned in-session
-    refresh becomes due at that same sample, so non-terminal maintenance
-    starts it -- and `refresh.start()`'s own send crosses the recovery
-    deadline. The post-maintenance pure terminal check must catch this and
-    must NOT let the refresh mask proactive recovery."""
+    """Regression 4 (MP1 outcome): ping #1 is outstanding and captured by
+    the migration proof. The matching ACK is read at t=8.9 and credited at
+    once, resolving ping #1. A planned in-session refresh then becomes due
+    at t=9.0 and its start's own send advances the clock to t=10.5, past
+    ping #1's keepalive deadline (t=10.0). Ping #1 is already resolved, so
+    ping #2 is sent on the ordinary cadence at t=10.5 and the session ends
+    peer_timeout after the ACK."""
     station_private_key, server_identity_public_key = _station_keypair()
     token = os.urandom(32)
     clock = {"t": 0.0}
@@ -2115,7 +2129,7 @@ def test_e2e_final_maintenance_refresh_start_crosses_proactive_recovery(
         proxy, keys, monkeypatch, events,
         config_overrides={
             "keepalive_interval": 5,
-            "peer_timeout": 1000,
+            "peer_timeout": 20,
             "session_refresh_interval": 9,
         },
         station_private_key=station_private_key,
@@ -2125,94 +2139,63 @@ def test_e2e_final_maintenance_refresh_start_crosses_proactive_recovery(
     )
     assert log_triggered["done"], "the scripted acknowledgement log line never fired"
     assert send_triggered["done"], "the scripted refresh-start send never fired"
-    assert reason == proxy.SESSION_END_PROACTIVE_REKEY, (
-        f"reason={reason!r}; a refresh-start send that itself crosses the "
-        "unresolved-ping recovery deadline during final ACK admission must "
-        "still terminate the session via proactive recovery"
-    )
-    assert pings == [(5.0, 1)], (
-        "no ping #2 may be sent -- the ACK must not have cleared ping #1 "
-        "after the recovery deadline came due"
-    )
-    assert ended_at == pytest.approx(10.5)
+    assert pings[:2] == [(5.0, 1), (10.5, 2)]
+    assert {seq for _when, seq in pings[1:]} == {2}
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
+    assert ended_at == pytest.approx(28.9)  # ACK credit (8.9) + peer_timeout
 
 
-def test_e2e_simultaneous_planned_refresh_and_proactive_recovery_at_final_admission(
+def test_e2e_supported_planned_refresh_never_masks_a_simultaneous_liveness_verdict(
     proxy, keys, monkeypatch
 ):
-    """Regression 5 (Confirmed Failure C): at the SAME final admission
-    sample, a supported planned refresh is due AND the unresolved-ping
-    proactive-recovery deadline is also due. Proactive recovery is
-    terminal; a supported planned refresh is deliberately non-terminal and
-    must never mask it. The pure terminal classifier must select
-    `SESSION_END_PROACTIVE_REKEY` in phase 1, BEFORE the non-terminal
-    maintenance phase ever runs -- so `refresh.start()` must never be
-    called at all, and the ACK must get no effects."""
+    """Regression 5 (the MP5 property, restated for MP1): a supported
+    planned refresh and the terminal liveness bound fall due at the SAME
+    instant (t=10.0, with ping #1 unanswered since t=5). The liveness
+    verdict is terminal and a supported planned refresh is non-terminal
+    maintenance, so the pure terminal classification wins before any
+    maintenance runs: `refresh.start()` is never called and ping #1 is not
+    retransmitted at that instant. (MP5's original timeline, an ACK arriving
+    just before that instant, now simply resolves ping #1 first, so no
+    liveness verdict is due there any more.)"""
     station_private_key, server_identity_public_key = _station_keypair()
-    token = os.urandom(32)
-    clock = {"t": 0.0}
-
-    ACK_MESSAGE = "Secure session path migration acknowledged by peer."
-    real_print = builtins.print
-    log_triggered = {"done": False}
-
-    def fake_print(*args, **kwargs):
-        text = " ".join(str(a) for a in args)
-        if not log_triggered["done"] and text == ACK_MESSAGE:
-            log_triggered["done"] = True
-            clock["t"] = 10.0  # both deadlines are due at exactly t=10.0
-        return real_print(*args, **kwargs)
-
-    monkeypatch.setattr(builtins, "print", fake_print)
-
     refresh_send_occurred = {"done": False}
 
     def on_send(message, clk):
         if message.get("type") == udpsec_protocol.REFRESH_INIT_TYPE:
             refresh_send_occurred["done"] = True
 
-    events = [
-        # t=5: ping #1 auto-sent by the ordinary keepalive cadence.
-        # t=6: PATH_CHALLENGE answered while ping #1 is outstanding.
-        (6.0, 6.0, _challenge_packet(proxy, keys, token=token, generation=1)),
-        (9.5, 9.9, _ack_packet(proxy, keys, token=token, generation=1)),
-    ]
     reason, ended_at, pings, received = _run_scripted_path_loop(
-        proxy, keys, monkeypatch, events,
+        proxy, keys, monkeypatch, [],
         config_overrides={
             "keepalive_interval": 5,
-            "peer_timeout": 1000,
-            # last_ping_at(5) + keepalive_interval(5) == session_started_at(0)
-            # + session_refresh_interval(10) == 10.0: both due at once.
+            # session start (0) + peer_timeout (10) == session start (0) +
+            # session_refresh_interval (10) == 10.0: both due at once.
+            "peer_timeout": 10,
             "session_refresh_interval": 10,
         },
         station_private_key=station_private_key,
         server_identity_public_key=server_identity_public_key,
         on_send=on_send,
-        clock=clock,
     )
-    assert log_triggered["done"], "the scripted acknowledgement log line never fired"
-    assert reason == proxy.SESSION_END_PROACTIVE_REKEY, (
-        f"reason={reason!r}; proactive recovery must win over a "
-        "simultaneously-due supported planned refresh at final admission"
-    )
+    assert received == []
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
     assert not refresh_send_occurred["done"], (
-        "a simultaneously-due planned refresh must never be started when "
-        "it would mask a terminal proactive-recovery deadline -- the "
-        "terminal classifier must reject before maintenance ever runs"
+        "a simultaneously-due supported planned refresh must never be "
+        "started when a terminal liveness verdict is due at the same instant"
     )
-    assert pings == [(5.0, 1)], "no ping #2 -- the ACK must not have cleared ping #1"
+    assert pings == [(5.0, 1)]
     assert ended_at == pytest.approx(10.0)
 
 
 def test_e2e_final_maintenance_ping_send_without_terminal_crossing(
     proxy, keys, monkeypatch
 ):
-    """Control A: the final admission sends a due maintenance ping (proof
-    captured no ping, so it has no clear authority over it), and the send
-    does NOT cross any terminal deadline. ACK liveness must still apply
-    (reanchoring `last_authenticated_peer`), and the newly sent ping must
-    remain outstanding (never cleared) until its own recovery deadline."""
+    """Control A: after the ACK (proof captured no ping, so it has no clear
+    authority) is read at t=8.9 and credited, a keepalive ping is due at
+    t=9.0 and sent without crossing any deadline. The ACK's liveness credit
+    applies (else peer_timeout at t=11), and the new ping stays outstanding,
+    never resolved: it is retransmitted at its keepalive deadline (t=18.0)
+    and the session ends peer_timeout after the ACK (t=19.9)."""
     token = os.urandom(32)
     clock = {"t": 0.0}
 
@@ -2237,36 +2220,31 @@ def test_e2e_final_maintenance_ping_send_without_terminal_crossing(
         proxy, keys, monkeypatch, events,
         config_overrides={
             "keepalive_interval": 9,
-            # If liveness were NOT reanchored to the admission's fresh
-            # sample (~9.0), peer_timeout (0 + 11 = 11.0) would fire
-            # before the maintenance-created ping's own unresolved-ping
-            # recovery at 9.0 + 9 = 18.0.
+            # If liveness were NOT reanchored by the ACK (t=8.9),
+            # peer_timeout (0 + 11 = 11.0) would end the session long
+            # before the reanchored bound 8.9 + 11 = 19.9.
             "peer_timeout": 11,
             "session_refresh_interval": 0,
         },
         clock=clock,
     )
     assert log_triggered["done"]
-    assert reason == proxy.SESSION_END_PROACTIVE_REKEY, (
-        f"reason={reason!r}; the ACK must reanchor liveness past the "
-        "unreanchored t=11 peer_timeout, surviving to the maintenance "
-        "ping's own unresolved recovery at t=18"
+    assert pings == [(9.0, 1), (18.0, 1)], (
+        "only the one logical ping created after the ACK -- it remains "
+        "outstanding (captured None has no authority to clear it) and is "
+        "retransmitted, so no second ping is ever sent"
     )
-    assert pings == [(9.0, 1)], (
-        "only the maintenance-created ping may have been sent -- it must "
-        "remain outstanding (captured None has no authority to clear it), "
-        "so no second ping is ever sent"
-    )
-    assert ended_at == pytest.approx(18.0)
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
+    assert ended_at == pytest.approx(19.9)
 
 
 def test_e2e_final_maintenance_refresh_start_without_terminal_crossing(
     proxy, keys, monkeypatch
 ):
-    """Control B: the final admission starts a due supported planned
-    refresh, and the start does NOT cross any terminal deadline. ACK
-    liveness must still apply normally (reanchoring `last_authenticated_peer`
-    to the post-maintenance sample)."""
+    """Control B: after the ACK is read (t=8.9) and credited, a due
+    supported planned refresh starts at t=9.0 without crossing any
+    deadline. The ACK's liveness credit applies normally: the session ends
+    at the reanchored bound 8.9 + 9.5 = 18.4."""
     station_private_key, server_identity_public_key = _station_keypair()
     token = os.urandom(32)
     clock = {"t": 0.0}
@@ -2292,12 +2270,10 @@ def test_e2e_final_maintenance_refresh_start_without_terminal_crossing(
         proxy, keys, monkeypatch, events,
         config_overrides={
             "keepalive_interval": 100000,
-            # peer_timeout (9.5) must be > the admission sample (~9.0) so
-            # the session survives to the final admission at all. If
-            # liveness were NOT reanchored there, the unreanchored
+            # If liveness were NOT reanchored by the ACK, the unreanchored
             # deadline (0 + 9.5 = 9.5) would end the session almost
-            # immediately afterward instead of surviving to the
-            # reanchored deadline at 9.0 + 9.5 = 18.5.
+            # immediately after the refresh start instead of at the
+            # reanchored deadline 8.9 + 9.5 = 18.4.
             "peer_timeout": 9.5,
             "session_refresh_interval": 9,
         },
@@ -2306,28 +2282,23 @@ def test_e2e_final_maintenance_refresh_start_without_terminal_crossing(
         clock=clock,
     )
     assert log_triggered["done"]
-    assert reason == proxy.SESSION_END_PEER_TIMEOUT, (
-        f"reason={reason!r}; the ACK must reanchor liveness to the "
-        "post-maintenance sample (~9.0), surviving to peer_timeout at "
-        "~18.5 rather than ending almost immediately at ~9.5"
-    )
+    assert reason == proxy.SESSION_END_PEER_TIMEOUT
     assert pings == []
-    assert ended_at == pytest.approx(18.5)
+    assert ended_at == pytest.approx(18.4)
 
 
-def test_e2e_final_maintenance_reanchors_to_post_not_pre_maintenance_sample(
+def test_e2e_ack_credit_is_anchored_at_its_receipt_not_at_later_work(
     proxy, keys, monkeypatch
 ):
-    """Control D: the maintenance refresh-start send takes a small,
-    measurable amount of (mocked) time that does NOT cross any terminal
-    deadline. `last_authenticated_peer` must be reanchored to the sample
-    taken AFTER that maintenance (`effect_now`), not the sample taken
-    before it (`admission_now`) -- the two are deliberately made different
-    here (unlike Control A/B, where nothing delays the maintenance itself,
-    so a pre- vs. post-maintenance mixup would not be observable there).
-    Keepalive is kept out of the picture entirely (no ping ever) so
-    `peer_timeout` is unambiguously what ends the session, and its exact
-    timing pins down which sample fed it."""
+    """Control D (MP1): the ACK is read at t=8.9; its logging then moves
+    the clock to t=9.0 and a due refresh start's send takes (mocked) time
+    to t=9.4. `last_authenticated_peer` is anchored at the instant the ACK
+    was read -- the session ends at 8.9 + 10 = 18.9, neither at 19.0 nor
+    at 19.4 -- so work after an ACK's receipt can neither shorten nor
+    extend its liveness credit. (MP5 anchored it at a post-maintenance
+    sample; MP1 applies the ACK before any such work.) Keepalive is kept
+    out of the picture entirely (no ping ever) so `peer_timeout` is
+    unambiguously what ends the session."""
     station_private_key, server_identity_public_key = _station_keypair()
     token = os.urandom(32)
     clock = {"t": 0.0}
@@ -2353,8 +2324,7 @@ def test_e2e_final_maintenance_reanchors_to_post_not_pre_maintenance_sample(
             and message.get("type") == udpsec_protocol.REFRESH_INIT_TYPE
         ):
             send_triggered["done"] = True
-            # A small, non-crossing delay: admission_now=9.0 but
-            # effect_now=9.4.
+            # A small, non-crossing delay after the ACK was read.
             clk["t"] = 9.4
 
     events = [
@@ -2365,9 +2335,8 @@ def test_e2e_final_maintenance_reanchors_to_post_not_pre_maintenance_sample(
         proxy, keys, monkeypatch, events,
         config_overrides={
             "keepalive_interval": 100000,
-            # peer_timeout(10) must survive past admission_now/effect_now
-            # (~9.x): 9.0 + 10 = 19.0 (pre-maintenance sample, WRONG) vs.
-            # 9.4 + 10 = 19.4 (post-maintenance sample, correct).
+            # 8.9 + 10 = 18.9 (ACK receipt, correct) vs. 9.0 + 10 = 19.0 or
+            # 9.4 + 10 = 19.4 (samples taken after later work, WRONG).
             "peer_timeout": 10,
             "session_refresh_interval": 9,
         },
@@ -2380,19 +2349,19 @@ def test_e2e_final_maintenance_reanchors_to_post_not_pre_maintenance_sample(
     assert send_triggered["done"]
     assert reason == proxy.SESSION_END_PEER_TIMEOUT
     assert pings == []
-    assert ended_at == pytest.approx(19.4), (
-        f"ended_at={ended_at!r}; last_authenticated_peer must be reanchored "
-        "to the fresh post-maintenance sample (9.4 -> deadline 19.4), not "
-        "the stale pre-maintenance sample (9.0 -> deadline 19.0)"
+    assert ended_at == pytest.approx(18.9), (
+        f"ended_at={ended_at!r}; last_authenticated_peer must be anchored "
+        "at the ACK's receipt (8.9 -> deadline 18.9), not at a sample taken "
+        "after later work (9.0 -> 19.0, 9.4 -> 19.4)"
     )
 
 
 def test_e2e_final_admission_no_maintenance_due_control(proxy, keys, monkeypatch):
-    """Control C: nothing is due at the final admission sample at all (no
-    maintenance phase has anything to do), so the two-phase choreography
-    is a pure pass-through. A valid pre-deadline ACK still clears the
-    exact captured ping and reanchors liveness, exactly as before this
-    corrective round."""
+    """Control C: nothing is due when the ACK is read, so crediting it is a
+    pure pass-through. A valid pre-deadline ACK clears the exact captured
+    ping and reanchors liveness; the next ping (#2) is then sent on the
+    ordinary cadence and, never answered, retransmitted until the
+    reanchored bound 7.4 + 13 = 20.4."""
     token = os.urandom(32)
     events = [
         # t=6: ping #1 auto-sent by the ordinary keepalive cadence.
@@ -2418,8 +2387,8 @@ def test_e2e_final_admission_no_maintenance_due_control(proxy, keys, monkeypatch
         "admission must still clear ping #1 (enabling ping #2) and "
         "reanchor peer_timeout forward"
     )
-    assert pings == [(6.0, 1), (12.0, 2)], (
+    assert pings == [(6.0, 1), (12.0, 2), (18.0, 2)], (
         "ping #2 must be sent on the normal cadence -- proof the ACK "
-        "cleared ping #1"
+        "cleared ping #1 -- and then only retransmitted"
     )
-    assert ended_at == pytest.approx(18.0)
+    assert ended_at == pytest.approx(20.4)

@@ -1,8 +1,9 @@
-"""Consistency of the MP0 baseline artifacts with the code that enforces them.
+"""Consistency of the recovery baseline artifacts with the code that enforces them.
 
 Keeps SCENARIO_MATRIX.md, the harness catalogue and the MP1 acceptance tests
-from drifting apart, keeps every cited existing test real, and keeps every
-MP1 xfail strict (an XPASS must fail the run).
+from drifting apart, keeps every cited existing test real, and keeps the
+MP1 acceptance tests free of xfail markers: MP1 is implemented, so a marker
+there could only hide a regression.
 """
 
 import inspect
@@ -17,9 +18,12 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 MATRIX = (HERE / "SCENARIO_MATRIX.md").read_text(encoding="utf-8")
 ID_PATTERN = re.compile(r"^[ABCD]\d+[a-z]?$")
-# Matrix rows tested by the MP0 lab without a scenario of their own.
+REQUIREMENT = re.compile(r"MP1-L\d+[a-z]?")
+# Provenance tags meaning "executed by the repository lab".
+LAB_PROVENANCE = {"MP0", "MP1"}
+# Matrix rows tested by the lab without a scenario of their own.
 DERIVED_MP0_ROWS = {"A8": "A3", "C4": "C3", "D7": "C3", "D8": "B1", "D9": "all"}
-# MP1 requirements that already hold and are guarded by ordinary tests.
+# MP1 requirements guarded by ordinary tests outside the acceptance module.
 GUARD_REQUIREMENTS = {"MP1-L9", "MP1-L10"}
 
 
@@ -38,6 +42,10 @@ def _matrix_rows():
     return rows
 
 
+def _provenance(row):
+    return set(row["Provenance"].split())
+
+
 def _acceptance_tests():
     return {
         name: function
@@ -46,59 +54,65 @@ def _acceptance_tests():
     }
 
 
-def _xfail_marks(function):
-    return [mark for mark in getattr(function, "pytestmark", []) if mark.name == "xfail"]
+def _requirement_of(test_name):
+    match = re.match(r"test_mp1_l(\d+)([a-z]?)_", test_name)
+    assert match, test_name
+    return f"MP1-L{match.group(1)}{match.group(2)}"
 
 
-def test_every_harness_scenario_has_an_mp0_matrix_row():
+def test_every_harness_scenario_has_a_lab_backed_matrix_row():
     rows = _matrix_rows()
     for scenario_id, spec in SCENARIOS.items():
         assert scenario_id in rows, f"{scenario_id} missing from SCENARIO_MATRIX.md"
         row = rows[scenario_id]
-        assert "MP0" in row["Provenance"].split()
+        assert LAB_PROVENANCE & _provenance(row), scenario_id
         assert row["Fable"] == (spec.fable_id or "—")
 
 
-def test_every_mp0_matrix_row_is_backed_by_the_lab():
+def test_every_lab_backed_matrix_row_is_backed_by_the_lab():
     for scenario_id, row in _matrix_rows().items():
-        if "MP0" in row["Provenance"].split():
+        if LAB_PROVENANCE & _provenance(row):
             assert scenario_id in SCENARIOS or scenario_id in DERIVED_MP0_ROWS, scenario_id
+
+
+def test_no_row_claims_a_strict_xfail_any_more():
+    for scenario_id, row in _matrix_rows().items():
+        assert "XFAIL" not in _provenance(row), scenario_id
 
 
 def test_matrix_requirements_match_the_acceptance_tests():
     rows = _matrix_rows()
-    named = set()
+    named = {}
     for scenario_id, row in rows.items():
-        found = set(re.findall(r"MP1-L\d+[a-z]?", row["Future target"]))
-        if "XFAIL" in row["Provenance"].split():
-            assert found - GUARD_REQUIREMENTS, f"{scenario_id} is XFAIL but names no MP1 requirement"
-        named |= found
+        for requirement in REQUIREMENT.findall(row["Target"]):
+            named.setdefault(requirement, []).append(scenario_id)
+            if requirement not in GUARD_REQUIREMENTS:
+                assert "MP1" in _provenance(row), (
+                    f"{scenario_id} names {requirement} but has no MP1 provenance"
+                )
     tests = _acceptance_tests()
-    for requirement in named - GUARD_REQUIREMENTS:
+    for requirement, scenario_ids in named.items():
+        if requirement in GUARD_REQUIREMENTS:
+            continue
         prefix = "test_" + requirement.lower().replace("-", "_") + "_"
         matching = [name for name in tests if name.startswith(prefix)]
         assert len(matching) == 1, f"{requirement}: acceptance tests {matching}"
+        source = inspect.getsource(tests[matching[0]])
+        assert any(f'run("{scenario_id}"' in source for scenario_id in scenario_ids), (
+            f"{matching[0]} runs none of the scenarios naming {requirement}: {scenario_ids}"
+        )
     for name in tests:
-        match = re.match(r"test_mp1_l(\d+)([a-z]?)_", name)
-        assert match, name
-        requirement = f"MP1-L{match.group(1)}{match.group(2)}"
-        assert requirement in named, f"{name} has no matrix row"
+        assert _requirement_of(name) in named, f"{name} has no matrix row"
     for requirement in GUARD_REQUIREMENTS:
+        assert requirement in named, requirement
         assert requirement in inspect.getsource(invariants), requirement
 
 
-def test_every_mp1_marker_is_strict_and_names_the_scenario_it_runs():
-    """While a marker exists it must be strict (an XPASS fails the run) and
-    only an AssertionError may satisfy it. MP1 removes markers as each
-    requirement is met."""
+def test_mp1_acceptance_tests_carry_no_xfail_marker():
     for name, function in _acceptance_tests().items():
-        for mark in _xfail_marks(function):
-            assert mark.kwargs.get("strict") is True, name
-            assert mark.kwargs.get("raises") is AssertionError, name
-            reason = mark.kwargs.get("reason", "")
-            match = re.match(r"MP1-L\d+[a-z]? \[([A-D]\d+[a-z]?)", reason)
-            assert match, f"{name}: reason must start 'MP1-Lx [<scenario>'"
-            assert f'run("{match.group(1)}"' in inspect.getsource(function), name
+        marks = [mark.name for mark in getattr(function, "pytestmark", [])]
+        assert "xfail" not in marks, name
+        assert "skip" not in marks and "skipif" not in marks, name
 
 
 def test_every_cited_existing_test_exists():

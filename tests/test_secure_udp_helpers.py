@@ -5258,7 +5258,7 @@ def test_proxy_deadline_action_has_deterministic_exact_boundary_priority():
         30,
         1,
         config,
-    ) == proxy.SESSION_END_PEER_TIMEOUT
+    ) == proxy.SESSION_END_PROACTIVE_REKEY
 
     config["peer_timeout"] = 90
     assert proxy.session_deadline_action(
@@ -5271,6 +5271,8 @@ def test_proxy_deadline_action_has_deterministic_exact_boundary_priority():
     ) == proxy.SESSION_END_PLANNED_REFRESH
 
     config["session_refresh_interval"] = 0
+    # MP1: an unresolved ping at its keepalive deadline is retransmitted
+    # (same sequence), never terminal by itself ...
     assert proxy.session_deadline_action(
         60,
         0,
@@ -5278,7 +5280,22 @@ def test_proxy_deadline_action_has_deterministic_exact_boundary_priority():
         30,
         1,
         config,
+    ) == proxy.SESSION_ACTION_RETRY_PING
+    assert proxy.session_deadline_action(
+        64.999, 0, 0, 60, 1, config, ping_retry_at=65,
+    ) is None
+    assert proxy.session_deadline_action(
+        65, 0, 0, 60, 1, config, ping_retry_at=65,
+    ) == proxy.SESSION_ACTION_RETRY_PING
+    # ... and the only terminal liveness bound is peer_timeout after the last
+    # evidence: proactive rekey when a probe is outstanding there, plain
+    # peer_timeout when none is.
+    assert proxy.session_deadline_action(
+        90, 0, 0, 60, 1, config, ping_retry_at=95,
     ) == proxy.SESSION_END_PROACTIVE_REKEY
+    assert proxy.session_deadline_action(
+        90, 0, 0, 60, None, config,
+    ) == proxy.SESSION_END_PEER_TIMEOUT
 
 
 def test_proxy_normal_ping_pong_does_not_trigger_periodic_reconnect():
@@ -5356,9 +5373,13 @@ def _run_idle_proxy_session(monkeypatch, config):
     return proxy, reason, out_sock, clock[0], confirmed_session
 
 
-def test_proxy_outstanding_ping_is_not_overwritten_and_proactively_rekeys(
+def test_proxy_outstanding_ping_is_retransmitted_not_overwritten_until_peer_timeout(
     monkeypatch,
 ):
+    """MP1: an unanswered ping is never replaced by a newer sequence; from
+    its keepalive deadline it is retransmitted -- same sequence, fresh
+    nonce -- every min(5 s, keepalive_interval) until peer_timeout after
+    the last evidence, which is the only terminal liveness bound."""
     config = {
         "station_id": "boat_001",
         "keepalive_interval": 30,
@@ -5374,22 +5395,28 @@ def test_proxy_outstanding_ping_is_not_overwritten_and_proactively_rekeys(
     )
 
     assert reason == proxy.SESSION_END_PROACTIVE_REKEY
-    assert ended_at == 2 * config["keepalive_interval"]
-    assert ended_at < config["peer_timeout"]
-    assert len(out_sock.sent) == 1
-    assert out_sock.sent_at == [config["keepalive_interval"]]
-    ping = proxy.decrypt_secure_json_message(
-        out_sock.sent[0][0],
-        confirmed_session.key_material.client_to_server_key,
-        confirmed_session.session_locator,
-    )
-    assert ping["type"] == "ping"
-    assert ping["seq"] == 1
+    assert ended_at == config["peer_timeout"]
+    assert out_sock.sent_at == [30, 60, 65, 70, 75, 80, 85]
+    nonces = set()
+    for packet, _addr in out_sock.sent:
+        ping = proxy.decrypt_secure_json_message(
+            packet,
+            confirmed_session.key_material.client_to_server_key,
+            confirmed_session.session_locator,
+        )
+        assert ping["type"] == "ping"
+        assert ping["seq"] == 1
+        nonces.add(proxy.parse_data_packet(packet)[2])
+    assert len(nonces) == len(out_sock.sent)
 
 
-def test_proxy_exact_keepalive_deadline_rekeys_before_ready_matching_pong(
+def test_proxy_matching_pong_ready_at_the_keepalive_deadline_is_credited_first(
     monkeypatch,
 ):
+    """MP1 evidence before verdict: a matching PONG that is readable at the
+    very instant its ping's keepalive deadline falls due is received and
+    credited before that deadline is serviced (before MP1 the deadline won
+    and the PONG was never read)."""
     proxy = load_proxy_module()
     client_key = b"\x01" * 32
     server_key = b"\x02" * 32
@@ -5467,10 +5494,17 @@ def test_proxy_exact_keepalive_deadline_rekeys_before_ready_matching_pong(
         remote_addr,
     )
 
+    assert out_sock.recv_calls == 1
+    # PONG #1 resolved ping #1 at t=60, so ping #2 followed on its cadence;
+    # nothing ever answers ping #2, so the session ends peer_timeout after
+    # that PONG (60 + 90) with ping #2 still outstanding.
+    assert [(item[0]["seq"], item[1]) for item in out_sock.sent[:2]] == [
+        (1, 30),
+        (2, 60),
+    ]
+    assert {item[0]["seq"] for item in out_sock.sent[1:]} == {2}
     assert reason == proxy.SESSION_END_PROACTIVE_REKEY
-    assert clock[0] == 60
-    assert [item[0]["seq"] for item in out_sock.sent] == [1]
-    assert out_sock.recv_calls == 0
+    assert clock[0] == 150
 
 
 def test_proxy_matching_pong_before_deadline_schedules_next_normal_ping(
@@ -5651,7 +5685,10 @@ def test_proxy_duplicate_pong_after_acceptance_does_not_refresh_liveness(
         remote_addr,
     )
 
-    assert reason == proxy.SESSION_END_PEER_TIMEOUT
+    # The liveness bound is peer_timeout after the ONE accepted PONG (10.5 +
+    # 15), not after the duplicate at 19; ping #2 is outstanding there, so
+    # MP1 reports proactive recovery rather than a bare peer_timeout.
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
     assert clock[0] == 25.5
     assert [item[0]["seq"] for item in out_sock.sent] == [1, 2]
     assert out_sock.recv_calls == 2
@@ -5748,9 +5785,12 @@ def test_proxy_forward_loop_exits_for_planned_refresh_without_local_udp(monkeypa
     assert reason == proxy.SESSION_END_PLANNED_REFRESH
 
 
-def test_proxy_forward_loop_ignores_forged_no_session_until_proactive_rekey(
+def test_proxy_forward_loop_ignores_forged_no_session_until_liveness_bound(
     monkeypatch,
 ):
+    """A forged plaintext datagram from the pinned address is never
+    liveness evidence: the session still ends exactly peer_timeout after
+    its start, having retransmitted its one unanswered ping (MP1)."""
     proxy = load_proxy_module()
     remote_addr = ("192.0.2.10", 17777)
     clock = [0.0]
@@ -5810,9 +5850,10 @@ def test_proxy_forward_loop_ignores_forged_no_session_until_proactive_rekey(
     )
 
     assert reason == proxy.SESSION_END_PROACTIVE_REKEY
-    assert clock[0] == 60
+    assert clock[0] == 90
     assert not out_sock.response_pending
-    assert len(out_sock.sent) == 1
+    # ping #1 at 30, then its retransmissions at 60, 65, ..., 85
+    assert len(out_sock.sent) == 7
     assert all(
         packet.startswith(proxy.DATA_PREFIX)
         for packet, _ in out_sock.sent

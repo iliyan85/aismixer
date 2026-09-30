@@ -12,8 +12,8 @@ Nothing here re-implements protocol logic. Every handshake, AEAD
 operation, nonce admission, keepalive/deadline decision, path-migration
 step and epoch refresh is production code; the lab only decides WHEN a
 datagram is delivered (one-way delay, blackhole windows, per-packet
-drop/hold hooks, NAT remapping, local send errors) and WHEN the local
-input produces NMEA.
+drop/hold hooks, NAT remapping, local send errors, ICMP-derived receive
+errors) and WHEN the local input produces NMEA.
 
 Fidelity limits (also recorded in UDPSEC_V2_RECOVERY_BASELINE.md):
 
@@ -87,12 +87,17 @@ DEFAULT_CLIENT_CONFIG = {
 CLIENT_SOCKET_TIMEOUT = 5.0
 
 
+# Inbox marker for a pending socket error (see `Lab.receive_error_at`).
+_RECEIVE_ERROR = object()
+
+
 class HarnessError(RuntimeError):
     """The lab itself misbehaved (busy loop, fault never injected, ...).
 
-    Deliberately NOT an AssertionError: the strict-xfail MP1 acceptance
-    tests are marked ``raises=AssertionError``, so a broken harness can
-    never masquerade as the expected pre-MP1 behavioural failure."""
+    Deliberately NOT an AssertionError, so a broken harness can never
+    masquerade as a behavioural outcome: MP0's strict xfails were marked
+    ``raises=AssertionError``, and every acceptance precondition is a
+    `Lab.require()` that raises this instead."""
 
 
 class _StopScenario(BaseException):
@@ -243,6 +248,8 @@ class _LabClientSocket:
         data = self.lab._guarded(self.lab._recv_blocking, self.timeout)
         if data is None:
             raise socket.timeout("timed out")
+        if data is _RECEIVE_ERROR:
+            raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
         return data, SERVER_ADDR
 
 
@@ -331,6 +338,16 @@ class Lab:
 
     def local_send_error(self, start, end, error=errno.ENETUNREACH):
         self.send_errors.append((start, end, error))
+
+    def receive_error_at(self, t):
+        """At `t` the client socket reports a pending ICMP-derived error:
+        its next recvfrom() raises ConnectionResetError, as Windows does
+        after a port-unreachable. Unauthenticated, like any ICMP signal."""
+        packet = Packet(t, "s2c", "icmp-reset", None, SERVER_ADDR, b"", verdict="sent")
+        self.packets.append(packet)
+        packet.deliver_at = t
+        self._seq += 1
+        self._inbox.append([t, self._seq, _RECEIVE_ERROR, packet])
 
     def at(self, t, callback):
         self._scheduled.append([t, callback, False])
@@ -795,8 +812,14 @@ class Lab:
     def _next_event_time(self, include_input=True):
         candidates = [e[0] for e in self._pending_c2s] + [e[0] for e in self._inbox]
         candidates += [e[0] for e in self._scheduled if not e[2]]
-        if include_input and self.input.next_line_time() is not None:
-            candidates.append(self.input.next_line_time())
+        # A serial-like line wakes the fake select only when it is produced
+        # (a future instant). A line already due but not read -- the client
+        # has paused reading input -- is no wake event: a real serial
+        # adapter has no descriptor for select, so the loop just sleeps its
+        # poll interval.
+        next_line = self.input.next_line_time()
+        if include_input and next_line is not None and next_line > self.clock.now:
+            candidates.append(next_line)
         return min(candidates) if candidates else None
 
     def _advance_to(self, target):

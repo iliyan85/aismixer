@@ -2,11 +2,12 @@
 
 Ordinary (non-xfail) tests. Each runs the real `nmea_sproxy` client and the
 real `aismixer_secure` server through the MP0 lab (harness/lab.py) and
-asserts only policy-independent outcomes: facts that hold under the
-current single-shot keepalive policy and must keep holding under any MP1
-liveness recovery or MP2 migration change. Scenario IDs are those of
-SCENARIO_MATRIX.md. Security properties that existing tests already cover
-are cited in that matrix instead of being cloned here.
+asserts only policy-independent outcomes: facts that held under the
+pre-MP1 single-shot keepalive policy, hold unchanged under MP1's staged
+liveness recovery, and must keep holding through any MP2 migration change.
+Scenario IDs are those of SCENARIO_MATRIX.md. Security properties that
+existing tests already cover are cited in that matrix instead of being
+cloned here.
 """
 
 import dataclasses

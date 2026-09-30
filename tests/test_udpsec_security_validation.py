@@ -951,12 +951,16 @@ def test_real_client_proactively_recovers_after_server_restart(
             )
             recovery_elapsed = time.monotonic() - recovery_started
 
+            # MP1: the restarted server silently drops the unknown locator,
+            # so the client retransmits its unanswered ping until the
+            # peer_timeout bound, then recovers immediately (a probe is
+            # outstanding there).
             assert reason == endpoints.proxy.SESSION_END_PROACTIVE_REKEY
             assert (
                 endpoints.proxy.retry_delay_for_reason(reason, config)
                 is None
             )
-            assert recovery_elapsed < config["peer_timeout"]
+            assert config["peer_timeout"] <= recovery_elapsed < 5.0
             lost_state_stats = restarted_server.call_in_loop(
                 restarted_server.state.stats
             )
@@ -1174,12 +1178,15 @@ def test_real_nonce_exhaustion_recovers_with_fresh_replay_epoch(
             )
             recovery_elapsed = time.monotonic() - recovery_started
 
+            # MP1: pings into the exhausted (gone) epoch are silently dropped;
+            # the client retransmits until the peer_timeout bound, then
+            # recovers immediately (a probe is outstanding there).
             assert reason == endpoints.proxy.SESSION_END_PROACTIVE_REKEY
             assert (
                 endpoints.proxy.retry_delay_for_reason(reason, config)
                 is None
             )
-            assert recovery_elapsed < config["peer_timeout"]
+            assert config["peer_timeout"] <= recovery_elapsed < 5.0
             after_silent_loss = server.call_in_loop(server.state.stats)
             assert after_silent_loss.current_sessions == 0
             assert after_silent_loss.current_data_nonces == 0

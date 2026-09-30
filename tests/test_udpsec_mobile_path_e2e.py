@@ -824,9 +824,11 @@ def test_08_lost_path_ack(env, proxy, keys, monkeypatch):
     for k in before:
         assert after[k] == before[k], f"{k} changed: {before[k]!r} -> {after[k]!r}"
 
-    # CLIENT: ends via ordinary, un-extended peer_timeout from session
-    # start -- proof the lost ACK granted no liveness/TTL extension.
-    assert reason == proxy.SESSION_END_PEER_TIMEOUT
+    # CLIENT: ends at the ordinary, un-extended peer_timeout bound from
+    # session start -- proof the lost ACK granted no liveness/TTL extension.
+    # Ping #1 (sent from B, never answered) is still outstanding there, so
+    # MP1 reports proactive recovery rather than a bare peer_timeout.
+    assert reason == proxy.SESSION_END_PROACTIVE_REKEY
     assert ended_at == pytest.approx(1008.0)
 
 
@@ -953,11 +955,14 @@ def test_10_ack_with_captured_none_cannot_clear_maintenance_ping(
     assert events["bumped"]
     assert events["acked"]
     assert _snap(server_sess)["active"] == ADDR_B
-    # exactly one maintenance-created ping was ever sent, and it was NEVER
-    # cleared (captured-None has liveness authority but no clear
-    # authority) -- the session eventually ends via its own unresolved
-    # proactive recovery, never via a second ping being sent normally.
-    assert ping_seqs == [1]
+    # exactly one maintenance-created logical ping ever existed, and it was
+    # NEVER cleared (captured-None has liveness authority but no clear
+    # authority): MP1 retransmits that same sequence until the session ends
+    # via its own unresolved liveness recovery, and no second ping is ever
+    # sent normally.
+    assert ping_seqs[0] == 1
+    assert len(ping_seqs) > 1
+    assert set(ping_seqs) == {1}
     assert reason == proxy.SESSION_END_PROACTIVE_REKEY
 
 

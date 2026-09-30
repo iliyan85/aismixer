@@ -1,8 +1,14 @@
-# UDPSEC V2 Recovery Evidence Ledger (MP0)
+# UDPSEC V2 Recovery Evidence Ledger (MP0, updated by MP1)
 
 Purpose: let every future independent gate (Astra Gate A and Gate B,
 baseline section 11) start from classified evidence instead of re-auditing
-the protocol from scratch. Baseline commit `de513674fabf2ee594d0f08f10ddbdf87267a352`.
+the protocol from scratch. Pre-MP1 baseline commit
+`de513674fabf2ee594d0f08f10ddbdf87267a352`; MP0 committed as `71a47894`; MP1
+is the client-only delta on top of `71a47894`. Section 1.1 is the pre-MP1
+record and keeps its Fable/MP0 evidence. Section 1.3 is MP1's own claims.
+Astra Gate A has since audited them (section 8): the audited design is
+accepted, and the F1-F3 corrections are IMPLEMENTER-REPORTED ONLY until the
+Astra corrective recheck.
 
 Evidence classes (as required by MP0):
 
@@ -12,6 +18,7 @@ Evidence classes (as required by MP0):
 | EXISTING PROJECT TEST | A pre-MP0 test in `tests/` asserts it; it passes at the baseline commit (MP0 run, section 3). |
 | FABLE INDEPENDENT HARNESS | Verified by the independent Fable audit, 2026-09-28: code reading (Fable "[A]") and/or its harness run. Fable did NOT run the project suite. |
 | PRIOR INDEPENDENT ASTRA EVIDENCE | Reported by the earlier independent Astra review; carried forward, not re-run. |
+| ASTRA GATE A | Established by the independent Astra Gate A audit of the MP1 worktree (2026-09-30; report outside the repository), including its own reproductions. |
 | FIELD OBSERVATION | Operator-reported road/field data. |
 | IMPLEMENTER-REPORTED ONLY | Produced by the implementer (including every MP0 test run), not independently re-run. |
 | NOT YET VERIFIED | Nobody has established it. |
@@ -19,7 +26,9 @@ Evidence classes (as required by MP0):
 A claim can hold several classes. "Re-verify when" names the change that
 voids the carried-forward evidence.
 
-## 1. Current liveness behaviour
+## 1. Liveness behaviour
+
+### 1.1 Pre-MP1 claims (line numbers are the baseline's)
 
 | ID | Claim | Classes | Pointer | Re-verify when |
 |---|---|---|---|---|
@@ -34,6 +43,41 @@ voids the carried-forward evidence.
 | E-L9 | One UDP socket per relation, reused for every handshake, so the same local port is kept across re-establishment. | CODE; FABLE [A]; IMPL (MP0 drift guard; same observed tuple in pins) | `3161-3166, 3229-3264` | `main()` changes |
 | E-L10 | The server answers every admitted active-path ping with its `seq`, including a same-`seq` fresh-nonce retransmission and a lower `seq`; a byte-identical replay is refused. Client-only MP1 therefore needs no wire change. | CODE; PROJECT TEST (`test_secure_server_replies_with_encrypted_pong_for_valid_ping`, `test_secure_server_rejects_duplicate_data_nonce_after_first_valid_packet`); FABLE [A] (M3 discussion); IMPL (MP0 L10) | `aismixer_secure.py:4830-4837, 5026-5037, 5107-5131` | server ping branch changes |
 | E-L11 | An unknown locator (e.g. after a server restart) is a silent drop; the client notices only at its keepalive deadline. | CODE; PROJECT TEST (`test_unknown_locator_never_reaches_decrypt_regardless_of_correct_path`, `test_real_client_proactively_recovers_after_server_restart`); FABLE (T16); IMPL (MP0 C5) | `aismixer_secure.py:4772-4783` | server lookup changes |
+
+### 1.2 Status of the pre-MP1 claims after MP1
+
+The Fable and MP0 evidence in 1.1 remains valid evidence about the pre-MP1
+client. It is not evidence about MP1.
+
+| ID | Status after MP1 |
+|---|---|
+| E-L1 | SUPERSEDED by E-P1: still one outstanding ping, never replaced, but now retransmitted. |
+| E-L2 | SUPERSEDED by E-P2: the unresolved ping no longer ends the session at its keepalive deadline. |
+| E-L3 | SUPERSEDED by E-P3 (R4 evidence before verdict). |
+| E-L4 | HOLDS: the inventory is unchanged, credited as of the read instant; MP1 adds no evidence type, and an ICMP-derived error is not evidence (E-P6). |
+| E-L5 | SUPERSEDED by E-P4: refresh evidence now postpones the only terminal bound. |
+| E-L6 | PARTLY HOLDS: the ACK still cannot clear a ping it did not capture; the rekey no longer follows (A10: recovered by the retransmission). |
+| E-L7 | HOLDS: forwarding never pauses while a ping is unresolved; input pauses only after a transient local send failure (E-P6). |
+| E-L8 | SUPERSEDED by E-P6 for the transient errnos; still true for every other socket error. |
+| E-L9 | HOLDS: `main()` is unchanged. |
+| E-L10 | HOLDS: the server is unchanged. It is the basis of the client-only MP1. |
+| E-L11 | HOLDS: the silent drop is unchanged, but the client now notices at last evidence + `peer_timeout` (E-P7). |
+
+### 1.3 MP1 claims
+
+Pointers name functions in the MP1 `nmea_sproxy/nmea_sproxy.py`.
+
+| ID | Claim | Classes | Pointer | Re-verify when |
+|---|---|---|---|---|
+| E-P1 | One logical ping at a time. If unanswered at its keepalive deadline, it is retransmitted then and every `min(5 s, keepalive_interval)`: same `seq`, a fresh encryption under the current epoch (fresh AEAD nonce), never replaced by a later `seq`. Each next retry is scheduled from a fresh monotonic sample taken after the previous attempt, never earlier than one retry interval after it. This was corrected after Gate A F1: the retry had been anchored at the pre-log `now`. | CODE (MP1); ASTRA GATE A (design accepted; F1 reproduced); IMPL (acceptance L1-L3, L4c, L12; `test_mp1_policy_pins.py`; `test_proxy_outstanding_ping_is_retransmitted_not_overwritten_until_peer_timeout`; F1 correction: `test_slow_suspect_log_cannot_compress_the_retry_spacing`) | `keepalive_action`, `keepalive_retry_interval`; `start_ping`, `retransmit_ping`, `transmit_ping` in `forward_loop` | any keepalive helper or `forward_loop` change |
+| E-P2 | The only terminal liveness bound is last authenticated evidence + `peer_timeout`, equality due. It ends with `proactive_rekey` (immediate) when a probe is outstanding, else `peer_timeout` (after `reconnect_delay`). | CODE; IMPL (acceptance L6, L8b; guards L9; pins A5e, A7, C1, C3, C3b, C5; `test_proxy_deadline_action_has_deterministic_exact_boundary_priority`) | `liveness_verdict`, `terminal_deadline_reason`, unchanged `retry_delay_for_reason` | same |
+| E-P3 | Evidence before verdict. A readable datagram is received and credited at its read instant, before the deadlines due at that instant. Before a terminal liveness verdict, at most 16 already-readable datagrams are drained (zero-timeout `select`) and the clock is re-sampled. Evidence readable only later has no effect. | CODE; IMPL (acceptance L4a, L4b, L4d, L5; units: the stall drain and the flood bound; mutation: with the drain disabled, the stall unit test fails) | `receive_datagram`, `drain_available_datagrams`, `service_deadlines`, main loop | same (Gate A focus) |
+| E-P4 | Failure accounting agrees with evidence. The first REFRESH_REPLY, a REFRESH_ACK commit and a matched PATH_ACK advance liveness as of their read instant. None clears a ping it did not capture, and no verdict comes before last evidence + `peer_timeout`. The MP5 two-phase PATH_ACK admission is replaced by this rule. | CODE; IMPL (acceptance L7, L7b, L8, L8b; `test_udpsec_client_path_migration.py` sections E-G) | `receive_datagram` | same |
+| E-P5 | Bounds, stated separately (corrected after Gate A F2, which showed the former unconditional "at most 12 retransmissions" false). STATE: per session, O(1) extra state (`ping_retry_at`, `ping_transmissions`, `send_paused_until`, `transient_failures`). RATE: at most one keepalive transmission per retry interval, which needs the F1 correction. EPISODE COUNT: at most ceil((`peer_timeout` - `keepalive_interval`) / retry interval) in an ordinary keepalive-only episode, 12 with the defaults and 7 in the steady state (A7, C5). With an A11 reprobe that brings retries forward, more fit before the same bound (17 in Astra's reproduction). While other qualifying evidence keeps renewing liveness there is no finite count, only the rate bound (A9b, accepted as designed). DRAIN: ≤ 16 datagrams per verdict (accepted bounded trade-off). | CODE; ASTRA GATE A (A9b and drain accepted; F2 reproduced); IMPL (pins A7, A9b, C1; units: flood; F2 correction: `test_a11_reprobe_can_exceed_the_ordinary_retransmission_count`) | same | same |
+| E-P6 | Transient network errors on the session socket (`_TRANSIENT_NETWORK_ERRNOS`, plus `ConnectionRefusedError`/`ConnectionResetError`) do not end the session. The failed NMEA sentence is dropped: not counted, never retried or replayed. Input pauses one retry interval, with input sockets out of `select`, and one keepalive probe runs before input resumes. A transient receive error is ignored and is not evidence. Every other error stays terminal. | CODE; IMPL (acceptance L11a, L11b; pins A11, A11b, C1; units: classification, pause, EBADF) | `is_transient_network_error`, `note_transient_failure`, `note_send_success`, `send_sentence`, main-loop pause and probe, `forward_input_payload` | any errno-list or pause change |
+| E-P7 | Trade-offs. (a) Server-restart detection moves from ~60 s to `peer_timeout` after the last evidence (C5: 1120.3 vs 1090.2; 8 vs 5 lines dropped). (b) With a dead forward path, lines forwarded until the verdict are lost (C3, C3b: 7 vs 4), because forwarding continues while liveness is only suspect (A8, MP1-L6). (c) A reverse-path-only loss costs less (A7: 40.2 s vs 70.2 s outage; 0 lines lost). | IMPL (pins; pre-MP1 numbers from one run of the MP1 lab against the pre-MP1 `nmea_sproxy.py`) | pins C3, C3b, C5, A7 | policy change |
+| E-P8 | No wire, server, configuration-schema, crypto, AAD, transcript or migration change, and no new message type or version. | CODE (production diff: `nmea_sproxy/nmea_sproxy.py` only); PROJECT TEST (`tests/test_udpsec_protocol.py` wire pins; L10 guard) | `git diff 71a47894 --stat` | any production diff outside that file |
+| E-P9 | The new log lines (liveness suspect, liveness recovered, transient failure, path usable again) are observational only. Nothing logged feeds back into liveness, admission or timing, and the lines carry errno text only (ASCII-escaped), never key material. | CODE | `note_transient_failure`, `note_send_success`, `retransmit_ping`, `resolve_ping` | log text changes |
 
 ## 2. Current migration behaviour
 
@@ -54,8 +98,8 @@ voids the carried-forward evidence.
 | E-S3 | Path-authority gating (unproved and retired paths carry inbound data only; commit needs exact proof). | PROJECT TEST (hardening a2/a5/a7, races); FABLE (T13-d/e/f, T10a/b, T11c) | matrix B, D5 | migration changes |
 | E-S4 | No reply or amplification for an unknown locator; replays refused before any candidate. | PROJECT TEST (D1, D2); FABLE (T13-a/c); IMPL (MP0 C4, C5) | matrix D1, D2 | server lookup changes |
 | E-S5 | Wrong-station, wrong-selector/epoch, forged, cross-listener and old-session ciphertext are all rejected. | PROJECT TEST (D3-D7); FABLE (T13-g/i/e/f/h/j); IMPL (MP0 C4) | matrix D3-D7 | admission or epoch changes |
-| E-S6 | No AEAD nonce reuse per (direction, locator, epoch) in any MP0 scenario; random 96-bit nonce per encryption. | PROJECT TEST (`test_proxy_encrypt_message_aes_gcm_uses_12_byte_nonce_and_locator_aad`); IMPL (MP0 D9 sweep) | `harness/lab.py` `nonce_reuse()` | every MP1 retry change (Gate A) |
-| E-S7 | Unauthenticated input never becomes liveness evidence. | PROJECT TEST (D10); FABLE [A] | matrix D10 | MP1 (Gate A) |
+| E-S6 | No AEAD nonce reuse per (direction, locator, epoch) in any scenario; random 96-bit nonce per encryption, including every MP1 retransmission. | PROJECT TEST (`test_proxy_encrypt_message_aes_gcm_uses_12_byte_nonce_and_locator_aad`); IMPL (MP0 D9 sweep; MP1: the sweep over all 34 scenarios, MP1-L12 with 8 distinct transmissions of ping#2 in A7, `test_proxy_outstanding_ping_is_retransmitted_not_overwritten_until_peer_timeout`) | `harness/lab.py` `nonce_reuse()` | every MP1 retry change (Gate A) |
+| E-S7 | Unauthenticated input never becomes liveness evidence. | PROJECT TEST (D10); FABLE [A]; IMPL (MP1: the D10 tests unchanged and passing; A11b: an ICMP-derived receive error is not evidence; the flood unit test: junk datagrams in the drain are not evidence) | matrix D10 | MP1 (Gate A) |
 | E-S8 | No BLOCKER or HIGH security finding in the reviewed UDPSEC V2. LOW residuals: a ClientHello costs one ECDSA verify before any per-source budget (F7); the ±30 s wall-clock window is a bring-up hazard (F6). | FABLE (sections 6-7). Not repaired. | `aismixer_secure.py:4548-4600, 4554` | handshake path changes |
 | E-S9 | Diagnostics are observational only. | CODE; PROJECT TEST (`tests/test_udpsec_field_diagnostics.py`); FABLE (F9); PRIOR INDEPENDENT ASTRA EVIDENCE (diagnostics delta: no confirmed new blocker) | contract 11.4 | diagnostics changes |
 
@@ -79,6 +123,13 @@ voids the carried-forward evidence.
 | E-T5 | MP0 harness behaviour on OpenWrt or a Raspberry Pi, and on Linux with cryptography `>=42.0`. | NOT YET VERIFIED |
 | E-T6 | Earlier independent Astra targeted runs at `c0a945d`: S6/S7 selections Windows 26 passed / 8 skipped and Linux 34 passed; a later targeted client-diagnostics selection passed 28 on each platform. Astra identified two observability gaps (heartbeat `path_gen`, the contract 11.4 section), since addressed. It found no confirmed new blocker for the diagnostics changes, and did not establish trip readiness. Residuals: repeated SIGTERM in a no-running-loop teardown gap (server); serial-client immediate-SIGTERM fake-hardware lock. | PRIOR INDEPENDENT ASTRA EVIDENCE (carried forward; the selections' exact content is defined in the prior assignment, not reproduced here) |
 | E-T7 | Earlier full-suite results: Windows 3753 passed / 37 skipped; Linux 3789 passed / 1 failed (a known OpenWrt-packaging WSL/POSIX baseline failure, reproduced on clean HEAD). | IMPLEMENTER-REPORTED ONLY (per the Astra resume note) |
+| E-T8 | MP1 acceptance tests discriminate. On the MP1 client all 16 pass. With the MP1 test tree run against the pre-MP1 `nmea_sproxy.py` (a scratch extraction of `71a47894` outside the repository), 15 fail at an acceptance assertion (`AssertionError`). The 16th, MP1-L4d, passes; it is a guard that holds under both policies. | IMPLEMENTER-REPORTED ONLY |
+| E-T9 | Mutation check: with `EVIDENCE_DRAIN_MAX_DATAGRAMS = 0`, exactly one test in the acceptance and unit modules fails, the stall-drain unit test. The lab boundary scenarios are carried by the evidence-first receive order. | IMPLEMENTER-REPORTED ONLY |
+| E-T10 | MP1 results on Windows 11 Pro 10.0.26200 (CPython 3.14.7, pytest 9.1.1, cryptography 50.0.0, PyYAML 6.0.3): MP1 acceptance, pin and unit modules 72 passed; the four changed existing test files 550 passed; `tests/udpsec_recovery` 142 passed; related UDPSEC/proxy slice 1900 passed, 8 skipped (POSIX-only SIGTERM tests); one full suite 3895 passed, 37 skipped (platform skips only). | IMPLEMENTER-REPORTED ONLY |
+| E-T11 | MP1 on Linux (WSL2 Ubuntu, kernel 5.15.153.1, CPython 3.12.3, pytest 9.1.1, cryptography 41.0.7, below the declared floor): `tests/udpsec_recovery` 142 passed. No Linux full suite was run for MP1. | IMPLEMENTER-REPORTED ONLY |
+| E-T12 | The pre-MP1 comparison numbers for scenarios MP1 added or re-measured (A4, A4b, A5e, A7, A9b, A10b, A11, A11b, C1, C3, C3b, C5) come from one run of the MP1 lab against the pre-MP1 `nmea_sproxy.py` in that scratch extraction. | IMPLEMENTER-REPORTED ONLY |
+| E-T13 | F1-F3 corrective tests: the two new regressions pass on the corrected code. Against the pre-correction `nmea_sproxy.py` (a scratch copy), the F1 regression fails exactly at Astra's reproduction (second retry at 65, one second after the delayed first retry at 64). The F2 accounting regression passes on both, because it pins documented behaviour, not a code change. | IMPLEMENTER-REPORTED ONLY (until the Astra corrective recheck) |
+| E-T14 | Final micro-correction (`start_ping` post-attempt anchor). `test_slow_initial_ping_send_cannot_compress_first_retry_spacing` passes: 3.5, 5.5, 7.5, …, 19.5, and `proactive_rekey` at 20.0. Against the pre-micro-correction `nmea_sproxy.py` (a scratch copy) it fails at Astra's reproduction: initial attempt 3.5, first retry 4.0. `tests/udpsec_recovery` 145 passed. The proxy `forward_loop` test files passed 837 with 8 skipped, after updating the pinned first-retry expectation of G1/G2 in `test_udpsec_client_path_migration.py` (baseline 11.2). | IMPLEMENTER-REPORTED ONLY (until the final Astra micro-recheck) |
 
 ## 6. Ingested artifacts (full hashes)
 
@@ -98,10 +149,37 @@ voids the carried-forward evidence.
 
 ## 7. What a Gate A reviewer may carry forward unchanged
 
-If the MP1 delta touches only `nmea_sproxy/nmea_sproxy.py` (the liveness
-state and the deadline helpers in `forward_loop`), its config validation, and
-the section 9 tests, then E-M1..E-M5, E-S1, E-S3, E-S4, E-S5 (server side),
-E-S8 and E-S9 carry forward without re-audit. Gate A re-verifies E-L*,
-E-S2, E-S6 and E-S7 against the delta. It also re-verifies the R4 × MP5
-equality change (baseline 7.1) and reruns this directory plus the section 9
-test files.
+The MP0 condition was: if the MP1 delta touches only
+`nmea_sproxy/nmea_sproxy.py` (the liveness state and the deadline helpers in
+`forward_loop`), its config validation, and the section 9 tests, then
+E-M1..E-M5, E-S1, E-S3, E-S4, E-S5 (server side), E-S8 and E-S9 carry forward
+without re-audit.
+
+It holds for the MP1 delta. The production change is limited to
+`nmea_sproxy/nmea_sproxy.py`: its liveness state, deadline helpers,
+`forward_loop` receive/drain/pause logic and `forward_input_payload`
+counting. Config validation and defaults are unchanged. The test changes are
+the ones listed in baseline section 9.1.
+
+Gate A therefore re-verifies:
+- E-P1..E-P9;
+- E-L4, E-L6 and E-L7 as restated in 1.2;
+- E-S6 and E-S7 against the delta.
+
+E-S2 (server-side ledger) is untouched, but retransmissions add admitted
+DATA traffic: one ping per retry interval at most. Gate A also re-verifies
+the R4 × MP5 change (baseline 7.1, "MP1 (conflict resolved)") and reruns the
+slices named in baseline 11.1.
+
+## 8. Astra Gate A (MP1) and the F1-F3 corrective iteration
+
+| ID | Claim | Classes |
+|---|---|---|
+| E-G1 | Gate A verdict on the MP1 worktree: NEEDS CORRECTION BEFORE MP2. No BLOCKER or HIGH security defect. | ASTRA GATE A |
+| E-G2 | Delta scope: production `nmea_sproxy/nmea_sproxy.py` only; no server, wire/version, AAD, crypto, transcript or configuration change (E-P8). | ASTRA GATE A; IMPL |
+| E-G3 | Accepted: the core liveness design (E-P1, E-P2), R4 (E-P3), PATH_ACK authority and epoch-refresh composition (E-P4), terminal recovery (E-P2, E-P7). | ASTRA GATE A |
+| E-G4 | A9b accepted as designed: the state and rate are bounded and the episode count is not. A finite retry-count cap could end a session despite fresh qualifying evidence. | ASTRA GATE A |
+| E-G5 | The 16-datagram drain is accepted as an explicit bounded trade-off. A valid PONG queued as datagram #17 behind 16 junk datagrams can miss the drain, and the terminal recovery then follows. The junk gains no authority. | ASTRA GATE A |
+| E-G6 | F1 (LOW): after a 4 s delay of the first "liveness suspect" line, keepalive transmissions left at about 64 s and 65 s; the next retry was anchored at a stale pre-log sample. Corrected in `retransmit_ping` (baseline 11.2); the Astra corrective recheck accepted that part. The recheck also found `start_ping` still anchored before its attempt (keepalive 2 s with a 1.5 s slow initial send gave a 0.5 s first-retry gap), corrected by the final micro-correction. | ASTRA GATE A (reproduced); Astra corrective recheck (`retransmit_ping` part accepted; `start_ping` part reproduced); corrections IMPL (E-T13, E-T14) |
+| E-G7 | F2 (LOW): the unconditional "never more than 12 retransmissions" claim is false. The A11 interaction gives 17 retransmissions before the correct verdict at 150. The accounting in E-P5, the contract and the code comment is corrected; no cap was added. | ASTRA GATE A (reproduced); correction IMPL (E-T13) |
+| E-G8 | F3 (LOW): the operator guide said a fixed 5 s interval and pause and "any authenticated answer". It now gives `min(5 s, keepalive_interval)`, a pause of one retry interval, and qualifying authenticated evidence. | ASTRA GATE A; correction documentation only |

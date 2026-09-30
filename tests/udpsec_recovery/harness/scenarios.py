@@ -51,6 +51,20 @@ def drop_once(kind, seq=None):
     return hook
 
 
+def drop_every(kind, min_seq=0):
+    """Drop every `kind` message whose sequence is at least `min_seq`."""
+
+    def hook(message, t, lab):
+        if not message or message.get("type") != kind:
+            return False
+        if message.get("seq", 0) < min_seq:
+            return False
+        lab.log("fault", f"dropped {kind}#{message.get('seq')}")
+        return True
+
+    return hook
+
+
 def hold_once(kind, seconds, seq=None):
     """Delay the first `kind` message by `seconds` extra."""
     state = {"done": False}
@@ -172,6 +186,20 @@ def a5d_pong_at_peer_timeout_boundary(monkeypatch):
     return lab.run_client(until=T0 + 200.0, peer_timeout=45)
 
 
+def a5e_pong_after_peer_timeout_boundary(monkeypatch):
+    """MP1: as A5d, but pong#1 becomes readable 10 ms AFTER the
+    peer_timeout boundary. Evidence before verdict only admits what is
+    already available when the verdict falls due; this pong is late."""
+    lab = Lab("A5e_MP1_pong_after_peer_timeout_boundary", monkeypatch)
+    lab.deliver_s2c_at = deliver_first_pong_at(
+        1,
+        lambda lab_: lab_.sessions[0].confirmed_at
+        + float(lab_.config["peer_timeout"])
+        + 0.01,
+    )
+    return lab.run_client(until=T0 + 200.0, peer_timeout=45)
+
+
 def a6_client_stall(monkeypatch):
     """Fable T07: pong#2 is delivered normally (1060.30) but the client
     process does not run again until 1095.0 (I/O stall, SIGSTOP, ...); the
@@ -212,12 +240,41 @@ def a10_ping_overtakes_path_response(monkeypatch):
     return lab.run_client(until=T0 + 200.0)
 
 
+def a9b_refresh_only_evidence(monkeypatch):
+    """MP1 (L7-strong, baseline 7.3): every PONG from pong#2 on is lost;
+    planned in-session refreshes (65 s) are the only authenticated
+    liveness evidence after pong#1 (1030.3)."""
+    lab = Lab("A9b_MP1_refresh_only_evidence", monkeypatch)
+    lab.drop_s2c = drop_every("pong", min_seq=2)
+    return lab.run_client(until=T0 + 300.0, session_refresh_interval=65)
+
+
+def a10b_path_ack_only_evidence(monkeypatch):
+    """MP1 (L8-strong, baseline 7.3): as A10, but every PONG from pong#2
+    on is lost too, so the proof-matched PATH_ACK (1060.6) is the last
+    authenticated liveness evidence -- and it can never resolve ping#2."""
+    lab = Lab("A10b_MP1_path_ack_only_evidence", monkeypatch)
+    lab.remap(1059.9, ADDR_B)
+    lab.hold_c2s = hold_once("path_response", 0.4)
+    lab.drop_s2c = drop_every("pong", min_seq=2)
+    return lab.run_client(until=T0 + 250.0)
+
+
 def a11_short_local_send_error(monkeypatch):
     """MP0: a 2.1 s local interface flap (sendto raises ENETUNREACH,
     1059.9-1062.0) on an otherwise healthy path."""
     lab = Lab("A11_MP0_short_local_send_error", monkeypatch)
     lab.local_send_error(1059.9, 1062.0, errno.ENETUNREACH)
     lab.blackhole(1059.9, 1062.0, "s2c")
+    return lab.run_client(until=T0 + 200.0)
+
+
+def a11b_transient_receive_error(monkeypatch):
+    """MP1: at 1070 the client socket reports one ICMP-derived reset on
+    recvfrom (Windows behaviour after a port-unreachable) on an otherwise
+    healthy path."""
+    lab = Lab("A11b_MP1_transient_receive_error", monkeypatch)
+    lab.receive_error_at(1070.0)
     return lab.run_client(until=T0 + 200.0)
 
 
@@ -406,11 +463,15 @@ SCENARIOS = {
         Scenario("A5b", "T05b", "A", "PONG at deadline", a5b_pong_at_deadline),
         Scenario("A5c", "T05c", "A", "PONG 10 ms after deadline", a5c_pong_after_deadline),
         Scenario("A5d", None, "A", "PONG at peer_timeout boundary", a5d_pong_at_peer_timeout_boundary),
+        Scenario("A5e", None, "A/C", "PONG 10 ms after peer_timeout boundary", a5e_pong_after_peer_timeout_boundary),
         Scenario("A6", "T07", "A", "35 s client stall, PONG buffered", a6_client_stall),
         Scenario("A7", "T06a", "A", "reverse-path-only loss 100 s", a7_reverse_path_loss),
         Scenario("A9", "T14", "A", "refresh evidence, lost PONG", a9_refresh_evidence_with_lost_pong),
+        Scenario("A9b", None, "A", "refresh-only evidence, every PONG lost", a9b_refresh_only_evidence),
         Scenario("A10", "T09d", "A/B", "ping overtakes PATH_RESPONSE", a10_ping_overtakes_path_response),
+        Scenario("A10b", None, "A/B", "PATH_ACK-only evidence, every PONG lost", a10b_path_ack_only_evidence),
         Scenario("A11", None, "A/C", "2 s local ENETUNREACH", a11_short_local_send_error),
+        Scenario("A11b", None, "A", "transient ICMP-derived receive error", a11b_transient_receive_error),
         Scenario("B1", "T08", "B", "healthy A->B migration", b1_migration),
         Scenario("B2", "T09a", "B", "lost PATH_CHALLENGE", b2_lost_challenge),
         Scenario("B2b", "T09a7", "B", "lost PATH_CHALLENGE, 7 s NMEA", b2b_lost_challenge_7s),

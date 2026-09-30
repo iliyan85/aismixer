@@ -297,7 +297,19 @@ DATA, ping, pong, and best-effort close messages are authenticated and
 encrypted. Close is unacknowledged. Keepalive ping/pong traffic provides
 liveness and helps retain NAT, CGNAT, and mobile-network UDP mappings.
 
-An unresolved liveness failure starts a fresh signed handshake. Optional
+A keepalive ping that goes unanswered is retransmitted inside the same
+session: same sequence, fresh encryption, first at its keepalive deadline and
+then once per retry interval, which is 5 seconds or `keepalive_interval`,
+whichever is shorter. Only when no qualifying authenticated evidence -- a
+matching pong, an in-session refresh reply or commit, or a matched
+path-migration acknowledgement -- has arrived for `peer_timeout` does the
+proxy start a fresh signed handshake. A lost ping or pong, a short two-way
+outage, or a momentary local network error such as "Network is unreachable"
+while an interface switches therefore no longer replaces the session. A
+sentence whose send failed is dropped, not resent; reading local input then
+pauses for one retry interval, and a keepalive transmission re-probes the
+path before input resumes. The log shows `liveness suspect` / `liveness
+recovered` and `failed transiently` / `usable again` lines. Optional
 `session_refresh_interval` instead runs a true in-session authenticated
 epoch refresh (REFRESH_INIT/REPLY/CONFIRM/ACK with fresh ephemeral ECDHE):
 the traffic keys roll over on the same session without a new handshake,
@@ -331,34 +343,17 @@ keepalive ping (if any) at that moment. A valid newer challenge immediately
 invalidates the older proof, even if sending the new response fails; a
 retry with the same new generation/token can establish its proof when the
 send succeeds. If the server's authenticated migration acknowledgement
-matches the current live proof, it gains liveness and ping-clear authority
-only through a bounded, side-effect-free final admission: a pure
-terminal-deadline classification (no send, no logging, no refresh
-start/tick, no mutation) taken immediately before those effects; if nothing
-terminal is due, at most the one non-terminal maintenance action that is
-due at that same instant (sending a keepalive ping with none outstanding,
-or starting a supported in-session refresh); then a fresh clock sample and
-the same pure classification run again, with no further blocking work
-between that second classification and the effects themselves -- so a
-deadline that becomes due while any of that surrounding work (retransmit
-sends, acknowledgement logging, or the maintenance action itself) was
-running still wins outright, exact equality included. A supported planned
-refresh due at the same instant as unresolved-ping recovery is classified
-as non-terminal maintenance, never as a reason to end the session, so it
-can never mask that recovery: recovery wins, and the refresh is not even
-started. Once the final classification passes clean, it counts as fresh
-peer liveness -- advancing `last_authenticated_peer` (to that final
-post-maintenance sample, never an older one taken before it) and therefore
-the `peer_timeout` deadline, exactly like an accepted pong -- and clears
-only the concrete ping sequence captured in that proof, and only if that
-same ping is still outstanding at that instant. A proof that captured no
-ping still supplies liveness but cannot clear a later ping, including one
-just sent by that same final admission's own maintenance because its
-keepalive deadline became due at that instant.
-This acknowledgement
-never resets the session's age, postpones a planned refresh, or restarts the
-keepalive schedule beyond that admission's own due maintenance; it is not a
-lease renewal in those senses. A rebind the
+matches the current live proof, it counts as fresh peer liveness as of the
+instant it is read -- before any deadline due at that instant is handled,
+and regardless of how long the work that follows it takes. It advances
+`last_authenticated_peer` and therefore the `peer_timeout` deadline,
+exactly like an accepted pong. It clears only the concrete ping sequence
+captured in that proof, and only if that same ping is still outstanding. A
+proof that captured no ping still supplies liveness but never clears a
+ping; a later ping stays outstanding and is retransmitted until it is
+answered. This acknowledgement never resets the session's age, postpones a
+planned refresh, or restarts the keepalive schedule; it is not a lease
+renewal in those senses. A rebind the
 server never observes as valid current-epoch traffic from the session (for
 example while it is otherwise idle) still falls back to
 keepalive/peer-timeout detection and a
@@ -554,7 +549,7 @@ Common symptoms:
 | Server signature verification failed | Confirm `remote_public_key` contains the intended mixer's P-256 public key and the output endpoint is correct. Never bypass verification. |
 | No handshake response | Check the mixer UDPSEC listener, bidirectional UDP firewall/NAT rules, endpoint, address family, station authorization, and clocks. |
 | Unauthorized station | Match `station_id` exactly and install the station public value in aismixer's `authorized_keys.yaml`; restart aismixer after changes. |
-| Repeated reconnects | Inspect bidirectional reachability, NAT timeout/rebinding, keepalive and peer-timeout values, and both endpoint logs. |
+| Repeated reconnects | Inspect bidirectional reachability, NAT timeout/rebinding, keepalive and peer-timeout values, and both endpoint logs. A re-handshake follows only `peer_timeout` without qualifying authenticated evidence; `liveness suspect` lines before it show the unanswered retransmissions. |
 | Identity startup failure | Stop a restarting unit; inspect both canonical station files. Repair only when the retained private key is known to be correct. |
 | Bind or address error | Check address-family agreement, local address ownership, duplicate listeners, and port availability. |
 | Serial device unavailable | Check the configured path, OS permission, USB-serial driver, physical connection, and competing processes. |
