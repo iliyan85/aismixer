@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | Обработка и маршрутизиране на AIS потоци</title>
   <link rel="canonical" href="https://aismixer.net/bg/">
-  <meta name="description" content="AISMixer обработва и маршрутизира логически AIS NMEA 0183 потоци с етапи с ограничен капацитет, локална за процеса runtime наблюдаемост чрез aismixerctl и автентикиран ECDHE UDPSEC.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183, детерминирана обработка на AIS потоци, логическо маршрутизиране, runtime наблюдаемост, UDPSEC, автентикиран ECDHE, nmea_sproxy, AIVDM, AIVDO, aismixerctl, морски данни">
+  <meta name="description" content="AISMixer обединява, дедуплицира, маркира и маршрутизира AIS NMEA 0183 потоци от множество приемници, с автентикиран UDPSECv2 транспорт за отдалечени и мобилни станции.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, детерминирана обработка на AIS потоци, логическо маршрутизиране, runtime наблюдаемост, UDPSEC, UDPSECv2, автентикиран ECDHE, мобилна непрекъснатост на сесията, nmea_sproxy, AIVDM, AIVDO, aismixerctl, морски данни">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
-  <meta property="og:description" content="Детерминирана обработка и логическо маршрутизиране на AIS с етапи с ограничен капацитет, локална за процеса runtime наблюдаемост и автентикиран ECDHE UDPSEC.">
+  <meta property="og:description" content="Детерминирана обработка и логическо маршрутизиране на AIS с локална за процеса runtime наблюдаемост и автентикиран UDPSECv2 транспорт с мобилна непрекъснатост на сесията.">
   <meta property="og:url" content="https://aismixer.net/bg/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,7 +28,7 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | Обработка и маршрутизиране на AIS потоци">
-  <meta name="twitter:description" content="AIS обработка · Логическо маршрутизиране · Runtime наблюдаемост · Автентикиран ECDHE UDPSEC">
+  <meta name="twitter:description" content="AIS обработка · Логическо маршрутизиране · Runtime наблюдаемост · Мобилна непрекъснатост с UDPSECv2">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="Преглед на платформата AISMixer за обработка и маршрутизиране на AIS потоци">
 
@@ -47,7 +47,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu", "OpenWrt"],
-    "description": "Платформа за детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, етапи с ограничен капацитет, локална за процеса runtime наблюдаемост и автентикиран ECDHE UDPSEC; изходният код е публично достъпен при условията на CC BY-NC 4.0.",
+    "description": "Платформа за детерминирана обработка на AIS NMEA 0183, логическо маршрутизиране, етапи с ограничен капацитет, локална за процеса runtime наблюдаемост и автентикиран UDPSECv2 транспорт с мобилна непрекъснатост на сесията; изходният код е публично достъпен при условията на CC BY-NC 4.0.",
     "url": "https://aismixer.net/bg/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -67,7 +67,7 @@
       "https://github.com/iliyan85/aismixer"
     ],
     "inLanguage": "bg",
-    "keywords": ["AIS NMEA 0183", "детерминирана обработка на потоци", "логическо маршрутизиране", "runtime наблюдаемост", "aismixerctl", "UDPSEC", "автентикиран ECDHE", "nmea_sproxy", "AIVDM", "AIVDO"]
+    "keywords": ["AIS NMEA 0183", "детерминирана обработка на потоци", "логическо маршрутизиране", "runtime наблюдаемост", "aismixerctl", "UDPSEC", "UDPSECv2", "автентикиран ECDHE", "мобилна непрекъснатост на сесията", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -114,8 +114,9 @@
         <p class="hero-kicker">Платформа за обработка и маршрутизиране на AIS потоци</p>
         <p class="tagline">Нормализира · Дедуплицира · Маркира · Маршрутизира · Препраща</p>
         <p class="lead">
-          Приемайте AIS източници, превръщайте трафика от приемниците в един
-          контролиран логически поток и го доставяйте до нужните именувани UDP изходи.
+          Обединявайте AIS източници от стационарни, брегови, пристанищни и мобилни
+          приемници в един контролиран логически поток и го доставяйте до UDP
+          изходите, които се нуждаят от него.
         </p>
         <div class="cta" role="group" aria-label="Връзки към проекта">
           <a class="button primary" href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">Начално ръководство</a>
@@ -127,7 +128,7 @@
         <div class="icons" aria-hidden="true">📡 → 🧭 → 📤</div>
         <p class="card-heading" id="logical-stream-title">Един логически AIS поток</p>
         <ul class="list">
-          <li>Приема некриптиран UDP и автентикиран UDPSEC входящ трафик.</li>
+          <li>Приема некриптиран UDP и автентикиран UDPSECv2 трафик от стационарни и мобилни станции.</li>
           <li>Извлича и сглобява <span class="kbd">!AIVDM</span> и <span class="kbd">!AIVDO</span>.</li>
           <li>Дедуплицира, управлява TAG метаданните и прилага маршрутизация.</li>
           <li>Препраща приетите данни към избрани именувани UDP изходи.</li>
@@ -141,7 +142,7 @@
       <div class="section-heading">
         <p class="eyebrow">Обработка на AIS потоци</p>
         <h2>От трафика на приемниците до чист поток с ясни източници</h2>
-        <p class="section-intro">AISMixer обединява транспорта, NMEA сглобяването, метаданните, дедупликацията и доставката в един път за обработка в почти реално време. Екосистемата AISMixer включва услугата <span class="kbd">aismixer</span> за обработка и маршрутизиране на потоци, <span class="kbd">nmea_sproxy</span>, <span class="kbd">aismixerctl</span>, защитения транспорт, инструментите за внедряване и свързаните компоненти.</p>
+        <p class="section-intro">AISMixer обединява транспорта, NMEA сглобяването, метаданните, дедупликацията и доставката в един път за обработка в почти реално време. Компонентите му по време на работа са <span class="kbd">aismixer</span> — mixer, router и UDPSEC сървър; <span class="kbd">aismixerctl</span> за локално управление на маршрутизацията и runtime статистика; и <span class="kbd">nmea_sproxy</span> — проксито при станцията от един локален UDP или сериен/USB източник към една UDPSEC или изрично конфигурирана plain-UDP дестинация.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -190,11 +191,11 @@
 
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Основа на data plane от кампании C–F, подготвена за нативна реализация</p>
+        <p class="eyebrow">Основа на data plane, подготвена за нативна реализация</p>
         <h2>Изрична обработка, етапи с ограничен капацитет и унифициран egress</h2>
         <p class="section-intro">Неизменяемият ingress на ниво байтове преминава през изрично определени етапи с ограничен капацитет в рамките на един процес. След като стане наличен споделен капацитет за обработка, всеки допуснат кадър се свързва с една <span class="kbd">ProcessingSnapshot</span> и се обработва от <span class="kbd">PythonDataPlaneProcessor</span>, който притежава състоянието на инстанцията и остава единственият текущ продукционен и референтен процесор. Той връща един подреден неизменяем <span class="kbd">OutputBatch</span>, чиито стойности <span class="kbd">ProcessorOutput</span> пренасят точните байтове и числовите идентификатори на целите през egress предаването с ограничен капацитет.</p>
       </div>
-      <div class="pipeline representation-pipeline" role="group" aria-label="Реализирани продукционни data-plane етапи от кампании C–F">
+      <div class="pipeline representation-pipeline" role="group" aria-label="Реализирани продукционни data-plane етапи">
         <div class="pipeline-node">
           <strong>UDP / UDPSEC производители</strong>
           <span>Отделна ограничена опашка с <span class="kbd">IngressFrame</span> за всеки вход</span>
@@ -279,7 +280,7 @@
         <article class="card state-card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Защита от повторения и сесии</h3>
-          <p>Записите за защита от повторение при handshake, както и чакащите и активните сесии, имат монотонни TTL и твърди ограничения на капацитета. Всеки приет DATA nonce обаче се запазва за цялата използваема епоха на еднопосочния ключ за трафик, няма собствен TTL и не се изхвърля, докато тази епоха остава използваема. Изчерпването води до fail-closed отказ само на засегнатата ключова епоха; възстановяването използва нов автентикиран handshake с нови ключове за двете посоки.</p>
+          <p>Записите за защита от повторение при handshake, чакащите и активните сесии, както и регистърът на DATA nonce стойностите за всяка ключова епоха имат твърди ограничения на капацитета; по време на опресняване на ключовата епоха в сесията една сесия има най-много три активни епохи. Времето на живот на handshake записите и сесиите се определя от монотонни TTL. Всеки приет DATA nonce обаче се запазва за целия използваем живот на своята епоха, няма собствен TTL и не се изхвърля. Изчерпването на регистъра за текущата епоха води до fail-closed отказ и край на сесията, а възстановяването използва нов автентикиран handshake; изчерпването на чакаща или оттегляща се епоха премахва само нея. Състоянието за миграция на пътя е ограничено до един кандидат и един оттеглен път за сесия.</p>
           <p>Чакащ кандидат заменя само по-стар кандидат за същата връзка между физическия слушател и peer-а и запазва активната сесия, докато автентикираното криптирано потвърждение не успее. Сесиите за един и същ peer на отделни физически UDPSEC слушатели са изолирани една от друга; общите ограничения на капацитета остават на ниво процес. Цялото защитено състояние е в паметта, локално за процеса и се губи при рестарт.</p>
         </article>
         <article class="card state-card">
@@ -294,9 +295,9 @@
 
     <section id="worker-readiness" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Campaign F — реализирана</p>
+        <p class="eyebrow">Готовност за worker архитектура — реализирана</p>
         <h2>Граници, подготвени за worker архитектура в един процес</h2>
-        <p class="section-intro">Campaign F завърши ограничените и наблюдаеми граници около текущия Python runtime. Изменяемото състояние на обработката има изричен собственик на ниво инстанция, работата се допуска само при наличен капацитет, а свежата pull-based статистика прави активността на етапите видима, без да я променя.</p>
+        <p class="section-intro">Текущият Python runtime има ограничени и наблюдаеми граници около етапите на обработка. Изменяемото състояние на обработката има изричен собственик на ниво инстанция, работата се допуска само при наличен капацитет, а свежата pull-based статистика прави активността на етапите видима, без да я променя.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
@@ -422,9 +423,9 @@
 
     <section id="secure-state" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Жизнен цикъл на UDPSEC</p>
+        <p class="eyebrow">Защитен транспорт UDPSECv2</p>
         <h2>Автентикиран транспорт с ограничено локално състояние</h2>
-        <p class="section-intro">Текущият UDPSEC път в публикуваната версия между <span class="kbd">nmea_sproxy</span> и услугата <span class="kbd">aismixer</span> използва конфигурирани дългосрочни P-256 ECDSA идентичности, подписан ефемерен P-256 ECDHE обмен, нови AES-256-GCM ключове за двете посоки и криптирано потвърждение с пореден номер нула за притежание на ключовете, преди клиентът да приеме новата сесия за установена.</p>
+        <p class="section-intro">UDPSEC е специфичният за проекта AISMixer автентикиран и криптиран UDP транспорт между станции с <span class="kbd">nmea_sproxy</span> и услугата <span class="kbd">aismixer</span>. Текущият изходен код реализира UDPSECv2: конфигурирани дългосрочни P-256 ECDSA идентичности, подписано установяване с ефемерен P-256 ECDHE и криптирано потвърждение с пореден номер нула за притежание на ключовете, AES-256-GCM защита на DATA, защита от повторения, автентикирана проверка за активност, опресняване на ключовата епоха в рамките на сесията и автентикирана миграция на пътя. Частите за непрекъснатост на сесиите все още не са включени в издание с етикет, нито в публикуваните OpenWrt пакети.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="Поток за установяване на UDPSEC сесия чрез автентикиран ECDHE">
         <div class="pipeline-node">
@@ -467,10 +468,10 @@
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">♻️</div>
-          <h3>Съгласувано обновяване и локално състояние</h3>
-          <p>Двете крайни точки трябва да бъдат обновени заедно. След потвърждението NMEA DATA, ping/pong проверките за активност и затварянето без гаранция за доставка са автентикирани и криптирани. Проверка за активност без отговор или включено планирано обновяване на сесията започва проактивно нов подписан ECDHE handshake с нови ключове за двете посоки; UDPSEC не буферира и не препраща повторно NMEA данни по време на възстановяване.</p>
-          <p>Възстановяването използва нов автентикиран handshake. UDPSEC няма plaintext reset, <span class="kbd">NOSESSION</span> възстановяване, downgrade управление или автоматичен fallback към plain UDP. DATA за неизвестна стара сесия се игнорира без plaintext отговор за възстановяване. Защитеното състояние за сесии и повторения е в паметта, локално за процеса, нетрайно и се губи при рестарт.</p>
-          <p>UDPSEC работи през NAT или CGNAT, докато наблюдаваните от сървъра адрес и порт на източника остават стабилни. Rebinding или промяна на мрежата изисква нов автентикиран handshake; установената сесия не се мигрира автоматично.</p>
+          <h3>Сесии, ключови епохи и липса на fallback</h3>
+          <p>Сесията е обвързана с автентикираната станция и се идентифицира чрез издаден от mixer-а локатор на сесията, никога чрез IP адреса и порта на източника. След потвърждението NMEA DATA, keepalive ping/pong, управлението в сесията и затварянето без гаранция за доставка са автентикирани и криптирани, а всеки пакет е обвързан със своята сесия и ключова епоха. Получателите пазят всеки приет nonce за живота на неговата епоха и отхвърлят повторенията.</p>
+          <p>При <span class="kbd">session_refresh_interval</span> над нула станцията обновява ключовете за трафик в рамките на същата сесия чрез нов подписан ECDHE обмен; това не е нито нова сесия, нито смяна на пътя. UDPSEC няма plaintext reset, <span class="kbd">NOSESSION</span> възстановяване, downgrade управление или автоматичен fallback към plain UDP и не буферира и не препраща повторно NMEA данни. Защитеното състояние за сесии и повторения е в паметта, локално за процеса, нетрайно и се губи при рестарт.</p>
+          <p>Обновявайте двете крайни точки заедно: текущият формат на пакетите на UDPSECv2 не е съвместим с по-ранни версии, включително с публикуваните OpenWrt пакети <span class="kbd">0.2.1</span>.</p>
         </article>
       </div>
       <div class="callout">
@@ -478,6 +479,32 @@
         <p><strong>Граница на транспорта:</strong> UDPSEC автентикира и криптира пакетите с данни и управляващия трафик в своя обхват, но не доказва идентичността или позицията на плавателния съд, физическия произход или липсата на AIS подправяне, не гарантира доставка или ред на UDP дейтаграмите, не защитава компрометирани крайни точки и не осигурява пълна устойчивост срещу отказ на услуга. Той не скрива IP адресите на страните, моментите или размерите на пакетите, нито идентификатора на станцията, предаван като открит текст в ClientHello.</p>
         <p>Прочетете <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">политиката за сигурност</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">договора за поведение</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ръководството за <span class="kbd">nmea_sproxy</span></a> и <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a> за подробните граници.</p>
       </div>
+    </section>
+
+    <section id="mobile-continuity" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Мобилна непрекъснатост</p>
+        <h2>Запазване на сесията на станцията при обичайни мобилни загуби</h2>
+        <p class="section-intro">UDPSEC работи през NAT и CGNAT. Мобилните станции губят пакети, а публичният им IP адрес или UDP порт може да се смени. Полевите тестове показаха, че при смяна на клетката в мобилната мрежа публичният адрес и портът често остават същите, затова UDPSECv2 третира временната загуба различно от реалната смяна на адреса.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">📶</div>
+          <h3>Кратка загуба по същия път</h3>
+          <p><strong>Възстановяване на активността.</strong> Станцията повтаря с ограничена честота единствения си неотговорен keepalive ping, със същия пореден номер и с ново криптиране всеки път, докато пристигне автентикиран отговор. Една загубена размяна не прекратява сесията; единствената крайна граница е <span class="kbd">peer_timeout</span> след последното автентикирано доказателство.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔀</div>
+          <h3>Нов публичен адрес при активна сесия</h3>
+          <p><strong>Автентикирана миграция на пътя.</strong> На новия адрес не се има доверие автоматично: пакетите от него трябва да бъдат автентикирани с текущите ключове на сесията. След това услугата <span class="kbd">aismixer</span> изпраща проверка (challenge) към този адрес и пренасочва отговорите си там едва след като автентикираният отговор на станцията пристигне от същия адрес. Проверката се изпраща най-много четири пъти общо, през поне 2 секунди, в рамките на фиксиран 10-секунден прозорец; повторенията подобряват доставката, но не дават права.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔑</div>
+          <h3>Дълго или окончателно прекъсване</h3>
+          <p><strong>Ново автентикирано установяване.</strong> Щом бъде достигната границата за активност, станцията извършва нов подписан handshake, а услугата <span class="kbd">aismixer</span> сама премахва старата неактивна сесия.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><strong>Ограничено, не без загуби.</strong> Препращането продължава, докато активността е под съмнение, но UDPSEC никога не буферира и не изпраща повторно NMEA данни: изречения, изпратени по време на прекъсване, може да се загубят дори когато сесията оцелее, и никоя сесия не оцелява при всяко прекъсване. Възстановяването на активността по същия път е наблюдавано при реален тест в движение; миграцията на пътя е валидирана с end-to-end тестове. И двете са в текущия изходен код, но все още не са в издание с етикет.</p>
     </section>
 
     <section id="receivers" class="section section-emphasis">
@@ -520,13 +547,13 @@
         <article class="card">
           <h3>Реализирани изходи</h3>
           <ul class="list">
-            <li>Автентикиран и криптиран UDPSEC с ограничения жизнен цикъл на сесията, описан по-горе.</li>
+            <li>Автентикиран и криптиран UDPSEC: проксито автентикира mixer-а и бива автентикирано от него, участва в проверката за активност, отговаря на автентикирани проверки на пътя, изпълнява незадължително опресняване на ключовата епоха в сесията и след окончателна загуба преминава към нов автентикиран handshake.</li>
             <li>Изрично конфигуриран некриптиран UDP за доверена LAN, VPN или равностойна граница.</li>
           </ul>
         </article>
         <article class="card">
           <h3>Ясен модел на връзката</h3>
-          <p>Един локален вход се свързва с един конфигуриран изход. Проксито препраща само чистото поддържано AIS NMEA съвпадение, като премахва входните TAG блокове, префиксите, околните байтове и терминаторите. <span class="kbd">nmea_sproxy</span> не смесва, не разклонява към няколко изхода, не маршрутизира, не дедуплицира и не сглобява multipart AIS.</p>
+          <p>Един локален вход се свързва с един конфигуриран изход. Проксито препраща само чистото поддържано AIS NMEA съвпадение, като премахва входните TAG блокове, префиксите, околните байтове и терминаторите. <span class="kbd">nmea_sproxy</span> не смесва, не разклонява към няколко изхода, не маршрутизира, не дедуплицира и не сглобява multipart AIS, а решенията за миграция на пътя принадлежат на услугата <span class="kbd">aismixer</span>.</p>
         </article>
       </div>
       <div class="callout">
@@ -538,7 +565,7 @@
       <div class="section-heading">
         <p class="eyebrow">Периферно внедряване с OpenWrt</p>
         <h2>Стартирайте услугата <span class="kbd">aismixer</span> или <span class="kbd">nmea_sproxy</span> върху OpenWrt</h2>
-        <p class="section-intro">Подписаното AISMixer APK хранилище за OpenWrt 25.12 публикува <span class="kbd">0.2.1-r4</span> версията на Python/procd пакетите за архитектурите <span class="kbd">x86_64</span> и <span class="kbd">mips_24kc</span>.</p>
+        <p class="section-intro">OpenWrt е поддържана платформа за периферно внедряване както за услугата <span class="kbd">aismixer</span>, така и за <span class="kbd">nmea_sproxy</span>. Подписаното AISMixer APK хранилище за OpenWrt 25.12 в момента публикува <span class="kbd">0.2.1-r4</span> версията на Python/procd пакетите, изградена от изданието v0.2.1, за архитектурите <span class="kbd">x86_64</span> и <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
         <article class="card">
@@ -590,8 +617,8 @@ vi /etc/aismixer/authorized_keys.yaml
 /etc/init.d/aismixer start
 /etc/init.d/aismixer status
 logread -e aismixer</code></pre>
-      <p class="boundary-note"><strong>Версия на пакетите.</strong> Публикуваните пакети <span class="kbd">0.2.1-r4</span> използват фиксирана ревизия на изходния код и може да изостават от по-късни промени в <span class="kbd">main</span>. Проверете ревизията на пакета, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">списъка на промените</a> и <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">публикуваните версии</a>, преди да приемете, че е включено по-ново укрепване.</p>
-      <p class="boundary-note"><strong>Валидация от край до край.</strong> Пътят за внедряване на <span class="kbd">mips_24kc</span> е валидиран от край до край с физически сериен AIS вход, <span class="kbd">nmea_sproxy</span>, автентикиран UDPSEC, обработка от услугата <span class="kbd">aismixer</span>, работа на услугите чрез <span class="kbd">procd</span> и локален контрол и наблюдаемост по време на изпълнение.</p>
+      <p class="boundary-note"><strong>Версия на пакетите.</strong> Публикуваните пакети <span class="kbd">0.2.1-r4</span> са изградени от фиксираното издание v0.2.1. Те предхождат работата по непрекъснатост на сесиите в UDPSECv2 в текущия изходен код, а техният UDPSEC формат на пакетите не е съвместим с компилации от текущото дърво на изходния код: използвайте една и съща версия от двете страни на UDPSEC връзката. Пакети с тази функционалност изискват по-късно издание, при което рецептата се фиксира наново. Проверете ревизията на пакета, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">списъка на промените</a> и <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">публикуваните версии</a>.</p>
+      <p class="boundary-note"><strong>Валидация от край до край.</strong> Пътят за внедряване на <span class="kbd">mips_24kc</span> за публикуваната линия пакети е валидиран от край до край с физически сериен AIS вход, <span class="kbd">nmea_sproxy</span>, автентикиран UDPSEC, обработка от услугата <span class="kbd">aismixer</span>, работа на услугите чрез <span class="kbd">procd</span> и локален контрол и наблюдаемост по време на изпълнение.</p>
       <p class="boundary-note"><strong>Само крайна точка при приемника.</strong> Използвайте <span class="kbd">apk add nmea_sproxy</span> вместо <span class="kbd">apk add aismixer</span>, за да инсталирате самостоятелно проксито при станцията. Вижте <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ръководството за <span class="kbd">nmea_sproxy</span></a> и <a href="https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment" target="_blank" rel="noopener">ръководството за внедряване с OpenWrt</a> за пълните стъпки по внедряване и конфигуриране на доверието.</p>
     </section>
 
@@ -610,7 +637,7 @@ logread -e aismixer</code></pre>
         <article class="card">
           <div class="icons" aria-hidden="true">🔄</div>
           <h3>Инсталиране, актуализиране и деинсталиране</h3>
-          <p>Скриптовете за жизнения цикъл съобразяват работата с root или sudo и поддържат внедрените файлове за изпълнение и unit файловете на услугата. Обновяването на AISMixer рестартира услугата и може да стартира неактивна услуга; обновяването на <span class="kbd">nmea_sproxy</span> презарежда systemd, но не стартира или рестартира proxy инстанции. Вижте <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> и <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ръководството за <span class="kbd">nmea_sproxy</span></a>.</p>
+          <p>Скриптовете за жизнения цикъл съобразяват работата с root или sudo и поддържат внедрените файлове за изпълнение и unit файловете на услугата. Обновяването на <span class="kbd">aismixer</span> рестартира услугата и може да стартира неактивна услуга; обновяването на <span class="kbd">nmea_sproxy</span> презарежда systemd, но не стартира или рестартира proxy инстанции. Обновявайте UDPSEC станциите заедно с mixer-а. Вижте <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> и <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ръководството за <span class="kbd">nmea_sproxy</span></a>.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🗝️</div>
@@ -629,8 +656,9 @@ logread -e aismixer</code></pre>
       <div class="section-heading">
         <p class="eyebrow">Документация и състояние на проекта</p>
         <h2>Реализирана основа, ясно отделена от следващите стъпки</h2>
-        <p class="section-intro">Wiki е подробното ръководство за архитектура, конфигурация, маршрутизиране, сигурност и експлоатация. Roadmap отделя завършената основа от бъдещата работа без обещани срокове.</p>
+        <p class="section-intro">README файлът в хранилището е актуалният обзор на проекта за оператори, договорът за поведение определя точната семантика, а Wiki съдържа по-подробни ръководства за архитектурата и внедряването. Roadmap отделя завършената основа от бъдещата работа без обещани срокове.</p>
       </div>
+      <p class="boundary-note"><strong>Състояние на изданията.</strong> Последното издание с етикет е <span class="kbd">v0.2.1</span>. Текущият изходен код в <span class="kbd">main</span> съдържа и неиздадена работа, включително описаната по-горе непрекъснатост на сесиите в UDPSECv2. Публикуваните OpenWrt пакети (<span class="kbd">0.2.1-r4</span>) са изградени от v0.2.1. Вижте <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">списъка на промените</a>.</p>
       <div class="status-grid">
         <article class="card status-card status-now">
           <h3 class="status-label">Реализирано сега</h3>
@@ -641,22 +669,25 @@ logread -e aismixer</code></pre>
             <li>Логически зони и дедупликация по цели, атомарни локални за процеса промени на маршрутизацията, интерактивен <span class="kbd">aismixerctl</span> и read-only агрегирана статистика и статистика по входове и изходи.</li>
             <li>Детерминирано multipart сглобяване, управление на TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> и глобална или отделна за всяка цел дедупликация.</li>
             <li>UDPSEC с автентикиран ефемерен P-256 ECDHE обмен, конфигурирани дългосрочни P-256 ECDSA идентичности, нови AES-256-GCM ключове за двете посоки, криптирано потвърждение за притежание на ключовете, автентикирани и криптирани данни и проверки за активност, както и автентикирано и криптирано затваряне без гаранция за доставка, DATA защита от повторения за цялата ключова епоха, fail-closed ограничено състояние и изолация на сесиите по физически слушател.</li>
+            <li>В текущия изходен код, но все още не в издание с етикет: непрекъснатост на сесиите в UDPSECv2 — възстановяване на активността по същия път, автентикирана миграция на пътя с доказателство за обратна достижимост и опресняване на ключовата епоха в сесията.</li>
             <li>За всеки процес или systemd instance на <span class="kbd">nmea_sproxy</span> — един UDP или сериен вход към един UDPSEC или изрично конфигуриран plain-UDP изход за доверена мрежа, плюс IPv4/IPv6 контрол на крайните точки.</li>
-            <li>Внедряване със systemd за семейството на Debian и <span class="kbd">RuntimeDirectory</span>, скриптове за жизнения цикъл, съобразени с наличните привилегии, запазено операторско състояние и глобален операторски CLI, наред с подписаното APK/procd внедряване за OpenWrt 25.12, публикувано за <span class="kbd">x86_64</span> и <span class="kbd">mips_24kc</span>.</li>
+            <li>Внедряване със systemd за семейството на Debian и <span class="kbd">RuntimeDirectory</span>, скриптове за жизнения цикъл, съобразени с наличните привилегии, запазено операторско състояние и глобален операторски CLI, наред с подписаното APK/procd внедряване за OpenWrt 25.12, публикувано за <span class="kbd">x86_64</span> и <span class="kbd">mips_24kc</span> (<span class="kbd">0.2.1-r4</span>, изградено от v0.2.1).</li>
           </ul>
         </article>
         <article class="card status-card status-next">
           <h3 class="status-label">Планирана работа</h3>
           <ul class="list">
-            <li>Координаторен процес и реални отделни ingress и egress worker процеси.</li>
-            <li>IPC, междупроцесно разпространение на routing snapshot-и и надзор, политика за рестарт и възстановяване на worker процесите и при нужда агрегиране на метрики.</li>
-            <li>Бъдещ нативен процесор и bindings зад установените договори с диференциална проверка за съответствие; днес такава реализация няма и не се твърдят резултати за производителност.</li>
-            <li>По-широка архитектура за входни и изходни адаптери отвъд текущите UDP пътища.</li>
+            <li>Допълнително укрепване на оперативното внедряване, например изрична собственост на управляващия сокет и валидиране под Linux и Raspberry Pi.</li>
+            <li>Координаторен процес с отделни ingress и egress worker процеси, IPC и междупроцесен надзор, а по-късно и нативен процесор зад установените договори с диференциална проверка за съответствие; днес такава реализация няма и не се твърдят резултати за производителност.</li>
+            <li>Операции със състоянието на маршрутизацията, например незадължително трайно съхранение, безопасно презареждане на конфигурацията и история за връщане назад.</li>
+            <li>Изследвания в областта на морската сигурност и качеството на данните, включително откриване на AIS подправяне и аномалии, което днес не е реализирано.</li>
+            <li>Бъдещо разширяване, например допълнителни изходни адаптери и отдалечено автентикирано управление.</li>
           </ul>
         </article>
       </div>
       <div class="card links" role="group" aria-label="Връзки към документацията">
         <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Основно хранилище</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a href="https://github.com/iliyan85/aismixer/wiki/Quick-Start" target="_blank" rel="noopener">Quick Start</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">Договор за поведението</a>

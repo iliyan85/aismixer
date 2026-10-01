@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | AIS Stream Processing and Routing Platform</title>
   <link rel="canonical" href="https://aismixer.net/">
-  <meta name="description" content="AISMixer processes and logically routes AIS NMEA 0183 streams with bounded stages, process-local runtime observability through aismixerctl, and authenticated ECDHE UDPSEC.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183, AIS stream processing, logical routing, runtime observability, UDPSEC, authenticated ECDHE, nmea_sproxy, AIVDM, AIVDO, aismixerctl, maritime data">
+  <meta name="description" content="AISMixer combines, deduplicates, tags, and routes AIS NMEA 0183 streams from many receivers, with authenticated UDPSECv2 transport for remote and mobile stations.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, AIS stream processing, logical routing, runtime observability, UDPSEC, UDPSECv2, authenticated ECDHE, mobile session continuity, nmea_sproxy, AIVDM, AIVDO, aismixerctl, maritime data">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | AIS Stream Processing and Routing Platform">
-  <meta property="og:description" content="Deterministic AIS processing and logical routing with bounded stages, process-local runtime observability, and authenticated ECDHE UDPSEC.">
+  <meta property="og:description" content="Deterministic AIS processing and logical routing with process-local runtime observability and authenticated UDPSECv2 transport with mobile session continuity.">
   <meta property="og:url" content="https://aismixer.net/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,7 +28,7 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | AIS Stream Processing and Routing Platform">
-  <meta name="twitter:description" content="AIS processing · Logical routing · Runtime observability · Authenticated ECDHE UDPSEC">
+  <meta name="twitter:description" content="AIS processing · Logical routing · Runtime observability · UDPSECv2 mobile continuity">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="AISMixer AIS stream processing and routing platform overview">
 
@@ -47,7 +47,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu", "OpenWrt"],
-    "description": "Platform for deterministic AIS processing, logical routing, bounded stages, process-local runtime observability, and authenticated ECDHE UDPSEC; source code is publicly available under CC BY-NC 4.0.",
+    "description": "Platform for deterministic AIS processing, logical routing, bounded stages, process-local runtime observability, and authenticated UDPSECv2 transport with mobile session continuity; source code is publicly available under CC BY-NC 4.0.",
     "url": "https://aismixer.net/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -67,7 +67,7 @@
       "https://github.com/iliyan85/aismixer"
     ],
     "inLanguage": "en",
-    "keywords": ["AIS NMEA 0183", "stream processing", "logical routing", "runtime observability", "aismixerctl", "UDPSEC", "authenticated ECDHE", "nmea_sproxy", "AIVDM", "AIVDO"]
+    "keywords": ["AIS NMEA 0183", "stream processing", "logical routing", "runtime observability", "aismixerctl", "UDPSEC", "UDPSECv2", "authenticated ECDHE", "mobile session continuity", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -114,8 +114,9 @@
         <p class="hero-kicker">AIS stream processing and routing platform</p>
         <p class="tagline">Normalize · Deduplicate · Tag · Route · Forward</p>
         <p class="lead">
-          Receive AIS feeds, turn receiver traffic into one controlled logical
-          stream, and deliver it to the UDP egress targets that need it.
+          Combine AIS feeds from fixed, shore, harbour, and mobile receivers into
+          one controlled logical stream, and deliver it to the UDP egress targets
+          that need it.
         </p>
         <div class="cta" role="group" aria-label="Project links">
           <a class="button primary" href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">Get started</a>
@@ -127,7 +128,7 @@
         <div class="icons" aria-hidden="true">📡 → 🧭 → 📤</div>
         <p class="card-heading" id="logical-stream-title">One logical AIS stream</p>
         <ul class="list">
-          <li>Receive plain UDP and authenticated UDPSEC ingress.</li>
+          <li>Receive plain UDP and authenticated UDPSECv2 traffic from fixed and mobile stations.</li>
           <li>Extract and assemble <span class="kbd">!AIVDM</span> and <span class="kbd">!AIVDO</span>.</li>
           <li>Deduplicate, control TAG metadata, and apply routing.</li>
           <li>Forward accepted data to selected named UDP egress targets.</li>
@@ -141,7 +142,7 @@
       <div class="section-heading">
         <p class="eyebrow">AIS stream processing</p>
         <h2>From receiver traffic to a clean, source-aware feed</h2>
-        <p class="section-intro">AISMixer keeps transport, NMEA assembly, metadata, deduplication, and delivery in one near-real-time processing path. The AISMixer ecosystem combines the <span class="kbd">aismixer</span> stream-processing and routing service, <span class="kbd">nmea_sproxy</span>, <span class="kbd">aismixerctl</span>, secure transport, deployment tooling, and related components.</p>
+        <p class="section-intro">AISMixer keeps transport, NMEA assembly, metadata, deduplication, and delivery in one near-real-time processing path. Its runtime components are the <span class="kbd">aismixer</span> mixer, router, and UDPSEC server; <span class="kbd">aismixerctl</span> for local routing control and runtime statistics; and <span class="kbd">nmea_sproxy</span>, the station-side proxy from one local UDP or serial/USB source to one UDPSEC or explicitly configured plain-UDP destination.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -190,11 +191,11 @@
 
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Campaign C–F native-ready data-plane foundation</p>
+        <p class="eyebrow">Native-ready data-plane foundation</p>
         <h2>Explicit processing, bounded stages, and unified egress</h2>
         <p class="section-intro">Immutable bytes-based ingress moves through bounded, explicit single-process stages. After shared processing capacity becomes available, each admitted frame is bound to one <span class="kbd">ProcessingSnapshot</span> and handled by the instance-owned <span class="kbd">PythonDataPlaneProcessor</span>—the sole current production and reference processor. It returns one ordered immutable <span class="kbd">OutputBatch</span> whose <span class="kbd">ProcessorOutput</span> values carry exact bytes and numeric target IDs through the bounded egress handoff.</p>
       </div>
-      <div class="pipeline representation-pipeline" role="group" aria-label="Implemented Campaign C–F production data-plane stages">
+      <div class="pipeline representation-pipeline" role="group" aria-label="Implemented production data-plane stages">
         <div class="pipeline-node">
           <strong>UDP / UDPSEC producers</strong>
           <span>Private bounded <span class="kbd">IngressFrame</span> queue per input</span>
@@ -279,7 +280,7 @@
         <article class="card state-card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Secure replay and sessions</h3>
-          <p>Handshake replay records, pending sessions, active sessions, and each session's private DATA-nonce replay ledger are hard-bounded. Handshake and session lifetimes use monotonic TTLs. Every admitted DATA nonce is instead retained for the full usable directional traffic-key epoch, has no independent TTL, and is not evicted while that epoch remains usable. Exhaustion fails closed for that key epoch; recovery uses a fresh authenticated handshake with fresh directional keys.</p>
+          <p>Handshake replay records, pending sessions, active sessions, and the DATA-nonce replay ledger of each key epoch are hard-bounded; during an in-session key-epoch refresh a session holds at most three live epochs. Handshake and session lifetimes use monotonic TTLs. Every admitted DATA nonce is instead retained for its epoch's full usable lifetime, has no independent TTL, and is not evicted. Exhausting the current epoch's ledger fails closed and ends the session, and recovery uses a fresh authenticated handshake; exhausting a pending or retiring epoch discards only that epoch. Path-migration state is limited to one candidate and one retired path per session.</p>
           <p>A pending candidate replaces only an older candidate for the same physical-listener/peer relation and preserves any active session until authenticated encrypted confirmation succeeds. Sessions from the same peer on separate physical UDPSEC listeners are isolated from one another; aggregate capacity budgets remain process-wide. All secure state is in-memory, process-local, and lost at restart.</p>
         </article>
         <article class="card state-card">
@@ -294,9 +295,9 @@
 
     <section id="worker-readiness" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Campaign F — implemented</p>
+        <p class="eyebrow">Worker readiness — implemented</p>
         <h2>Worker-ready boundaries in one process</h2>
-        <p class="section-intro">Campaign F completed bounded, observable boundaries around the current Python runtime. Mutable processing state has an explicit instance owner, work is admitted only when capacity is available, and fresh pull-based statistics make stage activity visible without changing it.</p>
+        <p class="section-intro">The current Python runtime has bounded, observable boundaries around its processing stages. Mutable processing state has an explicit instance owner, work is admitted only when capacity is available, and fresh pull-based statistics make stage activity visible without changing it.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
@@ -422,9 +423,9 @@
 
     <section id="secure-state" class="section">
       <div class="section-heading">
-        <p class="eyebrow">UDPSEC lifecycle</p>
+        <p class="eyebrow">UDPSECv2 secure transport</p>
         <h2>Authenticated transport with bounded local state</h2>
-        <p class="section-intro">The currently released UDPSEC path between <span class="kbd">nmea_sproxy</span> and <span class="kbd">aismixer</span> uses configured long-term P-256 ECDSA identities, signed ephemeral P-256 ECDHE, fresh directional AES-256-GCM keys, and encrypted sequence-zero proof of key possession before the client treats a new session as established.</p>
+        <p class="section-intro">UDPSEC is AISMixer's project-specific authenticated and encrypted UDP transport between <span class="kbd">nmea_sproxy</span> stations and the <span class="kbd">aismixer</span> service. The current source implements UDPSECv2: configured long-term P-256 ECDSA identities, signed ephemeral P-256 ECDHE establishment with encrypted sequence-zero proof of key possession, AES-256-GCM protected DATA, replay protection, authenticated liveness, in-session key-epoch refresh, and authenticated path migration. The session-continuity parts are not yet in a tagged release or in the published OpenWrt packages.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="UDPSEC authenticated ECDHE session-establishment flow">
         <div class="pipeline-node">
@@ -467,10 +468,10 @@
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">♻️</div>
-          <h3>Coordinated update and local state</h3>
-          <p>Both endpoints must be updated together. After confirmation, NMEA DATA, ping/pong liveness, and best-effort close are authenticated and encrypted. An unresolved liveness check or enabled planned session refresh proactively starts a fresh signed ECDHE handshake with fresh directional keys; UDPSEC does not buffer or replay NMEA payloads during recovery.</p>
-          <p>Recovery uses a fresh authenticated handshake. UDPSEC has no plaintext reset, <span class="kbd">NOSESSION</span> recovery, downgrade control, or automatic fallback to plain UDP. DATA for an unknown old session is ignored without a plaintext recovery response. Secure session and replay state is in-memory, process-local, non-durable, and lost at restart.</p>
-          <p>UDPSEC works through NAT or CGNAT while the server-observed source address and port remain stable. Rebinding or network change requires a fresh authenticated handshake; an established session is not automatically migrated.</p>
+          <h3>Sessions, key epochs, and no fallback</h3>
+          <p>A session is bound to the authenticated station and identified by a mixer-issued session locator, never by the source IP address and port. After confirmation, NMEA DATA, keepalive ping/pong, in-session control, and best-effort close are authenticated and encrypted, and every packet is bound to its session and key epoch. Receivers keep every admitted nonce for its epoch's lifetime and reject replays.</p>
+          <p>With <span class="kbd">session_refresh_interval</span> above zero, the station renews the traffic keys inside the same session through a fresh signed ECDHE exchange; this is neither a new session nor a path change. UDPSEC has no plaintext reset, <span class="kbd">NOSESSION</span> recovery, downgrade control, or automatic fallback to plain UDP, and it does not buffer or replay NMEA payloads. Secure session and replay state is in-memory, process-local, non-durable, and lost at restart.</p>
+          <p>Update both endpoints together: the current UDPSECv2 wire format does not interoperate with earlier builds, including the published <span class="kbd">0.2.1</span> OpenWrt packages.</p>
         </article>
       </div>
       <div class="callout">
@@ -478,6 +479,32 @@
         <p><strong>Transport boundary:</strong> UDPSEC authenticates and encrypts data and control packets within its scope, but does not prove vessel identity, position, physical origin, or the absence of AIS spoofing; guarantee UDP delivery or ordering; protect compromised endpoints; or provide complete denial-of-service resistance. It does not hide peer IP addresses, packet timing or lengths, or the cleartext ClientHello station identifier.</p>
         <p>Read the <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">security policy</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">behavioural contract</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>, and <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki</a> for the detailed boundaries.</p>
       </div>
+    </section>
+
+    <section id="mobile-continuity" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Mobile continuity</p>
+        <h2>Keep a station's session through ordinary mobile loss</h2>
+        <p class="section-intro">UDPSEC works through NAT and CGNAT. Mobile stations lose packets, and their public IP address or UDP port can change. Field runs showed that cellular handovers often keep the same public address and port, so UDPSECv2 treats a temporary loss differently from a real address change.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">📶</div>
+          <h3>Short loss on the same path</h3>
+          <p><strong>Liveness recovery.</strong> The station resends its one outstanding keepalive ping at a bounded rate, with the same sequence number and a fresh encryption each time, until an authenticated answer arrives. One lost exchange does not end the session; the only terminal bound is <span class="kbd">peer_timeout</span> after the last authenticated evidence.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔀</div>
+          <h3>New public address while the session is alive</h3>
+          <p><strong>Authenticated path migration.</strong> A new address is not trusted automatically: its packets must authenticate under the session's current keys. The <span class="kbd">aismixer</span> service then challenges that address and moves its replies there only after the station's authenticated response arrives from it. The challenge is sent at most four times in total, at least 2 seconds apart, within a fixed 10-second window; retries improve delivery but grant no authority.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔑</div>
+          <h3>Long or terminal outage</h3>
+          <p><strong>Fresh authenticated establishment.</strong> Once the liveness bound is reached, the station performs a new signed handshake, and the <span class="kbd">aismixer</span> service expires the idle old session on its own.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><strong>Bounded, not lossless.</strong> Forwarding continues while liveness is in doubt, but UDPSEC never buffers or resends NMEA: sentences sent into an outage can be lost even when the session survives, and no session survives every outage. Same-path liveness recovery has been observed in a real road test; path migration is validated by end-to-end tests. Both are in the current source, not yet in a tagged release.</p>
     </section>
 
     <section id="receivers" class="section section-emphasis">
@@ -520,13 +547,13 @@
         <article class="card">
           <h3>Implemented outputs</h3>
           <ul class="list">
-            <li>Authenticated encrypted UDPSEC using the bounded session lifecycle described above.</li>
+            <li>Authenticated encrypted UDPSEC: the proxy authenticates the mixer and is authenticated by it, takes part in liveness, answers authenticated path challenges, runs optional in-session key-epoch refresh, and falls back to a fresh authenticated handshake after terminal loss.</li>
             <li>Explicit plain UDP for a trusted LAN, VPN, or equivalent boundary.</li>
           </ul>
         </article>
         <article class="card">
           <h3>Clear relation boundary</h3>
-          <p>One local input maps to one configured output. The proxy forwards the bare supported AIS sentence match, stripping ingress TAG blocks, prefixes, surrounding bytes, and input terminators. <span class="kbd">nmea_sproxy</span> does not mix, fan out, route, deduplicate, or assemble multipart AIS.</p>
+          <p>One local input maps to one configured output. The proxy forwards the bare supported AIS sentence match, stripping ingress TAG blocks, prefixes, surrounding bytes, and input terminators. <span class="kbd">nmea_sproxy</span> does not mix, fan out, route, deduplicate, or assemble multipart AIS, and path-migration decisions belong to the <span class="kbd">aismixer</span> service.</p>
         </article>
       </div>
       <div class="callout">
@@ -538,7 +565,7 @@
       <div class="section-heading">
         <p class="eyebrow">OpenWrt edge deployment</p>
         <h2>Run <span class="kbd">aismixer</span> or <span class="kbd">nmea_sproxy</span> on OpenWrt</h2>
-        <p class="section-intro">The signed AISMixer APK repository for OpenWrt 25.12 currently publishes the <span class="kbd">0.2.1-r4</span> Python/procd package snapshot for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</p>
+        <p class="section-intro">OpenWrt is a supported edge-deployment target for both the <span class="kbd">aismixer</span> service and <span class="kbd">nmea_sproxy</span>. The signed AISMixer APK repository for OpenWrt 25.12 currently publishes the <span class="kbd">0.2.1-r4</span> Python/procd package snapshot, built from the v0.2.1 release, for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
         <article class="card">
@@ -590,8 +617,8 @@ vi /etc/aismixer/authorized_keys.yaml
 /etc/init.d/aismixer start
 /etc/init.d/aismixer status
 logread -e aismixer</code></pre>
-      <p class="boundary-note"><strong>Package snapshot.</strong> Published <span class="kbd">0.2.1-r4</span> packages use a pinned source revision and may trail later <span class="kbd">main</span> changes. Check the package revision, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>, and <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">Releases</a> before assuming newer hardening is included.</p>
-      <p class="boundary-note"><strong>End-to-end validation.</strong> The <span class="kbd">mips_24kc</span> deployment path has been validated end to end with physical serial AIS ingress, <span class="kbd">nmea_sproxy</span>, authenticated UDPSEC, processing by the <span class="kbd">aismixer</span> service, <span class="kbd">procd</span> service operation, and local runtime control and observability.</p>
+      <p class="boundary-note"><strong>Package snapshot.</strong> The published <span class="kbd">0.2.1-r4</span> packages are built from the pinned v0.2.1 release. They predate the UDPSECv2 session-continuity work in the current source, and their UDPSEC wire format does not interoperate with current source-tree builds: keep both ends of a UDPSEC relation on the same release line. Packages with this work need a later release, at which the recipe is repinned. Check the package revision, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>, and <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">Releases</a>.</p>
+      <p class="boundary-note"><strong>End-to-end validation.</strong> The <span class="kbd">mips_24kc</span> deployment path of the published package line has been validated end to end with physical serial AIS ingress, <span class="kbd">nmea_sproxy</span>, authenticated UDPSEC, processing by the <span class="kbd">aismixer</span> service, <span class="kbd">procd</span> service operation, and local runtime control and observability.</p>
       <p class="boundary-note"><strong>Receiver-side endpoint only.</strong> Use <span class="kbd">apk add nmea_sproxy</span> instead of <span class="kbd">apk add aismixer</span> to install the station proxy independently. See the <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>, and <a href="https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment" target="_blank" rel="noopener">OpenWrt Deployment Wiki</a> for complete deployment and trust-provisioning steps.</p>
     </section>
 
@@ -610,7 +637,7 @@ logread -e aismixer</code></pre>
         <article class="card">
           <div class="icons" aria-hidden="true">🔄</div>
           <h3>Install, update, and uninstall</h3>
-          <p>Privilege-aware lifecycle scripts handle root or sudo operation and maintain the deployed runtime and service units. The AISMixer updater restarts its service and can start an inactive service; the <span class="kbd">nmea_sproxy</span> updater reloads systemd but does not start or restart proxy instances. See the <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> and <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>.</p>
+          <p>Privilege-aware lifecycle scripts handle root or sudo operation and maintain the deployed runtime and service units. The <span class="kbd">aismixer</span> updater restarts its service and can start an inactive service; the <span class="kbd">nmea_sproxy</span> updater reloads systemd but does not start or restart proxy instances. Update UDPSEC stations and the mixer together. See the <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> and <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener"><span class="kbd">nmea_sproxy</span> guide</a>.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🗝️</div>
@@ -629,8 +656,9 @@ logread -e aismixer</code></pre>
       <div class="section-heading">
         <p class="eyebrow">Documentation and project status</p>
         <h2>Implemented foundations, clearly separated from what comes next</h2>
-        <p class="section-intro">The Wiki is the detailed guide to architecture, configuration, routing, security, and operations. The Roadmap separates the completed baseline from future work without promising dates.</p>
+        <p class="section-intro">The repository README is the current project and operator overview, the behavioural contract defines exact semantics, and the Wiki holds deeper architecture and deployment guides. The Roadmap separates the completed baseline from future work without promising dates.</p>
       </div>
+      <p class="boundary-note"><strong>Release status.</strong> The latest tagged release is <span class="kbd">v0.2.1</span>. The current <span class="kbd">main</span> source also contains unreleased work, including the UDPSECv2 session continuity described above. The published OpenWrt packages (<span class="kbd">0.2.1-r4</span>) are built from v0.2.1. See the <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>.</p>
       <div class="status-grid">
         <article class="card status-card status-now">
           <h3 class="status-label">Implemented now</h3>
@@ -641,22 +669,25 @@ logread -e aismixer</code></pre>
             <li>Logical zones and target-scoped deduplication, atomic process-local routing updates, interactive <span class="kbd">aismixerctl</span>, and read-only aggregate, per-input, and per-output statistics.</li>
             <li>Deterministic multipart assembly, TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> handling, and global or target-scoped deduplication.</li>
             <li>Authenticated ephemeral P-256 ECDHE UDPSEC, configured long-term P-256 ECDSA identities, fresh directional AES-256-GCM keys, encrypted key-possession confirmation, authenticated and encrypted data, liveness, and best-effort close, full-epoch DATA replay protection, fail-closed bounded state, and physical-listener session isolation.</li>
+            <li>In the current source, not yet in a tagged release: UDPSECv2 session continuity — liveness recovery on the same path, authenticated path migration with return-routability proof, and in-session key-epoch refresh.</li>
             <li>One UDP or serial input to one UDPSEC or explicit trusted plain-UDP output per <span class="kbd">nmea_sproxy</span> process or systemd instance, plus IPv4/IPv6 endpoint controls.</li>
-            <li>Debian-family deployment with systemd <span class="kbd">RuntimeDirectory</span>, privilege-aware lifecycle scripts, preserved operator state, and the global operator CLI, alongside the signed OpenWrt 25.12 APK/procd deployment published for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span>.</li>
+            <li>Debian-family deployment with systemd <span class="kbd">RuntimeDirectory</span>, privilege-aware lifecycle scripts, preserved operator state, and the global operator CLI, alongside the signed OpenWrt 25.12 APK/procd deployment published for <span class="kbd">x86_64</span> and <span class="kbd">mips_24kc</span> (<span class="kbd">0.2.1-r4</span>, built from v0.2.1).</li>
           </ul>
         </article>
         <article class="card status-card status-next">
           <h3 class="status-label">Planned work</h3>
           <ul class="list">
-            <li>A coordinator process and actual separate ingress and egress worker processes.</li>
-            <li>IPC, cross-process routing-snapshot distribution and supervision, worker restart and recovery policy, and metrics aggregation where required.</li>
-            <li>A future native processor and bindings behind the established contracts, with differential conformance; none exists today, and no performance result is claimed.</li>
-            <li>A broader ingress and egress adapter architecture beyond the current UDP pathways.</li>
+            <li>Further operational deployment hardening, such as explicit control-socket ownership and Linux and Raspberry Pi validation.</li>
+            <li>A coordinator process with separate ingress and egress worker processes, IPC, and cross-process supervision, and later a native processor behind the established contracts with differential conformance; none exists today, and no performance result is claimed.</li>
+            <li>Routing-state operations such as optional persistence, safe configuration reload, and rollback history.</li>
+            <li>Maritime security and data-quality research, including AIS spoof and anomaly detection, which is not implemented today.</li>
+            <li>Later expansion such as additional egress adapters and remote authenticated control.</li>
           </ul>
         </article>
       </div>
       <div class="card links" role="group" aria-label="Documentation links">
         <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Main repository</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a href="https://github.com/iliyan85/aismixer/wiki/Quick-Start" target="_blank" rel="noopener">Quick Start</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">Behavioural contract</a>

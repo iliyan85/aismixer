@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AISMixer | Platformă de procesare și rutare a fluxurilor AIS</title>
   <link rel="canonical" href="https://aismixer.net/ro/">
-  <meta name="description" content="AISMixer procesează și rutează logic fluxuri AIS NMEA 0183 cu etape cu capacitate finită, observabilitate runtime locală procesului prin aismixerctl și UDPSEC cu ECDHE autentificat.">
-  <meta name="keywords" content="AISMixer, AIS NMEA 0183, procesarea fluxurilor AIS, rutare logică, observabilitate runtime, UDPSEC, ECDHE autentificat, nmea_sproxy, AIVDM, AIVDO, aismixerctl, date maritime">
+  <meta name="description" content="AISMixer combină, deduplică, etichetează și rutează fluxuri AIS NMEA 0183 de la mai multe receptoare, cu transport UDPSECv2 autentificat pentru stații aflate la distanță și mobile.">
+  <meta name="keywords" content="AISMixer, AIS NMEA 0183, procesarea fluxurilor AIS, rutare logică, observabilitate runtime, UDPSEC, UDPSECv2, ECDHE autentificat, continuitatea mobilă a sesiunii, nmea_sproxy, AIVDM, AIVDO, aismixerctl, date maritime">
   <meta name="robots" content="index,follow">
   <meta name="theme-color" content="#0b1220">
   <meta name="color-scheme" content="light dark">
@@ -14,7 +14,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AISMixer">
   <meta property="og:title" content="AISMixer | Platformă de procesare și rutare a fluxurilor AIS">
-  <meta property="og:description" content="Procesare AIS deterministă și rutare logică, cu etape cu capacitate finită, observabilitate runtime locală procesului și UDPSEC cu ECDHE autentificat.">
+  <meta property="og:description" content="Procesare AIS deterministă și rutare logică, cu observabilitate runtime locală procesului și transport UDPSECv2 autentificat cu continuitate mobilă a sesiunii.">
   <meta property="og:url" content="https://aismixer.net/ro/">
   <meta property="og:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta property="og:image:secure_url" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
@@ -28,7 +28,7 @@
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="AISMixer | Platformă de procesare și rutare a fluxurilor AIS">
-  <meta name="twitter:description" content="Procesare AIS · Rutare logică · Observabilitate runtime · UDPSEC cu ECDHE autentificat">
+  <meta name="twitter:description" content="Procesare AIS · Rutare logică · Observabilitate runtime · Continuitate mobilă UDPSECv2">
   <meta name="twitter:image" content="https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png">
   <meta name="twitter:image:alt" content="Prezentare generală a platformei AISMixer pentru procesarea și rutarea fluxurilor AIS">
 
@@ -47,7 +47,7 @@
     "applicationCategory": "DeveloperApplication",
     "programmingLanguage": "Python",
     "operatingSystem": ["Linux", "Raspberry Pi OS", "Debian", "Ubuntu", "OpenWrt"],
-    "description": "Platformă pentru procesarea deterministă AIS NMEA 0183, rutare logică, etape cu capacitate finită, observabilitate runtime locală procesului și UDPSEC cu ECDHE autentificat; codul-sursă este disponibil public sub licența CC BY-NC 4.0.",
+    "description": "Platformă pentru procesarea deterministă AIS NMEA 0183, rutare logică, etape cu capacitate finită, observabilitate runtime locală procesului și transport UDPSECv2 autentificat cu continuitate mobilă a sesiunii; codul-sursă este disponibil public sub licența CC BY-NC 4.0.",
     "url": "https://aismixer.net/ro/",
     "image": "https://aismixer.net/assets/img/aismixer-social-preview-1280x640.png",
     "codeRepository": "https://github.com/iliyan85/aismixer",
@@ -67,7 +67,7 @@
       "https://github.com/iliyan85/aismixer"
     ],
     "inLanguage": "ro",
-    "keywords": ["AIS NMEA 0183", "procesarea fluxurilor", "rutare logică", "observabilitate runtime", "aismixerctl", "UDPSEC", "ECDHE autentificat", "nmea_sproxy", "AIVDM", "AIVDO"]
+    "keywords": ["AIS NMEA 0183", "procesarea fluxurilor", "rutare logică", "observabilitate runtime", "aismixerctl", "UDPSEC", "UDPSECv2", "ECDHE autentificat", "continuitatea mobilă a sesiunii", "nmea_sproxy", "AIVDM", "AIVDO"]
   }
   </script>
   <link rel="alternate" hreflang="en" href="https://aismixer.net/">
@@ -114,9 +114,9 @@
         <p class="hero-kicker">Platformă de procesare și rutare a fluxurilor AIS</p>
         <p class="tagline">Normalizează · Deduplică · Etichetează · Rutează · Redirecționează</p>
         <p class="lead">
-          Recepționați fluxuri AIS, transformați traficul receptoarelor într-un
-          singur flux logic controlat și livrați-l către destinațiile UDP egress
-          care au nevoie de el.
+          Combinați fluxuri AIS de la receptoare fixe, de coastă, din porturi și
+          mobile într-un singur flux logic controlat și livrați-l către
+          destinațiile UDP egress care au nevoie de el.
         </p>
         <div class="cta" role="group" aria-label="Legături către proiect">
           <a class="button primary" href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">Începeți</a>
@@ -128,7 +128,7 @@
         <div class="icons" aria-hidden="true">📡 → 🧭 → 📤</div>
         <p class="card-heading" id="logical-stream-title">Un singur flux AIS logic</p>
         <ul class="list">
-          <li>Recepționează ingress prin UDP simplu și UDPSEC autentificat.</li>
+          <li>Recepționează UDP simplu și trafic UDPSECv2 autentificat de la stații fixe și mobile.</li>
           <li>Extrage și asamblează <span class="kbd">!AIVDM</span> și <span class="kbd">!AIVDO</span>.</li>
           <li>Deduplică, controlează metadatele TAG și aplică rutarea.</li>
           <li>Redirecționează datele acceptate către destinații UDP egress denumite și selectate.</li>
@@ -142,7 +142,7 @@
       <div class="section-heading">
         <p class="eyebrow">Procesarea fluxurilor AIS</p>
         <h2>De la traficul receptoarelor la un flux curat, cu surse identificabile</h2>
-        <p class="section-intro">AISMixer reunește transportul, asamblarea NMEA, metadatele, deduplicarea și livrarea într-un singur traseu de procesare aproape în timp real. Ecosistemul AISMixer include serviciul <span class="kbd">aismixer</span> pentru procesarea și rutarea fluxurilor, <span class="kbd">nmea_sproxy</span>, <span class="kbd">aismixerctl</span>, transportul securizat, instrumentele de implementare și componentele conexe.</p>
+        <p class="section-intro">AISMixer reunește transportul, asamblarea NMEA, metadatele, deduplicarea și livrarea într-un singur traseu de procesare aproape în timp real. Componentele sale de runtime sunt <span class="kbd">aismixer</span> — mixerul, routerul și serverul UDPSEC; <span class="kbd">aismixerctl</span> pentru controlul local al rutării și statisticile runtime; și <span class="kbd">nmea_sproxy</span> — proxy-ul de la stație, de la o sursă locală UDP sau serial/USB la o destinație UDPSEC ori UDP simplu configurată explicit.</p>
       </div>
       <div class="grid">
         <article class="card">
@@ -191,11 +191,11 @@
 
     <section id="processing-contract" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Fundament al planului de date din campaniile C–F, pregătit pentru o implementare nativă</p>
+        <p class="eyebrow">Fundament al planului de date, pregătit pentru o implementare nativă</p>
         <h2>Procesare explicită, etape cu capacitate finită și egress unificat</h2>
         <p class="section-intro">Ingress-ul imuabil la nivel de octeți trece prin etape explicite, cu capacitate finită, într-un singur proces. După ce devine disponibilă capacitatea comună de procesare, fiecare cadru admis este asociat unui singur <span class="kbd">ProcessingSnapshot</span> și procesat de <span class="kbd">PythonDataPlaneProcessor</span>, care deține starea instanței și rămâne unicul procesor actual de producție și de referință. Acesta returnează un <span class="kbd">OutputBatch</span> imuabil și ordonat, ale cărui valori <span class="kbd">ProcessorOutput</span> transportă octeții exacți și ID-urile numerice ale destinațiilor prin handoff-ul egress cu capacitate finită.</p>
       </div>
-      <div class="pipeline representation-pipeline" role="group" aria-label="Etapele implementate ale planului de date de producție din campaniile C–F">
+      <div class="pipeline representation-pipeline" role="group" aria-label="Etapele implementate ale planului de date de producție">
         <div class="pipeline-node">
           <strong>Producători UDP / UDPSEC</strong>
           <span>Coadă privată limitată cu <span class="kbd">IngressFrame</span> pentru fiecare intrare</span>
@@ -280,7 +280,7 @@
         <article class="card state-card">
           <div class="icons" aria-hidden="true">🔐</div>
           <h3>Protecție anti-replay și sesiuni securizate</h3>
-          <p>Înregistrările anti-replay pentru handshake, precum și sesiunile în așteptare și active, au TTL-uri monotone și limite stricte de capacitate. Fiecare nonce DATA admis rămâne însă memorat pentru întreaga epocă utilizabilă a cheii de trafic direcționale, fără TTL independent și fără eliminare cât timp acea epocă rămâne utilizabilă. Epuizarea invalidează în mod sigur (fail-closed) numai epoca de cheie afectată; recuperarea folosește un handshake autentificat nou, cu chei direcționale proaspete.</p>
+          <p>Înregistrările anti-replay pentru handshake, sesiunile în așteptare și active, precum și registrul de nonce-uri DATA al fiecărei epoci de chei au limite stricte de capacitate; în timpul unei reîmprospătări a epocii de chei în sesiune, o sesiune are cel mult trei epoci active. Durata de viață a handshake-urilor și a sesiunilor folosește TTL-uri monotone. Fiecare nonce DATA admis rămâne însă memorat pe toată durata utilizabilă a epocii sale, fără TTL independent și fără eliminare. Epuizarea registrului epocii curente eșuează în mod sigur (fail-closed) și încheie sesiunea, iar recuperarea folosește un handshake autentificat nou; epuizarea unei epoci în așteptare sau în retragere elimină numai acea epocă. Starea migrării căii este limitată la un candidat și o cale retrasă pentru fiecare sesiune.</p>
           <p>Un candidat în așteptare înlocuiește numai un candidat mai vechi pentru aceeași relație dintre listenerul fizic și peer și păstrează orice sesiune activă până când confirmarea criptată autentificată reușește. Sesiunile aceluiași peer pe listenere UDPSEC fizice separate sunt izolate unele de altele; limitele agregate de capacitate rămân la nivelul procesului. Toată starea securizată rămâne numai în memorie, este locală procesului și se pierde la repornire.</p>
         </article>
         <article class="card state-card">
@@ -295,9 +295,9 @@
 
     <section id="worker-readiness" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Campania F — implementată</p>
+        <p class="eyebrow">Pregătirea pentru workeri — implementată</p>
         <h2>Limite pregătite pentru workeri într-un singur proces</h2>
-        <p class="section-intro">Campania F a finalizat limitele observabile și cu capacitate finită din jurul runtime-ului Python actual. Starea mutabilă de procesare are un proprietar explicit la nivel de instanță, lucrul este admis numai când există capacitate, iar statisticile pull-based proaspete fac vizibilă activitatea etapelor fără să o modifice.</p>
+        <p class="section-intro">Runtime-ul Python actual are limite observabile și cu capacitate finită în jurul etapelor de procesare. Starea mutabilă de procesare are un proprietar explicit la nivel de instanță, lucrul este admis numai când există capacitate, iar statisticile pull-based proaspete fac vizibilă activitatea etapelor fără să o modifice.</p>
       </div>
       <div class="grid feature-row">
         <article class="card">
@@ -423,9 +423,9 @@
 
     <section id="secure-state" class="section">
       <div class="section-heading">
-        <p class="eyebrow">Ciclul de viață UDPSEC</p>
+        <p class="eyebrow">Transportul securizat UDPSECv2</p>
         <h2>Transport autentificat cu stare locală limitată</h2>
-        <p class="section-intro">Traseul UDPSEC actual din versiunea publicată dintre <span class="kbd">nmea_sproxy</span> și serviciul <span class="kbd">aismixer</span> folosește identități ECDSA P-256 pe termen lung configurate, ECDHE efemer P-256 semnat, chei AES-256-GCM direcționale proaspete și dovada criptată a posesiei cheilor prin confirmarea cu secvența zero înainte ca clientul să considere stabilită o sesiune nouă.</p>
+        <p class="section-intro">UDPSEC este transportul UDP autentificat și criptat, specific proiectului AISMixer, dintre stațiile cu <span class="kbd">nmea_sproxy</span> și serviciul <span class="kbd">aismixer</span>. Sursa actuală implementează UDPSECv2: identități ECDSA P-256 pe termen lung configurate, stabilire semnată prin ECDHE efemer P-256 cu dovada criptată a posesiei cheilor prin confirmarea cu secvența zero, DATA protejat cu AES-256-GCM, protecție anti-replay, liveness autentificat, reîmprospătarea epocii de chei în sesiune și migrare autentificată a căii. Funcțiile de continuitate a sesiunii nu sunt încă incluse într-o versiune etichetată și nici în pachetele OpenWrt publicate.</p>
       </div>
       <div class="pipeline reference-pipeline" role="group" aria-label="Fluxul de stabilire a unei sesiuni UDPSEC autentificate">
         <div class="pipeline-node">
@@ -468,10 +468,10 @@
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">♻️</div>
-          <h3>Actualizare coordonată și stare locală</h3>
-          <p>Ambele endpoint-uri trebuie actualizate împreună. După confirmare, mesajele NMEA DATA, schimburile ping/pong pentru verificarea activității și închiderea best-effort sunt autentificate și criptate. O verificare a activității rămasă fără răspuns sau reîmprospătarea planificată opțională a sesiunii pornește proactiv un handshake ECDHE semnat nou, cu chei direcționale proaspete; UDPSEC nu memorează și nu retransmite payload-uri NMEA în timpul recuperării.</p>
-          <p>Recuperarea folosește un handshake autentificat nou. UDPSEC nu are resetare în clar, recuperare <span class="kbd">NOSESSION</span>, control de downgrade sau revenire automată la UDP simplu. Pachetele DATA pentru sesiuni vechi necunoscute sunt ignorate fără răspuns de recuperare în clar. Starea securizată a sesiunilor și protecției anti-replay rămâne numai în memorie, este locală procesului, nepersistentă și se pierde la repornire.</p>
-          <p>UDPSEC funcționează prin NAT sau CGNAT cât timp adresa și portul sursă observate de server rămân stabile. Reasocierea adresei sau portului ori schimbarea rețelei necesită un handshake autentificat nou; sesiunea existentă nu este migrată automat.</p>
+          <h3>Sesiuni, epoci de chei și fără revenire automată</h3>
+          <p>O sesiune este legată de stația autentificată și identificată printr-un locator de sesiune emis de mixer, niciodată prin adresa IP și portul sursă. După confirmare, mesajele NMEA DATA, ping/pong-ul keepalive, controlul din sesiune și închiderea best-effort sunt autentificate și criptate, iar fiecare pachet este legat de sesiunea și epoca sa de chei. Receptoarele păstrează fiecare nonce admis pe durata epocii sale și resping repetările.</p>
+          <p>Cu <span class="kbd">session_refresh_interval</span> peste zero, stația reînnoiește cheile de trafic în cadrul aceleiași sesiuni, printr-un schimb ECDHE semnat nou; aceasta nu este nici o sesiune nouă, nici o schimbare de cale. UDPSEC nu are resetare în clar, recuperare <span class="kbd">NOSESSION</span>, control de downgrade sau revenire automată la UDP simplu și nu memorează și nu retransmite payload-uri NMEA. Starea securizată a sesiunilor și protecției anti-replay rămâne numai în memorie, este locală procesului, nepersistentă și se pierde la repornire.</p>
+          <p>Actualizați ambele endpoint-uri împreună: formatul actual al pachetelor UDPSECv2 nu este compatibil cu versiunile anterioare, inclusiv cu pachetele OpenWrt <span class="kbd">0.2.1</span> publicate.</p>
         </article>
       </div>
       <div class="callout">
@@ -479,6 +479,32 @@
         <p><strong>Limita transportului:</strong> UDPSEC autentifică și criptează pachetele de date și de control în domeniul său, dar nu dovedește identitatea sau poziția navei, originea fizică ori absența spoofing-ului AIS, nu garantează livrarea sau ordinea UDP, nu protejează endpoint-uri compromise și nu oferă rezistență completă la atacuri de refuz al serviciului. Nu ascunde adresele IP ale participanților, temporizarea sau lungimile pachetelor și nici identificatorul stației din ClientHello, transmis în clar.</p>
         <p>Citiți <a href="https://github.com/iliyan85/aismixer/blob/main/SECURITY.md" target="_blank" rel="noopener">politica de securitate</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">contractul comportamental</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> și <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">Wiki-ul</a> pentru limitele detaliate.</p>
       </div>
+    </section>
+
+    <section id="mobile-continuity" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">Continuitate mobilă</p>
+        <h2>Păstrarea sesiunii stației în cazul pierderilor mobile obișnuite</h2>
+        <p class="section-intro">UDPSEC funcționează prin NAT și CGNAT. Stațiile mobile pierd pachete, iar adresa lor IP publică sau portul UDP se pot schimba. Testele de teren au arătat că un handover celular păstrează adesea aceeași adresă publică și același port, astfel încât UDPSECv2 tratează o pierdere temporară diferit de o schimbare reală de adresă.</p>
+      </div>
+      <div class="grid feature-row">
+        <article class="card">
+          <div class="icons" aria-hidden="true">📶</div>
+          <h3>Pierdere scurtă pe aceeași cale</h3>
+          <p><strong>Recuperarea liveness.</strong> Stația retrimite, cu o rată limitată, singurul său ping keepalive fără răspuns, cu același număr de secvență și cu o criptare nouă de fiecare dată, până când sosește un răspuns autentificat. Un singur schimb pierdut nu încheie sesiunea; singura limită terminală este <span class="kbd">peer_timeout</span> după ultima dovadă autentificată.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔀</div>
+          <h3>Adresă publică nouă cât timp sesiunea este activă</h3>
+          <p><strong>Migrare autentificată a căii.</strong> O adresă nouă nu este considerată de încredere automat: pachetele ei trebuie să se autentifice cu cheile curente ale sesiunii. Serviciul <span class="kbd">aismixer</span> trimite apoi o verificare (challenge) către acea adresă și își mută răspunsurile acolo numai după ce răspunsul autentificat al stației sosește de la ea. Verificarea este trimisă de cel mult patru ori în total, la cel puțin 2 secunde distanță, într-o fereastră fixă de 10 secunde; retrimiterile îmbunătățesc livrarea, dar nu acordă autoritate.</p>
+        </article>
+        <article class="card">
+          <div class="icons" aria-hidden="true">🔑</div>
+          <h3>Întrerupere lungă sau terminală</h3>
+          <p><strong>Stabilire autentificată nouă.</strong> Odată atinsă limita de liveness, stația efectuează un handshake semnat nou, iar serviciul <span class="kbd">aismixer</span> elimină singur vechea sesiune inactivă.</p>
+        </article>
+      </div>
+      <p class="boundary-note"><strong>Limitat, nu fără pierderi.</strong> Redirecționarea continuă cât timp liveness-ul este incert, dar UDPSEC nu memorează și nu retransmite niciodată date NMEA: propozițiile trimise în timpul unei întreruperi se pot pierde chiar și atunci când sesiunea supraviețuiește, iar nicio sesiune nu supraviețuiește oricărei întreruperi. Recuperarea liveness pe aceeași cale a fost observată într-un test real pe drum; migrarea căii este validată prin teste end-to-end. Ambele sunt în sursa actuală, dar încă nu într-o versiune etichetată.</p>
     </section>
 
     <section id="receivers" class="section section-emphasis">
@@ -521,13 +547,13 @@
         <article class="card">
           <h3>Ieșiri implementate</h3>
           <ul class="list">
-            <li>UDPSEC autentificat și criptat, folosind ciclul de viață limitat al sesiunilor descris mai sus.</li>
+            <li>UDPSEC autentificat și criptat: proxy-ul autentifică mixerul și este autentificat de acesta, participă la verificarea liveness, răspunde la verificările autentificate ale căii, rulează opțional reîmprospătarea epocii de chei în sesiune și, după o pierdere terminală, trece la un handshake autentificat nou.</li>
             <li>UDP simplu explicit pentru o rețea LAN, un VPN sau o limită echivalentă declarată de încredere.</li>
           </ul>
         </article>
         <article class="card">
           <h3>Model clar al relației</h3>
-          <p>O intrare locală este asociată unei singure ieșiri configurate. Fiecare potrivire AIS NMEA acceptată este redirecționată fără blocuri TAG de intrare, prefixe, octeți din jur și terminatori. <span class="kbd">nmea_sproxy</span> nu mixează, nu distribuie către mai multe ieșiri, nu rutează, nu deduplică și nu asamblează AIS multipart.</p>
+          <p>O intrare locală este asociată unei singure ieșiri configurate. Fiecare potrivire AIS NMEA acceptată este redirecționată fără blocuri TAG de intrare, prefixe, octeți din jur și terminatori. <span class="kbd">nmea_sproxy</span> nu mixează, nu distribuie către mai multe ieșiri, nu rutează, nu deduplică și nu asamblează AIS multipart, iar deciziile de migrare a căii aparțin serviciului <span class="kbd">aismixer</span>.</p>
         </article>
       </div>
       <div class="callout">
@@ -539,7 +565,7 @@
       <div class="section-heading">
         <p class="eyebrow">Implementare OpenWrt la marginea rețelei</p>
         <h2>Rulați serviciul <span class="kbd">aismixer</span> sau serviciul <span class="kbd">nmea_sproxy</span> pe OpenWrt</h2>
-        <p class="section-intro">Depozitul AISMixer APK semnat pentru OpenWrt 25.12 publică versiunea <span class="kbd">0.2.1-r4</span> a pachetelor Python/procd pentru arhitecturile <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</p>
+        <p class="section-intro">OpenWrt este o țintă de implementare la marginea rețelei acceptată atât pentru serviciul <span class="kbd">aismixer</span>, cât și pentru <span class="kbd">nmea_sproxy</span>. Depozitul AISMixer APK semnat pentru OpenWrt 25.12 publică în prezent versiunea <span class="kbd">0.2.1-r4</span> a pachetelor Python/procd, construită din versiunea v0.2.1, pentru arhitecturile <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</p>
       </div>
       <div class="grid feature-row proxy-grid">
         <article class="card">
@@ -591,8 +617,8 @@ vi /etc/aismixer/authorized_keys.yaml
 /etc/init.d/aismixer start
 /etc/init.d/aismixer status
 logread -e aismixer</code></pre>
-      <p class="boundary-note"><strong>Versiunea pachetelor.</strong> Pachetele <span class="kbd">0.2.1-r4</span> publicate folosesc o revizie fixată a sursei și pot rămâne în urma modificărilor ulterioare din <span class="kbd">main</span>. Verificați revizia pachetului, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">lista de modificări</a> și <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">versiunile publicate</a> înainte de a presupune că sunt incluse consolidări mai noi.</p>
-      <p class="boundary-note"><strong>Validare cap la cap.</strong> Calea de implementare pentru <span class="kbd">mips_24kc</span> a fost validată cap la cap cu intrare AIS serială fizică, <span class="kbd">nmea_sproxy</span>, UDPSEC autentificat, procesare prin serviciul <span class="kbd">aismixer</span>, funcționarea serviciilor prin <span class="kbd">procd</span>, control local și observabilitate runtime.</p>
+      <p class="boundary-note"><strong>Versiunea pachetelor.</strong> Pachetele <span class="kbd">0.2.1-r4</span> publicate sunt construite din versiunea fixată v0.2.1. Ele sunt anterioare lucrărilor de continuitate a sesiunilor UDPSECv2 din sursa actuală, iar formatul lor de pachete UDPSEC nu este compatibil cu build-urile din arborele-sursă actual: folosiți aceeași linie de versiune la ambele capete ale unei relații UDPSEC. Pachetele care includ aceste lucrări necesită o versiune ulterioară, la care rețeta este refixată. Verificați revizia pachetului, <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">lista de modificări</a> și <a href="https://github.com/iliyan85/aismixer/releases" target="_blank" rel="noopener">versiunile publicate</a>.</p>
+      <p class="boundary-note"><strong>Validare cap la cap.</strong> Calea de implementare pentru <span class="kbd">mips_24kc</span> a liniei de pachete publicate a fost validată cap la cap cu intrare AIS serială fizică, <span class="kbd">nmea_sproxy</span>, UDPSEC autentificat, procesare prin serviciul <span class="kbd">aismixer</span>, funcționarea serviciilor prin <span class="kbd">procd</span>, control local și observabilitate runtime.</p>
       <p class="boundary-note"><strong>Doar punctul terminal de lângă receptor.</strong> Folosiți <span class="kbd">apk add nmea_sproxy</span> în loc de <span class="kbd">apk add aismixer</span> pentru a instala independent proxy-ul de la stație. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a>, <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a> și <a href="https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment" target="_blank" rel="noopener">ghidul de implementare OpenWrt</a> pentru pașii compleți de implementare și configurare a încrederii.</p>
     </section>
 
@@ -611,7 +637,7 @@ logread -e aismixer</code></pre>
         <article class="card">
           <div class="icons" aria-hidden="true">🔄</div>
           <h3>Instalare, actualizare și dezinstalare</h3>
-          <p>Scripturile pentru ciclul de viață gestionează rularea ca root sau prin sudo și întrețin fișierele runtime și unitățile de serviciu instalate. Updaterul AISMixer repornește serviciul și poate porni un serviciu inactiv; updaterul <span class="kbd">nmea_sproxy</span> reîncarcă systemd, dar nu pornește și nu repornește instanțele proxy. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> și <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a>.</p>
+          <p>Scripturile pentru ciclul de viață gestionează rularea ca root sau prin sudo și întrețin fișierele runtime și unitățile de serviciu instalate. Updaterul <span class="kbd">aismixer</span> repornește serviciul și poate porni un serviciu inactiv; updaterul <span class="kbd">nmea_sproxy</span> reîncarcă systemd, dar nu pornește și nu repornește instanțele proxy. Actualizați stațiile UDPSEC împreună cu mixerul. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a> și <a href="https://github.com/iliyan85/aismixer/blob/main/nmea_sproxy/README.md" target="_blank" rel="noopener">ghidul <span class="kbd">nmea_sproxy</span></a>.</p>
         </article>
         <article class="card">
           <div class="icons" aria-hidden="true">🗝️</div>
@@ -630,8 +656,9 @@ logread -e aismixer</code></pre>
       <div class="section-heading">
         <p class="eyebrow">Documentație și starea proiectului</p>
         <h2>Funcționalitățile implementate sunt separate clar de pașii următori</h2>
-        <p class="section-intro">Wiki-ul este ghidul detaliat pentru arhitectură, configurare, rutare, securitate și operare. Roadmap-ul separă fundamentul finalizat de activitatea viitoare fără a promite termene.</p>
+        <p class="section-intro">README-ul din depozit este prezentarea generală actuală a proiectului pentru operatori, contractul comportamental definește semantica exactă, iar Wiki-ul conține ghiduri mai detaliate de arhitectură și implementare. Roadmap-ul separă fundamentul finalizat de activitatea viitoare fără a promite termene.</p>
       </div>
+      <p class="boundary-note"><strong>Starea versiunilor.</strong> Ultima versiune etichetată este <span class="kbd">v0.2.1</span>. Sursa actuală din <span class="kbd">main</span> conține și lucrări nelansate, inclusiv continuitatea sesiunilor UDPSECv2 descrisă mai sus. Pachetele OpenWrt publicate (<span class="kbd">0.2.1-r4</span>) sunt construite din v0.2.1. Consultați <a href="https://github.com/iliyan85/aismixer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">lista de modificări</a>.</p>
       <div class="status-grid">
         <article class="card status-card status-now">
           <h3 class="status-label">Implementat acum</h3>
@@ -642,22 +669,25 @@ logread -e aismixer</code></pre>
             <li>Zone logice și deduplicare per destinație, actualizări atomice ale rutării locale procesului, <span class="kbd">aismixerctl</span> interactiv și statistici read-only agregate, per intrare și per ieșire.</li>
             <li>Asamblare multipart deterministă, gestionarea TAG <span class="kbd">s</span>/<span class="kbd">c</span>/<span class="kbd">g</span> și deduplicare globală sau per destinație.</li>
             <li>UDPSEC cu ECDHE efemer P-256 autentificat, identități ECDSA P-256 pe termen lung configurate, chei AES-256-GCM direcționale proaspete, confirmarea criptată a posesiei cheilor, date și verificări ale activității autentificate și criptate, închidere best-effort autentificată și criptată, protecție anti-replay DATA pe întreaga epocă a cheii, stare limitată fail-closed și izolarea sesiunilor pe listener fizic.</li>
+            <li>În sursa actuală, încă neinclusă într-o versiune etichetată: continuitatea sesiunilor UDPSECv2 — recuperarea liveness pe aceeași cale, migrarea autentificată a căii cu dovada rutabilității de retur și reîmprospătarea epocii de chei în sesiune.</li>
             <li>Pentru fiecare proces sau instanță systemd <span class="kbd">nmea_sproxy</span>, o intrare UDP sau serială spre o ieșire UDPSEC ori o ieșire plain-UDP configurată explicit pentru o rețea de încredere, plus controale endpoint IPv4/IPv6.</li>
-            <li>Implementare pentru familia Debian cu <span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață care gestionează privilegiile, păstrarea stării operatorului și CLI global pentru operatori, alături de implementarea APK/procd semnată pentru OpenWrt 25.12, publicată pentru <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span>.</li>
+            <li>Implementare pentru familia Debian cu <span class="kbd">RuntimeDirectory</span> systemd, scripturi pentru ciclul de viață care gestionează privilegiile, păstrarea stării operatorului și CLI global pentru operatori, alături de implementarea APK/procd semnată pentru OpenWrt 25.12, publicată pentru <span class="kbd">x86_64</span> și <span class="kbd">mips_24kc</span> (<span class="kbd">0.2.1-r4</span>, construită din v0.2.1).</li>
           </ul>
         </article>
         <article class="card status-card status-next">
           <h3 class="status-label">Activități planificate</h3>
           <ul class="list">
-            <li>Un proces coordonator și procese worker ingress și egress reale și separate.</li>
-            <li>IPC, distribuirea snapshot-urilor de rutare și supravegherea între procese, politici de repornire și recuperare a workerilor și agregarea metricilor acolo unde este necesar.</li>
-            <li>Un viitor procesor nativ și binding-uri în spatele contractelor stabilite, cu verificare diferențială a conformității; în prezent nu există o astfel de implementare și nu se afirmă rezultate de performanță.</li>
-            <li>O arhitectură mai largă pentru adaptoarele ingress și egress, dincolo de traseele UDP actuale.</li>
+            <li>Consolidarea suplimentară a implementării operaționale, de exemplu proprietatea explicită a socketului de control și validarea pe Linux și Raspberry Pi.</li>
+            <li>Un proces coordonator cu procese worker ingress și egress separate, IPC și supraveghere între procese, iar ulterior un procesor nativ în spatele contractelor stabilite, cu verificare diferențială a conformității; în prezent nu există o astfel de implementare și nu se afirmă rezultate de performanță.</li>
+            <li>Operații asupra stării rutării, precum persistența opțională, reîncărcarea sigură a configurației și istoricul pentru rollback.</li>
+            <li>Cercetare privind securitatea maritimă și calitatea datelor, inclusiv detectarea spoofing-ului și a anomaliilor AIS, care nu este implementată în prezent.</li>
+            <li>Extindere ulterioară, precum adaptoare de ieșire suplimentare și control la distanță autentificat.</li>
           </ul>
         </article>
       </div>
       <div class="card links" role="group" aria-label="Legături către documentație">
         <a href="https://github.com/iliyan85/aismixer" target="_blank" rel="noopener">Depozitul principal</a>
+        <a href="https://github.com/iliyan85/aismixer/blob/main/README.md" target="_blank" rel="noopener">README</a>
         <a href="https://github.com/iliyan85/aismixer/wiki" target="_blank" rel="noopener">GitHub Wiki</a>
         <a href="https://github.com/iliyan85/aismixer/wiki/Quick-Start" target="_blank" rel="noopener">Quick Start</a>
         <a href="https://github.com/iliyan85/aismixer/blob/main/BEHAVIORAL_CONTRACT.md" target="_blank" rel="noopener">Contract comportamental</a>
