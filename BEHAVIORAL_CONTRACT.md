@@ -2395,6 +2395,10 @@ mechanisms compose (`tests/test_udpsec_mp3_integration.py`):
   or after it is omitted. Each listener's driver claims and sends only its
   own endpoint token's retries, through its own socket.
 
+The recovery baseline's closure section (14) records the committed recovery
+baseline, the independent gate results, the field-evidence status and the
+accepted residuals. It adds no guarantee beyond this section.
+
 ## 12. Routing snapshot boundary
 
 Routing configuration, `RouteDefinition.to`, route errors, status, control

@@ -1,12 +1,11 @@
 # 🧩 nmea_sproxy — operator guide
 
-`nmea_sproxy` is the station-side bridge between one local AIS/NMEA input and
-one network output. It can read UDP or serial input and send either protected
-UDPSEC traffic or explicitly selected plain UDP.
-
-This guide covers normal installation, configuration, identity and trust,
-service operation, OpenWrt deployment, and troubleshooting. For the project
-overview, see the [root README](../README.md).
+`nmea_sproxy` is AISMixer's lightweight station-side proxy. It runs next to an
+AIS receiver, reads one local UDP or serial input, and sends the AIS sentences
+it finds to a remote `aismixer` service: over UDPSEC, or over plain UDP when
+explicitly selected. Deduplication, multipart assembly, TAG handling, and
+routing happen at the mixer, not here. For the project overview, see the
+[root README](../README.md).
 
 ## 🧭 Purpose and relation model
 
@@ -16,8 +15,6 @@ One `nmea_sproxy` process represents one runtime relation:
 
 It does not mix inputs, perform aismixer routing or fan-out, deduplicate, or
 assemble multipart AIS. Run another process for every independent relation.
-A systemd template name or procd instance name identifies a supervised process;
-it is service-manager configuration, not a UDPSEC concept.
 
 ## 🚀 Debian/systemd quick start
 
@@ -105,12 +102,30 @@ station_private_key: /etc/nmea_sproxy/keys/station_private.pem
 remote_public_key: /etc/nmea_sproxy/keys/aismixer_public.pem
 ```
 
-Replace all documentation addresses. The `output.source_ip` line is optional;
-when omitted, the operating system selects the outbound source address.
-
-The shown timing values are the defaults; zero `session_refresh_interval`
-disables planned refresh. [`config.yaml`](config.yaml) is for checkout/manual
+Replace all documentation addresses; `output.port` must match the mixer's
+`sec_inputs` listener. [`config.yaml`](config.yaml) is for checkout/manual
 use, while [`config.system.yaml`](config.system.yaml) seeds the system config.
+
+### Settings and defaults
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `input.type` | required | `udp` or `serial` (see "Input modes") |
+| `output.type` | required | `udpsec` or `udp` |
+| `output.host`, `output.port` | required | destination, resolved once at startup |
+| `output.source_ip` | OS choice | optional literal local address; fixes the address family |
+| `station_id` | `boat_001` | station name; must match the mixer's authorization entry |
+| `station_private_key` | `/etc/nmea_sproxy/keys/station_private.pem` | station identity (UDPSEC) |
+| `remote_public_key` | `/etc/nmea_sproxy/keys/aismixer_public.pem` | trusted mixer key (UDPSEC) |
+| `keepalive_interval` | `30` | seconds between keepalive pings (UDPSEC) |
+| `peer_timeout` | `90` | seconds without authenticated evidence before a fresh handshake (UDPSEC) |
+| `session_refresh_interval` | `0` | seconds between in-session key epoch refreshes; `0` disables them (UDPSEC) |
+| `reconnect_delay` | `5` | seconds to wait after a failed handshake, a socket error, or a peer close before the next attempt |
+
+Timing values are finite numbers of seconds, never booleans or numeric
+strings. `keepalive_interval` and `peer_timeout` must be above zero;
+`session_refresh_interval` and `reconnect_delay` may be zero. No ratio between
+them is enforced. Plain UDP uses only `reconnect_delay`.
 
 ### Configuration selection and legacy migration
 
@@ -128,12 +143,10 @@ An explicitly selected CLI or environment path must exist. Relative
 YAML file, not the current working directory.
 
 For compatibility, omitting `input` selects the legacy top-level UDP-input form
-and omitting `output` selects UDPSEC. Old endpoint, ACL, and source-address
-fields remain accepted with deprecation notices.
-
-Do not use legacy syntax for new deployments. Explicit mappings do not borrow
-missing deprecated values. `log_level` is not a functional runtime logging
-filter and is not documented as a supported control.
+and omitting `output` selects UDPSEC; old endpoint, ACL, and source-address
+fields remain accepted with deprecation notices. Do not use legacy syntax for
+new deployments: explicit mappings do not borrow missing deprecated values.
+`log_level` is not a functional runtime logging filter.
 
 ## 📡 Input modes
 
@@ -168,17 +181,16 @@ input:
   max_line_bytes: 4096
 ```
 
-Defaults are 38400 baud, 8-N-1, a one-second read timeout, five-second reconnect,
-and a 4096-byte line limit; CR, LF, and CRLF terminate lines. Device/read failure
-clears partial framing and retries the same path. Overlong input is discarded
-through its next delimiter.
+The values shown are the defaults; CR, LF, and CRLF terminate lines.
+Device/read failure clears partial framing and retries the same path. Overlong
+input is discarded through its next delimiter.
 
 The reader queue holds 256 complete lines. When full, it drops the oldest line,
 keeps fresher traffic, and logs the drop; serial input is not lossless.
 Manual use needs device permission, OpenWrt needs the correct USB-serial driver,
 and two relations must not compete for one device. Prefer stable device names.
 
-### NMEA extraction
+### NMEA extraction and payload semantics
 
 Each datagram or completed serial line is scanned for `!<talker>VDM` or
 `!<talker>VDO` substrings ending in an uppercase `*HH` checksum-shaped suffix,
@@ -189,7 +201,8 @@ only: it does not calculate the checksum value.
 
 Every match is forwarded independently. Multipart fragments are not assembled;
 nonmatching material is silently discarded. The bare match is forwarded, so
-ingress TAG blocks, prefixes, surrounding bytes, and terminators are removed.
+ingress TAG blocks, prefixes, surrounding bytes, and terminators are removed;
+the mixer applies its own TAG policy.
 
 ## 📤 Output modes and endpoint controls
 
@@ -206,8 +219,9 @@ source port; fixed source ports and interface/routing selection are unsupported.
 ### UDPSEC
 
 `output.type: udpsec` activates identity, trust, authenticated handshake,
-encryption, replay protection, and liveness. The bare NMEA match becomes its
-protected DATA payload. Invalid identity or trust prevents activation.
+encryption, replay protection, and liveness. Each bare NMEA match travels as
+one authenticated, encrypted DATA message of the station's session. Invalid
+identity or trust prevents activation.
 
 ### Explicit plain UDP
 
@@ -238,14 +252,10 @@ to aismixer.
 ### Station identity
 
 For the canonical system key directory, the key tool creates a P-256 pair and
-prints the compressed public value used by aismixer:
+prints the compressed public value used by aismixer (Debian/systemd command in
+the quick start above). On OpenWrt:
 
-```bash
-# Debian/systemd
-sudo python3 /opt/nmea_sproxy/tools/aismixer_keys.py station \
-  --keys-dir /etc/nmea_sproxy/keys --station-id boat_001
-
-# OpenWrt
+```sh
 python3 /usr/lib/aismixer/tools/aismixer_keys.py station \
   --keys-dir /etc/nmea_sproxy/keys --station-id boat_001
 ```
@@ -271,8 +281,10 @@ runtime neither invents its public filename nor generates or repairs it.
 ### Trust the mixer and authorize the station
 
 Obtain the intended mixer public key through an authenticated channel and copy
-it to `remote_public_key`. Proxy tooling and lifecycle scripts never generate,
-download, exchange, replace, or repair this trust key.
+it to `remote_public_key`. Every handshake reply must carry a valid signature
+by that key; otherwise the proxy rejects it and never falls back. Proxy
+tooling and lifecycle scripts never generate, download, exchange, replace, or
+repair this trust key.
 
 Add the station public value printed by the key tool to aismixer's
 `authorized_keys.yaml`, normally `/etc/aismixer/authorized_keys.yaml`:
@@ -286,85 +298,115 @@ authorized_clients:
 The name must match `station_id`. Restart aismixer after authorization changes,
 then start the proxy. Plain UDP skips identity/trust handling.
 
-## 🔐 UDPSEC behavior and recovery
+## 🔐 UDPSECv2 sessions
 
-UDPSEC authenticates the configured long-term P-256 station identity and
-trusted mixer identity, binds them to fresh signed ephemeral P-256 ECDHE
-material, derives separate client-to-server and server-to-client AES-256-GCM
-keys, and confirms key possession over the encrypted channel.
+### Establishment
 
-DATA, ping, pong, and best-effort close messages are authenticated and
-encrypted. Close is unacknowledged. Keepalive ping/pong traffic provides
-liveness and helps retain NAT, CGNAT, and mobile-network UDP mappings.
+The proxy sends one signed ClientHello with its `station_id`, a timestamp,
+and a fresh ephemeral P-256 key, then waits up to 5 seconds for the mixer's
+signed reply. It verifies that reply against `remote_public_key`, derives
+separate AES-256-GCM traffic keys for each direction, and confirms them with
+an encrypted ping that the mixer answers (`Mutual ECDHE session confirmed.`).
+The mixer, in turn, accepts only an authorized station public key. Handshake
+timestamps must be within 30 seconds of the mixer's clock. A failed attempt
+waits `reconnect_delay` before the next one.
 
-A keepalive ping that goes unanswered is retransmitted inside the same
-session: same sequence, fresh encryption, first at its keepalive deadline and
-then once per retry interval, which is 5 seconds or `keepalive_interval`,
-whichever is shorter. Only when no qualifying authenticated evidence -- a
-matching pong, an in-session refresh reply or commit, or a matched
-path-migration acknowledgement -- has arrived for `peer_timeout` does the
-proxy start a fresh signed handshake. A lost ping or pong, a short two-way
-outage, or a momentary local network error such as "Network is unreachable"
-while an interface switches therefore no longer replaces the session. A
-sentence whose send failed is dropped, not resent; reading local input then
-pauses for one retry interval, and a keepalive transmission re-probes the
-path before input resumes. The log shows `liveness suspect` / `liveness
-recovered` and `failed transiently` / `usable again` lines. Optional
-`session_refresh_interval` instead runs a true in-session authenticated
-epoch refresh (REFRESH_INIT/REPLY/CONFIRM/ACK with fresh ephemeral ECDHE):
-the traffic keys roll over on the same session without a new handshake,
-locator, or forwarding-loop restart. Zero disables planned refresh. Each
-control retransmission re-encrypts the same signed message under a fresh
-nonce and one bounded per-phase attempt budget; every datagram passes a
-final monotonic deadline check taken after encryption and immediately
-before it is sent, and the retransmit interval runs from the actual send
-time. The client commits only on a REFRESH_ACK authenticated under the
-pending epoch and only before the transaction deadline. Session and replay
-state are in-memory and non-durable, so process restart establishes a
+Every DATA packet is bound to its session, identified by a mixer-issued
+session locator, and to its traffic-key epoch. Each receiver keeps every
+admitted nonce for the epoch's lifetime and rejects replays; if the current
+epoch's bounded nonce ledger fills, that epoch fails closed and a fresh
+handshake follows. State is in memory only: restarting either end requires a
 fresh session.
 
-A receiver remembers every admitted DATA nonce for the full usable directional
-traffic-key epoch. Those nonce records have no independent TTL and are not
-evicted while that epoch remains usable. The bounded replay ledger fails closed
-for the affected epoch when exhausted; recovery uses a fresh authenticated
-handshake and fresh directional keys.
+### Liveness recovery on the same path
 
-Exact confirmation, nonce admission, exhaustion, and session-transition rules
-are normative in the [Behavioural Contract](../BEHAVIORAL_CONTRACT.md).
+After confirmation the proxy sends an encrypted keepalive ping whenever
+`keepalive_interval` passes with no ping outstanding, and the mixer answers
+each with a pong. At most one logical ping is outstanding. If it is still
+unanswered at its keepalive deadline, the proxy retransmits the same ping --
+same sequence number, fresh encryption with a fresh nonce -- and then again
+once per retry interval, which is 5 seconds or `keepalive_interval`, whichever
+is shorter, until it is answered. NMEA forwarding continues meanwhile.
 
-When the server observes a rebind (a new NAT/CGNAT mapping, or a network
-change) as authenticated current-epoch traffic from the still-valid session,
-it challenges the new path and, once the client's authenticated response
-proves return routability, migrates the session's active path in place --
-no new handshake, locator, keys, or forwarding-loop restart. The client
-answers that challenge and, only after a successful response send,
-remembers a proof for a short bounded window, including the outstanding
-keepalive ping (if any) at that moment. A valid newer challenge immediately
-invalidates the older proof, even if sending the new response fails; a
-retry with the same new generation/token can establish its proof when the
-send succeeds. If the server's authenticated migration acknowledgement
-matches the current live proof, it counts as fresh peer liveness as of the
-instant it is read -- before any deadline due at that instant is handled,
-and regardless of how long the work that follows it takes. It advances
-`last_authenticated_peer` and therefore the `peer_timeout` deadline,
-exactly like an accepted pong. It clears only the concrete ping sequence
-captured in that proof, and only if that same ping is still outstanding. A
-proof that captured no ping still supplies liveness but never clears a
-ping; a later ping stays outstanding and is retransmitted until it is
-answered. This acknowledgement never resets the session's age, postpones a
-planned refresh, or restarts the keepalive schedule; it is not a lease
-renewal in those senses. A rebind the
-server never observes as valid current-epoch traffic from the session (for
-example while it is otherwise idle) still falls back to
-keepalive/peer-timeout detection and a
-fresh handshake.
+Only when no qualifying authenticated evidence -- a matching pong, the first
+verified reply or the commit of an in-session epoch refresh, or a matched
+path-migration acknowledgement -- has arrived for `peer_timeout` does the proxy
+end the session and start a fresh signed handshake. With the defaults, one lost
+ping or pong costs one retransmission about 60 seconds after the last
+evidence, answered in the same session; a peer silent for 90 seconds triggers
+fresh establishment. Plaintext, forged, mismatched, and ICMP-derived signals
+are never evidence.
+
+A momentary local network error while an interface switches -- "Network is
+unreachable" or another missing route, a network or host down, a vanished
+source address, buffer pressure, or an ICMP-derived refusal or reset -- does
+not end the session by itself. A sentence whose send failed is dropped, not
+resent; reading local input then pauses for one retry interval, and a
+keepalive transmission re-probes the path before input resumes. A long outage
+still ends at the `peer_timeout` bound. Any other socket error ends the session
+and waits `reconnect_delay`.
+
+### Path migration
+
+When the station's public address or port changes while the session is alive
+-- for example after a NAT or CGNAT rebinding -- the mixer decides whether to
+migrate; the proxy never moves the mixer's path itself. Authenticated
+current-epoch packets from the new address make it a candidate, and the mixer
+sends an encrypted path challenge there: at most four times in total, at least
+2 seconds apart, within a fixed 10-second window. The proxy answers each valid
+challenge with an encrypted path response. Only when a response arrives from
+the candidate address does the mixer make it the active path and confirm with
+a path acknowledgement. Session, keys, and replay state are unchanged.
+
+A challenge is not liveness evidence. When the proxy answers one, it records a
+short-lived proof that includes the keepalive ping outstanding at that moment,
+if any. A matching acknowledgement counts as fresh liveness evidence as of the
+instant it is read, exactly like an accepted pong; it clears only the ping
+captured in that proof, and only if it is still outstanding. It never resets
+the session age, postpones a planned refresh, or restarts the keepalive
+schedule. Until the mixer commits, pings sent from the new address get no
+pong and stay outstanding; after the commit, pongs reach the new address.
+
+Migration needs a live session on both ends. If the proxy has already reached
+its `peer_timeout` bound, or the mixer has expired the idle session, the next
+step is a fresh handshake.
+
+### Key epoch refresh
+
+With `session_refresh_interval` above zero, the proxy periodically renews the
+traffic keys inside the same session: a signed exchange with fresh ephemeral
+ECDHE keys (REFRESH_INIT, REPLY, CONFIRM, ACK) derives a new key epoch while
+forwarding continues under the current one. The proxy switches only after an
+acknowledgement authenticated under the new epoch, and abandons a refresh that
+has not completed within 15 seconds, keeping the current epoch. Each control
+retransmission re-encrypts the same signed message under a fresh nonce, at
+most 6 attempts per phase and at least 2 seconds apart, and every send is
+checked against the transaction deadline immediately before it leaves.
+
+A refresh is neither a new session nor a path change: the session locator,
+the active path, and the forwarding loop are unchanged. Zero disables planned
+refresh; a liveness failure still leads to a fresh full handshake.
+
+### Mobile behaviour
+
+| Event | What happens | Session |
+| --- | --- | --- |
+| Lost ping or pong, a short two-way outage, or an interface switch that keeps the public address | the outstanding ping is retransmitted; sentences whose send failed are dropped | kept if authenticated evidence returns within `peer_timeout` |
+| New public address or port while the session is alive | forwarding continues; the proxy answers the mixer's path challenges | kept; the mixer moves its active path after proof |
+| Outage longer than `peer_timeout`, a mixer restart, or an expired session | a fresh signed handshake, with `reconnect_delay` between failed attempts | new session |
+
+### No fallback and compatibility
 
 UDPSEC has no plaintext `NOSESSION`, plaintext reset, downgrade control, or
 automatic fallback to plain UDP. Unauthenticated control-looking datagrams do
-not alter session state.
+not alter session state. UDP remains lossy: AIS payloads are not buffered,
+retransmitted, or replayed during handshake or recovery, so UDPSEC does not
+guarantee delivery.
 
-UDP remains lossy. AIS payloads are not buffered, retransmitted, or replayed
-during handshake or recovery, so UDPSEC does not guarantee delivery.
+The current UDPSECv2 wire format does not interoperate with earlier builds,
+including the 0.2.1 OpenWrt packages: upgrade `nmea_sproxy` and `aismixer`
+together. Exact confirmation, admission, migration, refresh, and recovery
+rules are normative in the [Behavioural Contract](../BEHAVIORAL_CONTRACT.md).
 
 ## 🎛️ Services and instances
 
@@ -422,6 +464,20 @@ py nmea_sproxy.py --config config.yaml
 
 Use a reported name such as `COM3`; no Windows Service integration is supplied.
 
+## 🍓 Raspberry Pi and edge hosts
+
+The Debian/systemd installer suits Raspberry Pi OS. On small edge hosts:
+
+- Synchronise the clock (NTP) before UDPSEC starts. A board without a
+  real-time clock can boot far from real time, and a handshake outside the
+  30-second window then fails as if the mixer were unreachable.
+- Prefer `/dev/serial/by-id/...` paths, and attach each receiver to exactly
+  one relation; run a named instance for each additional receiver.
+- The 256-line serial queue drops the oldest lines when full, so a fast feed
+  can lose lines during an input pause after a local send error.
+- Cellular hotspots and CGNAT work through keepalive and mobile continuity;
+  keep plain UDP for a trusted LAN or VPN.
+
 ## 📦 OpenWrt
 
 The OpenWrt recipe produces `aismixer-common`, `aismixer`, and `nmea_sproxy`.
@@ -431,18 +487,19 @@ on target Python, cryptography, serial, and related packages.
 The currently built, published, and validated repository feed targets include
 `x86_64` and `mips_24kc`; this does not intentionally exclude other targets with
 suitable dependencies. The package recipe pins a source revision, so packaged
-behavior may lag current `main`. Check the [root README](../README.md) and
-[changelog](../CHANGELOG.md) for the applicable package revision.
+behavior may lag current `main`: it currently builds `0.2.1-r4` from the
+v0.2.1 release, which predates the UDPSECv2 session behaviour described above
+and does not interoperate with current source-tree builds. Pair packages only
+with a mixer from the same release line, and check the
+[root README](../README.md) and [changelog](../CHANGELOG.md).
 
 ### Installation and first configuration
 
 After configuring a supported AISMixer package feed, verify writable overlay
-space and establish firewall or network isolation before installation. Generated
-package hooks enable and attempt to start the service during `apk add`, so an
-initial start can precede operator review.
-
-Install, stop the automatically started service, configure it, provision
-station identity and mixer trust, authorize the station at aismixer, then start:
+space and establish firewall or network isolation: generated package hooks
+enable and attempt to start the service during `apk add`, before operator
+review. Install, stop the service, configure it, provision station identity and
+mixer trust, authorize the station at aismixer, then start:
 
 ```sh
 apk -U add nmea_sproxy
@@ -485,22 +542,17 @@ the unnamed singleton.
 
 Each relation is preflighted independently. Valid relations can start while
 invalid configurations or unusable trust skip only their relation. Startup
-fails when no configured relation is valid.
-
-Preflight validates configuration and required UDPSEC identity/trust. It does
-not prove that a UDP address can be bound or that a serial device is exclusively
-available.
+fails when no configured relation is valid. Preflight validates configuration
+and required UDPSEC identity/trust; it does not prove that a UDP address can be
+bound or that a serial device is exclusively available.
 
 ### Serial and storage prerequisites
 
-Install the USB-serial kernel package appropriate for the receiver chipset and
-confirm the configured device path exists. Prefer a stable path when OpenWrt
-provides one, and do not assign one device to multiple relations.
-
-Python, cryptography, pySerial, and their dependencies need materially more
-writable space than a minimal router image. Verify overlay capacity before
-installation; extroot may be appropriate on constrained devices. Detailed feed,
-hardware, and storage procedures belong in the
+Install the USB-serial kernel package for the receiver chipset and confirm the
+configured device path exists. Python, cryptography, pySerial, and their
+dependencies need materially more writable space than a minimal router image;
+extroot may be appropriate on constrained devices. Detailed feed, hardware, and
+storage procedures belong in the
 [OpenWrt deployment guide](https://github.com/iliyan85/aismixer/wiki/OpenWrt-Deployment).
 
 ## 🔄 Update and uninstall
@@ -516,7 +568,8 @@ sudo systemctl restart nmea_sproxy.service
 sudo systemctl status nmea_sproxy.service
 ```
 
-Restart only the singleton or named instances chosen by the operator.
+Restart only the singleton or named instances chosen by the operator, and
+update the mixer in the same maintenance window.
 
 `./nmea_sproxy/uninstall.sh` stops and disables proxy units, removes the
 installed runtime and unit files, and preserves `/etc/nmea_sproxy`.
@@ -525,69 +578,103 @@ installed runtime and unit files, and preserves `/etc/nmea_sproxy`.
 directory, including operator configurations and keys. Use it only when that
 destructive result is intended.
 
-OpenWrt package lifecycle is separate. Update with
-`apk --update-cache add --upgrade nmea_sproxy`. Its generated upgrade hook stops
-and starts the service even if it had been manually stopped, while preserving
-the boot enable/disable state.
+OpenWrt package lifecycle is separate. `apk --update-cache add --upgrade
+nmea_sproxy` updates it; the generated upgrade hook stops and starts the service
+even if it had been manually stopped, while preserving the boot enable/disable
+state. `apk del nmea_sproxy` stops, disables, and removes it. There is no
+project-specific purge contract, so do not assume configurations, named
+relations, or keys will be retained after removal.
 
-Remove the OpenWrt package with `apk del nmea_sproxy`. Removal stops and
-disables the service. There is no project-specific purge contract, so do not
-assume configurations, named relations, or keys will be retained after removal.
+## 🩺 Logs and diagnostics
 
-## 🩺 Status, logs, and troubleshooting
+Read logs with `journalctl -u nmea_sproxy.service` (or the named unit) on
+systemd, and `logread -e nmea_sproxy` on OpenWrt. The proxy does not trace
+every forwarded sentence. Roughly every 60 seconds it prints one `Runtime:`
+line with the input and output modes and cumulative forwarded counts,
+independent of `log_level` and traffic volume. For UDPSEC it adds the session
+state:
 
-For systemd, use `sudo systemctl status nmea_sproxy.service` and
-`sudo journalctl -u nmea_sproxy.service -f`; substitute
-`nmea_sproxy@boat.service` for a named relation. On OpenWrt, use
-`/etc/init.d/nmea_sproxy status`, `ubus call service list
-'{"name":"nmea_sproxy"}'`, and `logread -e nmea_sproxy`.
+```text
+Runtime: input=serial output=udpsec forwarded=640 messages / 51.20KiB session=8fb44452 epoch=0 peer=alive observed=192.0.2.10:41000 path_gen=0 age=28s
+```
 
-Common symptoms:
+`session` is a short label of the session locator, and `epoch` the
+traffic-key epoch, which rises with each in-session refresh. `peer` is the
+local liveness state, not a confirmation from the mixer. `observed` is the
+public address and port the mixer saw on the last answered ping (`ipv4:port`
+or `ipv6.port`, or `unknown`), and `age` the seconds since that observation.
+`path_gen` is the mixer's committed path-migration generation for the session:
+`0` before any migration, `unknown` when not reported, and marked `last-known`
+when older than an acknowledged migration. A fresh handshake shows a new
+`session` label with `epoch=0 path_gen=0`; a migration keeps the label and
+raises `path_gen`. These fields are observational only: nothing displayed
+controls liveness, migration, or keys.
+
+| Log line | Meaning |
+| --- | --- |
+| `Mutual ECDHE session confirmed.` | a new session is established |
+| `Secure session liveness suspect: keepalive ping #N ...` | first retransmission of an unanswered ping |
+| `Secure session liveness recovered: keepalive ping #N answered ...` | answered in the same session |
+| `Secure ... failed transiently (...); keeping the session ...` | local network error inside the liveness bound |
+| `Secure session network path usable again after N transient failure(s).` | first successful send after it |
+| `Secure session path migration acknowledged by peer.` | the mixer committed a path migration |
+| `Starting in-session authenticated epoch refresh.` | a key epoch refresh began |
+| `Secure epoch refresh committed; continuing on the new epoch ...` | the refresh completed in the same session |
+| `Secure session liveness unresolved; starting authenticated re-handshake.` | `peer_timeout` reached with a ping outstanding |
+| `⚠️ No response from server during handshake.` | no signed reply within 5 seconds |
+
+On the mixer, migration appears as `[+] Path candidate OPENED`,
+`[+] Path challenge RETRY n/4`, `[+] Path migration COMMITTED ... old=... new=...`,
+and `[+] Path candidate EXPIRED` lines, which never contain keys, nonces, or
+challenge tokens.
+
+## 🛠️ Troubleshooting
 
 | Symptom | Checks |
 | --- | --- |
+| No handshake response | Check the mixer's `sec_inputs` listener and port, bidirectional UDP firewall/NAT rules, the output endpoint and address family, station authorization, and both clocks (30-second window). |
 | Server signature verification failed | Confirm `remote_public_key` contains the intended mixer's P-256 public key and the output endpoint is correct. Never bypass verification. |
-| No handshake response | Check the mixer UDPSEC listener, bidirectional UDP firewall/NAT rules, endpoint, address family, station authorization, and clocks. |
 | Unauthorized station | Match `station_id` exactly and install the station public value in aismixer's `authorized_keys.yaml`; restart aismixer after changes. |
-| Repeated reconnects | Inspect bidirectional reachability, NAT timeout/rebinding, keepalive and peer-timeout values, and both endpoint logs. A re-handshake follows only `peer_timeout` without qualifying authenticated evidence; `liveness suspect` lines before it show the unanswered retransmissions. |
 | Identity startup failure | Stop a restarting unit; inspect both canonical station files. Repair only when the retained private key is known to be correct. |
+| "Network is unreachable" or `failed transiently` | The local interface or route is missing, for example during a Wi-Fi or cellular switch. Short episodes keep the session; a persistent one ends at `peer_timeout`, and `Handshake send error` then repeats each reconnect cycle until the network returns. |
+| `liveness suspect` without `recovered` | Pongs are not arriving: check return-path firewall and NAT state and the mixer's reachability. Without qualifying authenticated evidence the session ends at `peer_timeout` with a fresh handshake. |
+| Repeated re-handshakes | Inspect bidirectional reachability, NAT timeout/rebinding, keepalive and peer-timeout values, and both endpoint logs. A re-handshake follows only `peer_timeout` without qualifying authenticated evidence. |
+| `observed` changed | A change with a raised `path_gen` and the same `session` label is a completed migration; a change with a new label and `path_gen=0` followed a fresh handshake. |
+| Mixer logs candidate `OPENED` then `EXPIRED` without `COMMITTED` | Challenges or responses for the new address are lost: check that return traffic reaches the station's new address. Later traffic opens a new candidate; if no proof succeeds, the session ends at `peer_timeout`. |
 | Bind or address error | Check address-family agreement, local address ownership, duplicate listeners, and port availability. |
 | Serial device unavailable | Check the configured path, OS permission, USB-serial driver, physical connection, and competing processes. |
 | No network output | Confirm matching NMEA input, output type, pinned destination, routing, firewall, and plain-UDP consumer or UDPSEC session state. |
 | Restart loop | Stop the unit, run the process manually with its exact config if safe, correct the persistent error, then start it again. |
 
-The runtime no longer traces every forwarded sentence to standard output.
-Instead it prints a sparse `Runtime: ...` summary roughly every 60 seconds,
-reporting input mode, output mode, cumulative forwarded message/byte counts,
-and UDPSEC session liveness where applicable. This heartbeat is independent
-of `log_level` and does not scale with traffic volume.
-
-## ⚠️ Limitations and security boundary
+## ⚠️ Limitations and security notes
 
 Current operator-visible limits:
 
-- one input-to-output relation per process;
-- no mixing, aismixer routing, fan-out, deduplication, or multipart assembly;
+- one input-to-output relation per process, with no mixing, routing, fan-out,
+  deduplication, or multipart assembly;
 - checksum-shaped syntax checking without checksum arithmetic verification;
 - ingress TAG blocks, prefixes, and surrounding material stripped;
 - lossy UDP delivery without payload buffering or retransmission;
-- one destination resolution pinned until process restart;
-- automatically allocated outbound source port;
+- one destination resolution pinned until process restart, and an
+  automatically allocated outbound source port;
 - bounded serial queue that discards the oldest entry when full;
 - process-local, non-durable UDPSEC session and replay state;
-- a source-address or source-port tuple change migrates in place only when
-  the server observes it as authenticated current-epoch traffic from the
-  still-valid session; otherwise a fresh handshake is required after
-  keepalive/peer-timeout detection.
+- a public address or port change keeps the session only while it is alive
+  and the mixer has proven the new path; otherwise a fresh handshake follows.
 
-UDPSEC provides confidentiality, cryptographic integrity, and peer
-authentication for transport between configured and authenticated endpoints.
-It does not establish the semantic truth of AIS reports, the physical truth of
-vessel positions, or the accuracy of transmitted AIS content.
+Security notes:
 
-`input.allow_from` is an application filter, not peer authentication. Plain UDP
-has no confidentiality, peer authentication, cryptographic integrity, replay
-protection, or UDPSEC liveness behavior.
+- Protect `station_private.pem` and its key directory; never copy it to the
+  mixer. Replacing it changes the station's identity.
+- The public IP address and port are not identity: a new address gains nothing
+  without authentication and the mixer's return-routability proof.
+- UDPSEC provides confidentiality, cryptographic integrity, and peer
+  authentication between configured endpoints. It does not establish the
+  semantic truth of AIS reports, the physical truth of vessel positions, or
+  the accuracy of transmitted AIS content.
+- `input.allow_from` is an application filter, not peer authentication.
+- Plain UDP is an explicit non-secure mode without UDPSEC's protections or
+  liveness; UDPSEC never falls back to it automatically.
 
 ## 📚 Further documentation
 

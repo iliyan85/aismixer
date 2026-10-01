@@ -1,11 +1,11 @@
-# UDPSEC V2 Recovery Baseline and Acceptance Contract (MP0, updated by MP1, MP2 and MP3)
+# UDPSEC V2 Recovery Baseline and Acceptance Contract (MP0, updated by MP1, MP2 and MP3; closed by MP4-A)
 
 | | |
 |---|---|
-| Status | MP0 baseline (tests and documentation). MP1 client liveness recovery: complete, after Astra Gate A and its corrections (section 11.2); committed as `aa41b782` and road-validated for its Class-A target (section 4.5). MP2 bounded path-migration recovery: implemented as a server-side working-tree delta on `aa41b782`, implementer-verified, not yet independently audited (section 11.3). MP3 liveness × migration × epoch/lifecycle integration: the four MP3 candidates are covered by deterministic integration tests; one lifecycle defect (C3, listener shutdown) was found and corrected (section 11.4). MP2 and MP3 together change one production file, `aismixer_secure.py`. |
-| Branch / commits | `main`. Pre-MP1 production baseline `de513674fabf2ee594d0f08f10ddbdf87267a352` (2026-09-25, "feat(udpsec): add authenticated field diagnostics for mobile path migration"), unchanged by MP0. MP0 committed as `71a47894264105531b0d873b09d0520ba90e15eb`. MP1 committed as `aa41b7820e953e747d4763a3167945351b0c77e5` ("feat(udpsec): add bounded client liveness recovery"). MP2 and MP3 are one working-tree delta on top of `aa41b782`. |
-| Written | MP0 2026-09-29; MP1 update 2026-09-29; Gate A corrective iteration 2026-09-30; MP2 update 2026-09-30; MP3 update 2026-09-30 |
-| Serves the next instruction | Astra Gate B on the MP2 + MP3 delta (handoff in section 11.5). |
+| Status | **Recovery campaign closed (section 14).** MP0 baseline (tests and documentation). MP1 client liveness recovery: Astra Gate A passed after its corrections (section 11.2); committed as `aa41b782`; real Class-A road FIELD PASS (section 4.5). MP2 bounded path-migration recovery (section 7.2) and MP3 liveness × migration × epoch/lifecycle integration (section 11.4; one lifecycle defect, C3, found and corrected): committed together as `e70a43a0` and independently passed by Astra Gate B with no BLOCKER, HIGH or LOW finding (section 11.6). MP2 and MP3 together change one production file, `aismixer_secure.py`. |
+| Branch / commits | `main`. Pre-MP1 production baseline `de513674fabf2ee594d0f08f10ddbdf87267a352` (2026-09-25, "feat(udpsec): add authenticated field diagnostics for mobile path migration"), unchanged by MP0. MP0 committed as `71a47894264105531b0d873b09d0520ba90e15eb`. MP1 committed as `aa41b7820e953e747d4763a3167945351b0c77e5` ("feat(udpsec): add bounded client liveness recovery"), the rollback boundary before MP2 + MP3. MP2 + MP3 committed as `e70a43a07dfc52713c5f861ab3d7cc584ed5f0f3` ("feat(udpsec): add bounded path migration recovery and lifecycle hardening"), the current committed recovery baseline. |
+| Written | MP0 2026-09-29; MP1 update 2026-09-29; Gate A corrective iteration 2026-09-30; MP2 update 2026-09-30; MP3 update 2026-09-30; MP4-A closure 2026-10-01 |
+| Serves the next instruction | None for the recovery work itself. The remaining MP4 phases are documentation and release work only (section 14). |
 | Normative behaviour | `BEHAVIORAL_CONTRACT.md` section 11, rewritten by MP1 and extended by MP2 and MP3 (see its 11.5). This file adds no guarantee beyond it. |
 
 Companion files in this directory:
@@ -178,6 +178,13 @@ exist. The server-observed CGNAT port is the NAT's mapping. It is not
 necessarily the Raspberry Pi's local UDP source port (L8 keeps the local port;
 the NAT chose a new public one). Reproduced as C1/C2.
 
+### 4.4 Consequence
+
+The assumption "MOBILE NETWORK CHANGE == PUBLIC IP/PORT CHANGE" is falsified by
+4.1 and 4.2. The dominant observed failure class is same-tuple (class A).
+Hence the ordering: **packet-loss tolerance first, path migration second,
+full re-establishment last.**
+
 ### 4.5 MP1 road run (after MP1 was committed as `aa41b782`)
 
 Operator report in the MP2 instruction; no logs supplied.
@@ -189,12 +196,8 @@ Operator report in the MP2 instruction; no logs supplied.
 Classification: a same-tuple liveness event (class A), recovered as MP1
 intends, not a migration event. Which packet was lost is unknown.
 
-### 4.4 Consequence
-
-The assumption "MOBILE NETWORK CHANGE == PUBLIC IP/PORT CHANGE" is falsified by
-4.1 and 4.2. The dominant observed failure class is same-tuple (class A).
-Hence the ordering: **packet-loss tolerance first, path migration second,
-full re-establishment last.**
+No field run has yet shown a class-B event (a live tuple change migrated
+inside the same `LogicalSession`); see section 14.
 
 ## 5. Recovery classes
 
@@ -218,10 +221,10 @@ Every pre-MP1 outcome below was reproduced in-repo by the MP0 lab on the
 baseline commit (real client, real server, fake clock) and pinned by MP0's
 `test_pre_mp1_policy_pins.py`. The rows marked (MP1) are scenarios MP1 added;
 their pre-MP1 outcome comes from one implementer run of the MP1 lab against the
-pre-MP1 `nmea_sproxy.py`. The MP1 outcomes are implementer-run, pinned
-exactly in `test_mp1_policy_pins.py`, and not yet independently verified
-(Gate A). Times are fake-clock seconds; the session starts at 1000.2 and
-ping#2 leaves at 1060.2.
+pre-MP1 `nmea_sproxy.py`. The MP1 outcomes are implementer-run and pinned
+exactly in `test_mp1_policy_pins.py`; Astra Gate A then audited the MP1
+delta (section 11.2). Times are fake-clock seconds; the session starts at
+1000.2 and ping#2 leaves at 1060.2.
 
 | ID (Fable) | Fault | Pre-MP1 outcome, reproduced | MP1 outcome | MP1 test |
 |---|---|---|---|---|
@@ -462,17 +465,27 @@ driver, so pre-MP2 timing is unchanged there.
 Status: the MP1 exit criteria were met, implementer-run (section 9.1; the
 test results are in the MP1 report). Gate A then ran and returned NEEDS
 CORRECTION BEFORE MP2 with three LOW findings, corrected in section 11.2.
-Next is the **Astra corrective recheck** of F1-F3 only, then **MP2**.
+The **Astra corrective recheck** of F1-F3 followed, Gate A passed, MP1 was
+committed as `aa41b782`, and **MP2** began.
 
 MP2 status (2026-09-30): its exit criteria are met, implementer-run
 (section 9.2; test results in the MP2 report). The pre-MP2 pins are replaced
 by bounded-retransmission and anti-amplification tests, and the B guards are
-green. Next is MP3 / Gate-B preparation (section 11.3).
+green. MP3 and the Gate B preparation followed (sections 11.3-11.5).
 
 MP3 status (2026-09-30): its exit criteria are met, implementer-run. The four
 MP3 candidates are covered by closure tests (section 11.4); C3 found one
 bounded lifecycle defect, corrected in two hunks of `aismixer_secure.py`.
-MP1 and MP2 suites stay green. Next is **Astra Gate B** (section 11.5).
+MP1 and MP2 suites stay green. **Astra Gate B** followed and passed
+(section 11.6); MP2 and MP3 were then committed together as `e70a43a0`.
+
+MP4 status (2026-10-01): MP4-A closed the recovery documentation against the
+committed baseline `e70a43a0` (section 14). MP4 changes no production code,
+so no deep audit applies (section 11, item 2). Class-A field evidence is
+recorded (section 4.5); class-B field evidence is not yet available and is
+not a closure condition (section 14). The remaining MP4 phases (website,
+Wiki, release closure) are documentation and release work; the Fable F8
+`CHANGELOG.md` rewording above belongs to release closure.
 
 One finding does not automatically create one new major prompt. Minor findings
 are batched into the current corrective round of the phase that owns them.
@@ -566,13 +579,13 @@ No other production hunk changed after Gate A. The corrective delta is limited t
 - F3: the README wording matches the implementation.
 - Tests to run: the two regressions above, `python -m pytest tests/udpsec_recovery`, and `git diff --check`.
 
-### 11.3 MP2 handoff material for MP3 / Gate B (Gate B not requested yet)
+### 11.3 MP2 handoff material for MP3 / Gate B (prepared before Gate B was requested)
 
 Gate B comes after MP3, or once the owner declares MP3 unnecessary. Prepared
 material:
 
 - **Baseline:** `aa41b7820e953e747d4763a3167945351b0c77e5` (MP1 committed).
-- **Delta:** the MP2 working tree.
+- **Delta:** the MP2 working tree (later committed together with MP3 as `e70a43a0`).
 - **Production file changed:** `aismixer_secure.py` only.
   - New constants: `PATH_CHALLENGE_RETRY_INTERVAL_SECONDS`, `PATH_CHALLENGE_MAX_SENDS`.
   - New `CandidatePath` fields: `challenge_sends`, `next_challenge_at`. New record `_PathChallengeSend`. New stat: `SecureStateStats.migration_challenge_retries_sent`.
@@ -599,51 +612,6 @@ material:
   2. Retry and candidate expiry at equality versus the client's MP1 terminal-liveness verdict at the same instant (A10-class timing).
   3. Shutdown while a retry attempt is admitted but not yet sent. The driver is cancelled first and cannot send after `secure_server` begins closing. Still to prove: an end-to-end SIGTERM / supervisor test.
   4. Retry-driver scheduling latency under heavy listener load. A retry can be late, never early; lateness only means fewer attempts fit before expiry.
-
-Not verified by MP0 (and not claimed):
-- Which packet was lost, or for how long, in any field event.
-- OpenWrt or Raspberry Pi behaviour of the MP0 harness. On Linux, MP0 ran only its own suite and only under WSL2, with cryptography 41.0.7 (below the declared `>=42.0` floor).
-- The real `main()` config/key/socket/SIGTERM path, `SecureState` maintenance, and the diagnostics output worker.
-- A real IPv4 CGNAT mapping lifetime.
-- Hello-flood CPU cost, nonce exhaustion under load, multi-listener collisions beyond the existing tests.
-- Anything about MP1/MP2 implementations (the xfails prove only that current code fails them; a scratch satisfiability probe is in the ledger).
-
-Not verified by MP2 (and not claimed):
-- Any independent review of the MP2 delta: every MP2 result is implementer-run.
-- The production retry driver on real sockets and a real event loop under load. The lab runs the same retry pass at exact fake instants, and the driver itself is unit-tested with a scripted wait.
-- Field evidence of a real tuple change needing a challenge retry.
-
-Not verified by MP1 (and not claimed):
-- Any independent review of the MP1 delta: every MP1 result is implementer-run until Gate A.
-- MP1 on real networks, a Raspberry Pi or OpenWrt; no field run of the MP1 client yet (MP4).
-- The pause against the real serial adapter's 256-line drop-oldest queue. The lab's serial input has no queue. A feed above about 50 lines/s can overflow the queue during one 5 s pause, which is bounded and the same exposure as a pre-MP1 reconnect.
-- Real OS behaviour of every errno in `_TRANSIENT_NETWORK_ERRNOS`. The classification is unit-tested with the platform's `errno` constants. On this Windows CPython those are the `WSAE*` codes (for example `ENETUNREACH == 10051`). The lab raises `ENETUNREACH` and `ECONNRESET` only.
-
-Harness provenance: `harness/lab.py` and `harness/scenarios.py` are
-repository ports of Fable's `udpsec_lab.py` and `scenarios.py`. Scenario
-fault injections, timings and IDs are kept.
-
-Changes versus Fable's harness:
-- The Fable-local `pytest.py` stub is dropped; real pytest `monkeypatch` is used.
-- The hard-coded `REPO` path is dropped; the repository test import convention is used.
-- Global `builtins.print` patching is replaced by per-module `print` capture.
-- Exact float timestamps are kept (Fable rounded them), so boundary scenarios are exact; `deliver_s2c_at` places a datagram exactly on a client deadline.
-- `HarnessError`/`_HarnessAbort` make harness faults visible. A Fable-harness poll-limit or hook error raised inside `select()` would have been swallowed by `forward_loop` as `socket_error`.
-- Each consumed server datagram records whether the handshake or `forward_loop` read it.
-- Local send errors, identity snapshots and injection were added, and so were scenarios A5d, A11, C1, C2 and C3.
-- MP1 added ICMP-derived receive errors (`receive_error_at`) and scenarios A5e, A9b, A10b and A11b. A local-input line that is due but unread is no longer a fake-`select` wake event: a real serial adapter has no descriptor, so the loop sleeps its poll interval.
-- A restarted server gets a new endpoint token.
-
-Not copied:
-- Fable's 26 logs, `_results.json` and `show.py`. Set `UDPSEC_RECOVERY_TRACE_DIR` to regenerate traces.
-- T13 negatives a-i (existing project tests cover them, see D1-D6); T13-j became C4.
-
-Fidelity limits:
-- `main()` is replicated; a drift guard checks its call order, and `test_udpsec_main_proactive_rekey_is_immediate_then_failure_backs_off` runs the real `main()`.
-- One datagram per `asyncio.run()`; no maintenance task.
-- Constant 50 ms one-way delay; zero server processing time.
-- Serial-like input without the 256-line drop-oldest queue.
-- `time.monotonic`/`time.time`/`select.select` are patched process-wide during a test.
 
 ### 11.4 MP3 — liveness × migration × epoch/lifecycle integration outcomes
 
@@ -683,13 +651,16 @@ Not verified by MP3 (and not claimed):
 - A real OS SIGTERM through `aismixer.main()` and `_supervise_named_tasks` down to `secure_server`; the tests cancel the listener task directly.
 - Real sockets under real network load. The C4 runs use a real event loop and real monotonic time, with in-memory sockets at a 1/20 time scale.
 - The revalidation → `sendto` window against a mutation from another thread. It is protected by event-loop atomicity, not by the lock; no production code mutates session, epoch or candidate state off the event-loop thread.
-- Any independent review: every MP3 result is implementer-run.
+
+Every MP3 result above is implementer-run. Astra Gate B has since audited the
+MP2 + MP3 delta and accepted the four items above as residuals, not defects
+(section 11.6).
 
 ### 11.5 Gate B handoff (MP2 + MP3)
 
 Audit THIS EXACT DELTA against THIS EXACT carried-forward baseline:
 - **Baseline:** `aa41b7820e953e747d4763a3167945351b0c77e5` (MP1 committed; Gate A accepted; MP1 road FIELD PASS, section 4.5).
-- **Delta:** the MP2 + MP3 working tree, or the commit that records it. Production: `aismixer_secure.py` only.
+- **Delta:** the MP2 + MP3 working tree, or the commit that records it (`e70a43a0`, section 11.6). Production: `aismixer_secure.py` only.
   - MP2 hunks: section 11.3.
   - MP3 hunks: `secure_server` (termination wait before cleanup, nested `finally`); `_wait_for_path_challenge_retry` (Event plus loop timer instead of `asyncio.wait_for`); the `_run_path_challenge_retries` docstring.
 - **Carried forward, not to re-audit:** MP1 as accepted by Gate A (liveness, R4 evidence-before-verdict, PATH_ACK authority, A11 transient errors, terminal recovery); the client; wire, version, AAD, crypto and transcript; the replay ledger; the candidate TTL; the commit transaction; the configuration.
@@ -703,7 +674,78 @@ Audit THIS EXACT DELTA against THIS EXACT carried-forward baseline:
   5. Multi-listener isolation: the endpoint-token filter (C4B).
   6. No wire, client or configuration drift (`git diff`).
 - **Critical slices to rerun:** `tests/test_udpsec_mp3_integration.py`, `tests/test_udpsec_path_challenge_retry.py`, `python -m pytest tests/udpsec_recovery`, `tests/test_udpsec_path_migration.py`, `tests/test_udpsec_client_path_migration.py`, `tests/test_udpsec_mobile_path_e2e.py`, `tests/test_udpsec_migration_lifecycle_races.py`, `tests/test_aismixer_secure.py`, `tests/test_secure_udp_helpers.py`.
-- **Remaining UNVERIFIED:** the "Not verified by MP2" list after section 11.3 and the "Not verified by MP3" list above.
+- **Remaining UNVERIFIED:** the "Not verified by MP2" list in section 12 and the "Not verified by MP3" list above.
+
+### 11.6 Gate B result (MP2 + MP3)
+
+**Astra Gate B** (independent; report outside the repository) audited the
+MP2 + MP3 delta against the section 11.5 handoff.
+- **Verdict:** READY FOR MP4 / COMMIT. No BLOCKER, HIGH or LOW finding.
+- **Scoped verification:**
+  - retry interval, count and TTL bounds (section 7.2);
+  - retry authority and anti-amplification: a retry is delivery, never authority;
+  - stale candidate and stale epoch prevention: the claim and the final revalidation;
+  - fresh encryption, with a fresh AEAD nonce, for every challenge attempt within the retry scope;
+  - C1 retry × epoch-refresh composition;
+  - C2 retry/expiry × terminal-liveness composition;
+  - C3 listener-shutdown correction: the retry driver has actually ended before any listener-owned cleanup, and its wait no longer depends on the pre-3.12 `asyncio.wait_for` cancellation race;
+  - C4 load and multi-listener isolation;
+  - no wire, client or configuration drift.
+- **Accepted residuals, not defects:** the four "Not verified by MP3" items in section 11.4 (no physical Python 3.11 run; no real SIGTERM through `main()`; no real sockets under real network load; the revalidation → `sendto` window relies on event-loop ownership and atomicity).
+- **Outside this scope:** areas carried forward per section 11.5 keep their earlier evidence; Gate B adds none to them.
+
+The audited delta was then committed on `main` as
+`e70a43a07dfc52713c5f861ab3d7cc584ed5f0f3` ("feat(udpsec): add bounded path
+migration recovery and lifecycle hardening"). Its production change is
+`aismixer_secure.py` only; its parent is the rollback boundary
+`aa41b7820e953e747d4763a3167945351b0c77e5`.
+
+## 12. NOT VERIFIED boundaries, harness provenance and fidelity limits
+
+Not verified by MP0 (and not claimed):
+- Which packet was lost, or for how long, in any field event.
+- OpenWrt or Raspberry Pi behaviour of the MP0 harness. On Linux, MP0 ran only its own suite and only under WSL2, with cryptography 41.0.7 (below the declared `>=42.0` floor).
+- The real `main()` config/key/socket/SIGTERM path, `SecureState` maintenance, and the diagnostics output worker.
+- A real IPv4 CGNAT mapping lifetime.
+- Hello-flood CPU cost, nonce exhaustion under load, multi-listener collisions beyond the existing tests.
+- Anything about MP1/MP2 implementations (the xfails prove only that current code fails them; a scratch satisfiability probe is in the ledger).
+
+Not verified by MP2 (and not claimed):
+- Independent review of the MP2 delta at the time: every MP2 result is implementer-run. Astra Gate B later audited MP2 together with MP3 (section 11.6).
+- The production retry driver on real sockets and a real event loop under load. The lab runs the same retry pass at exact fake instants, and the driver itself is unit-tested with a scripted wait. MP3 C4 later ran the real driver on a real event loop with in-memory sockets; real sockets under real network load remain an accepted residual (section 11.6).
+- Field evidence of a real tuple change needing a challenge retry.
+
+Not verified by MP1 (and not claimed):
+- Independent review of the MP1 delta at the time: every MP1 result is implementer-run. Astra Gate A later audited it (section 11.2).
+- MP1 on real networks beyond the one Class-A road run of section 4.5 (operator report; no logs; platform not recorded), and MP1 on OpenWrt.
+- The pause against the real serial adapter's 256-line drop-oldest queue. The lab's serial input has no queue. A feed above about 50 lines/s can overflow the queue during one 5 s pause, which is bounded and the same exposure as a pre-MP1 reconnect.
+- Real OS behaviour of every errno in `_TRANSIENT_NETWORK_ERRNOS`. The classification is unit-tested with the platform's `errno` constants. On this Windows CPython those are the `WSAE*` codes (for example `ENETUNREACH == 10051`). The lab raises `ENETUNREACH` and `ECONNRESET` only.
+
+Harness provenance: `harness/lab.py` and `harness/scenarios.py` are
+repository ports of Fable's `udpsec_lab.py` and `scenarios.py`. Scenario
+fault injections, timings and IDs are kept.
+
+Changes versus Fable's harness:
+- The Fable-local `pytest.py` stub is dropped; real pytest `monkeypatch` is used.
+- The hard-coded `REPO` path is dropped; the repository test import convention is used.
+- Global `builtins.print` patching is replaced by per-module `print` capture.
+- Exact float timestamps are kept (Fable rounded them), so boundary scenarios are exact; `deliver_s2c_at` places a datagram exactly on a client deadline.
+- `HarnessError`/`_HarnessAbort` make harness faults visible. A Fable-harness poll-limit or hook error raised inside `select()` would have been swallowed by `forward_loop` as `socket_error`.
+- Each consumed server datagram records whether the handshake or `forward_loop` read it.
+- Local send errors, identity snapshots and injection were added, and so were scenarios A5d, A11, C1, C2 and C3.
+- MP1 added ICMP-derived receive errors (`receive_error_at`) and scenarios A5e, A9b, A10b and A11b. A local-input line that is due but unread is no longer a fake-`select` wake event: a real serial adapter has no descriptor, so the loop sleeps its poll interval.
+- A restarted server gets a new endpoint token.
+
+Not copied:
+- Fable's 26 logs, `_results.json` and `show.py`. Set `UDPSEC_RECOVERY_TRACE_DIR` to regenerate traces.
+- T13 negatives a-i (existing project tests cover them, see D1-D6); T13-j became C4.
+
+Fidelity limits:
+- `main()` is replicated; a drift guard checks its call order, and `test_udpsec_main_proactive_rekey_is_immediate_then_failure_backs_off` runs the real `main()`.
+- One datagram per `asyncio.run()`; no maintenance task.
+- Constant 50 ms one-way delay; zero server processing time.
+- Serial-like input without the 256-line drop-oldest queue.
+- `time.monotonic`/`time.time`/`select.select` are patched process-wide during a test.
 
 ## 13. Fable scenario → phase mapping
 
@@ -731,3 +773,23 @@ Audit THIS EXACT DELTA against THIS EXACT carried-forward baseline:
 | T16 | C5 | C | MP1 (detection-time trade-off) | pin + guard | guard + MP1 pin (trade-off) | unchanged |
 | — | A11, A11b | A/C | MP1 (7.3 decision) | pin (A11) | acceptance L11a, L11b + MP1 pins | unchanged |
 | — | B12 | B | MP2 | — | — | MP2 pin + MP2-B4 tests |
+
+## 14. Recovery campaign closure (MP4-A)
+
+The UDPSEC V2 mobile recovery campaign is closed at the committed baseline
+below. Normative behaviour remains in `BEHAVIORAL_CONTRACT.md` section 11;
+the evidence classes are in `EVIDENCE_LEDGER.md`.
+
+| Item | Closure record |
+|---|---|
+| MP1 — client liveness recovery | Same-tuple liveness recovery: one logical outstanding ping, same-sequence retransmission with a fresh encryption, terminal bound at last authenticated evidence + `peer_timeout`, fresh authenticated establishment as the terminal fallback. **Astra Gate A: PASS** after the F1-F3 corrections (section 11.2). **Real Class-A road FIELD PASS:** the same logical session, unchanged public tuple, `path_gen=0` (section 4.5). Committed as `aa41b782`. |
+| MP2 — bounded path-migration recovery | Bounded same-incarnation PATH_CHALLENGE retransmission: the same token, `path_generation`, candidate address and epoch, a fresh encryption per attempt, every 2 s, at most 4 sends in total, inside the fixed 10 s candidate TTL, which is never extended. Retry is delivery, not authority. No wire, client or configuration change (section 7.2). |
+| MP3 — composition | C1 retry × epoch refresh, C2 retry/expiry × terminal liveness and C4 load/multi-listener isolation: COVERED / NO PRODUCTION CHANGE. C3 shutdown with an admitted retry: DEFECT FOUND / CORRECTED (section 11.4). |
+| Astra Gate B | Independent **PASS** on the MP2 + MP3 delta; no BLOCKER, HIGH or LOW finding (section 11.6). |
+| Accepted residuals | Not defects and not open work items: no physical Python 3.11 run; no real SIGTERM-through-`main()` reproduction; no real sockets under real network load; the revalidation → `sendto` window relies on event-loop ownership and atomicity (sections 11.4, 11.6). |
+| Field evidence | **Field proven:** class A, same-tuple mobile liveness recovery (section 4.5). **Not yet field proven:** class B, a live tuple change migrated inside the same `LogicalSession`; MP2 and the class-B behaviour are proven only by the lab and the test suites. A planned roaming road test into Romania may produce a natural public tuple change. It would add field evidence; it is not a closure or release condition. |
+| Rollback boundary | `aa41b7820e953e747d4763a3167945351b0c77e5` (MP1; the last commit before MP2 + MP3). |
+| Committed recovery baseline | `e70a43a07dfc52713c5f861ab3d7cc584ed5f0f3` ("feat(udpsec): add bounded path migration recovery and lifecycle hardening"); production change `aismixer_secure.py` only. |
+
+Remaining MP4 work is outside the recovery mechanism: MP4-D website
+synchronisation, MP4-E Wiki expansion and MP4-F release closure and tagging.

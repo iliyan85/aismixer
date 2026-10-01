@@ -1,11 +1,12 @@
-# UDPSEC V2 Recovery Scenario Matrix (MP0, updated by MP1, MP2 and MP3)
+# UDPSEC V2 Recovery Scenario Matrix (MP0, updated by MP1, MP2 and MP3; closed by MP4-A)
 
 Companion to `UDPSEC_V2_RECOVERY_BASELINE.md`. Pre-MP1 baseline commit
 `de513674` (MP0 itself was committed as `71a47894`); MP1 is the client-only
 delta on top of `71a47894` (committed as `aa41b782`); MP2 is the server-side
-path-migration delta on top of `aa41b782`, and MP3 its integration closure in
-the same working tree (section "MP3 integration" at the end; it changes no
-row). One row per scenario; `test_baseline_consistency.py`
+path-migration delta on top of `aa41b782`, and MP3 its integration closure
+(section "MP3 integration" at the end; it changes no row). MP2 and MP3 passed
+Astra Gate B and were committed together as `e70a43a0` (baseline sections
+11.6 and 14). One row per scenario; `test_baseline_consistency.py`
 checks this table against the harness catalogue and the MP1 acceptance tests,
 so it cannot silently drift.
 
@@ -31,8 +32,8 @@ Legend:
 - **Provenance** (what exists; a PLANNED entry proves nothing):
   - `FABLE`: executed by the independent Fable harness, 2026-09-28, on the pre-MP1 client (logs outside the repo);
   - `MP0`: executed by the MP0 repository lab (implementer-run);
-  - `MP1`: an MP1 acceptance test or MP1 policy pin runs this scenario on the MP1 client (implementer-run; independent verification belongs to Gate A);
-  - `MP2`: an MP2 policy pin runs this scenario with the MP2 server (implementer-run; not independently verified);
+  - `MP1`: an MP1 acceptance test or MP1 policy pin runs this scenario on the MP1 client (implementer-run; the MP1 delta was independently audited by Astra Gate A, baseline 11.2);
+  - `MP2`: an MP2 policy pin runs this scenario with the MP2 server (implementer-run; the MP2 + MP3 delta was independently audited by Astra Gate B, baseline 11.6);
   - `PYTEST`: covered by pre-existing project tests (listed below);
   - `FIELD`: operator field observation;
   - `PLANNED`: future test (none left after MP2).
@@ -163,7 +164,8 @@ live in `tests/test_udpsec_mp3_integration.py`. The C2 timelines use the
 same lab, built directly: `peer_timeout: 45`, the first session's PONGs lost,
 an A→B remap, so the MP1 verdict falls at 1045.2 as `proactive_rekey` (ping#1
 outstanding) and the fresh ClientHello leaves at once. Outcomes and the
-correction: baseline section 11.4. All rows are implementer-run.
+correction: baseline section 11.4. All rows are implementer-run; Astra Gate B
+then audited these outcomes and passed (baseline section 11.6).
 
 | MP3 ID | Timeline | Result | Status | Test |
 |---|---|---|---|---|
