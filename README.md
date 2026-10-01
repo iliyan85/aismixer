@@ -339,8 +339,9 @@ forwarders:
 Adapt all example addresses, ports, IDs, paths, and policy before use.
 Repository examples are inactive until copied or adapted. The examples use
 port 17778 for plain UDP and 17779 for UDPSEC; both are project-chosen example
-values and remain configurable. Seeded and packaged configuration files may
-still contain older port values until the next release cleanup.
+values and remain configurable. The seeded and packaged configurations in the
+current source also use 17779 for UDPSEC; already published packages keep the
+configuration of the release they were built from.
 
 ### 📡 Ingress and forwarders
 
@@ -988,8 +989,9 @@ forwarders:
 преди употреба. Примерите в хранилището са неактивни, докато не бъдат копирани
 или адаптирани. Примерите използват порт 17778 за plain UDP и 17779 за UDPSEC;
 това са избрани от проекта примерни стойности, които остават конфигурируеми.
-Началните и пакетираните конфигурационни файлове все още може да съдържат
-по-стари стойности на портовете до почистването в следващото издание.
+Началните и пакетираните конфигурации в текущия изходен код също използват
+17779 за UDPSEC; вече публикуваните пакети запазват конфигурацията на
+изданието, от което са изградени.
 
 ### 📡 Входове и UDP цели
 
@@ -1655,9 +1657,9 @@ Adaptați înainte de utilizare toate adresele, porturile, ID-urile, căile și
 politicile din exemple. Exemplele din depozit sunt inactive până când sunt
 copiate sau adaptate. Exemplele folosesc portul 17778 pentru UDP simplu și
 17779 pentru UDPSEC; acestea sunt valori de exemplu alese de proiect și rămân
-configurabile. Fișierele de configurație inițiale și cele incluse în pachete
-pot conține încă valori de port mai vechi până la curățarea din următoarea
-versiune.
+configurabile. În sursa actuală, configurațiile inițiale și cele incluse în
+pachete folosesc, de asemenea, 17779 pentru UDPSEC; pachetele deja publicate
+păstrează configurația versiunii din care au fost construite.
 
 ### 📡 Intrări și forwardere
 

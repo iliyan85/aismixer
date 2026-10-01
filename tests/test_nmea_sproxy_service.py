@@ -191,7 +191,7 @@ def test_shipped_configs_use_canonical_active_endpoints(name):
     assert config["output"] == {
         "type": "udpsec",
         "host": "192.0.2.10",
-        "port": 17777,
+        "port": 17779,
     }
     assert not {
         "listen_ip",

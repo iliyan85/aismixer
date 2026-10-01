@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +123,15 @@ def test_install_preserves_config_before_any_create_operation():
     assert preserve in install
     assert "preserving it" in install
     assert install.index(preserve) < install.index(create)
+
+
+def test_seeded_mixer_listener_matches_seeded_proxy_udpsec_destination():
+    mixer = yaml.safe_load(read_root_file("config.yaml"))
+    proxy = yaml.safe_load(read_root_file("nmea_sproxy/config.system.yaml"))
+
+    assert [entry["listen_port"] for entry in mixer["sec_inputs"]] == [17779]
+    assert proxy["output"]["type"] == "udpsec"
+    assert proxy["output"]["port"] == mixer["sec_inputs"][0]["listen_port"]
 
 
 def test_install_user_facing_examples_use_root_cmd_prefix():

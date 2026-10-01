@@ -1,6 +1,6 @@
 sec_inputs:
   - listen_ip: 0.0.0.0
-    listen_port: 19999
+    listen_port: 17779
     id: secA
     # Optional application-level ingress ACL. Omit allow_from for unrestricted.
     # An empty list denies all.

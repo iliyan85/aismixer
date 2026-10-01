@@ -247,7 +247,7 @@ DEFAULT_CONFIG = {
     "listen_ip": "::",
     "listen_port": 50000,
     "remote_host": "192.168.190.53",
-    "remote_port": 19999,
+    "remote_port": 17779,
     "station_id": "boat_001",
     "remote_public_key": CANONICAL_REMOTE_PUBLIC_KEY_PATH,
     "station_private_key": CANONICAL_STATION_PRIVATE_KEY_PATH,

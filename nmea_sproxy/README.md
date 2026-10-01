@@ -106,8 +106,7 @@ Replace all documentation addresses; `output.port` must match the mixer's
 `sec_inputs` listener. The examples use mixer port 17779 for UDPSEC and 17778
 for plain UDP; both are project-chosen example values and remain configurable.
 [`config.yaml`](config.yaml) is for checkout/manual use, while
-[`config.system.yaml`](config.system.yaml) seeds the system config; until the
-next release cleanup, both templates may still use an older example port.
+[`config.system.yaml`](config.system.yaml) seeds the system config.
 
 ### Settings and defaults
 

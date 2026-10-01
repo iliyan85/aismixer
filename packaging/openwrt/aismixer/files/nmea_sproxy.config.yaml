@@ -16,7 +16,7 @@ input:
 output:
   type: udpsec
   host: 192.0.2.10
-  port: 17777
+  port: 17779
   # Optional outbound source bind. Omit to let the OS choose.
   # source_ip: 192.0.2.20
 #
@@ -25,7 +25,7 @@ output:
 # output:
 #   type: udp
 #   host: 192.168.10.20
-#   port: 17777
+#   port: 17778
 #   source_ip: 192.168.10.15
 #
 # Inactive Linux serial input example. Replace the active input mapping above.
@@ -64,7 +64,7 @@ output:
 # output:
 #   type: udp
 #   host: 192.168.10.20
-#   port: 17777
+#   port: 17778
 #   source_ip: 192.168.10.15
 station_id: boat_001
 keepalive_interval: 30

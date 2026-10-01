@@ -394,6 +394,52 @@ def test_legacy_output_stays_udpsec_and_emits_one_output_notice(tmp_path, capsys
     ]
 
 
+@pytest.mark.parametrize(
+    "operator_config",
+    (
+        pytest.param(None, id="no-config-file"),
+        pytest.param(
+            {"input": canonical_input(), "remote_host": "192.0.2.10"},
+            id="legacy-output-without-remote-port",
+        ),
+    ),
+)
+def test_built_in_legacy_fallback_sends_udpsec_to_port_17779(
+    monkeypatch,
+    tmp_path,
+    operator_config,
+):
+    proxy = load_proxy_module()
+    monkeypatch.delenv(proxy.CONFIG_ENV_VAR, raising=False)
+    monkeypatch.setattr(
+        proxy,
+        "SYSTEM_CONFIG_PATH",
+        str(tmp_path / "absent-system.yaml"),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "LOCAL_CONFIG_PATH",
+        str(tmp_path / "absent-local.yaml"),
+    )
+    config_path = None
+    expected_host = proxy.DEFAULT_CONFIG["remote_host"]
+    if operator_config is not None:
+        config_path = write_config(tmp_path / "legacy-output.yaml", operator_config)
+        expected_host = operator_config["remote_host"]
+
+    config = proxy.load_config(config_path)
+    remote_addr, family = proxy.resolve_output_endpoint(config["output"])
+
+    assert config["output"] == {
+        "type": "udpsec",
+        "host": expected_host,
+        "port": 17779,
+        "legacy": True,
+    }
+    assert family == proxy.socket.AF_INET
+    assert remote_addr == (expected_host, 17779)
+
+
 def test_fully_legacy_config_emits_one_notice_per_side_without_value_changes(
     tmp_path,
     capsys,
@@ -506,7 +552,7 @@ def test_shipped_template_uses_active_explicit_input_and_output(template_name):
     assert config["output"] == {
         "type": "udpsec",
         "host": "192.0.2.10",
-        "port": 17777,
+        "port": 17779,
     }
     assert not set(config).intersection(
         {
