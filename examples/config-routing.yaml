@@ -19,7 +19,7 @@ sec_inputs:
   #   udpsec:vitara_mobile
   - id: secure_listener_alias
     listen_ip: "::"
-    listen_port: 29999
+    listen_port: 17779
     # Optional application allow-list. Omit allow_from for no application ACL;
     # use [] to deny all.
     allow_from:
@@ -36,11 +36,12 @@ udp_inputs:
       - 192.0.2.15
       - 198.51.100.0/24
 
-  # Another UDP receiver on a different port:
+  # Another UDP receiver on an IPv6-only listener, sharing the port number
+  # of the IPv4 listener above:
   #   id: dock_gate -> udp:dock_gate
   - id: dock_gate
     listen_ip: "::"
-    listen_port: 17779
+    listen_port: 17778
     allow_from:
       - 2001:db8:42::/64
 

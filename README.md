@@ -326,7 +326,7 @@ station_id: mixstation_1
 udp_inputs:
   - id: roof_receiver
     listen_ip: "0.0.0.0"
-    listen_port: 17777
+    listen_port: 17778
     allow_from:
       - 192.0.2.0/24
 
@@ -337,7 +337,10 @@ forwarders:
 ```
 
 Adapt all example addresses, ports, IDs, paths, and policy before use.
-Repository examples are inactive until copied or adapted.
+Repository examples are inactive until copied or adapted. The examples use
+port 17778 for plain UDP and 17779 for UDPSEC; both are project-chosen example
+values and remain configurable. Seeded and packaged configuration files may
+still contain older port values until the next release cleanup.
 
 ### 📡 Ingress and forwarders
 
@@ -370,7 +373,7 @@ Add a secure listener, and authorize each station's public key under its
 ```yaml
 sec_inputs:
   - listen_ip: "0.0.0.0"
-    listen_port: 19999
+    listen_port: 17779
 ```
 
 ```yaml
@@ -971,7 +974,7 @@ station_id: mixstation_1
 udp_inputs:
   - id: roof_receiver
     listen_ip: "0.0.0.0"
-    listen_port: 17777
+    listen_port: 17778
     allow_from:
       - 192.0.2.0/24
 
@@ -983,7 +986,10 @@ forwarders:
 
 Адаптирайте всички примерни адреси, портове, идентификатори, пътища и правила
 преди употреба. Примерите в хранилището са неактивни, докато не бъдат копирани
-или адаптирани.
+или адаптирани. Примерите използват порт 17778 за plain UDP и 17779 за UDPSEC;
+това са избрани от проекта примерни стойности, които остават конфигурируеми.
+Началните и пакетираните конфигурационни файлове все още може да съдържат
+по-стари стойности на портовете до почистването в следващото издание.
 
 ### 📡 Входове и UDP цели
 
@@ -1015,7 +1021,7 @@ IP адресите на източниците и UDP alias-ите са опе�
 ```yaml
 sec_inputs:
   - listen_ip: "0.0.0.0"
-    listen_port: 19999
+    listen_port: 17779
 ```
 
 ```yaml
@@ -1635,7 +1641,7 @@ station_id: mixstation_1
 udp_inputs:
   - id: roof_receiver
     listen_ip: "0.0.0.0"
-    listen_port: 17777
+    listen_port: 17778
     allow_from:
       - 192.0.2.0/24
 
@@ -1647,7 +1653,11 @@ forwarders:
 
 Adaptați înainte de utilizare toate adresele, porturile, ID-urile, căile și
 politicile din exemple. Exemplele din depozit sunt inactive până când sunt
-copiate sau adaptate.
+copiate sau adaptate. Exemplele folosesc portul 17778 pentru UDP simplu și
+17779 pentru UDPSEC; acestea sunt valori de exemplu alese de proiect și rămân
+configurabile. Fișierele de configurație inițiale și cele incluse în pachete
+pot conține încă valori de port mai vechi până la curățarea din următoarea
+versiune.
 
 ### 📡 Intrări și forwardere
 
@@ -1681,7 +1691,7 @@ sub `station_id`-ul ei în `/etc/aismixer/authorized_keys.yaml`:
 ```yaml
 sec_inputs:
   - listen_ip: "0.0.0.0"
-    listen_port: 19999
+    listen_port: 17779
 ```
 
 ```yaml

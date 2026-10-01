@@ -89,7 +89,7 @@ input:
 output:
   type: udpsec
   host: mixer.example.net
-  port: 17777
+  port: 17779
   # source_ip: 192.0.2.20
 
 station_id: boat_001
@@ -103,8 +103,11 @@ remote_public_key: /etc/nmea_sproxy/keys/aismixer_public.pem
 ```
 
 Replace all documentation addresses; `output.port` must match the mixer's
-`sec_inputs` listener. [`config.yaml`](config.yaml) is for checkout/manual
-use, while [`config.system.yaml`](config.system.yaml) seeds the system config.
+`sec_inputs` listener. The examples use mixer port 17779 for UDPSEC and 17778
+for plain UDP; both are project-chosen example values and remain configurable.
+[`config.yaml`](config.yaml) is for checkout/manual use, while
+[`config.system.yaml`](config.system.yaml) seeds the system config; until the
+next release cleanup, both templates may still use an older example port.
 
 ### Settings and defaults
 
@@ -233,7 +236,7 @@ identity or trust prevents activation.
 output:
   type: udp
   host: 192.168.10.20
-  port: 17777
+  port: 17778
   # source_ip: 192.168.10.15
 ```
 

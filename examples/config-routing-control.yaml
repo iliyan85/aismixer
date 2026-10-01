@@ -20,7 +20,7 @@ sec_inputs:
   # but it does not replace the authenticated routing source ID.
   - id: secure_listener_alias
     listen_ip: "::"
-    listen_port: 29999
+    listen_port: 17779
     allow_from:
       - 2001:db8:42::/64
       - 203.0.113.44
@@ -35,7 +35,7 @@ udp_inputs:
 
   - id: dock_gate
     listen_ip: "::"
-    listen_port: 17779
+    listen_port: 17778
     allow_from:
       - 2001:db8:42::/64
 
