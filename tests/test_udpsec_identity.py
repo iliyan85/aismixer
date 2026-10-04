@@ -12,6 +12,7 @@ import core.udpsec_identity as udpsec_identity
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_PRIVATE_NAME = "aismixer_private.pem"
 SERVER_PUBLIC_NAME = "aismixer_public.pem"
+LEGACY_PRIVATE_NAME = "aismixer_private.key"
 PLAIN_CONFIG = {"sec_inputs": []}
 UDPSEC_CONFIG = {
     "sec_inputs": [
@@ -295,3 +296,179 @@ def test_mismatched_complete_pair_fails_without_overwrite(tmp_path):
 
     assert generated.private_path.read_bytes() == mismatched_private
     assert generated.public_path.read_bytes() == mismatched_public
+
+
+def _rerooted_identity_pairs(tmp_path: Path):
+    """Return the real default search order with every directory moved.
+
+    The canonical keys directory maps to ``tmp_path / "canonical"``, the
+    checkout directory to ``tmp_path / "checkout"`` and every other default
+    directory to its own directory under ``tmp_path``, so a test follows the
+    production lookup order without touching real key locations.
+    """
+    canonical_dir = tmp_path / "canonical"
+    checkout_dir = tmp_path / "checkout"
+    directories = {
+        udpsec_identity.UDPSEC_SERVER_KEYS_DIR: canonical_dir,
+        ROOT: checkout_dir,
+    }
+
+    def reroot(path: Path) -> Path:
+        directory = directories.setdefault(
+            path.parent,
+            tmp_path / f"system-{len(directories)}",
+        )
+        return directory / path.name
+
+    pairs = tuple(
+        udpsec_identity._IdentityPair(
+            reroot(pair.private_path),
+            reroot(pair.public_path),
+        )
+        for pair in udpsec_identity._default_identity_pairs()
+    )
+    assert {
+        path.parent
+        for pair in pairs
+        for path in (pair.private_path, pair.public_path)
+    } >= {canonical_dir, checkout_dir}
+    return pairs, canonical_dir, checkout_dir
+
+
+def _service_with_identity_pairs(monkeypatch, pairs):
+    monkeypatch.setattr(
+        udpsec_identity,
+        "_default_identity_pairs",
+        lambda: pairs,
+    )
+    service = udpsec_identity.UdpsecServerIdentityService()
+    # Never let a test fall through to the real default key locations.
+    assert service._identity_pairs == pairs
+    return service
+
+
+@pytest.mark.parametrize(
+    ("present_name", "missing_name"),
+    (
+        # A fresh checkout has this shape: the repository tracks the server
+        # public key but never its private key.
+        (SERVER_PUBLIC_NAME, SERVER_PRIVATE_NAME),
+        (SERVER_PRIVATE_NAME, SERVER_PUBLIC_NAME),
+        (LEGACY_PRIVATE_NAME, SERVER_PUBLIC_NAME),
+    ),
+)
+def test_checkout_half_identity_fails_closed_without_generation(
+    monkeypatch,
+    tmp_path,
+    present_name,
+    missing_name,
+):
+    pairs, canonical_dir, checkout_dir = _rerooted_identity_pairs(tmp_path)
+    source = _generate_server_pair(tmp_path / "source")
+    member = (
+        source.public_path
+        if present_name == SERVER_PUBLIC_NAME
+        else source.private_path
+    )
+    checkout_dir.mkdir()
+    present_path = checkout_dir / present_name
+    present_path.write_bytes(member.read_bytes())
+    original_present = present_path.read_bytes()
+    service = _service_with_identity_pairs(monkeypatch, pairs)
+
+    with pytest.raises(
+        udpsec_identity.IncompleteUdpsecServerIdentityError,
+        match="identity is incomplete",
+    ) as exc_info:
+        service.ensure_for_configuration(UDPSEC_CONFIG)
+
+    assert exc_info.value.existing_path == present_path
+    assert exc_info.value.missing_path == checkout_dir / missing_name
+    assert present_path.read_bytes() == original_present
+    assert list(checkout_dir.iterdir()) == [present_path]
+    assert not canonical_dir.exists()
+
+
+def test_checkout_legacy_key_with_shared_public_key_is_used_without_generation(
+    monkeypatch,
+    tmp_path,
+):
+    pairs, canonical_dir, checkout_dir = _rerooted_identity_pairs(tmp_path)
+    generated = _generate_pair(
+        checkout_dir,
+        private_name=LEGACY_PRIVATE_NAME,
+        public_name=SERVER_PUBLIC_NAME,
+    )
+    original_private = generated.private_path.read_bytes()
+    original_public = generated.public_path.read_bytes()
+    service = _service_with_identity_pairs(monkeypatch, pairs)
+
+    result = service.ensure_for_configuration(UDPSEC_CONFIG)
+
+    assert result is not None
+    assert result.generated is False
+    assert result.private_path == generated.private_path
+    assert result.public_path == generated.public_path
+    assert generated.private_path.read_bytes() == original_private
+    assert generated.public_path.read_bytes() == original_public
+    assert not (checkout_dir / SERVER_PRIVATE_NAME).exists()
+    assert not canonical_dir.exists()
+
+
+def test_checkout_legacy_key_with_mismatched_public_key_fails_closed(
+    monkeypatch,
+    tmp_path,
+):
+    pairs, canonical_dir, checkout_dir = _rerooted_identity_pairs(tmp_path)
+    generated = _generate_pair(
+        checkout_dir,
+        private_name=LEGACY_PRIVATE_NAME,
+        public_name=SERVER_PUBLIC_NAME,
+    )
+    other = _generate_server_pair(tmp_path / "other")
+    generated.public_path.write_bytes(other.public_path.read_bytes())
+    mismatched_private = generated.private_path.read_bytes()
+    mismatched_public = generated.public_path.read_bytes()
+    service = _service_with_identity_pairs(monkeypatch, pairs)
+
+    with pytest.raises(
+        udpsec_identity.UdpsecServerIdentityError,
+        match="public key does not match its private key",
+    ):
+        service.ensure_for_configuration(UDPSEC_CONFIG)
+
+    assert generated.private_path.read_bytes() == mismatched_private
+    assert generated.public_path.read_bytes() == mismatched_public
+    assert not canonical_dir.exists()
+
+
+def test_absent_identity_is_generated_in_canonical_directory_not_checkout(
+    monkeypatch,
+    tmp_path,
+):
+    pairs, canonical_dir, checkout_dir = _rerooted_identity_pairs(tmp_path)
+    service = _service_with_identity_pairs(monkeypatch, pairs)
+
+    result = service.ensure_for_configuration(UDPSEC_CONFIG)
+
+    assert result is not None
+    assert result.generated is True
+    assert result.private_path == canonical_dir / SERVER_PRIVATE_NAME
+    assert result.public_path == canonical_dir / SERVER_PUBLIC_NAME
+    assert not checkout_dir.exists()
+
+
+def test_plain_configuration_ignores_checkout_half_identity(
+    monkeypatch,
+    tmp_path,
+):
+    pairs, canonical_dir, checkout_dir = _rerooted_identity_pairs(tmp_path)
+    checkout_dir.mkdir()
+    lone_public = checkout_dir / SERVER_PUBLIC_NAME
+    lone_public.write_bytes(b"public half only")
+    service = _service_with_identity_pairs(monkeypatch, pairs)
+
+    assert service.ensure_for_configuration(PLAIN_CONFIG) is None
+    assert lone_public.read_bytes() == b"public half only"
+    assert list(checkout_dir.iterdir()) == [lone_public]
+    assert not canonical_dir.exists()

@@ -8,21 +8,68 @@ still change public APIs and configuration behavior as the project matures.
 
 ### Added
 
-- UDPSEC sessions now tolerate the station's externally observed UDP
-  source address changing during an active session — for example, a
-  mobile/cellular station moving between towers or NAT mappings — without
-  dropping the connection or requiring a new authenticated handshake. The
-  server authenticates the new address through a bounded
-  challenge/response exchange before treating it as authoritative, and
-  the whole exchange rides on the existing session's own encryption key
-  and replay protection; a station that never changes address sees no
-  behavioral difference. This has been validated end to end, including
-  its interaction with the existing in-session key-refresh feature and
-  with multi-part AIS sentence reassembly across an address change, using
-  a test harness that drives the real client and server network loops
-  together. Adds `migration_challenges_sent`, `migration_invalid_responses`,
-  and `retired_path_packets_admitted` to the local secure-state runtime
-  statistics for observability into this new behavior.
+- UDPSEC now recovers from temporary mobile and network disruption without
+  starting a new session, within explicit bounds, and distinguishes a short
+  loss on an unchanged path (same public address and port) from a real public
+  address or port change. In field runs, the dominant mobile failure left the
+  station's public IP address and UDP port unchanged.
+- Same-path liveness recovery in `nmea_sproxy`: one missed keepalive exchange
+  no longer immediately ends an otherwise viable session. The station keeps
+  at most one logical keepalive ping outstanding and, while NMEA forwarding
+  continues, retransmits it at a bounded rate with the same sequence number,
+  each time freshly encrypted with a fresh AEAD nonce. Qualifying
+  authenticated evidence (a matching pong, the first verified reply or the
+  commit of a key epoch refresh, or a matched path-migration
+  acknowledgement) that arrives within `peer_timeout` (default 90 s) of the
+  last such evidence preserves the same logical session; `peer_timeout` is
+  the terminal liveness bound. Transient local network errors, such as a
+  temporarily unreachable network, are handled within the same bound instead
+  of ending the session; a sentence whose send failed is dropped, not resent.
+- Authenticated path migration: a live session can move to a new public
+  address or port, for example after NAT/CGNAT rebinding, without a new
+  handshake. NMEA and keepalive packets from the new address that
+  authenticate under the session's current keys are accepted into the same
+  session at once, so NMEA keeps flowing and multipart AIS messages that
+  straddle the change still reassemble, but they do not by themselves make
+  the new address authoritative. `aismixer` first proves return
+  routability, that the station can receive at the new address: it sends an
+  encrypted PATH_CHALLENGE there and moves its replies to the new address
+  only after the station's encrypted PATH_RESPONSE arrives from that address,
+  which commits the new path. If no proof arrives in time, the session keeps
+  its previous path, later traffic from the new address starts a new
+  attempt, and the `peer_timeout` bound still applies. A committed migration
+  keeps the same logical session, traffic-key epochs, and replay state.
+- Bounded PATH_CHALLENGE retransmission: the mixer sends the same challenge,
+  freshly encrypted each time, at most four times in total and at least 2 s
+  apart, within the candidate path's fixed 10 s window. Retransmission
+  improves delivery only; it grants no authority and never extends that
+  window.
+- Liveness recovery and path migration compose with in-session key epoch
+  refresh and with session expiry, replacement, and shutdown handling. These
+  retransmissions and this integration reuse existing UDPSECv2 messages and
+  add no message type, wire-format change, or configuration option of their
+  own.
+- Recovery is bounded: when no qualifying authenticated evidence arrives
+  within `peer_timeout`, for example after a long outage or a mixer crash,
+  the station falls back to a fresh authenticated establishment, a new
+  session with a new signed handshake. UDPSEC never buffers or resends NMEA,
+  so sentences sent into an outage can be lost even when the session
+  survives.
+- Validation: same-path recovery has field validation from a real mobile road
+  run, in which the public address and port stayed unchanged and one
+  keepalive retransmission recovered the same session. Path migration has
+  end-to-end, security, and integration validation in the project's test
+  suites, whose end-to-end tests drive the real client and server loops over
+  a simulated network; a successful in-session migration has not yet been
+  observed in a field run.
+- Recovery is visible in `aismixer` path-migration log lines and in
+  `nmea_sproxy` liveness log lines and runtime status fields, including
+  `path_gen`, which is 0 before any path migration and rises with each
+  committed one; the `nmea_sproxy` guide lists them. Mixer-side migration
+  counters such as `migration_challenges_sent`,
+  `migration_challenge_retries_sent`, `migration_invalid_responses`, and
+  `retired_path_packets_admitted` are internal secure-state accounting and
+  are not exported through the runtime heartbeat or `aismixerctl`.
 
 ### Changed
 
@@ -41,6 +88,50 @@ still change public APIs and configuration behavior as the project matures.
 - Advances OpenWrt packaging to `0.2.1-r4` for the packaging/deployment
   terminology corrections and unbuffered-output wrapper changes, while
   remaining pinned to the upstream v0.2.1 source revision.
+- Standardizes the UDPSEC port convention on 17779, a project-chosen and
+  configurable value. The seeded mixer `sec_inputs` listener (repository
+  `config.yaml` and the OpenWrt source package seed), the `nmea_sproxy`
+  configuration templates (checkout, system, and OpenWrt seed), the
+  `nmea_sproxy` built-in legacy fallback, and the operator documentation and
+  examples now use 17779; documentation examples use 17778 for plain UDP. The
+  seeded mixer listener (previously 19999) and the seeded `nmea_sproxy`
+  destination (previously 17777) now match.
+- Changes the `nmea_sproxy` built-in legacy fallback destination port from
+  19999 to 17779. The fallback applies only when no configuration file is
+  found, the selected file is empty, or a legacy top-level configuration
+  omits both `output:` and `remote_port`; an explicit `output:` mapping still
+  requires `output.port`.
+
+### Compatibility and operator impact
+
+- Upgrade both ends together: the current UDPSECv2 wire format does not
+  interoperate with v0.2.1 or earlier builds, including the published
+  OpenWrt `0.2.1-r4` packages, and has no version negotiation or fallback.
+  Upgrade `aismixer` and every `nmea_sproxy` that sends to it at the same
+  time; matching ports alone do not make a mixed-version relation work.
+- Check UDPSEC ports when upgrading any deployment, including OpenWrt: for
+  every station, verify that its UDPSEC destination port (`output.port`,
+  legacy `remote_port`, or the built-in 17779 fallback described above)
+  equals the mixer's `sec_inputs` `listen_port`. Ports set explicitly in
+  configuration still apply, and the systemd install and update scripts keep
+  existing configuration files rather than rewriting them, so a preserved
+  mixer configuration may still listen on 19999 while a legacy-form
+  `nmea_sproxy` configuration that omits `remote_port` now sends to 17779.
+  Such a station cannot connect until both ends use the same port; its
+  handshakes get no reply.
+- `peer_timeout` is now the only liveness bound at which `nmea_sproxy` ends a
+  UDPSEC session: an unanswered keepalive ping no longer forces a fresh
+  handshake at the next keepalive deadline. Detecting a mixer that crashed or
+  became unreachable, or whose shutdown close was lost, can therefore take up
+  to `peer_timeout` after the last authenticated evidence, and a station
+  configured with a large `peer_timeout` waits correspondingly longer before
+  re-establishing. `aismixer` still expires a session that receives no
+  admitted traffic for 300 s, so a `peer_timeout` above that cannot keep a
+  session through a longer outage.
+- Published OpenWrt `0.2.1-r4` packages are unchanged: they run the 0.2.1
+  code and keep the configuration of the release they were built from. The
+  OpenWrt source package seed files in this repository now carry 17779, but
+  no package containing them has been built or published.
 
 ## [0.2.1] - 2026-09-04
 
