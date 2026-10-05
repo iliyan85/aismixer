@@ -8,47 +8,101 @@ still change public APIs and configuration behavior as the project matures.
 
 ### Added
 
+- UDPSECv2, revision 2 of the UDPSEC protocol between `nmea_sproxy` and
+  `aismixer`. The signed handshake now carries protocol version 2, and the
+  mixer's signed reply assigns each new session a random 16-byte session
+  locator; the mixer's signature and the key derivation cover both. DATA
+  packets use new `NMEA-D2` framing that carries the locator and a one-byte
+  traffic-key epoch hint, and each packet's authentication binds the
+  locator and the full epoch number. `aismixer` now finds an established
+  session by its locator instead of the station's source IP address and
+  UDP port, which makes the path migration below possible; a handshake
+  that has not completed stays bound to the address and port it started
+  from. The locator is a lookup hint, not a credential or a secret: it
+  travels in clear and grants nothing by itself, because every packet must
+  still pass `allow_from`, authenticate under the session's keys, pass the
+  replay check, and carry the session's station identity in its encrypted
+  payload. A packet that names an unknown session is dropped without
+  decryption or reply.
+- In-session key epoch refresh: with `session_refresh_interval` above zero,
+  `nmea_sproxy` periodically renews the traffic keys inside the running
+  session through a fresh ephemeral P-256 ECDHE exchange whose request and
+  reply are signed with the station and mixer identity keys; the new keys
+  for each direction come from that exchange, never from the previous
+  keys. The REFRESH_INIT, REFRESH_REPLY, REFRESH_CONFIRM, and REFRESH_ACK
+  control messages travel inside the encrypted DATA channel, NMEA and
+  keepalives keep flowing under the current keys meanwhile, and the
+  station switches only after the mixer's acknowledgement authenticates
+  under the new keys. A refresh is neither a new session nor a path
+  change: the locator, the active path, and multipart reassembly continue.
+- Key epoch refresh is bounded: the station sends each of its two refresh
+  messages (REFRESH_INIT and REFRESH_CONFIRM) at most six times, at least
+  2 s apart and freshly encrypted, and abandons a refresh not completed
+  within 15 s, keeping the current keys until the next planned attempt. If
+  the mixer has already switched and its acknowledgements are lost, the
+  old keys stop working shortly afterwards, so the session ends at the
+  `peer_timeout` bound and a fresh handshake follows. `aismixer` keeps a
+  separate nonce ledger for each epoch and accepts the previous epoch only
+  briefly after a switch, for late NMEA, keepalive, and close traffic.
+  Refresh is time-based only: if the current epoch's nonce ledger fills,
+  the session still fails closed and a fresh handshake follows.
 - UDPSEC now recovers from temporary mobile and network disruption without
   starting a new session, within explicit bounds, and distinguishes a short
   loss on an unchanged path (same public address and port) from a real public
   address or port change. In field runs, the dominant mobile failure left the
   station's public IP address and UDP port unchanged.
 - Same-path liveness recovery in `nmea_sproxy`: one missed keepalive exchange
-  no longer immediately ends an otherwise viable session. The station keeps
-  at most one logical keepalive ping outstanding and, while NMEA forwarding
-  continues, retransmits it at a bounded rate with the same sequence number,
-  each time freshly encrypted with a fresh AEAD nonce. Qualifying
-  authenticated evidence (a matching pong, the first verified reply or the
-  commit of a key epoch refresh, or a matched path-migration
+  no longer immediately ends an otherwise viable session, and NMEA
+  forwarding continues meanwhile. The station keeps at most one logical
+  keepalive ping outstanding and retransmits it at a bounded rate with the
+  same sequence number, each time freshly encrypted with a fresh AEAD nonce.
+  Qualifying authenticated evidence (a matching pong, the first verified
+  reply or the commit of a key epoch refresh, or a matched path-migration
   acknowledgement) that arrives within `peer_timeout` (default 90 s) of the
   last such evidence preserves the same logical session; `peer_timeout` is
   the terminal liveness bound. Transient local network errors, such as a
-  temporarily unreachable network, are handled within the same bound instead
-  of ending the session; a sentence whose send failed is dropped, not resent.
+  temporarily unreachable network or an ICMP-derived refusal, are handled
+  within the same bound instead of ending the session and never count as
+  evidence; other socket errors still end it. A sentence whose send failed
+  is dropped, not resent, and not counted as forwarded, and local input
+  pauses until a keepalive can be sent again without a local error; input
+  that overflows its buffer meanwhile is lost.
 - Authenticated path migration: a live session can move to a new public
   address or port, for example after NAT/CGNAT rebinding, without a new
   handshake. NMEA and keepalive packets from the new address that
   authenticate under the session's current keys are accepted into the same
   session at once, so NMEA keeps flowing and multipart AIS messages that
   straddle the change still reassemble, but they do not by themselves make
-  the new address authoritative. `aismixer` first proves return
-  routability, that the station can receive at the new address: it sends an
-  encrypted PATH_CHALLENGE there and moves its replies to the new address
-  only after the station's encrypted PATH_RESPONSE arrives from that address,
-  which commits the new path. If no proof arrives in time, the session keeps
-  its previous path, later traffic from the new address starts a new
-  attempt, and the `peer_timeout` bound still applies. A committed migration
-  keeps the same logical session, traffic-key epochs, and replay state.
+  the new address authoritative, and keepalives from it are not answered
+  yet. `aismixer` first proves return routability, that the station can
+  receive at the new address: it sends an encrypted PATH_CHALLENGE there,
+  which `nmea_sproxy` answers automatically, and moves its replies to the
+  new address only after the station's encrypted PATH_RESPONSE arrives from
+  that address, which commits the new path; an encrypted acknowledgement
+  confirms the commit to the station. If no proof arrives in time, the
+  session keeps its previous path, later traffic from the new address
+  starts a new attempt, and the `peer_timeout` bound still applies. A
+  committed migration keeps the same logical session, traffic-key epochs,
+  and replay state. Migration has no configuration option.
+- Path migration limits: only packets that authenticate under the session's
+  current keys, pass the replay check, and come from a source admitted by
+  the listener's `allow_from` can propose a new address; packets that fail
+  these checks draw no PATH_CHALLENGE or other reply. Each session holds at
+  most one unproven address, which a newer one replaces, and until the
+  commit that address cannot close the session or start a key refresh.
+  After a migration, late NMEA from the previous address is still accepted
+  briefly, but that address cannot become active again without a new
+  challenge and response.
 - Bounded PATH_CHALLENGE retransmission: the mixer sends the same challenge,
   freshly encrypted each time, at most four times in total and at least 2 s
   apart, within the candidate path's fixed 10 s window. Retransmission
   improves delivery only; it grants no authority and never extends that
   window.
 - Liveness recovery and path migration compose with in-session key epoch
-  refresh and with session expiry, replacement, and shutdown handling. These
-  retransmissions and this integration reuse existing UDPSECv2 messages and
-  add no message type, wire-format change, or configuration option of their
-  own.
+  refresh and with session expiry, replacement, and shutdown handling. The
+  keepalive and PATH_CHALLENGE retransmissions and this integration add no
+  message type, wire-format change, or configuration option beyond the
+  UDPSECv2 messages described above.
 - Recovery is bounded: when no qualifying authenticated evidence arrives
   within `peer_timeout`, for example after a long outage or a mixer crash,
   the station falls back to a fresh authenticated establishment, a new
@@ -62,14 +116,32 @@ still change public APIs and configuration behavior as the project matures.
   suites, whose end-to-end tests drive the real client and server loops over
   a simulated network; a successful in-session migration has not yet been
   observed in a field run.
-- Recovery is visible in `aismixer` path-migration log lines and in
-  `nmea_sproxy` liveness log lines and runtime status fields, including
-  `path_gen`, which is 0 before any path migration and rises with each
-  committed one; the `nmea_sproxy` guide lists them. Mixer-side migration
-  counters such as `migration_challenges_sent`,
+- Field diagnostics: each authenticated pong now also reports, inside its
+  encrypted payload, the address and port from which `aismixer` received
+  the answered keepalive and the session's committed path-migration
+  generation. For UDPSEC output, the `nmea_sproxy` `Runtime:` status line
+  shows a short session label (`session=`), the traffic-key epoch
+  (`epoch=`), the local liveness state (`peer=alive` or `peer=dead`), the
+  reported address (`observed=`) with its age, and the generation
+  (`path_gen=`), which is 0 before any migration and rises with each
+  committed one; both read `unknown` without a report, and `last-known`
+  marks a report older than an acknowledged migration. These values are
+  display only: they never select or authorize a path and are never
+  liveness evidence beyond the pong that carries them.
+- `aismixer` logs each committed path migration and key epoch refresh, and
+  also writes path-candidate, challenge-retransmission, migration-commit,
+  and path-expiry events through a bounded queue on a best-effort basis:
+  during bursts or blocked log output, some of these lines can be lost
+  without notice. The queued lines carry the same session label as the
+  station's status line and include IP addresses and ports, but never
+  keys, nonces, or challenge tokens. `nmea_sproxy` logs suspected and
+  recovered liveness, transient send failures and their end, acknowledged
+  migrations, and key epoch refresh start, commit, and abandonment; its
+  guide describes these lines, the mixer lines, and the status fields.
+  Mixer-side migration counters such as `migration_challenges_sent`,
   `migration_challenge_retries_sent`, `migration_invalid_responses`, and
-  `retired_path_packets_admitted` are internal secure-state accounting and
-  are not exported through the runtime heartbeat or `aismixerctl`.
+  `retired_path_packets_admitted` are internal secure-state accounting
+  only and are not exported through the runtime heartbeat or `aismixerctl`.
 
 ### Changed
 
@@ -81,34 +153,109 @@ still change public APIs and configuration behavior as the project matures.
 - Starts the systemd-managed and OpenWrt-wrapped `aismixer` and `nmea_sproxy`
   long-lived processes with unbuffered Python output (`python3 -u`), so the
   existing sparse runtime heartbeat and status lines reach journald/logd
-  promptly instead of being delayed by pipe-buffered stdout. This is a
-  deployment-only change: heartbeat scheduling, logging design, and
-  protocol/runtime-statistics semantics are unchanged, and `nmea_sproxy`
-  gains no debug or log-level feature.
-- Advances OpenWrt packaging to `0.2.1-r4` for the packaging/deployment
-  terminology corrections and unbuffered-output wrapper changes, while
-  remaining pinned to the upstream v0.2.1 source revision.
+  promptly instead of being delayed by pipe-buffered stdout. This
+  deployment-only change does not by itself alter heartbeat scheduling,
+  logging design, or protocol and runtime-statistics semantics, and adds no
+  `nmea_sproxy` debug or log-level option.
+- Advances OpenWrt packaging from `0.2.1-r1` to `0.2.1-r4`. Since `0.2.1-r2`
+  the packages are built from the v0.2.1 release commit itself; `0.2.1-r1`
+  was built from an earlier pre-release revision that still used the
+  unauthenticated plaintext `NOSESSION` notice. `0.2.1-r2` also seeds an
+  empty `/etc/aismixer/udp_alias_map.yaml` instead of two developer lab
+  aliases, marks the packages architecture-independent as intended, and
+  declares `python3-cryptography` for `aismixer-common`; `0.2.1-r3` makes
+  `aismixer` and `nmea_sproxy` require the identical `aismixer-common`
+  revision; `0.2.1-r4` adds the packaging terminology corrections and the
+  unbuffered-output wrappers above. `0.2.1-r2` through `0.2.1-r4` run the
+  same v0.2.1 Python code.
 - Standardizes the UDPSEC port convention on 17779, a project-chosen and
   configurable value. The seeded mixer `sec_inputs` listener (repository
   `config.yaml` and the OpenWrt source package seed), the `nmea_sproxy`
-  configuration templates (checkout, system, and OpenWrt seed), the
-  `nmea_sproxy` built-in legacy fallback, and the operator documentation and
-  examples now use 17779; documentation examples use 17778 for plain UDP. The
-  seeded mixer listener (previously 19999) and the seeded `nmea_sproxy`
-  destination (previously 17777) now match.
+  configuration templates (checkout, system, and OpenWrt seed), and the
+  operator documentation and examples now use 17779; documentation examples
+  use 17778 for plain UDP. The seeded mixer listener (previously 19999) and
+  the seeded `nmea_sproxy` destination (previously 17777) now match.
 - Changes the `nmea_sproxy` built-in legacy fallback destination port from
   19999 to 17779. The fallback applies only when no configuration file is
   found, the selected file is empty, or a legacy top-level configuration
   omits both `output:` and `remote_port`; an explicit `output:` mapping still
   requires `output.port`.
+- Ties UDPSEC multipart reassembly to the authenticated session instead of
+  the sender's IP address and port. Fragments of one AIS message still join
+  across a key epoch refresh, a path migration, or a re-handshake in which
+  the same station replaces its live session from the same address and
+  port. Fragments from different stations, or from a session that has
+  already ended, are never combined, even from the same address and port.
+- Discards a UDPSEC NMEA frame that has waited more than 20 s inside
+  `aismixer` before processing, for example under sustained backlog,
+  instead of feeding it to multipart assembly late. Plain UDP input is not
+  affected; such drops are not logged and appear in runtime statistics only
+  as processing calls without output.
+- Hardens UDPSEC state handling for long-running mixers: expiry is checked
+  against the current monotonic time rather than one sampled before
+  processing, so delays cannot keep expired state alive, and a background
+  task reclaims expired UDPSEC state every 30 s even without traffic.
+  UDPSEC timeouts and capacity limits are unchanged. `aismixer` shutdown
+  now attempts every cleanup step, for sockets, the control socket,
+  forwarders, and UDPSEC state, even if an earlier one fails.
+- Compares UDPSEC peer addresses with one canonical rule on both ends: IPv6
+  addresses in canonical form, including their scope (zone) and ignoring
+  the flow label, so `nmea_sproxy` accepts mixer replies only from the
+  configured mixer address with a matching IPv6 scope.
+- Renders network endpoints in `aismixer` and `nmea_sproxy` log and status
+  output, and in the input `display` field, with one display-only
+  convention: IPv4 as `192.0.2.10:17778` and IPv6 as `2001:db8::10.17778`
+  (tcpdump style, without brackets). It replaces `[ip]:port` in `aismixer`
+  listener lines, `ip:port` for IPv6 in `nmea_sproxy` and UDPSEC listener
+  lines, and Python address tuples such as `('192.0.2.10', 41000)` in
+  UDPSEC log lines; update log parsers that read endpoints. The text is
+  never parsed back or used as session, path, routing, or filter identity,
+  and it omits the scope id of received IPv6 addresses.
+- Raises the local routing-control protocol that `aismixerctl` uses over
+  the `control.unix` socket from version 1 to version 2; this number is
+  unrelated to the UDPSEC protocol revision. Each
+  `runtime.statistics.inputs` row gains a required human-readable `display`
+  field, and an input without an `id` now has the address-independent
+  selector `udp-ingress:<n>` or `udpsec-ingress:<n>`, where `<n>` is its
+  0-based position in `udp_inputs` or `sec_inputs`, instead of one that
+  embedded its listen address, such as `udp-ingress:0:0.0.0.0:17778`;
+  inputs with an `id` keep `<kind>-ingress:<n>:<id>`. The selector is each
+  row's `name`; in the interactive `show statistics inputs` table, the
+  INPUT column shows the `display` label and a new SELECTOR column shows
+  the selector, which input filters match. Ingress queues in
+  `show statistics` use the same selectors.
+- `aismixer` now acts on SIGTERM, such as from `systemctl stop` or procd,
+  at a safe point between event-loop callbacks instead of interrupting
+  whatever code is running, so a stop request no longer cuts through an
+  operation in progress; a repeated SIGTERM while the service loop runs is
+  ignored. SIGTERM still runs the normal shutdown path, but a callback that
+  blocks, such as a stalled log write, now delays the stop until it returns
+  or the service manager's stop timeout ends the process. `nmea_sproxy`
+  signal handling is unchanged.
+- During a re-handshake, `nmea_sproxy` now skips a delayed encrypted packet
+  from its previous session silently instead of logging a misleading
+  `Invalid handshake response format` warning; a malformed handshake reply
+  still logs it.
+- The `nmea_sproxy` install and update scripts also install the shared
+  `core/endpoint_display.py` and `core/sockaddr_identity.py` modules; a
+  station installed by hand must now copy them as well.
 
 ### Compatibility and operator impact
 
-- Upgrade both ends together: the current UDPSECv2 wire format does not
-  interoperate with v0.2.1 or earlier builds, including the published
-  OpenWrt `0.2.1-r4` packages, and has no version negotiation or fallback.
-  Upgrade `aismixer` and every `nmea_sproxy` that sends to it at the same
-  time; matching ports alone do not make a mixed-version relation work.
+- Upgrade both ends together: UDPSECv2 does not interoperate with v0.2.1 or
+  earlier builds, including the published OpenWrt `0.2.1-r4` packages, and
+  has no version negotiation, downgrade, or fallback. Upgrade `aismixer`
+  and every `nmea_sproxy` that sends to it at the same time, and roll them
+  back together too; matching ports alone do not make a mixed-version
+  relation work. In a mixed pair the mixer logs
+  `Handshake error ... invalid ClientHello packet format` for each attempt
+  and sends no reply, while the station logs
+  `No response from server during handshake.` and retries. UDPSECv2 also
+  evolved during this unreleased development line, so do not assume that
+  any earlier development build interoperates: builds whose DATA framing
+  predates key epoch refresh announce version 2 as well, and their
+  handshakes get a reply, but the session is never confirmed
+  (`No session confirmation from server.`).
 - Check UDPSEC ports when upgrading any deployment, including OpenWrt: for
   every station, verify that its UDPSEC destination port (`output.port`,
   legacy `remote_port`, or the built-in 17779 fallback described above)
@@ -119,19 +266,56 @@ still change public APIs and configuration behavior as the project matures.
   `nmea_sproxy` configuration that omits `remote_port` now sends to 17779.
   Such a station cannot connect until both ends use the same port; its
   handshakes get no reply.
+- Path migration does not bypass a `sec_inputs` `allow_from` list: packets
+  from a new public address outside it are dropped before any migration
+  step. A mobile station whose public address can change needs a list that
+  covers every address it may use, or no list.
 - `peer_timeout` is now the only liveness bound at which `nmea_sproxy` ends a
   UDPSEC session: an unanswered keepalive ping no longer forces a fresh
   handshake at the next keepalive deadline. Detecting a mixer that crashed or
-  became unreachable, or whose shutdown close was lost, can therefore take up
-  to `peer_timeout` after the last authenticated evidence, and a station
-  configured with a large `peer_timeout` waits correspondingly longer before
-  re-establishing. `aismixer` still expires a session that receives no
-  admitted traffic for 300 s, so a `peer_timeout` above that cannot keep a
-  session through a longer outage.
+  became unreachable, whose shutdown close was lost, or that dropped the
+  session without telling the station (for example when the session's
+  nonce ledger filled) can therefore take up to `peer_timeout` after the
+  last authenticated evidence (about 90 s with the defaults, instead of
+  about 60 s), and a station configured with a large `peer_timeout` waits
+  correspondingly longer before re-establishing.
+  `aismixer` still expires a session that receives no admitted traffic for
+  300 s, so a `peer_timeout` above that cannot keep a session through a
+  longer outage.
+- `session_refresh_interval` keeps its name, unit (seconds), default (`0`,
+  disabled), and validation, but a value above zero now runs the in-session
+  key epoch refresh instead of ending the session for a fresh signed
+  handshake at each interval, as 0.2.1 did. The logs then show an
+  in-session refresh instead of a new handshake, and the station's
+  `session=` label stays the same while `epoch=` rises. `aismixer` needs no
+  new setting.
+- The `nmea_sproxy` UDPSEC `Runtime:` status line has a new format:
+  `session=` now carries a short session label instead of `up` or `down`,
+  and the local liveness state it used to show is now `peer=alive` or
+  `peer=dead`. Update log filters and monitoring that match `session=up` or
+  `session=down`; plain-UDP status lines are unchanged.
+- Use the `aismixerctl` from the same release as `aismixer`, and restart
+  `aismixer` after updating: routing-control protocol version 2 has no
+  negotiation or fallback, `aismixer` answers a version-1 request with error
+  code `unsupported_version`, and a mismatched `aismixerctl` reports
+  `Unsupported routing control response version.` for every command (exit
+  status 5 for a one-shot command). Scripts that send their own control
+  requests must send `"version": 2`. Statistics filters, scripts, or
+  monitoring that use the old address-bearing selector of an input without
+  an `id` now get an empty result rather than an error; this includes the
+  unnamed `udp_inputs` of the seeded configuration. Use the new selector:
+  the SELECTOR column in the interactive shell, or `name` in one-shot JSON
+  output. Routing configuration is not affected.
 - Published OpenWrt `0.2.1-r4` packages are unchanged: they run the 0.2.1
-  code and keep the configuration of the release they were built from. The
-  OpenWrt source package seed files in this repository now carry 17779, but
-  no package containing them has been built or published.
+  code and keep the seed configuration they were published with. The
+  OpenWrt source package seed files in this repository now carry 17779,
+  but no package containing them has been built or published. On OpenWrt,
+  upgrade every installed AISMixer package (`aismixer-common`, `aismixer`,
+  `nmea_sproxy`) in the same `apk` command, because `aismixer` and
+  `nmea_sproxy` require the identical `aismixer-common` revision; on
+  routers first installed from `0.2.1-r1`, check
+  `/etc/aismixer/udp_alias_map.yaml` for developer lab alias entries you
+  did not add.
 
 ## [0.2.1] - 2026-09-04
 
