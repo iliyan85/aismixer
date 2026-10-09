@@ -6,7 +6,7 @@ still change public APIs and configuration behavior as the project matures.
 
 ## [Unreleased]
 
-Planned v0.3.0 — not yet tagged/published.
+## [0.3.0] - 2026-10-09
 
 ### Added
 
@@ -112,12 +112,12 @@ Planned v0.3.0 — not yet tagged/published.
   so sentences sent into an outage can be lost even when the session
   survives.
 - Validation: same-path recovery has field validation from a real mobile road
-  run, in which the public address and port stayed unchanged and one
-  keepalive retransmission recovered the same session. Path migration has
-  end-to-end, security, and integration validation in the project's test
-  suites, whose end-to-end tests drive the real client and server loops over
-  a simulated network; a successful in-session migration has not yet been
-  observed in a field run.
+  run with an earlier development build of this release, in which the public
+  address and port stayed unchanged and one keepalive retransmission
+  recovered the same session. Path migration has end-to-end, security, and
+  integration validation in the project's test suites, whose end-to-end tests
+  drive the real client and server loops over a simulated network; a
+  successful in-session migration has not yet been observed in a field run.
 - Field diagnostics: each authenticated pong now also reports, inside its
   encrypted payload, the address and port from which `aismixer` received
   the answered keepalive and the session's committed path-migration
@@ -804,7 +804,8 @@ Planned v0.3.0 — not yet tagged/published.
 - No long-term storage or analytics.
 - No operational maritime-picture generation.
 
-[Unreleased]: https://github.com/iliyan85/aismixer/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/iliyan85/aismixer/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/iliyan85/aismixer/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/iliyan85/aismixer/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/iliyan85/aismixer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/iliyan85/aismixer/releases/tag/v0.1.0

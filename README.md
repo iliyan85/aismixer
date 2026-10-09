@@ -599,9 +599,8 @@ See the [security policy](SECURITY.md) for vulnerability reporting.
 ## 🧭 Project status and roadmap
 
 AISMixer is in active pre-1.0 development; pre-1.0 releases may still change
-configuration and interfaces. The latest tagged release is v0.2.1. The `main`
-branch also contains unreleased work planned for v0.3.0 (not tagged yet),
-including the UDPSECv2 session continuity described above; see the
+configuration and interfaces. The latest tagged release is v0.3.0, which
+includes the UDPSECv2 session continuity described above; see the
 [changelog](CHANGELOG.md).
 
 Planned directions, none of which is implemented yet (see the
@@ -1280,10 +1279,8 @@ UDPSEC удостоверява конфигурираните крайни то
 
 AISMixer е в активна разработка преди версия 1.0; изданията преди 1.0 все
 още могат да променят конфигурацията и интерфейсите. Последното издание с
-етикет е v0.2.1. Клонът `main` съдържа и неиздадена работа, планирана за
-изданието v0.3.0, което все още няма етикет, включително описаната по-горе
-непрекъснатост на сесиите в UDPSECv2; вижте
-[списъка на промените](CHANGELOG.md).
+етикет е v0.3.0, което включва описаната по-горе непрекъснатост на сесиите в
+UDPSECv2; вижте [списъка на промените](CHANGELOG.md).
 
 Планирани посоки, нито една от които все още не е реализирана (вижте
 [пътната карта](ROADMAP.md)):
@@ -1966,10 +1963,8 @@ vulnerabilităților.
 
 AISMixer este în dezvoltare activă înainte de versiunea 1.0; versiunile
 anterioare lui 1.0 pot încă schimba configurația și interfețele. Ultima
-versiune etichetată este v0.2.1. Ramura `main` conține și lucrări nelansate,
-planificate pentru versiunea v0.3.0, care nu este încă etichetată, inclusiv
-continuitatea sesiunilor UDPSECv2 descrisă mai sus; consultați
-[lista de modificări](CHANGELOG.md).
+versiune etichetată este v0.3.0, care include continuitatea sesiunilor
+UDPSECv2 descrisă mai sus; consultați [lista de modificări](CHANGELOG.md).
 
 Direcții planificate, dintre care niciuna nu este încă implementată (consultați
 [foaia de parcurs](ROADMAP.md)):
