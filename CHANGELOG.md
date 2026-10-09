@@ -6,6 +6,8 @@ still change public APIs and configuration behavior as the project matures.
 
 ## [Unreleased]
 
+Planned v0.3.0 — not yet tagged/published.
+
 ### Added
 
 - UDPSECv2, revision 2 of the UDPSEC protocol between `nmea_sproxy` and
@@ -269,12 +271,15 @@ still change public APIs and configuration behavior as the project matures.
   has no version negotiation, downgrade, or fallback. Upgrade `aismixer`
   and every `nmea_sproxy` that sends to it at the same time, and roll them
   back together too; matching ports alone do not make a mixed-version
-  relation work. In a mixed pair the mixer logs
+  relation work. On Debian/systemd stations, `nmea_sproxy/update.sh`
+  restarts no proxy, so after updating restart every running
+  `nmea_sproxy`: the singleton, each named instance, and any manually
+  started process. In a mixed pair the mixer logs
   `Handshake error ... invalid ClientHello packet format` for each attempt
   and sends no reply, while the station logs
   `No response from server during handshake.` and retries. UDPSECv2 also
-  evolved during this unreleased development line, so do not assume that
-  any earlier development build interoperates: builds whose DATA framing
+  evolved during development after v0.2.1, so do not assume that any
+  earlier development build interoperates: builds whose DATA framing
   predates key epoch refresh announce version 2 as well, and their
   handshakes get a reply, but the session is never confirmed
   (`No session confirmation from server.`).
@@ -330,14 +335,29 @@ still change public APIs and configuration behavior as the project matures.
   output. Routing configuration is not affected.
 - Published OpenWrt `0.2.1-r4` packages are unchanged: they run the 0.2.1
   code and keep the seed configuration they were published with. The
-  OpenWrt source package seed files in this repository now carry 17779,
-  but no package containing them has been built or published. On OpenWrt,
-  upgrade every installed AISMixer package (`aismixer-common`, `aismixer`,
-  `nmea_sproxy`) in the same `apk` command, because `aismixer` and
+  OpenWrt source package seed files in this repository now carry 17779;
+  the recipe installs them from its own `files/` directory, not from the
+  pinned source, so only packages built from this updated recipe contain
+  them. On OpenWrt, upgrade every installed AISMixer package
+  (`aismixer-common` and whichever of `aismixer` and `nmea_sproxy` the
+  router has) in the same `apk` command, because `aismixer` and
   `nmea_sproxy` require the identical `aismixer-common` revision; on
   routers first installed from `0.2.1-r1`, check
   `/etc/aismixer/udp_alias_map.yaml` for developer lab alias entries you
   did not add.
+- UDPSEC rejection logging is not rate-limited. As in 0.2.1, `aismixer`
+  logs every rejected handshake (`[!] Rejected ...` or
+  `[!] Handshake error ...`), now always as one line, synchronously on its
+  event loop. It does the same for replayed or forged DATA packets that
+  carry a live session's locator (`[!] Duplicate secure data nonce ...` or
+  `[!] Secure data error ... InvalidTag`), which, unlike in 0.2.1, need not
+  come from the session's own address: other addresses that `allow_from`
+  admits can send them too. Log volume therefore follows the sender's
+  packet rate, and a log sink that falls behind stalls all `aismixer`
+  input. Datagrams outside `allow_from` are dropped without a log line, so
+  restrict who can reach `sec_inputs` with `allow_from` or host firewall
+  rules; journald rate limits bound only what is stored, not the work done
+  for each line.
 
 ## [0.2.1] - 2026-09-04
 

@@ -262,8 +262,9 @@ to exclude other OpenWrt targets with suitable dependencies.
 release source. These packages predate the UDPSECv2 session continuity
 described above (key epoch refresh, path migration, and liveness recovery),
 and their UDPSEC wire format does not interoperate with the current source
-tree. Use one release line on both ends of a UDPSEC relation. Packages with
-this work need a later release, at which the recipe is repinned; check the
+tree. Use one release line on both ends of a UDPSEC relation. No published
+package contains this work yet: that requires repinning the recipe to
+v0.3.0 after that release is tagged and rebuilding the packages; check the
 package revision and the [changelog](CHANGELOG.md).
 
 Before installation, verify writable overlay space and establish firewall or
@@ -599,8 +600,9 @@ See the [security policy](SECURITY.md) for vulnerability reporting.
 
 AISMixer is in active pre-1.0 development; pre-1.0 releases may still change
 configuration and interfaces. The latest tagged release is v0.2.1. The `main`
-branch also contains unreleased work, including the UDPSECv2 session
-continuity described above; see the [changelog](CHANGELOG.md).
+branch also contains unreleased work planned for v0.3.0 (not tagged yet),
+including the UDPSECv2 session continuity described above; see the
+[changelog](CHANGELOG.md).
 
 Planned directions, none of which is implemented yet (see the
 [roadmap](ROADMAP.md)):
@@ -921,9 +923,10 @@ Python/shell съдържанието декларира `PKGARCH:=all`, защ�
 непрекъснатост на сесиите в UDPSECv2 (опресняване на ключовата епоха, миграция
 на пътя и възстановяване на активността), а техният UDPSEC формат на пакетите
 не е съвместим с текущото дърво на изходния код. Използвайте една и съща
-версия от двете страни на UDPSEC връзката. Пакети с тази функционалност
-изискват по-късно издание, при което рецептата се фиксира наново; проверявайте
-ревизията на пакета и [списъка на промените](CHANGELOG.md).
+версия от двете страни на UDPSEC връзката. Все още няма публикуван пакет с
+тази функционалност: за целта рецептата трябва да се фиксира наново към
+v0.3.0 след поставянето на етикета му и пакетите да се изградят отново;
+проверявайте ревизията на пакета и [списъка на промените](CHANGELOG.md).
 
 Преди инсталиране проверете свободното записваемо място в overlay и установете
 firewall или мрежова изолация. Генерираните hook скриптове на OpenWrt пакета
@@ -1277,8 +1280,9 @@ UDPSEC удостоверява конфигурираните крайни то
 
 AISMixer е в активна разработка преди версия 1.0; изданията преди 1.0 все
 още могат да променят конфигурацията и интерфейсите. Последното издание с
-етикет е v0.2.1. Клонът `main` съдържа и неиздадена работа, включително
-описаната по-горе непрекъснатост на сесиите в UDPSECv2; вижте
+етикет е v0.2.1. Клонът `main` съдържа и неиздадена работа, планирана за
+изданието v0.3.0, което все още няма етикет, включително описаната по-горе
+непрекъснатост на сесиите в UDPSECv2; вижте
 [списъка на промените](CHANGELOG.md).
 
 Планирани посоки, нито една от които все още не е реализирана (вижте
@@ -1600,9 +1604,10 @@ versiunii v0.2.1. Aceste pachete sunt anterioare continuității sesiunilor
 UDPSECv2 descrise mai sus (reîmprospătarea epocii de chei, migrarea căii și
 recuperarea liveness), iar formatul lor de pachete UDPSEC nu este compatibil
 cu arborele-sursă actual. Folosiți aceeași linie de versiune la ambele capete
-ale unei relații UDPSEC. Pachetele care includ această funcționalitate necesită
-o versiune ulterioară, la care rețeta este refixată; verificați revizia
-pachetului și [lista de modificări](CHANGELOG.md).
+ale unei relații UDPSEC. Încă nu există niciun pachet publicat care să
+includă această funcționalitate: rețeta trebuie refixată pe v0.3.0 după ce
+această versiune este etichetată, iar pachetele trebuie reconstruite;
+verificați revizia pachetului și [lista de modificări](CHANGELOG.md).
 
 Înainte de instalare, verificați spațiul disponibil pentru scriere în overlay și
 aplicați firewall sau izolare de rețea. Hook-urile generate de OpenWrt pentru pachet
@@ -1962,7 +1967,8 @@ vulnerabilităților.
 AISMixer este în dezvoltare activă înainte de versiunea 1.0; versiunile
 anterioare lui 1.0 pot încă schimba configurația și interfețele. Ultima
 versiune etichetată este v0.2.1. Ramura `main` conține și lucrări nelansate,
-inclusiv continuitatea sesiunilor UDPSECv2 descrisă mai sus; consultați
+planificate pentru versiunea v0.3.0, care nu este încă etichetată, inclusiv
+continuitatea sesiunilor UDPSECv2 descrisă mai sus; consultați
 [lista de modificări](CHANGELOG.md).
 
 Direcții planificate, dintre care niciuna nu este încă implementată (consultați
