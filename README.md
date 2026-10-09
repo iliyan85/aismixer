@@ -258,14 +258,16 @@ to exclude other OpenWrt targets with suitable dependencies.
 | `x86_64` | [`packages.adb`](https://aismixer.net/openwrt/25.12/x86_64/packages.adb) |
 | `mips_24kc` | [`packages.adb`](https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb) |
 
-**Package status.** The recipe builds `0.2.1-r4` from the pinned v0.2.1
-release source. These packages predate the UDPSECv2 session continuity
-described above (key epoch refresh, path migration, and liveness recovery),
-and their UDPSEC wire format does not interoperate with the current source
-tree. Use one release line on both ends of a UDPSEC relation. No published
-package contains this work yet: that requires repinning the recipe to
-v0.3.0 after that release is tagged and rebuilding the packages; check the
-package revision and the [changelog](CHANGELOG.md).
+**Package status.** AISMixer v0.3.0 is a tagged source release, and the
+recipe in this repository is pinned to build `0.3.0-r1` from that tag's
+exact commit. Until `0.3.0-r1` packages are built, validated, and published,
+the `x86_64` and `mips_24kc` feeds above may still offer only `0.2.1-r4`,
+built from the v0.2.1 release. The `0.2.1-r4` packages predate the UDPSECv2
+session continuity described above (key epoch refresh, path migration, and
+liveness recovery), and v0.2.1 and v0.3.0 UDPSEC peers do not interoperate.
+Use one release line on both ends of a UDPSEC relation and, once matching
+packages are available, upgrade both ends together; check the package
+revision and the [changelog](CHANGELOG.md).
 
 Before installation, verify writable overlay space and establish firewall or
 network isolation. OpenWrt's generated package hooks enable and start the
@@ -917,15 +919,18 @@ Python/shell съдържанието декларира `PKGARCH:=all`, защ�
 | `x86_64` | [`packages.adb`](https://aismixer.net/openwrt/25.12/x86_64/packages.adb) |
 | `mips_24kc` | [`packages.adb`](https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb) |
 
-**Състояние на пакетите.** Рецептата изгражда `0.2.1-r4` от фиксирания
-изходен код на изданието v0.2.1. Тези пакети предхождат описаната по-горе
-непрекъснатост на сесиите в UDPSECv2 (опресняване на ключовата епоха, миграция
-на пътя и възстановяване на активността), а техният UDPSEC формат на пакетите
-не е съвместим с текущото дърво на изходния код. Използвайте една и съща
-версия от двете страни на UDPSEC връзката. Все още няма публикуван пакет с
-тази функционалност: за целта рецептата трябва да се фиксира наново към
-v0.3.0 след поставянето на етикета му и пакетите да се изградят отново;
-проверявайте ревизията на пакета и [списъка на промените](CHANGELOG.md).
+**Състояние на пакетите.** AISMixer v0.3.0 е издание на изходния код с
+етикет, а рецептата в това хранилище е фиксирана към точния commit на този
+етикет, за да изгражда `0.3.0-r1`. Докато пакетите `0.3.0-r1` не бъдат
+изградени, валидирани и публикувани, feed-овете за `x86_64` и `mips_24kc`
+по-горе може все още да предлагат само пакети `0.2.1-r4`, изградени от
+изданието v0.2.1. Тези пакети предхождат описаната по-горе непрекъснатост
+на сесиите в UDPSECv2 (опресняване на ключовата епоха, миграция на пътя и
+възстановяване на активността), а UDPSEC страните с v0.2.1 и v0.3.0 не са
+съвместими помежду си. Използвайте една и съща версия от двете страни на
+UDPSEC връзката и, когато има съответстващи пакети, обновете двете страни
+заедно; проверявайте ревизията на пакета и
+[списъка на промените](CHANGELOG.md).
 
 Преди инсталиране проверете свободното записваемо място в overlay и установете
 firewall или мрежова изолация. Генерираните hook скриптове на OpenWrt пакета
@@ -1596,15 +1601,18 @@ excludă alte ținte OpenWrt care au dependențe adecvate.
 | `x86_64` | [`packages.adb`](https://aismixer.net/openwrt/25.12/x86_64/packages.adb) |
 | `mips_24kc` | [`packages.adb`](https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb) |
 
-**Starea pachetelor.** Rețeta construiește `0.2.1-r4` din sursa fixată a
-versiunii v0.2.1. Aceste pachete sunt anterioare continuității sesiunilor
-UDPSECv2 descrise mai sus (reîmprospătarea epocii de chei, migrarea căii și
-recuperarea liveness), iar formatul lor de pachete UDPSEC nu este compatibil
-cu arborele-sursă actual. Folosiți aceeași linie de versiune la ambele capete
-ale unei relații UDPSEC. Încă nu există niciun pachet publicat care să
-includă această funcționalitate: rețeta trebuie refixată pe v0.3.0 după ce
-această versiune este etichetată, iar pachetele trebuie reconstruite;
-verificați revizia pachetului și [lista de modificări](CHANGELOG.md).
+**Starea pachetelor.** AISMixer v0.3.0 este o versiune etichetată a codului
+sursă, iar rețeta din acest depozit este fixată pe commit-ul exact al acestei
+etichete pentru a construi `0.3.0-r1`. Până când pachetele `0.3.0-r1` sunt
+construite, validate și publicate, feed-urile `x86_64` și `mips_24kc` de mai
+sus pot oferi în continuare doar pachete `0.2.1-r4`, construite din versiunea
+v0.2.1. Aceste pachete sunt anterioare continuității sesiunilor UDPSECv2
+descrise mai sus (reîmprospătarea epocii de chei, migrarea căii și
+recuperarea liveness), iar capetele UDPSEC cu v0.2.1 și v0.3.0 nu sunt
+compatibile între ele. Folosiți aceeași linie de versiune la ambele capete ale
+unei relații UDPSEC și, când sunt disponibile pachete corespunzătoare,
+actualizați ambele capete împreună; verificați revizia pachetului și
+[lista de modificări](CHANGELOG.md).
 
 Înainte de instalare, verificați spațiul disponibil pentru scriere în overlay și
 aplicați firewall sau izolare de rețea. Hook-urile generate de OpenWrt pentru pachet

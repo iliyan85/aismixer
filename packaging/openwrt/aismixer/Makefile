@@ -5,18 +5,19 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=aismixer
-PKG_VERSION:=0.2.1
-PKG_RELEASE:=4
+PKG_VERSION:=0.3.0
+PKG_RELEASE:=1
 
-# Pinned to the tagged, signed v0.2.1 release commit. Do not follow a moving
-# branch; repin explicitly, source revision and mirror hash together, at the
-# next release.
+# Pinned to the commit of the signed, annotated v0.3.0 release tag (the
+# commit SHA, not the tag object's SHA). Do not follow a moving branch;
+# repin explicitly, source revision and mirror hash together, at the next
+# release. The SDK-generated mirror hash also depends on PKG_VERSION.
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/iliyan85/aismixer.git
-PKG_SOURCE_DATE:=2026-09-04
-PKG_SOURCE_VERSION:=d8d8c500f5bcfcb451db92b899b2eba5a1626e48
+PKG_SOURCE_DATE:=2026-10-09
+PKG_SOURCE_VERSION:=7f162912a085e3d86f2620763b686fafd6a7f76a
 
-PKG_MIRROR_HASH:=8f95da56763df989923f7d1ebe283aa2f5ed173a3b37ff4399022ec9bacee9cb
+PKG_MIRROR_HASH:=fea0ef75a27b8c5e97ce2afee68d8050c813c7122b536feba63a8f3a816cc69d
 
 PKG_MAINTAINER:=Iliyan Iliev
 PKG_LICENSE:=CC-BY-NC-4.0

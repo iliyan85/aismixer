@@ -508,11 +508,14 @@ on target Python, cryptography, serial, and related packages.
 
 The currently built, published, and validated repository feed targets include
 `x86_64` and `mips_24kc`; this does not intentionally exclude other targets with
-suitable dependencies. The package recipe pins a source revision, so packaged
-behavior may lag current `main`: it currently builds `0.2.1-r4` from the
-v0.2.1 release, which predates the UDPSECv2 session behaviour described above
-and does not interoperate with current source-tree builds. Pair packages only
-with a mixer from the same release line, and check the
+suitable dependencies. The package recipe pins a fixed source commit, never a
+moving branch, so packaged behavior can lag this guide: it is now pinned to
+build `0.3.0-r1` from the commit of the signed v0.3.0 release tag. Until those
+packages are built, validated, and published, the feeds may still offer only
+`0.2.1-r4`, built from the v0.2.1 release, which predates the UDPSECv2 session
+behaviour described above and does not interoperate with v0.3.0 peers. Pair
+packages only with a mixer from the same release line and, once matching
+packages are available, upgrade the station and its mixer together; check the
 [root README](../README.md) and [changelog](../CHANGELOG.md).
 
 ### Installation and first configuration

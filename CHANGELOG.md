@@ -6,6 +6,20 @@ still change public APIs and configuration behavior as the project matures.
 
 ## [Unreleased]
 
+### Changed
+
+- Repins the OpenWrt package recipe to build `0.3.0-r1` from the signed
+  v0.3.0 tag's commit, `7f162912a085e3d86f2620763b686fafd6a7f76a`
+  (`PKG_SOURCE_DATE` 2026-10-09), with a `PKG_MIRROR_HASH` that the OpenWrt
+  25.12 SDK generated for that commit's source archive. `0.3.0-r1` is a
+  package revision of the v0.3.0 source, not a new source release. This
+  change does not build, validate, or publish packages; those are follow-up
+  steps, and until `0.3.0-r1` packages are published, the `x86_64` and
+  `mips_24kc` feeds may still offer only `0.2.1-r4`, which does not
+  interoperate with v0.3.0 UDPSEC peers. Once matching packages are
+  available, upgrade both ends of each UDPSEC relation together and check
+  UDPSEC ports, as the 0.3.0 compatibility notes describe.
+
 ## [0.3.0] - 2026-10-09
 
 ### Added

@@ -35,12 +35,12 @@ CANONICAL_PROXY_UDP_OUTPUT = (
     "  host: 192.0.2.20\n"
     "  port: 17777\n"
 )
-EXPECTED_OPENWRT_VERSION = "0.2.1"
-EXPECTED_OPENWRT_RELEASE = "4"
-EXPECTED_OPENWRT_SOURCE_DATE = "2026-09-04"
-EXPECTED_OPENWRT_SOURCE_REVISION = "d8d8c500f5bcfcb451db92b899b2eba5a1626e48"
+EXPECTED_OPENWRT_VERSION = "0.3.0"
+EXPECTED_OPENWRT_RELEASE = "1"
+EXPECTED_OPENWRT_SOURCE_DATE = "2026-10-09"
+EXPECTED_OPENWRT_SOURCE_REVISION = "7f162912a085e3d86f2620763b686fafd6a7f76a"
 EXPECTED_OPENWRT_MIRROR_HASH = (
-    "8f95da56763df989923f7d1ebe283aa2f5ed173a3b37ff4399022ec9bacee9cb"
+    "fea0ef75a27b8c5e97ce2afee68d8050c813c7122b536feba63a8f3a816cc69d"
 )
 
 
@@ -877,6 +877,13 @@ def test_openwrt_packages_pin_expected_release_source_metadata():
     assert re.findall(
         r"^PKG_SOURCE_VERSION:=(\S+)$", recipe, re.MULTILINE
     ) == [EXPECTED_OPENWRT_SOURCE_REVISION]
+    # A branch name or abbreviated SHA must never be the source pin, even on
+    # both sides of the equality above. (The format cannot tell a tag
+    # object's SHA from a commit's; the pin must be the commit's.)
+    assert re.fullmatch(r"[0-9a-f]{40}", EXPECTED_OPENWRT_SOURCE_REVISION), (
+        "PKG_SOURCE_VERSION must be a full 40-hex commit SHA, not "
+        f"{EXPECTED_OPENWRT_SOURCE_REVISION!r}"
+    )
 
 
 def test_openwrt_package_mirror_hash_matches_current_source_pin():
@@ -884,23 +891,30 @@ def test_openwrt_package_mirror_hash_matches_current_source_pin():
 
     Kept as its own test, separate from
     test_openwrt_packages_pin_expected_release_source_metadata, so a source
-    repin that updates PKG_SOURCE_VERSION without regenerating the matching
-    SDK-produced PKG_MIRROR_HASH fails here specifically, rather than being
-    masked by (or conflated with) the other pin fields. This is the release
-    pin's content-integrity check: the archive OpenWrt actually downloads
-    and builds from must be the exact byte content of the pinned release
-    commit, not merely a commit SHA that resolves at fetch time.
+    repin that updates PKG_SOURCE_VERSION or PKG_VERSION without
+    regenerating the matching SDK-produced PKG_MIRROR_HASH fails here
+    specifically, rather than being masked by (or conflated with) the other
+    pin fields. This is the release pin's content-integrity check: the
+    archive OpenWrt actually downloads and builds from must be the exact
+    byte content of the pinned release commit, not merely a commit SHA that
+    resolves at fetch time. This test compares the committed values; the
+    OpenWrt SDK verifies the downloaded archive against PKG_MIRROR_HASH.
     """
     recipe = read_text(PACKAGE_DIR / "Makefile")
     (mirror_hash,) = re.findall(
         r"^PKG_MIRROR_HASH:=(\S+)$", recipe, re.MULTILINE
     )
 
+    # A placeholder such as OpenWrt's "skip" (which disables verification)
+    # must never be committed, even on both sides of the equality below.
+    assert re.fullmatch(r"[0-9a-f]{64}", mirror_hash), (
+        f"PKG_MIRROR_HASH must be a 64-hex SHA-256 digest, not {mirror_hash!r}"
+    )
     assert mirror_hash == EXPECTED_OPENWRT_MIRROR_HASH, (
         "PKG_MIRROR_HASH does not match the SDK-generated hash for the "
         f"pinned PKG_SOURCE_VERSION; the Makefile holds {mirror_hash!r}. "
-        "Regenerate it with the OpenWrt SDK whenever PKG_SOURCE_VERSION "
-        "changes, and update EXPECTED_OPENWRT_MIRROR_HASH to match."
+        "Regenerate it with the OpenWrt SDK whenever PKG_SOURCE_VERSION or "
+        "PKG_VERSION changes, and update EXPECTED_OPENWRT_MIRROR_HASH to match."
     )
 
 
@@ -1025,9 +1039,11 @@ def test_openwrt_consumers_pin_exact_matching_aismixer_common_revision():
         )
 
         # Package-variable-derived, not hard-coded release text: this must
-        # keep matching automatically on the next release bump.
+        # keep matching automatically on the next release bump. No digit may
+        # appear in the pin at all, so no hard-coded version or revision can.
         assert "0.2.1-3" not in extra_depends[0]
         assert "0.2.1-r3" not in extra_depends[0]
+        assert not re.search(r"\d", extra_depends[0]), extra_depends[0]
 
     # 5. aismixer-common must not gain a circular/self dependency, in
     #    either DEPENDS or EXTRA_DEPENDS.
@@ -1038,13 +1054,15 @@ def test_openwrt_consumers_pin_exact_matching_aismixer_common_revision():
     )
     assert "aismixer-common" not in common_depends
 
-    # 6. Packaging revision bump.
+    # 6. PKG_RELEASE is the current pin's expected packaging revision; the
+    #    EXTRA_DEPENDS pins above derive from it.
     assert re.findall(r"^PKG_RELEASE:=(\S+)$", recipe, re.MULTILINE) == [
         EXPECTED_OPENWRT_RELEASE
     ]
 
-    # 7. Upstream source pin/date/hash remain exactly the published 0.2.1
-    #    values; only the packaging revision changed for this fix.
+    # 7. Upstream source pin/date/hash equal the expected release-pin values.
+    #    The exact-revision pin above is packaging metadata: 0.2.1-r3
+    #    introduced it without changing the v0.2.1 source pin.
     assert re.findall(r"^PKG_SOURCE_DATE:=(\S+)$", recipe, re.MULTILINE) == [
         EXPECTED_OPENWRT_SOURCE_DATE
     ]
@@ -1081,8 +1099,9 @@ def test_openwrt_aismixer_config_only_enables_packaged_unix_control():
 
 def test_openwrt_aismixer_udp_alias_map_uses_sanitized_packaged_default():
     """Regression for Point 12A.2: the packaged alias map must come from the
-    sanitized ./files/ template, not the repository-root developer/lab copy,
-    and must ship structurally empty."""
+    sanitized ./files/ template, not the repository-root copy (a
+    developer/lab alias map when this regression was found), and must ship
+    structurally empty."""
     recipe = read_text(PACKAGE_DIR / "Makefile")
     install = makefile_block(recipe, "Package/aismixer/install")
     conffiles = makefile_block(recipe, "Package/aismixer/conffiles")
@@ -1097,8 +1116,11 @@ def test_openwrt_aismixer_udp_alias_map_uses_sanitized_packaged_default():
 
 def test_conventional_root_alias_map_seed_is_as_empty_as_the_openwrt_seed():
     """The conventional install.sh seed (repository root) is now as empty as
-    the OpenWrt ./files/ seed. The recipe must still install ./files/: the
-    root copy in its pinned v0.2.1 source tree carries developer lab aliases."""
+    the OpenWrt ./files/ seed. The recipe still installs ./files/: package
+    seeds come from the recipe tree, not from the pinned source tree, whose
+    root copy need not match ./files/ byte for byte (v0.2.1's root copy
+    carried developer lab aliases; v0.3.0's is empty apart from operator
+    comments)."""
     root_seed = yaml.safe_load(read_text(ROOT / "udp_alias_map.yaml"))
     package_seed = yaml.safe_load(read_text(PACKAGE_FILES / "udp_alias_map.yaml"))
 
