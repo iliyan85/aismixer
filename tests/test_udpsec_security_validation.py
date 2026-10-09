@@ -7,6 +7,7 @@ import itertools
 import json
 import os
 import queue
+import re
 import socket
 import sys
 import threading
@@ -37,6 +38,11 @@ from core.udpsec_protocol import (
     build_server_hello_packet,
     parse_client_hello_packet,
     parse_server_hello_packet,
+)
+from test_secure_udp_helpers import (
+    _run_secure_server_with_packets,
+    _signed_client_hello as _signed_module_client_hello,
+    load_secure_module_with_fake_keys,
 )
 
 
@@ -3742,3 +3748,363 @@ def test_legacy_handshake_wire_shapes_remain_rejected():
         parse_server_hello_packet(
             b"OK|" + base64.b64encode(b"old-signature")
         )
+
+
+# F-1: handshake rejection lines print the station_id a ClientHello claims;
+# the freshness and unknown-client rejections do so before any signature
+# check (the replay rejection follows verification). These tests drive the
+# real `_secure_server_loop` (fake socket and loop from
+# test_secure_udp_helpers, whose wall clock reads 1010.0) and inspect its
+# log lines.
+_REJECTION_PEER = ("192.0.2.10", 41000)
+_FORGED_RECORD = "[+] Confirmed secure session for boat_001 @ 192.0.2.10:41000"
+# name -> (station_id the sender claims, expected rendering or None when the
+# rendering is truncated)
+_HOSTILE_STATION_IDS = {
+    "crlf-forged-records": (
+        "evil\n" + _FORGED_RECORD + "\r" + _FORGED_RECORD,
+        "evil\\n" + _FORGED_RECORD + "\\r" + _FORGED_RECORD,
+    ),
+    "ansi-and-controls": (
+        "boat\x1b[2K\x1b[1G\x1b]0;x\x07_001\x00\x08\x7f\x85\x9b",
+        "boat\\x1b[2K\\x1b[1G\\x1b]0;x\\x07_001\\x00\\x08\\x7f\\x85\\x9b",
+    ),
+    "unicode-separators": (
+        "boat\u2028" + _FORGED_RECORD + "\u2029\u202e_001",
+        "boat\\u2028" + _FORGED_RECORD + "\\u2029\\u202e_001",
+    ),
+    # About 8 KB, as in the MP4-F3 reproduction: one forged record per line.
+    "oversized-8k": (("x\n" + _FORGED_RECORD) * 128, None),
+}
+# (ClientHello timestamp, rejection reason): both reject before verification.
+_PRE_AUTH_REJECTIONS = (
+    (900, "timestamp out of window"),
+    (1010, "unknown client"),
+)
+_LOG_FIELD_MAX_CHARS = 160
+_LOG_FIELD_TRUNCATED = "...[truncated]"
+_WHOLE_ESCAPES = re.compile(
+    r"(?:[^\\]|\\(?:\\|[nrt]|x[0-9a-f]{2}|u[0-9a-f]{4}|U[0-9a-f]{8}))*"
+)
+
+
+def _rejected_field(line, reason):
+    prefix = "[!] Rejected "
+    suffix = f": {reason}"
+    assert line.startswith(prefix), line
+    assert line.endswith(suffix), line
+    return line[len(prefix):-len(suffix)]
+
+
+def _lines_after_listener_start(out):
+    # The loop's own start line comes first; the rest is per-packet output.
+    lines = out.splitlines()
+    assert lines[0] == "[+] Secure listener started on 127.0.0.1:9999"
+    return lines[1:]
+
+
+def test_preauth_rejections_render_hostile_station_ids_as_one_bounded_line(
+    monkeypatch,
+    capsys,
+):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    cases = []
+    for name, (station_id, rendered) in _HOSTILE_STATION_IDS.items():
+        for timestamp, reason in _PRE_AUTH_REJECTIONS:
+            packet, _, _ = _signed_module_client_hello(
+                secure,
+                client_private_key,
+                station_id,
+                timestamp,
+            )
+            # The real parser carries every one of them, and each datagram
+            # fits the listener's 8192-byte receive.
+            assert parse_client_hello_packet(packet).station_id == station_id
+            assert len(packet) <= 8192
+            cases.append((name, rendered, reason, packet))
+    assert max(len(packet) for *_, packet in cases) > 8000
+    state = secure.SecureState()
+
+    queue_, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, _REJECTION_PEER) for *_, packet in cases],
+        state=state,
+    )
+
+    out = capsys.readouterr().out
+    lines = _lines_after_listener_start(out)
+    # One physical line per rejection: no CR, LF, NEL, U+2028, U+2029 or
+    # other line break survives inside a line, so no forged record starts
+    # a line of its own.
+    assert len(lines) == len(cases)
+    assert out.count("\n") == len(cases) + 1
+    for line, (name, rendered, reason, _) in zip(lines, cases):
+        field = _rejected_field(line, reason)
+        # No control, format or separator character remains (ESC included).
+        assert line.isprintable(), (name, line)
+        assert len(field) <= _LOG_FIELD_MAX_CHARS, name
+        if rendered is None:
+            assert field.endswith(_LOG_FIELD_TRUNCATED), name
+            assert _WHOLE_ESCAPES.fullmatch(
+                field[: -len(_LOG_FIELD_TRUNCATED)]
+            ), name
+        else:
+            assert field == rendered, name
+    # Rejection behaviour is unchanged: no reply, no frame, no state.
+    assert fake_socket.sent == []
+    assert queue_.items == []
+    stats = state.stats()
+    assert stats.current_pending_sessions == 0
+    assert stats.current_handshake_replays == 0
+    assert stats.handshake_replay_accepted == 0
+    assert stats.handshake_replay_rejected == 0
+
+
+@pytest.mark.parametrize(
+    ("station_id", "timestamp", "expected"),
+    [
+        ("boat_002", 1010, "[!] Rejected boat_002: unknown client"),
+        (
+            "boat_001",
+            900,
+            "[!] Rejected boat_001: timestamp out of window",
+        ),
+        (
+            "Балчик-01 O'Hara",
+            1010,
+            "[!] Rejected Балчик-01 O'Hara: unknown client",
+        ),
+    ],
+)
+def test_preauth_rejections_keep_ordinary_station_ids_readable(
+    monkeypatch,
+    capsys,
+    station_id,
+    timestamp,
+    expected,
+):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    packet, _, _ = _signed_module_client_hello(
+        secure,
+        client_private_key,
+        station_id,
+        timestamp,
+    )
+
+    _queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, _REJECTION_PEER)],
+    )
+
+    out = capsys.readouterr().out
+    assert _lines_after_listener_start(out) == [expected]
+    assert out.count("\n") == 2
+    assert fake_socket.sent == []
+
+
+@pytest.mark.parametrize(
+    ("station_id", "rendered"),
+    [
+        ("boat_001", "boat_001"),
+        # An odd operator-configured name: authentication must see the raw
+        # value, while the replay rejection shows it escaped.
+        ("dock\x1b[31m_7\x00", "dock\\x1b[31m_7\\x00"),
+    ],
+)
+def test_replay_rejection_uses_the_same_rendering_and_auth_is_unchanged(
+    monkeypatch,
+    capsys,
+    station_id,
+    rendered,
+):
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    if station_id not in secure.AUTHORIZED_KEYS:
+        monkeypatch.setitem(
+            secure.AUTHORIZED_KEYS,
+            station_id,
+            client_private_key.public_key(),
+        )
+    packet, client_hello, _ = _signed_module_client_hello(
+        secure,
+        client_private_key,
+        station_id,
+        1010,
+    )
+    server_key = ec.derive_private_key(29, ec.SECP256R1())
+    state = secure.SecureState()
+
+    _queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(packet, _REJECTION_PEER), (packet, _REJECTION_PEER)],
+        state=state,
+        server_private_key=server_key,
+    )
+
+    out = capsys.readouterr().out
+    # The first copy authenticates as before: one ServerHello to the sender,
+    # signed over the raw, unescaped station_id, and one pending session
+    # holding that raw value.
+    [(reply, addr)] = fake_socket.sent
+    assert addr == _REJECTION_PEER
+    server_hello = parse_server_hello_packet(reply)
+    assert secure.verify_transcript_signature(
+        server_key.public_key(),
+        server_hello.server_signature,
+        secure.build_server_auth_digest(
+            protocol_version=client_hello.protocol_version,
+            station_id=station_id,
+            timestamp=client_hello.timestamp,
+            client_random=client_hello.client_random,
+            client_ephemeral_public_key=(
+                client_hello.client_ephemeral_public_key
+            ),
+            client_signature=client_hello.client_signature,
+            session_locator=server_hello.session_locator,
+            server_random=server_hello.server_random,
+            server_ephemeral_public_key=(
+                server_hello.server_ephemeral_public_key
+            ),
+        ),
+    )
+    assert [
+        pending.station_id for pending in state._pending_sessions.values()
+    ] == [station_id]
+    stats = state.stats()
+    assert stats.handshake_replay_accepted == 1
+    assert stats.handshake_replay_rejected == 1
+    assert stats.current_pending_sessions == 1
+    # The replayed copy is rejected with exactly one escaped line.
+    assert [
+        line for line in out.split("\n") if line.startswith("[!] Rejected ")
+    ] == [f"[!] Rejected {rendered}: handshake replay"]
+
+
+def test_handshake_error_lines_never_echo_client_hello_field_text(
+    monkeypatch,
+    capsys,
+):
+    # The generic `[!] Handshake error` line prints exception text. Every
+    # exception a ClientHello can raise before authentication carries fixed
+    # text, never the sender's field bytes; pin that with a marker in every
+    # field.
+    secure, client_private_key = load_secure_module_with_fake_keys(
+        monkeypatch,
+        with_client_private_key=True,
+    )
+    packet, _, _ = _signed_module_client_hello(
+        secure,
+        client_private_key,
+        "boat_001",
+        1010,
+    )
+    fields = packet.split(b"|")
+    marker = b"ZQX\n[+] Confirmed secure session\x1b[2J\x00"
+    packets = [
+        b"|".join(fields[:index] + [poison] + fields[index + 1:])
+        for index in range(1, len(fields))
+        for poison in (marker, b"\xff" + marker)
+    ]
+    packets.append(packet + b"|" + marker)
+
+    _queue, fake_socket = _run_secure_server_with_packets(
+        monkeypatch,
+        secure,
+        [(poisoned, _REJECTION_PEER) for poisoned in packets],
+    )
+
+    lines = _lines_after_listener_start(capsys.readouterr().out)
+    assert len(lines) == len(packets)
+    for line in lines:
+        assert line.isprintable(), line
+        if line.startswith("[!] Handshake error "):
+            assert "ZQX" not in line, line
+        else:
+            # Only the station_id field is printed, escaped, by a rejection.
+            assert line.startswith("[!] Rejected ZQX\\n[+] Confirmed"), line
+    assert sum(line.startswith("[!] Rejected ") for line in lines) == 1
+    assert fake_socket.sent == []
+
+
+@pytest.mark.parametrize(
+    ("value", "rendered"),
+    [
+        ("boat_001", "boat_001"),
+        ("Балчик-01 ⚓", "Балчик-01 ⚓"),
+        ("lab\\boat", "lab\\\\boat"),
+        ("a\r\nb\tc", "a\\r\\nb\\tc"),
+        ("\x00\x1b\x7f\x85\x9b", "\\x00\\x1b\\x7f\\x85\\x9b"),
+        ("\u2028\u2029\u200b\u202e\xa0", "\\u2028\\u2029\\u200b\\u202e\\xa0"),
+        ("\U000e0001", "\\U000e0001"),
+    ],
+)
+def test_render_log_field_escapes_backslash_and_every_non_printable(
+    monkeypatch,
+    value,
+    rendered,
+):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+
+    assert secure._render_log_field(value) == rendered
+
+
+def test_render_log_field_is_bounded_and_never_splits_an_escape(monkeypatch):
+    secure = load_secure_module_with_fake_keys(monkeypatch)
+    render = secure._render_log_field
+    limit = _LOG_FIELD_MAX_CHARS
+    marker = _LOG_FIELD_TRUNCATED
+
+    assert render("a" * limit) == "a" * limit
+    assert render("a" * (limit + 1)) == "a" * (limit - len(marker)) + marker
+    for prefix_length in range(limit + 2):
+        for filler in ("\n", "\x1b", "\u2028", "\U000e0001", "\\", "é"):
+            rendered = render("a" * prefix_length + filler * 200)
+            assert len(rendered) <= limit
+            assert rendered.isprintable()
+            assert rendered.endswith(marker)
+            assert _WHOLE_ESCAPES.fullmatch(rendered[: -len(marker)])
+    # A non-str value is rendered from its repr under the same policy.
+    rendered = render(b"\n\x1b" * 500)
+    assert rendered.isprintable()
+    assert len(rendered) <= limit
+
+
+def test_static_handshake_rejection_lines_render_station_id_via_helper():
+    server_loop = _definition(
+        _source_tree("aismixer_secure.py"),
+        "_secure_server_loop",
+    )
+    rejections = [
+        node
+        for node in ast.walk(server_loop)
+        if isinstance(node, ast.JoinedStr)
+        and node.values
+        and isinstance(node.values[0], ast.Constant)
+        and str(node.values[0].value).startswith("[!] Rejected ")
+    ]
+
+    assert len(rejections) >= 3
+    for node in rejections:
+        fields = [
+            value
+            for value in node.values
+            if isinstance(value, ast.FormattedValue)
+        ]
+        assert len(fields) == 1, ast.unparse(node)
+        call = fields[0].value
+        assert isinstance(call, ast.Call), ast.unparse(node)
+        assert _dotted_name(call.func) == "_render_log_field"
+        assert [_dotted_name(argument) for argument in call.args] == [
+            "station_id"
+        ]

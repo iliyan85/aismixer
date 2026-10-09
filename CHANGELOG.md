@@ -247,6 +247,21 @@ still change public APIs and configuration behavior as the project matures.
   `core/endpoint_display.py` and `core/sockaddr_identity.py` modules; a
   station installed by hand must now copy them as well.
 
+### Fixed
+
+- UDPSEC handshake rejection lines (`[!] Rejected <station>: timestamp out
+  of window`, `unknown client`, and `handshake replay`) now escape and bound
+  the station identifier. Before authentication it is untrusted text from
+  the ClientHello, and a crafted identifier could split one rejection into
+  many log lines, forge separate records such as `[+] Confirmed secure
+  session`, or carry terminal control sequences. Backslashes and every
+  non-printable character (control and format characters, line or paragraph
+  separators, and spaces other than the ASCII space) now appear as Python
+  escapes such as `\n` or `\x1b`, and an escaped identifier longer than 160
+  characters is cut to at most 160, ending in `...[truncated]`. Ordinary
+  identifiers print unchanged, and authentication is not affected. This
+  does not limit how many rejection lines a flood of datagrams can produce.
+
 ### Compatibility and operator impact
 
 - Upgrade both ends together: UDPSECv2 does not interoperate with v0.2.1 or

@@ -4803,6 +4803,44 @@ async def _run_path_challenge_retries(
         )
 
 
+# Handshake rejection lines print the station_id a ClientHello claims. The
+# freshness and unknown-client rejections do so before its signature is
+# checked, so that text is untrusted log input; the replay rejection, after
+# verification, uses the same rendering for one consistent format.
+_LOG_FIELD_MAX_CHARS = 160
+_LOG_FIELD_TRUNCATED = "...[truncated]"
+
+
+def _render_log_field(value):
+    """Render one untrusted value as a bounded, single-line log field.
+
+    Printable characters, non-ASCII letters included, are kept. A backslash
+    and every non-printable character -- CR, LF, NUL, ESC and the other C0
+    and C1 controls, Unicode line and paragraph separators, format
+    characters -- are written as their Python escape (`\\\\`, `\\n`, `\\x1b`,
+    `\\u2028`), so in UTF-8 log output the value can neither split a log
+    line nor leave a terminal control sequence active. The result has at most
+    `_LOG_FIELD_MAX_CHARS` characters: a longer rendering is cut between
+    whole escapes and ends with `_LOG_FIELD_TRUNCATED`. Only the log text
+    changes; callers keep the original value for every protocol decision.
+    """
+    text = value if isinstance(value, str) else repr(value)
+    pieces = []
+    length = 0
+    for char in text:
+        if char.isprintable() and char != "\\":
+            piece = char
+        else:
+            piece = repr(char)[1:-1]
+        if length + len(piece) > _LOG_FIELD_MAX_CHARS:
+            while length + len(_LOG_FIELD_TRUNCATED) > _LOG_FIELD_MAX_CHARS:
+                length -= len(pieces.pop())
+            return "".join(pieces) + _LOG_FIELD_TRUNCATED
+        pieces.append(piece)
+        length += len(piece)
+    return "".join(pieces)
+
+
 async def _secure_server_loop(
     sock,
     queue,
@@ -4880,12 +4918,17 @@ async def _secure_server_loop(
 
                 if abs(wall_now() - timestamp) > 30:
                     print(
-                        f"[!] Rejected {station_id}: timestamp out of window")
+                        f"[!] Rejected {_render_log_field(station_id)}: "
+                        "timestamp out of window"
+                    )
                     continue
 
                 client_identity_public_key = AUTHORIZED_KEYS.get(station_id)
                 if client_identity_public_key is None:
-                    print(f"[!] Rejected {station_id}: unknown client")
+                    print(
+                        f"[!] Rejected {_render_log_field(station_id)}: "
+                        "unknown client"
+                    )
                     continue
 
                 client_auth_digest = build_client_auth_digest(
@@ -4915,7 +4958,10 @@ async def _secure_server_loop(
                 if not state_owner.accept_handshake_replay(
                     replay_key, local_now
                 ):
-                    print(f"[!] Rejected {station_id}: handshake replay")
+                    print(
+                        f"[!] Rejected {_render_log_field(station_id)}: "
+                        "handshake replay"
+                    )
                     continue
 
                 # Minted before the ServerHello is signed and built: the
