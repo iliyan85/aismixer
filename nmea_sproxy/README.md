@@ -122,7 +122,7 @@ for plain UDP; both are project-chosen example values and remain configurable.
 | `keepalive_interval` | `30` | seconds between keepalive pings (UDPSEC) |
 | `peer_timeout` | `90` | seconds without authenticated evidence before a fresh handshake (UDPSEC) |
 | `session_refresh_interval` | `0` | seconds between in-session key epoch refreshes; `0` disables them (UDPSEC) |
-| `reconnect_delay` | `5` | seconds to wait after a failed handshake, a socket error, or a peer close before the next attempt |
+| `reconnect_delay` | `5` | seconds to wait after a failed handshake, a socket error, a peer close, or a `peer_timeout` with no ping outstanding before the next attempt |
 
 Timing values are finite numbers of seconds, never booleans or numeric
 strings. `keepalive_interval` and `peer_timeout` must be above zero;
@@ -314,11 +314,24 @@ timestamps must be within 30 seconds of the mixer's clock. A failed attempt
 waits `reconnect_delay` before the next one.
 
 Every DATA packet is bound to its session, identified by a mixer-issued
-session locator, and to its traffic-key epoch. Each receiver keeps every
-admitted nonce for the epoch's lifetime and rejects replays; if the current
-epoch's bounded nonce ledger fills, that epoch fails closed and a fresh
-handshake follows. State is in memory only: restarting either end requires a
-fresh session.
+session locator, and to its traffic-key epoch. Replay tracking is one-sided.
+The mixer keeps a bounded nonce ledger for each key epoch: it records every
+nonce it admits from the station -- NMEA, keepalives, and control messages --
+for as long as that epoch is accepted, drops any repeat, and starts a fresh
+ledger with each committed key refresh. If the current epoch's ledger fills
+(100,000 admitted packets), the mixer ends the session without telling the
+proxy; the proxy's pings then go unanswered until its `peer_timeout` bound
+starts a fresh handshake, and NMEA sent meanwhile is lost. With
+`session_refresh_interval: 0` (the default) one epoch lasts the whole
+session, so a busy station reaches this limit regularly -- at 10 sentences
+per second, after about 2.8 hours; a nonzero `session_refresh_interval` that
+keeps each epoch well under 100,000 packets avoids it. The proxy keeps no
+nonce ledger: it acts on a mixer reply only when the reply matches what it is
+waiting for -- the sequence number of its one outstanding ping, its own
+refresh transaction, or the path challenge it last answered -- and only once.
+A repeated path challenge is answered again but grants nothing, and an
+authenticated close from the mixer ends the session. State is in memory
+only: restarting either end requires a fresh session.
 
 ### Liveness recovery on the same path
 
@@ -376,14 +389,21 @@ step is a fresh handshake.
 ### Key epoch refresh
 
 With `session_refresh_interval` above zero, the proxy periodically renews the
-traffic keys inside the same session: a signed exchange with fresh ephemeral
-ECDHE keys (REFRESH_INIT, REPLY, CONFIRM, ACK) derives a new key epoch while
-forwarding continues under the current one. The proxy switches only after an
-acknowledgement authenticated under the new epoch, and abandons a refresh that
-has not completed within 15 seconds, keeping the current epoch. Each control
-retransmission re-encrypts the same signed message under a fresh nonce, at
-most 6 attempts per phase and at least 2 seconds apart, and every send is
-checked against the transaction deadline immediately before it leaves.
+traffic keys inside the same session: an exchange with fresh ephemeral ECDHE
+keys (REFRESH_INIT, REPLY, CONFIRM, ACK) derives a new key epoch while
+forwarding continues under the current one. REFRESH_INIT is signed with the
+station identity key and REPLY with the mixer identity key; the proxy
+verifies the REPLY signature with `remote_public_key`. Both travel under the
+current epoch.
+CONFIRM and ACK carry no signature: AES-GCM under the new epoch's keys, which
+derive from the signed exchange, authenticates them. The proxy switches only
+after an acknowledgement authenticated under the new epoch, and abandons a
+refresh that has not completed within 15 seconds, keeping the current epoch.
+The proxy sends REFRESH_INIT and CONFIRM each at most 6 times, at least 2
+seconds apart. A retransmission repeats the same logical message -- same
+transaction and, for REFRESH_INIT, the same ephemeral key and signature --
+freshly encrypted under a new AEAD nonce, and every send is checked against
+the transaction deadline immediately before it leaves.
 
 A refresh is neither a new session nor a path change: the session locator,
 the active path, and the forwarding loop are unchanged. Zero disables planned
@@ -580,12 +600,19 @@ installed runtime and unit files, and preserves `/etc/nmea_sproxy`.
 directory, including operator configurations and keys. Use it only when that
 destructive result is intended.
 
-OpenWrt package lifecycle is separate. `apk --update-cache add --upgrade
-nmea_sproxy` updates it; the generated upgrade hook stops and starts the service
-even if it had been manually stopped, while preserving the boot enable/disable
-state. `apk del nmea_sproxy` stops, disables, and removes it. There is no
-project-specific purge contract, so do not assume configurations, named
-relations, or keys will be retained after removal.
+OpenWrt package lifecycle is separate. Upgrade every installed AISMixer
+package in one `apk` command, because `nmea_sproxy` and `aismixer` each
+require the identical `aismixer-common` revision. With only `nmea_sproxy`
+installed, run `apk --update-cache add --upgrade aismixer-common nmea_sproxy`.
+If the same device also has `aismixer` installed, upgrade all three with
+`apk --update-cache add --upgrade aismixer-common aismixer nmea_sproxy`.
+Never name a package the device does not have: `apk add` would install it,
+and its hook would enable and start it. The generated upgrade hooks
+stop and start each service even if it had been manually stopped, while
+preserving the boot enable/disable state. `apk del nmea_sproxy` stops,
+disables, and removes it. There is no project-specific purge contract, so
+do not assume configurations, named relations, or keys will be retained
+after removal.
 
 ## 🩺 Logs and diagnostics
 
@@ -601,13 +628,20 @@ Runtime: input=serial output=udpsec forwarded=640 messages / 51.20KiB session=8f
 ```
 
 `session` is a short label of the session locator, and `epoch` the
-traffic-key epoch, which rises with each in-session refresh. `peer` is the
-local liveness state, not a confirmation from the mixer. `observed` is the
-public address and port the mixer saw on the last answered ping (`ipv4:port`
-or `ipv6.port`, or `unknown`), and `age` the seconds since that observation.
-`path_gen` is the mixer's committed path-migration generation for the session:
-`0` before any migration, `unknown` when not reported, and marked `last-known`
-when older than an acknowledged migration. A fresh handshake shows a new
+traffic-key epoch, which rises by one with each committed in-session refresh.
+`peer` is the local `peer_timeout` state, not a confirmation from the mixer:
+a session ends as soon as `peer_timeout` passes without authenticated
+evidence, so a running session shows `peer=alive` even while pings go
+unanswered. `observed` is the public address and port the mixer saw on the
+last answered ping (`ipv4:port` or `ipv6.port`, or `unknown`), and `age` the
+seconds since the proxy accepted that pong; until a new session's first
+keepalive pong arrives, `age` counts from the start of the session. While
+pongs keep arriving, `age` stays below about `keepalive_interval`.
+`path_gen` is the mixer's committed path-migration generation for the
+session: `0` before any migration and `unknown` when not reported. It can
+rise by more than one per migration, because unproven candidates also use up
+generations. `last-known` marks a report older than a migration the proxy has
+since acknowledged. A fresh handshake shows a new
 `session` label with `epoch=0 path_gen=0`; a migration keeps the label and
 raises `path_gen`. These fields are observational only: nothing displayed
 controls liveness, migration, or keys.
@@ -615,20 +649,36 @@ controls liveness, migration, or keys.
 | Log line | Meaning |
 | --- | --- |
 | `Mutual ECDHE session confirmed.` | a new session is established |
-| `Secure session liveness suspect: keepalive ping #N ...` | first retransmission of an unanswered ping |
-| `Secure session liveness recovered: keepalive ping #N answered ...` | answered in the same session |
-| `Secure ... failed transiently (...); keeping the session ...` | local network error inside the liveness bound |
-| `Secure session network path usable again after N transient failure(s).` | first successful send after it |
+| `Secure session liveness suspect: keepalive ping #N ...` | first retransmission of an unanswered ping; the proxy keeps sending NMEA, but nothing acknowledges it: sentences sent while pongs are missing may be lost and are never resent |
+| `Secure session liveness recovered: keepalive ping #N answered ...` | that ping was answered, or cleared by a migration acknowledgement, in the same session |
+| `Secure ... failed transiently (...); keeping the session ...` | first transient send or receive error of an episode, such as a missing route; the session is kept and sentences whose send failed are dropped |
+| `Secure session network path usable again after N transient failure(s).` | first successful send after that episode |
 | `Secure session path migration acknowledged by peer.` | the mixer committed a path migration |
 | `Starting in-session authenticated epoch refresh.` | a key epoch refresh began |
-| `Secure epoch refresh committed; continuing on the new epoch ...` | the refresh completed in the same session |
-| `Secure session liveness unresolved; starting authenticated re-handshake.` | `peer_timeout` reached with a ping outstanding |
-| `⚠️ No response from server during handshake.` | no signed reply within 5 seconds |
+| `Secure epoch refresh committed; continuing on the new epoch ...` | the refresh completed in the same session; `epoch` rises by one |
+| `Secure epoch refresh deadline reached; keeping the current epoch.` | the refresh was abandoned after 15 seconds and the current keys stay in use; if the mixer had already switched, the session ends at `peer_timeout` |
+| `Secure session liveness unresolved; starting authenticated re-handshake.` | `peer_timeout` reached with a ping outstanding; a fresh handshake starts at once |
+| `Secure session invalidated: peer_timeout` | `peer_timeout` reached with no ping outstanding -- in practice only when `keepalive_interval` is not below `peer_timeout`; the next handshake waits `reconnect_delay` |
+| `Secure peer closed the current session gracefully.` | the mixer closed the session, for example while stopping; the next handshake waits `reconnect_delay` |
+| `⚠️ No response from server during handshake.` | no valid signed reply within 5 seconds |
+| `❌ Handshake send error: ...` | the handshake could not be sent, for example with no route; retried after `reconnect_delay` |
 
-On the mixer, migration appears as `[+] Path candidate OPENED`,
-`[+] Path challenge RETRY n/4`, `[+] Path migration COMMITTED ... old=... new=...`,
-and `[+] Path candidate EXPIRED` lines, which never contain keys, nonces, or
-challenge tokens.
+On the mixer, `[+] Confirmed secure session for ...`,
+`[+] Committed UDPSEC path migration for ...`, and
+`[+] Committed in-session epoch refresh for ...` are printed directly.
+Migration progress is logged separately, with the same `session=` label as
+the proxy's `Runtime:` line: `[+] Path candidate OPENED` or `REPLACED`
+(authenticated traffic from a new address, or a new candidate replacing an
+unproven one, including the same address after a key epoch refresh),
+`[+] Path challenge RETRY n/4` (`[!] ... send FAILED` when a
+retry could not be sent), `[+] Path migration COMMITTED ... old=... new=...`,
+`[+] Path candidate EXPIRED` (no proof within 10 seconds), and
+`[+] Retired path EXPIRED` (the end of the old address's 5-second grace).
+These lines never contain keys, nonces, or challenge tokens. They are
+best-effort: they pass through a bounded queue of 256 lines that drops the
+oldest first, so during bursts, blocked log output, or shutdown some can be
+lost without notice, and an `EXPIRED` line can appear up to about 30 seconds
+after the expiry itself.
 
 ## 🛠️ Troubleshooting
 
@@ -639,7 +689,7 @@ challenge tokens.
 | Unauthorized station | Match `station_id` exactly and install the station public value in aismixer's `authorized_keys.yaml`; restart aismixer after changes. |
 | Identity startup failure | Stop a restarting unit; inspect both canonical station files. Repair only when the retained private key is known to be correct. |
 | "Network is unreachable" or `failed transiently` | The local interface or route is missing, for example during a Wi-Fi or cellular switch. Short episodes keep the session; a persistent one ends at `peer_timeout`, and `Handshake send error` then repeats each reconnect cycle until the network returns. |
-| `liveness suspect` without `recovered` | Pongs are not arriving: check return-path firewall and NAT state and the mixer's reachability. Without qualifying authenticated evidence the session ends at `peer_timeout` with a fresh handshake. |
+| `liveness suspect` without `recovered` | Pongs are not arriving: check return-path firewall and NAT state, the mixer's reachability, and the mixer log for `[!] Secure session nonce capacity exhausted` (see "Establishment"). Without qualifying authenticated evidence the session ends at `peer_timeout` with a fresh handshake. |
 | Repeated re-handshakes | Inspect bidirectional reachability, NAT timeout/rebinding, keepalive and peer-timeout values, and both endpoint logs. A re-handshake follows only `peer_timeout` without qualifying authenticated evidence. |
 | `observed` changed | A change with a raised `path_gen` and the same `session` label is a completed migration; a change with a new label and `path_gen=0` followed a fresh handshake. |
 | Mixer logs candidate `OPENED` then `EXPIRED` without `COMMITTED` | Challenges or responses for the new address are lost: check that return traffic reaches the station's new address. Later traffic opens a new candidate; if no proof succeeds, the session ends at `peer_timeout`. |

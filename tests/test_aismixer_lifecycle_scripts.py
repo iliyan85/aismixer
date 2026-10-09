@@ -1,7 +1,16 @@
+import re
+import shlex
 from pathlib import Path
 
 import pytest
 import yaml
+
+# The POSIX sh harness shared with the OpenWrt init-script tests.
+from test_openwrt_packaging import (
+    _run_with_spawn_retry,
+    posix_shell_command,
+    shell_path,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +25,18 @@ RUN_AS_ROOT_FUNCTION = """run_as_root() {
 \t\t"$@"
 \tfi
 }"""
+# Developer lab addresses that the repository-root alias seed (and so every
+# fresh conventional install) carried up to v0.2.1.
+DEVELOPER_LAB_ALIAS_ADDRESSES = ("192.168.190.223", "10.172.10.101")
+OPERATOR_ALIAS_MAP = b'udp_alias_map:\n  - ip: "192.0.2.10"\n    id: "dock_gate"\n'
+INSTALL_CONFIG_SEEDING_LOOP = re.compile(
+    r"^for config_name in config\.yaml udp_alias_map\.yaml; do\n.*?^done$",
+    flags=re.MULTILINE | re.DOTALL,
+)
+INSTALL_PATH_EXISTS_FUNCTION = re.compile(
+    r"^path_exists\(\) \{\n.*?^\}$",
+    flags=re.MULTILINE | re.DOTALL,
+)
 
 
 def read_root_file(name):
@@ -50,6 +71,65 @@ def assert_no_direct_privileged_commands(script):
         )
         assert not line.startswith(("if systemctl ", "if test "))
         assert " | sudo " not in line
+
+
+def run_install_config_seeding(tmp_path, *, existing_alias_map=None):
+    """Run install.sh's real config-seeding loop against a scratch config dir.
+
+    Only that loop and its `path_exists` helper are taken from install.sh.
+    `run_as_root` is the script's own root branch (run the command as is) and
+    CONFIG_DIR is a tmp_path directory instead of /etc/aismixer, so this needs
+    no root and never touches the live /etc. SCRIPT_DIR stays the repository
+    root, so the seeds copied are the real repository files.
+    """
+    command = posix_shell_command()
+    install = read_root_file("install.sh")
+    seeding_loop = INSTALL_CONFIG_SEEDING_LOOP.search(install)
+    path_exists = INSTALL_PATH_EXISTS_FUNCTION.search(install)
+    assert "\nCONFIG_DIR=/etc/aismixer\n" in install
+    assert seeding_loop is not None
+    assert path_exists is not None
+
+    config_dir = tmp_path / "etc-aismixer"
+    config_dir.mkdir()
+    # The script rebuilds the scratch config dir itself, so a retried attempt
+    # (see _run_with_spawn_retry) starts from the same state as the first.
+    fixture = [
+        'rm -f "$CONFIG_DIR/config.yaml" "$CONFIG_DIR/udp_alias_map.yaml"',
+    ]
+    if existing_alias_map is not None:
+        assert existing_alias_map.endswith(b"\n")
+        lines = existing_alias_map.decode("utf-8").split("\n")[:-1]
+        fixture.append(
+            "printf '%s\\n' "
+            + " ".join(shlex.quote(line) for line in lines)
+            + ' > "$CONFIG_DIR/udp_alias_map.yaml"'
+        )
+
+    script = "\n".join(
+        (
+            "set -eu",
+            'run_as_root() { "$@"; }',
+            path_exists.group(0),
+            f"SCRIPT_DIR={shlex.quote(shell_path(ROOT, command))}",
+            f"CONFIG_DIR={shlex.quote(shell_path(config_dir, command))}",
+            *fixture,
+            seeding_loop.group(0),
+            "",
+        )
+    )
+    # Bytes in, as in the OpenWrt init harness: `wsl.exe sh -s` corrupts
+    # text-mode stdin.
+    result = _run_with_spawn_retry(
+        [*command, "-s"],
+        input=script.encode("utf-8"),
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8")
+    return config_dir, result.stdout.decode("utf-8").splitlines()
 
 
 @pytest.mark.parametrize("name", AISMIXER_LIFECYCLE_SCRIPTS)
@@ -123,6 +203,60 @@ def test_install_preserves_config_before_any_create_operation():
     assert preserve in install
     assert "preserving it" in install
     assert install.index(preserve) < install.index(create)
+
+
+def test_root_udp_alias_map_seed_is_empty_and_loads_no_aliases():
+    import aismixer  # the real loader; local because importing it loads config.yaml
+
+    seed_path = ROOT / "udp_alias_map.yaml"
+    seed = seed_path.read_text(encoding="utf-8")
+
+    assert yaml.safe_load(seed) == {"udp_alias_map": []}
+    for address in DEVELOPER_LAB_ALIAS_ADDRESSES:
+        assert address not in seed
+    assert aismixer.load_udp_alias_map({"udp_alias_map_file": str(seed_path)}) == {}
+
+
+def test_udp_alias_map_loader_still_applies_operator_aliases(tmp_path):
+    import aismixer
+
+    operator_map = tmp_path / "udp_alias_map.yaml"
+    operator_map.write_bytes(OPERATOR_ALIAS_MAP)
+
+    assert aismixer.load_udp_alias_map(
+        {"udp_alias_map_file": str(operator_map)}
+    ) == {"192.0.2.10": "dock_gate"}
+
+
+def test_fresh_install_seeds_the_empty_root_alias_map(tmp_path):
+    config_dir, output = run_install_config_seeding(tmp_path)
+    installed = config_dir / "udp_alias_map.yaml"
+
+    assert installed.read_bytes() == (ROOT / "udp_alias_map.yaml").read_bytes()
+    assert yaml.safe_load(installed.read_bytes()) == {"udp_alias_map": []}
+    assert any(
+        line.strip().startswith("- Installed ")
+        and line.endswith("/udp_alias_map.yaml")
+        for line in output
+    )
+
+
+def test_install_preserves_an_existing_operator_alias_map(tmp_path):
+    config_dir, output = run_install_config_seeding(
+        tmp_path,
+        existing_alias_map=OPERATOR_ALIAS_MAP,
+    )
+
+    assert (config_dir / "udp_alias_map.yaml").read_bytes() == OPERATOR_ALIAS_MAP
+    assert any(
+        line.strip().startswith("- Existing ")
+        and line.endswith("/udp_alias_map.yaml found; preserving it")
+        for line in output
+    )
+    # Preservation is decided per file: the absent config.yaml is still seeded.
+    assert (config_dir / "config.yaml").read_bytes() == (
+        ROOT / "config.yaml"
+    ).read_bytes()
 
 
 def test_seeded_mixer_listener_matches_seeded_proxy_udpsec_destination():

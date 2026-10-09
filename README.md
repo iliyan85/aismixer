@@ -89,9 +89,13 @@ an external standard; the current version is UDPSECv2.
 - **Encrypted DATA:** NMEA payloads, keepalive pings and pongs, and all
   in-session control messages travel in one encrypted DATA channel; every
   packet is bound to its session and to its traffic-key epoch.
-- **Replay protection:** a receiver keeps every admitted nonce for the life of
-  its key epoch and rejects repeats. If the current epoch's bounded nonce
-  ledger fills, that epoch fails closed and a fresh handshake follows.
+- **Replay protection:** the mixer keeps every nonce it admits from a station
+  for the life of that key epoch and rejects repeats. If the current epoch's
+  bounded ledger fills, the mixer ends the session and the station performs a
+  fresh handshake at its `peer_timeout` bound; NMEA sent in between is lost,
+  and a nonzero `session_refresh_interval` gives each refreshed epoch a fresh
+  ledger. The station keeps no nonce ledger; it acts on a mixer answer only
+  when it matches a request still outstanding, and only once.
 - **Authenticated liveness:** only authenticated, matching answers count as
   evidence that the peer is still reachable.
 - **Key epoch refresh (optional):** with `session_refresh_interval` above zero,
@@ -283,9 +287,17 @@ isolation policy before `apk add`. Python and its dependencies require
 materially more writable storage than a minimal router image; extroot may be
 appropriate when internal overlay space is limited.
 
-Update with `apk --update-cache add --upgrade aismixer` from the device's
-configured feed; the update hook stops and starts the service even if it was
-previously stopped, while preserving its enable/disable state.
+Update every installed AISMixer package in one `apk` command from the
+device's configured feed, because `aismixer` and `nmea_sproxy` each require
+the identical `aismixer-common` revision. With both installed, run
+`apk --update-cache add --upgrade aismixer-common aismixer nmea_sproxy`;
+with only one, name `aismixer-common` and that package:
+`apk --update-cache add --upgrade aismixer-common aismixer` on a mixer, or
+`apk --update-cache add --upgrade aismixer-common nmea_sproxy` on a station.
+Never name a package the device does not have: `apk add` would install it,
+and its hook would enable and start it. The update hooks stop and start each
+service even if it was previously stopped, while preserving its
+enable/disable state.
 `apk del aismixer` stops, disables, and removes it. The package has no
 project-specific purge contract, so this README makes no promise about
 configuration or key retention after removal.
@@ -724,10 +736,15 @@ UDPSEC е удостовереният и криптиран UDP транспо�
   всички контролни съобщения в сесията се пренасят в един криптиран DATA
   канал; всеки пакет е обвързан със своята сесия и със своята епоха на
   ключовете за трафик.
-- **Защита от replay:** получателят пази всеки приет nonce за целия живот на
-  ключовата му епоха и отхвърля повторенията. Ако ограниченият регистър на
-  nonce стойностите за текущата епоха се запълни, тази епоха отказва в режим
-  fail closed и следва нов handshake.
+- **Защита от replay:** mixer-ът пази всеки nonce, който приеме от станция,
+  за целия живот на съответната ключова епоха и отхвърля повторенията. Ако
+  ограниченият регистър на nonce стойностите за текущата епоха се запълни,
+  mixer-ът прекратява сесията, а станцията извършва нов handshake при
+  достигане на границата `peer_timeout`; NMEA данните, изпратени междувременно,
+  се губят, а ненулев `session_refresh_interval` дава нов регистър на всяка
+  опреснена епоха. Станцията не води регистър на nonce стойностите; тя приема
+  отговор от mixer-а само ако той съответства на нейна заявка, която все още
+  чака отговор, и само веднъж.
 - **Удостоверена проверка за активност:** само удостоверени и съвпадащи
   отговори се приемат като доказателство, че отсрещната страна е достижима.
 - **Опресняване на ключовата епоха (по избор):** при `session_refresh_interval`
@@ -930,9 +947,18 @@ logread -e aismixer
 и зависимостите му изискват значително повече записваемо място от минимален
 образ на рутера; extroot може да е подходящ при ограничено overlay пространство.
 
-Обновете с `apk --update-cache add --upgrade aismixer` от конфигурирания на
-устройството feed; hook скриптът за обновяване спира и стартира услугата дори
-ако е била спряна, като запазва състоянието ѝ за включване при зареждане.
+Обновете с една команда `apk` всички инсталирани пакети на AISMixer от
+конфигурирания на устройството feed, защото `aismixer` и `nmea_sproxy`
+изискват точно същата ревизия на пакета `aismixer-common`. Ако на
+устройството са инсталирани и `aismixer`, и `nmea_sproxy`, изпълнете
+`apk --update-cache add --upgrade aismixer-common aismixer nmea_sproxy`; ако
+е инсталиран само единият, посочете `aismixer-common` и този пакет:
+`apk --update-cache add --upgrade aismixer-common aismixer` на mixer или
+`apk --update-cache add --upgrade aismixer-common nmea_sproxy` на станция.
+Никога не посочвайте пакет, който устройството няма: `apk add` ще го
+инсталира, а hook скриптът му ще включи и стартира услугата.
+Hook скриптовете за обновяване спират и стартират всяка услуга дори
+ако е била спряна, като запазват състоянието ѝ за включване при зареждане.
 `apk del aismixer` спира, изключва и премахва пакета. Пакетът не определя
 специфично за проекта поведение за пълно изчистване, затова този README не
 обещава запазване на конфигурацията или ключовете след премахването.
@@ -1391,10 +1417,15 @@ standard extern; versiunea actuală este UDPSECv2.
   toate mesajele de control din sesiune circulă printr-un singur canal DATA
   criptat; fiecare pachet este legat de sesiunea sa și de epoca sa de chei de
   trafic.
-- **Protecție anti-replay:** receptorul păstrează fiecare nonce admis pe toată
-  durata epocii sale de chei și respinge repetările. Dacă registrul limitat de
-  nonce-uri al epocii curente se umple, acea epocă eșuează în mod sigur
-  (fail-closed) și urmează un handshake nou.
+- **Protecție anti-replay:** mixerul păstrează fiecare nonce admis de la o
+  stație pe toată durata epocii de chei respective și respinge repetările.
+  Dacă registrul limitat de nonce-uri al epocii curente se umple, mixerul
+  încheie sesiunea, iar stația efectuează un handshake nou la limita
+  `peer_timeout`; datele NMEA trimise între timp se pierd, iar un
+  `session_refresh_interval` nenul oferă fiecărei epoci reîmprospătate un
+  registru nou. Stația nu ține un registru de nonce-uri; acceptă un răspuns
+  de la mixer numai dacă acesta corespunde unei cereri proprii aflate încă în
+  așteptare și numai o singură dată.
 - **Liveness autentificat:** numai răspunsurile autentificate și corespunzătoare
   contează ca dovadă că partenerul este încă accesibil.
 - **Reîmprospătarea epocii de chei (opțională):** cu `session_refresh_interval`
@@ -1596,9 +1627,18 @@ dependențele sale necesită mult mai mult spațiu disponibil pentru scriere dec
 o imagine minimală de router; extroot poate fi potrivit când spațiul intern din
 overlay este limitat.
 
-Actualizați cu `apk --update-cache add --upgrade aismixer` din feed-ul
-configurat pe dispozitiv; hook-ul de actualizare oprește și pornește serviciul
-chiar dacă acesta era oprit anterior, păstrând însă starea sa de
+Actualizați cu o singură comandă `apk` toate pachetele AISMixer instalate,
+din feed-ul configurat pe dispozitiv, deoarece `aismixer` și `nmea_sproxy`
+necesită exact aceeași revizie a pachetului `aismixer-common`. Dacă pe
+dispozitiv sunt instalate atât `aismixer`, cât și `nmea_sproxy`, rulați
+`apk --update-cache add --upgrade aismixer-common aismixer nmea_sproxy`; dacă
+este instalat doar unul, specificați `aismixer-common` și pachetul respectiv:
+`apk --update-cache add --upgrade aismixer-common aismixer` pe un mixer sau
+`apk --update-cache add --upgrade aismixer-common nmea_sproxy` pe o stație.
+Nu specificați niciodată un pachet pe care dispozitivul nu îl are: `apk add`
+l-ar instala, iar hook-ul său ar activa și ar porni serviciul.
+Hook-urile de actualizare opresc și pornesc fiecare serviciu chiar dacă
+acesta era oprit anterior, păstrând însă starea sa de
 activare/dezactivare. `apk del aismixer` oprește, dezactivează și elimină
 pachetul. Pachetul nu are un contract de purge specific proiectului, astfel
 încât acest README nu promite păstrarea configurației sau a cheilor după

@@ -1095,6 +1095,16 @@ def test_openwrt_aismixer_udp_alias_map_uses_sanitized_packaged_default():
     assert alias_map == {"udp_alias_map": []}
 
 
+def test_conventional_root_alias_map_seed_is_as_empty_as_the_openwrt_seed():
+    """The conventional install.sh seed (repository root) is now as empty as
+    the OpenWrt ./files/ seed. The recipe must still install ./files/: the
+    root copy in its pinned v0.2.1 source tree carries developer lab aliases."""
+    root_seed = yaml.safe_load(read_text(ROOT / "udp_alias_map.yaml"))
+    package_seed = yaml.safe_load(read_text(PACKAGE_FILES / "udp_alias_map.yaml"))
+
+    assert root_seed == package_seed == {"udp_alias_map": []}
+
+
 def test_openwrt_package_has_safe_authorization_default_and_no_identity_payload():
     recipe = read_text(PACKAGE_DIR / "Makefile")
     authorization = yaml.safe_load(

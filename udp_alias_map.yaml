@@ -1,5 +1,15 @@
-udp_alias_map:
-  - ip: "192.168.190.223"
-    id: "rpi"
-  - ip: "10.172.10.101"
-    id: "catcher"
+# Optional aliases for plain UDP sources.
+#
+# The alias map is empty by default.
+# To configure aliases, REPLACE the empty list below with entries
+# following this example, using your own IP addresses and identifiers:
+#
+# udp_alias_map:
+#   - ip: "192.0.2.10"
+#     id: "rpi"
+#   - ip: "192.0.2.11"
+#     id: "catcher"
+#
+# Do not retain both active udp_alias_map declarations.
+
+udp_alias_map: []

@@ -54,7 +54,7 @@ _AUTO_READLINE = object()
 _STATISTICS_HELP = (
     "Statistics commands:\n"
     "  show statistics\n"
-    "  show statistics inputs [INPUT]\n"
+    "  show statistics inputs [SELECTOR]\n"
     "  show statistics outputs [OUTPUT]"
 )
 
@@ -421,7 +421,11 @@ def _add_remote_command_parsers(
     inputs_parser.add_argument(
         "input_filter",
         nargs="?",
-        metavar="INPUT",
+        metavar="SELECTOR",
+        help=(
+            "show only the input whose selector (SELECTOR column, JSON name) "
+            "is exactly SELECTOR; INPUT display labels are not matched"
+        ),
     )
     outputs_parser = statistics_subparsers.add_parser(
         "outputs",
@@ -811,7 +815,7 @@ _INPUT_TRAFFIC_COUNTER_FIELDS = (
 )
 # Column order for the rendered table: the operator-facing display label
 # leads (it is what an operator actually wants to look at), followed by the
-# stable selector (what `--input` actually filters against -- kept visible
+# stable selector (what the SELECTOR filter matches -- kept visible
 # so an operator can see which exact string to pass), then kind and
 # counters. This is a presentation-only ordering; it is independent of
 # _INPUT_TRAFFIC_RESULT_FIELDS, which only states which fields must be

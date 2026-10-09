@@ -168,6 +168,13 @@ still change public APIs and configuration behavior as the project matures.
   revision; `0.2.1-r4` adds the packaging terminology corrections and the
   unbuffered-output wrappers above. `0.2.1-r2` through `0.2.1-r4` run the
   same v0.2.1 Python code.
+- Seeds fresh conventional (`install.sh`) installs with an empty
+  `/etc/aismixer/udp_alias_map.yaml` (`udp_alias_map: []`), as the OpenWrt
+  packages have done since `0.2.1-r2`, instead of two developer lab aliases;
+  a run from a source checkout directory, which reads the checkout's own
+  `udp_alias_map.yaml` first, no longer applies them either. `install.sh`
+  still keeps an existing `/etc/aismixer/udp_alias_map.yaml` unchanged, so
+  on a host installed earlier, check it for alias entries you did not add.
 - Standardizes the UDPSEC port convention on 17779, a project-chosen and
   configurable value. The seeded mixer `sec_inputs` listener (repository
   `config.yaml` and the OpenWrt source package seed), the `nmea_sproxy`

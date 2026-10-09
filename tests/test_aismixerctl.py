@@ -1392,7 +1392,7 @@ def test_interactive_input_statistics_table_is_transport_and_payload_explicit(
     ):
         assert heading in stdout
     # INPUT shows the operator-facing display label; SELECTOR shows the
-    # stable machine-facing name a --input filter actually matches -- the
+    # stable machine-facing name the SELECTOR filter actually matches -- the
     # two are deliberately different columns, not the same value rendered
     # twice, even though both distinguish these two rows from each other.
     assert stdout.index("192.0.2.10:17778") < stdout.index(
@@ -1958,7 +1958,8 @@ def test_one_shot_and_nested_help_include_show_statistics(capsys):
     statistics_help = capsys.readouterr().out
 
     assert "show statistics" in top_level_help
-    assert "show statistics inputs [INPUT]" in top_level_help
+    assert "show statistics inputs [SELECTOR]" in top_level_help
+    assert "[INPUT]" not in top_level_help
     assert "show statistics outputs [OUTPUT]" in top_level_help
     assert "statistics" in nested_help
     assert "inputs" in statistics_help
@@ -1969,8 +1970,41 @@ def test_interactive_help_contains_literal_show_statistics():
     help_text = aismixerctl.build_shell_parser().format_help()
 
     assert "show statistics" in help_text
-    assert "show statistics inputs [INPUT]" in help_text
+    assert "show statistics inputs [SELECTOR]" in help_text
+    assert "[INPUT]" not in help_text
     assert "show statistics outputs [OUTPUT]" in help_text
+
+
+def test_inputs_filter_help_names_the_selector_column_it_matches(
+    capsys,
+    monkeypatch,
+):
+    # Python 3.14+ argparse colours its usage line under FORCE_COLOR or
+    # PYTHON_COLORS=1, even into captured output. Both overrides are needed:
+    # PYTHON_COLORS=0 beats a preset PYTHON_COLORS=1, and NO_COLOR=1 still
+    # applies under `python -E`/`-I`, which ignore PYTHON_COLORS.
+    monkeypatch.setenv("PYTHON_COLORS", "0")
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert aismixerctl.main(
+        ["show", "statistics", "inputs", "--help"]
+    ) == aismixerctl.EXIT_OK
+    inputs_help = " ".join(capsys.readouterr().out.split())
+    selector_header = aismixerctl._INPUT_TRAFFIC_HEADERS[
+        aismixerctl._INPUT_TRAFFIC_COLUMN_ORDER.index("name")
+    ]
+    display_header = aismixerctl._INPUT_TRAFFIC_HEADERS[
+        aismixerctl._INPUT_TRAFFIC_COLUMN_ORDER.index("display")
+    ]
+
+    # The filter placeholder names the table column holding the row `name`,
+    # the only field the filter is compared with; `display` never is.
+    assert (selector_header, display_header) == ("SELECTOR", "INPUT")
+    assert "show statistics inputs [-h] [SELECTOR]" in inputs_help
+    assert (
+        "show only the input whose selector (SELECTOR column, JSON name) "
+        "is exactly SELECTOR; INPUT display labels are not matched"
+    ) in inputs_help
+    assert "[INPUT]" not in inputs_help
 
 
 @pytest.mark.parametrize(

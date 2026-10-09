@@ -1137,7 +1137,7 @@ pending, failed confirmation does not destroy it, and successful
 confirmation atomically promotes the candidate as specified below).
 Configured planned refresh (`session_refresh_interval > 0`) instead runs
 the in-session authenticated epoch refresh described in the epoch-refresh
-subsection above: it does not restart forwarding, does not
+subsection below: it does not restart forwarding, does not
 invoke ClientHello/ServerHello on success, and leaves the same server
 `LogicalSession` in place. The first proactive-rekey attempt and each
 planned-refresh transaction start are immediate; peer graceful close,
@@ -1189,8 +1189,15 @@ created with `active_path` set to the confirming packet's address, and a
 fresh `session_handle` is always minted (promotion is never
 object-identity-preserving in this stage). Because each ServerHello mints an
 independent locator, the promoted session's locator is always different from
-whatever locator any live session it replaces was using -- there is no
-notion of a rekey that preserves a locator in this revision. The new
+whatever locator any live session it replaces was using. This holds for
+every fresh ClientHello/ServerHello establishment, including proactive
+recovery and the full-establishment fallback (11.5): each yields a new
+`LogicalSession` with a new locator, epoch generation 0, and
+`path_generation` 0. Rekeying without a new locator is a different
+operation: the authenticated in-session epoch refresh (fresh ephemeral
+ECDHE; see "In-session authenticated epoch refresh" below) never goes
+through promotion and keeps the same `LogicalSession`, locator, active
+path, and `assembly_namespace`, so multipart assembly continues. The promoted
 session's `assembly_namespace` is carried forward from the exact live
 session this promotion replaces only when that session's authenticated
 `station_id` matches the promoted station_id; otherwise -- a different
@@ -1840,9 +1847,12 @@ traffic on the stale one. A retiring epoch cannot open or prove a
 migration. Path
 migration never promotes/discards/rekeys `CryptoEpoch` state, and epoch
 refresh never inherits authority from an unproved candidate path. A stale
-candidate cannot resurrect a closed/expired/exhausted session. The full
-migration x refresh x lifecycle race matrix is deferred to a later stage;
-these are the safe primitives it will build on.
+candidate cannot resurrect a closed/expired/exhausted session. The
+migration x refresh x lifecycle race cases built on these primitives are
+specified in 11.1 (Major Prompt 6); their migration x refresh subset is
+restated end to end in 11.3 (items 9-11), and they are composed with MP1/MP2
+recovery in 11.5 (MP3). Each is backed by dedicated tests, and no race
+guarantee beyond the cases stated in section 11 is implied.
 
 **Lifecycle.** Session expiry, close, capacity eviction, nonce exhaustion,
 listener teardown, and owner `close()` all discard the candidate and
@@ -2005,9 +2015,11 @@ remains valid only while all of those still hold.
 
 ### 11.2 Migration adversarial hardening and observability (Major Prompt 7)
 
-The central security statement: an attacker may cause bounded rejection
-work, but must not gain authority, amplify traffic, or create
-history-scaled state.
+The central security statement for path migration: an attacker may cause
+bounded rejection work, but must not gain authority, create history-scaled
+state, or amplify traffic beyond the fixed per-incarnation `PATH_CHALLENGE`
+budget of item 9, which only authenticated, replay-admitted, current-epoch
+traffic can open.
 
 1. **Guessed/unknown locator is non-authoritative and non-amplifying.**
    Session selection is an exact `(endpoint_token, session_locator)`
@@ -2058,8 +2070,22 @@ history-scaled state.
 9. **Anti-amplification.** Unknown locator, source-policy denial, failed
    AEAD, replay, and any rejected/stale/invalid migration response all
    produce zero response datagrams. A legitimate new or replacing
-   candidate observation produces at most one `PATH_CHALLENGE`; duplicate
-   traffic on an already-live candidate produces none.
+   candidate observation opens at most one candidate incarnation (one
+   token, one `path_generation`, one fixed deadline at creation plus
+   `PATH_CANDIDATE_TTL_SECONDS`, 10 s). That incarnation's one
+   `PATH_CHALLENGE` goes only to the candidate address, at most
+   `PATH_CHALLENGE_MAX_SENDS` (4) times in total including the initial
+   send, each freshly encrypted under a new AEAD nonce, at least
+   `PATH_CHALLENGE_RETRY_INTERVAL_SECONDS` (2 s) apart, and only before
+   that unchanged deadline; see "Bounded PATH_CHALLENGE retransmission
+   (MP2)". One opening datagram can therefore draw at most four challenge
+   datagrams toward an unproved address: a fixed, bounded ratio in
+   datagrams (larger in bytes, since a challenge is larger than a minimal
+   `ping`) that only authenticated, replay-admitted, current-epoch traffic
+   can trigger. A
+   retry grants no authority and never extends the deadline. Duplicate
+   traffic on an already-live candidate under the same current epoch
+   sends nothing and never resets that budget.
 10. **No payload/address/token history buffering.** Migration carries no
     payload queue, no address history, and no token history -- only the
     single live candidate/retired records already documented in 11.1.
@@ -2605,15 +2631,33 @@ runtime-orchestration mechanisms. The private `_EgressBatch` envelope contains
 one public `OutputBatch` and one process-local completion Future; the Future
 remains outside `OutputBatch` and every other public data-plane contract. These
 mechanisms define neither a native API or ABI nor an IPC protocol. The runtime
-uses no multiprocessing, threads, worker pool, or second processor
-implementation.
+uses no multiprocessing, no NMEA-processing worker pool, and no second
+processor implementation, and all NMEA processing runs on the asyncio
+event-loop thread. Threads off that loop are auxiliary: the bounded UDPSEC
+migration-diagnostics output consumer (at most one, owned by the
+`udpsec-state-maintenance` task; section 11.4, item 5) only formats and
+writes already-decided log lines, and asyncio's default thread-pool executor
+only runs `getaddrinfo()` when a forwarder transport is created for a `host`
+or `source_ip` that asyncio cannot use as a numeric address directly: a DNS
+name, or an IPv6 literal with a `%zone` scope. Neither processes NMEA,
+chooses a path or route, or grants authority. `SecureState`'s lock-based
+thread safety (section 11) is a component property exercised by its tests
+with real threads; in the service only the event-loop thread calls
+`SecureState`, and the diagnostics consumer takes only its own queue locks,
+never `SecureState`'s lock.
 
 ### Runtime lifecycle supervision
 
 Every essential long-lived runtime task—each UDP and UDPSEC ingress producer,
-ingress fan-in, the processor stage, the egress stage, and the sparse
-statistics heartbeat—is owned by one process-local supervision lifecycle. The
-fan-in in turn owns its private reader tasks. Failure, cancellation, or
+ingress fan-in, the processor stage, the egress stage, the sparse statistics
+heartbeat, and the `udpsec-state-maintenance` task—is owned by one
+process-local supervision lifecycle. The maintenance task exists only when at
+least one `sec_inputs` entry is configured, and then exactly once: one task
+serves the shared UDPSEC state of every secure listener. The fan-in in turn
+owns its private reader tasks, and each UDPSEC producer owns its
+non-essential PATH_CHALLENGE retry driver, which it cancels and awaits
+before closing its sessions and socket (see "Bounded PATH_CHALLENGE
+retransmission (MP2)"). Failure, cancellation, or
 unexpected normal return by any essential task terminates the runtime: every
 still-running sibling is cancelled, and all owned task outcomes are awaited and
 retrieved before the primary failure, or a clear unexpected-termination error,
@@ -2767,8 +2811,10 @@ back, and later admitted work is not processed after fail-fast shutdown. Local
 send completion is neither remote receipt nor a delivery acknowledgement.
 
 Every UDP and UDPSEC producer, fan-in, processor-stage, egress-stage, and sparse
-statistics-heartbeat task is an essential task in one process-local fail-fast
-supervision lifecycle; fan-in similarly owns its private readers. Failure,
+statistics-heartbeat task, plus the one shared `udpsec-state-maintenance` task
+that exists whenever at least one `sec_inputs` entry is configured, is an
+essential task in one process-local fail-fast supervision lifecycle; fan-in
+similarly owns its private readers. Failure,
 unexpected return, or unexpected cancellation terminates siblings and retrieves
 their outcomes. This is supervision of asyncio tasks in one service process. It
 supplies cleanup and termination, not a coordinator process, ingress or egress
@@ -2828,8 +2874,8 @@ historical time series is implied.
 
 ### Read-only local control exposure
 
-When the optional local version-1 control plane is enabled, it exposes three
-read-only protocol methods:
+When the optional local control plane (routing-control protocol version 2)
+is enabled, it exposes three read-only protocol methods:
 
 | Protocol method | Parameters and result |
 |---|---|
@@ -2873,7 +2919,7 @@ control plane and is unrelated to `UDPSEC_PROTOCOL_VERSION` (currently
 never be conflated.
 
 `aismixerctl` presents these protocol methods as `show statistics`,
-`show statistics inputs [INPUT]`, and `show statistics outputs [OUTPUT]`.
+`show statistics inputs [SELECTOR]`, and `show statistics outputs [OUTPUT]`.
 Those are CLI spellings, not additional protocol methods. One-shot CLI use
 prints the validated JSON response envelope; the interactive shell renders
 successful statistics results as tables.

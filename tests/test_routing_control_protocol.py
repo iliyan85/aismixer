@@ -549,6 +549,8 @@ def test_runtime_statistics_inputs_serializes_ordered_snapshots_and_calls_once()
     [
         ("udpsec-ingress:1:station-b", ["udpsec-ingress:1:station-b"]),
         ("udp-ingress:9:unknown", []),
+        # A display label is never a selector, even when it is unique.
+        ("2001:db8::1.17779", []),
     ],
 )
 def test_runtime_statistics_inputs_filters_to_zero_or_one_match(
