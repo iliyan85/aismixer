@@ -262,6 +262,20 @@ python3 /usr/lib/aismixer/tools/aismixer_keys.py station \
   --keys-dir /etc/nmea_sproxy/keys --station-id boat_001
 ```
 
+On OpenWrt, `apk add nmea_sproxy` normally creates this pair already: the
+package's first start runs the UDPSEC preflight, which creates both canonical
+files before it stops at the missing mixer key. The command above then refuses
+to overwrite them and suggests `--force`; never use `--force` on a valid
+identity. Print its public value with the validated repair instead: with a
+matching pair it rewrites neither key and only resets their modes to 0600 and
+0644, while a missing or mismatched public file is rewritten from the private
+key:
+
+```sh
+python3 /usr/lib/aismixer/tools/aismixer_keys.py station \
+  --keys-dir /etc/nmea_sproxy/keys --station-id boat_001 --repair-public
+```
+
 Canonical UDPSEC activation may create the identity only when both canonical
 files are absent; pre-generation permits authorization before service start.
 A valid matching pair is preserved. A missing member, malformed/non-P-256
@@ -610,12 +624,95 @@ installed, run `apk --update-cache add --upgrade aismixer-common nmea_sproxy`.
 If the same device also has `aismixer` installed, upgrade all three with
 `apk --update-cache add --upgrade aismixer-common aismixer nmea_sproxy`.
 Never name a package the device does not have: `apk add` would install it,
-and its hook would enable and start it. The generated upgrade hooks
-stop and start each service even if it had been manually stopped, while
-preserving the boot enable/disable state. `apk del nmea_sproxy` stops,
-disables, and removes it. There is no project-specific purge contract, so
-do not assume configurations, named relations, or keys will be retained
-after removal.
+and its hook would enable and start it. Upgrade the station and its mixer in
+one maintenance window: v0.2.1 and v0.3.0 UDPSEC peers do not interoperate,
+and partial upgrades are not supported.
+
+The generated upgrade hooks keep the boot enable/disable state and only run
+the service's `start` action. A stopped service therefore starts. procd
+restarts a running relation only if its command or configuration file
+changed, for example an unedited `config.yaml` that the package replaced, and
+stops a relation that no longer passes preflight; any other running relation
+keeps the old code. After the upgrade, or after rolling back every component
+package in one `apk` command, restart the service if it should run; this
+restarts the singleton and every named relation:
+
+```sh
+/etc/init.d/nmea_sproxy restart
+ubus call service list '{"name":"nmea_sproxy"}'
+logread -e nmea_sproxy
+```
+
+If the service should stay stopped, run `/etc/init.d/nmea_sproxy stop`
+instead. On a device that also runs the mixer, likewise run
+`/etc/init.d/aismixer restart`, or `/etc/init.d/aismixer stop` if it should
+stay stopped. An unedited `/etc/nmea_sproxy/config.yaml` may be replaced by
+the incoming default (upgrading from 0.2.1-r4 moves its UDPSEC `output.port`
+from 17777 to 17779, and a rollback moves it back); an edited one is kept,
+and the incoming default is saved as `config.yaml.apk-new`. Named relations
+are not package conffiles, so apk never replaces them. After an upgrade or a
+rollback, every UDPSEC relation's destination port must equal the mixer's
+`sec_inputs` `listen_port`: its `output.port`, or, in a legacy-form
+configuration without `remote_port`, the built-in default, which is 17779 in
+v0.3.0 and 19999 in v0.2.1 even though the file itself is unchanged.
+
+Roll back together with the mixer, from the previous revision's package
+files. Three checks are easy to confuse here:
+
+- **Index signature.** The feed signs `packages.adb`, and `apk` checks every
+  package it downloads from the feed against it, including with `apk fetch`;
+  a file that passes this check can still be unsigned.
+- **Package signature.** A package file can also carry its own signature.
+  `apk add` of a file path, as in a rollback, trusts the file only through
+  that signature and the keys apk trusts, normally those in `/etc/apk/keys`;
+  the signed index does not vouch for it, so an unsigned file fails with
+  `UNTRUSTED signature`. SDK `bin/` builds are unsigned, and later builds
+  prune them.
+- **SHA-256 checksum.** A matching checksum shows only that two copies are
+  identical; `apk` never trusts a file because of it.
+
+`apk verify` checks a saved file's signature and contents with those same
+keys. Keep only files it reports as `OK`; delete any other file before running
+`apk fetch` again, because `apk fetch` keeps a file of the expected size that
+is already there, even a damaged one. Run `apk verify` again just before a
+rollback: a damaged file can leave a rollback half applied until the same
+`apk add` runs again with intact files. Never add `--allow-untrusted`, which
+accepts unsigned or untrusted files.
+
+`apk fetch` saves the newest revision the feed index lists, not necessarily
+the installed one, and it cannot save a revision the index no longer lists,
+even as `name=version`. Save the packages right after each install or upgrade
+(on 0.2.1-r4: now, before 0.3.0-r1 is published; once the feed index lists
+0.3.0-r1, `apk fetch` saves that instead), then check that `ls` shows a file
+for every version that `apk list --installed` reports; if one is missing, the
+feed index no longer lists that revision and `apk fetch` cannot save it. On a
+device that also runs the mixer, add `aismixer` to the `apk fetch` and
+`apk list` commands, add its saved file to the `apk add` command, and restart
+or stop it as described above:
+
+```sh
+mkdir -p /root/aismixer-rollback
+apk fetch --output /root/aismixer-rollback aismixer-common nmea_sproxy
+apk verify /root/aismixer-rollback/*.apk
+apk list --installed aismixer-common nmea_sproxy
+ls /root/aismixer-rollback
+# Later, to roll back (file names shown for 0.2.1-r4):
+apk verify /root/aismixer-rollback/*.apk
+apk add /root/aismixer-rollback/aismixer-common-0.2.1-r4.apk \
+  /root/aismixer-rollback/nmea_sproxy-0.2.1-r4.apk
+/etc/init.d/nmea_sproxy restart
+```
+
+A rollback from files pins those revisions: `apk upgrade` leaves them in place
+even though `apk list --upgradable` shows newer ones, and the
+`apk --update-cache add --upgrade` command above moves them forward again.
+
+`apk del nmea_sproxy` stops, disables, and removes it. There is no
+project-specific purge contract, so do not assume configurations, named
+relations, or keys will be retained after removal. A firmware sysupgrade does
+not keep `/etc/nmea_sproxy/keys/`, `/etc/nmea_sproxy/instances/`, or, on a
+device that also runs the mixer, `/etc/aismixer/keys/` automatically: add them
+to `/etc/sysupgrade.conf`, or keep a secure, tested backup.
 
 ## 🩺 Logs and diagnostics
 

@@ -74,37 +74,60 @@ def makefile_block(recipe, name):
     return match.group(1)
 
 
+# The packaged preflight runs its heredoc as `/usr/bin/python3 -I -`. Isolated
+# mode keeps the caller's working directory, PYTHON* environment variables and
+# the user site directory out of the root-run import path.
+PACKAGED_PREFLIGHT_INTERPRETER_FLAGS = ("-I",)
+
+
 def nmea_sproxy_preflight_source():
     init = read_text(PACKAGE_FILES / "nmea_sproxy.init")
     match = re.search(
-        r'^\s*/usr/bin/python3 - "\$config" "\$RUNTIME_DIR" 2>&1 <<\'PY\'\n'
+        r'^\s*/usr/bin/python3 -I - "\$config" "\$RUNTIME_DIR" 2>&1 <<\'PY\'\n'
         r"(.*?)^PY$",
         init,
         flags=re.MULTILINE | re.DOTALL,
     )
     assert match is not None, "missing nmea_sproxy runtime preflight"
+    # run_nmea_sproxy_preflight() pipes this body as locale-encoded text, and
+    # Python parses a script read from stdin as UTF-8, so keep it ASCII.
+    assert match.group(1).isascii(), "nmea_sproxy preflight body must be ASCII"
     return match.group(1)
 
 
-def run_nmea_sproxy_preflight(config_path, *, runtime_dir=None, extra_env=None):
+def run_nmea_sproxy_preflight(
+    config_path,
+    *,
+    runtime_dir=None,
+    extra_env=None,
+    cwd=None,
+    interpreter_flags=PACKAGED_PREFLIGHT_INTERPRETER_FLAGS,
+):
+    """Run the preflight body as the init script does: a script read from
+    standard input after `-`, with the packaged interpreter flags. `-B` only
+    keeps bytecode out of the repository (isolated mode ignores
+    PYTHONDONTWRITEBYTECODE); it does not affect import resolution."""
     runtime_dir = ROOT / "nmea_sproxy" if runtime_dir is None else runtime_dir
     return subprocess.run(
         [
             sys.executable,
-            "-c",
-            nmea_sproxy_preflight_source(),
+            *interpreter_flags,
+            "-B",
+            "-",
             str(config_path),
             str(runtime_dir),
         ],
+        input=nmea_sproxy_preflight_source(),
         check=False,
         capture_output=True,
+        cwd=cwd,
         env={
             **os.environ,
             "PYTHONDONTWRITEBYTECODE": "1",
             **({} if extra_env is None else extra_env),
         },
-        stdin=subprocess.DEVNULL,
         text=True,
+        timeout=30,
     )
 
 
@@ -1493,6 +1516,69 @@ def test_openwrt_nmea_sproxy_preflight_uses_demand_driven_runtime_api():
     assert "prepare_station_identity" not in init
     assert "aismixer_keys.py" not in init
     assert "--repair-public" not in init
+
+
+def test_openwrt_nmea_sproxy_preflight_uses_isolated_interpreter():
+    """The root-run preflight must use Python's isolated mode. With a bare
+    `python3 -`, sys.path[0] is the caller's working directory, so a module
+    planted there could shadow a standard-library or dependency import."""
+    init = read_text(PACKAGE_FILES / "nmea_sproxy.init")
+    preflight = nmea_sproxy_preflight_source()
+
+    (invocation,) = re.findall(r"^\s*(/usr/bin/python3\b.*)$", init, re.MULTILINE)
+    assert invocation == (
+        '/usr/bin/python3 -I - "$config" "$RUNTIME_DIR" 2>&1 <<\'PY\''
+    )
+    flags = tuple(invocation.split(" - ", 1)[0].split()[1:])
+    assert flags == PACKAGED_PREFLIGHT_INTERPRETER_FLAGS
+    # The runtime directory is still added explicitly, before the import.
+    assert preflight.index("sys.path.insert(0, runtime_dir)") < preflight.index(
+        "import nmea_sproxy as runtime"
+    )
+
+
+@pytest.mark.parametrize("planted_via", ("cwd", "pythonpath"))
+def test_openwrt_nmea_sproxy_preflight_ignores_planted_modules(
+    tmp_path,
+    planted_via,
+):
+    """Plant an inert `argparse.py`, the first module the runtime imports,
+    in the caller's working directory or in a PYTHONPATH directory. Without
+    isolation Python imports it (the control run); the packaged `-I` form must
+    ignore it, and a valid relation must still pass preflight. The planted
+    module only raises an exception when imported."""
+    planted_dir = tmp_path / "untrusted"
+    planted_dir.mkdir()
+    marker = "planted module from an untrusted path was imported"
+    (planted_dir / "argparse.py").write_text(
+        f"raise RuntimeError({marker!r})\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        CANONICAL_PROXY_UDP_INPUT + CANONICAL_PROXY_UDP_OUTPUT,
+        encoding="utf-8",
+    )
+    if planted_via == "cwd":
+        placement = {"cwd": planted_dir}
+    else:
+        placement = {"extra_env": {"PYTHONPATH": str(planted_dir)}}
+
+    # An empty PYTHONSAFEPATH counts as unset, so a developer environment that
+    # sets it cannot keep the working directory off the control run's path.
+    control = run_nmea_sproxy_preflight(
+        config_path,
+        interpreter_flags=(),
+        cwd=placement.get("cwd"),
+        extra_env={"PYTHONSAFEPATH": "", **placement.get("extra_env", {})},
+    )
+    assert control.returncode == 1
+    assert marker in control.stdout
+
+    result = run_nmea_sproxy_preflight(config_path, **placement)
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
 
 
 @pytest.mark.parametrize(

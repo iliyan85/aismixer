@@ -294,16 +294,41 @@ Update every installed AISMixer package in one `apk` command from the
 device's configured feed, because `aismixer` and `nmea_sproxy` each require
 the identical `aismixer-common` revision. With both installed, run
 `apk --update-cache add --upgrade aismixer-common aismixer nmea_sproxy`;
-with only one, name `aismixer-common` and that package:
-`apk --update-cache add --upgrade aismixer-common aismixer` on a mixer, or
-`apk --update-cache add --upgrade aismixer-common nmea_sproxy` on a station.
-Never name a package the device does not have: `apk add` would install it,
-and its hook would enable and start it. The update hooks stop and start each
-service even if it was previously stopped, while preserving its
-enable/disable state.
+with only one, name `aismixer-common` and that package. Never name a package
+the device does not have: `apk add` would install it, and its hook would
+enable and start it. v0.2.1 and v0.3.0 UDPSEC peers do not interoperate, so
+upgrade the mixer and its stations in one maintenance window; partial
+upgrades and mixed-version peers are not supported.
+
+The upgrade hooks keep each service's boot enable/disable state and only run
+its `start` action: a stopped service starts, but procd restarts a running
+instance only if its command or a watched configuration file changed, so it
+may keep running the old code. After every upgrade or rollback, restart each
+service that should run, with `/etc/init.d/aismixer restart` on a mixer and
+`/etc/init.d/nmea_sproxy restart` on a station (it restarts every relation),
+and stop again any service that should stay stopped. Never-edited
+configuration files may be replaced by the incoming default files (upgrading
+from 0.2.1-r4 moves UDPSEC from 19999 on the mixer and 17777 on stations to
+17779; a rollback moves it back); edited files are kept, with the incoming
+default saved beside them as `.apk-new`. After either, match every station's
+UDPSEC `output.port` to the mixer's `sec_inputs` `listen_port`. Roll the mixer
+and its stations back together, each device with one `apk add` of the previous
+revision's package files. `apk fetch` saves the newest revision the feed index
+lists, so right after each install or upgrade (on 0.2.1-r4: now, before
+0.3.0-r1 is published) run `mkdir -p /root/aismixer-rollback`, then
+`apk fetch --output /root/aismixer-rollback` with the installed package names,
+and check the file names against `apk list --installed` for the same packages.
+`apk add` trusts a file given by path only through its own signature, not the
+signed index or a matching SHA-256 checksum: use only files that `apk verify`
+reports as `OK` when saved and before a rollback, and never add
+`--allow-untrusted`. SDK `bin/` builds are unsigned and pruned by later builds.
 `apk del aismixer` stops, disables, and removes it. The package has no
 project-specific purge contract, so this README makes no promise about
-configuration or key retention after removal.
+configuration or key retention after removal. A firmware sysupgrade does not
+keep AISMixer keys or named relations automatically: add
+`/etc/aismixer/keys/`, `/etc/nmea_sproxy/keys/`, and
+`/etc/nmea_sproxy/instances/` to `/etc/sysupgrade.conf`, or keep a secure,
+tested backup.
 
 Install `nmea_sproxy` instead of or alongside the mixer when the router is
 the station-side endpoint:
@@ -959,16 +984,48 @@ logread -e aismixer
 изискват точно същата ревизия на пакета `aismixer-common`. Ако на
 устройството са инсталирани и `aismixer`, и `nmea_sproxy`, изпълнете
 `apk --update-cache add --upgrade aismixer-common aismixer nmea_sproxy`; ако
-е инсталиран само единият, посочете `aismixer-common` и този пакет:
-`apk --update-cache add --upgrade aismixer-common aismixer` на mixer или
-`apk --update-cache add --upgrade aismixer-common nmea_sproxy` на станция.
-Никога не посочвайте пакет, който устройството няма: `apk add` ще го
-инсталира, а hook скриптът му ще включи и стартира услугата.
-Hook скриптовете за обновяване спират и стартират всяка услуга дори
-ако е била спряна, като запазват състоянието ѝ за включване при зареждане.
+е инсталиран само единият, посочете `aismixer-common` и този пакет. Никога не
+посочвайте пакет, който устройството няма: `apk add` ще го инсталира, а hook
+скриптът му ще включи и стартира услугата. UDPSEC страните с v0.2.1 и v0.3.0
+не са съвместими помежду си, затова обновете mixer-а и станциите му в един и
+същ планиран период за поддръжка; частичното обновяване и UDPSEC страни с
+различни версии не се поддържат.
+
+Hook скриптовете за обновяване запазват състоянието на всяка услуга за
+включване при зареждане и изпълняват само действието ѝ `start`: спряна
+услуга се стартира, но procd рестартира работеща инстанция само ако
+командата ѝ или наблюдаван конфигурационен файл са променени, затова тя може
+да продължи да изпълнява стария код. След всяко обновяване или връщане към
+предишна версия рестартирайте всяка услуга, която трябва да работи, с
+`/etc/init.d/aismixer restart` на mixer и
+`/etc/init.d/nmea_sproxy restart` на станция (рестартира всички връзки), и
+спрете отново всяка услуга, която трябва да остане спряна. Нередактираните
+конфигурационни файлове може да бъдат заменени с файловете по подразбиране от
+пакета, който се инсталира (обновяването от 0.2.1-r4 премества UDPSEC от 19999
+при mixer-а и 17777 при станциите към 17779, а връщането към предишна версия
+го премества обратно); редактираните файлове се запазват, а файлът по
+подразбиране от този пакет се записва до тях като `.apk-new`. И в двата случая
+съгласувайте UDPSEC `output.port` на всяка станция с `listen_port` в
+`sec_inputs` на mixer-а. Връщайте mixer-а и станциите му към предишна версия
+заедно, като на всяко устройство изпълните една команда `apk add` с пакетните
+файлове на предишната ревизия. `apk fetch` запазва най-новата ревизия, изброена
+в индекса на feed-а, затова веднага след всяко инсталиране или обновяване (при
+0.2.1-r4: сега, преди публикуването на 0.3.0-r1) изпълнете
+`mkdir -p /root/aismixer-rollback`, след това
+`apk fetch --output /root/aismixer-rollback` с имената на инсталираните пакети
+и сверете имената на файловете с `apk list --installed` за същите пакети.
+`apk add` приема за доверен файл, посочен с път, само по собствения му подпис,
+а не по подписания индекс или по съвпадаща SHA-256 сума: използвайте само
+файлове, за които `apk verify` показва `OK` при запазването и преди връщането,
+и никога не добавяйте `--allow-untrusted`. Пакетите в `bin/` на SDK не са
+подписани и следващите изграждания ги изтриват.
 `apk del aismixer` спира, изключва и премахва пакета. Пакетът не определя
 специфично за проекта поведение за пълно изчистване, затова този README не
 обещава запазване на конфигурацията или ключовете след премахването.
+Обновяването на фърмуера със sysupgrade не запазва автоматично ключовете и
+именуваните връзки на AISMixer: добавете `/etc/aismixer/keys/`,
+`/etc/nmea_sproxy/keys/` и `/etc/nmea_sproxy/instances/` в
+`/etc/sysupgrade.conf` или поддържайте защитено и проверено резервно копие.
 
 Инсталирайте `nmea_sproxy` вместо или заедно с mixer-а, когато рутерът е
 крайната точка при станцията:
@@ -1642,17 +1699,47 @@ din feed-ul configurat pe dispozitiv, deoarece `aismixer` și `nmea_sproxy`
 necesită exact aceeași revizie a pachetului `aismixer-common`. Dacă pe
 dispozitiv sunt instalate atât `aismixer`, cât și `nmea_sproxy`, rulați
 `apk --update-cache add --upgrade aismixer-common aismixer nmea_sproxy`; dacă
-este instalat doar unul, specificați `aismixer-common` și pachetul respectiv:
-`apk --update-cache add --upgrade aismixer-common aismixer` pe un mixer sau
-`apk --update-cache add --upgrade aismixer-common nmea_sproxy` pe o stație.
+este instalat doar unul, specificați `aismixer-common` și pachetul respectiv.
 Nu specificați niciodată un pachet pe care dispozitivul nu îl are: `apk add`
-l-ar instala, iar hook-ul său ar activa și ar porni serviciul.
-Hook-urile de actualizare opresc și pornesc fiecare serviciu chiar dacă
-acesta era oprit anterior, păstrând însă starea sa de
-activare/dezactivare. `apk del aismixer` oprește, dezactivează și elimină
-pachetul. Pachetul nu are un contract de purge specific proiectului, astfel
-încât acest README nu promite păstrarea configurației sau a cheilor după
-eliminare.
+l-ar instala, iar hook-ul său ar activa și ar porni serviciul. Capetele
+UDPSEC cu v0.2.1 și v0.3.0 nu sunt compatibile între ele, așa că actualizați
+mixerul și stațiile sale în aceeași fereastră de mentenanță; actualizările
+parțiale și capetele cu versiuni diferite nu sunt acceptate.
+
+Hook-urile de actualizare păstrează starea de activare/dezactivare la
+pornirea sistemului pentru fiecare serviciu și rulează doar acțiunea sa
+`start`: un serviciu oprit pornește, dar procd repornește o instanță aflată
+în execuție doar dacă i s-a schimbat comanda sau un fișier de configurare
+urmărit, așa că aceasta poate rula în continuare codul vechi. După fiecare
+actualizare sau revenire la versiunea anterioară, reporniți fiecare serviciu
+care trebuie să ruleze, cu `/etc/init.d/aismixer restart` pe un mixer și
+`/etc/init.d/nmea_sproxy restart` pe o stație (repornește toate relațiile),
+și opriți din nou orice serviciu care trebuie să rămână oprit. Fișierele de
+configurare needitate pot fi înlocuite cu fișierele implicite din pachetul
+care se instalează (actualizarea de la 0.2.1-r4 mută UDPSEC de la 19999 pe
+mixer și 17777 pe stații la 17779, iar o revenire îl mută înapoi); fișierele
+editate se păstrează, iar fișierul implicit din acest pachet este salvat
+alături ca `.apk-new`. În ambele cazuri, aliniați `output.port` UDPSEC al
+fiecărei stații cu `listen_port` din `sec_inputs` al mixerului. Readuceți
+împreună la versiunea anterioară mixerul și stațiile sale, rulând pe fiecare
+dispozitiv o singură comandă `apk add` cu fișierele de pachet ale reviziei
+anterioare. `apk fetch` salvează cea mai nouă revizie din indexul feed-ului,
+așa că imediat după fiecare instalare sau actualizare (pentru 0.2.1-r4: acum,
+înainte de publicarea 0.3.0-r1) rulați `mkdir -p /root/aismixer-rollback`, apoi
+`apk fetch --output /root/aismixer-rollback` cu numele pachetelor instalate și
+comparați numele fișierelor cu ieșirea comenzii `apk list --installed` pentru
+aceleași pachete. `apk add` consideră de încredere un fișier specificat prin
+cale doar pe baza propriei sale semnături, nu a indexului semnat sau a unei
+sume SHA-256 identice: folosiți doar fișierele pentru care `apk verify`
+raportează `OK` la salvare și înainte de revenire; nu adăugați niciodată
+`--allow-untrusted`. Pachetele din `bin/` al SDK-ului nu sunt semnate și sunt
+șterse de construcțiile ulterioare. `apk del aismixer` oprește, dezactivează și
+elimină pachetul. Pachetul nu are un contract de purge specific proiectului,
+astfel încât acest README nu promite păstrarea configurației sau a cheilor după
+eliminare. Un sysupgrade de firmware nu păstrează automat cheile și relațiile
+denumite ale AISMixer: adăugați `/etc/aismixer/keys/`, `/etc/nmea_sproxy/keys/`
+și `/etc/nmea_sproxy/instances/` în `/etc/sysupgrade.conf` sau păstrați o copie
+de rezervă sigură și testată.
 
 Instalați `nmea_sproxy` în locul mixerului sau împreună cu acesta atunci când
 routerul este endpoint-ul de la stație:

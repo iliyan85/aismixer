@@ -19,7 +19,7 @@ check_runtime_readiness() {
 	local readiness_error
 
 	readiness_error="$(
-		/usr/bin/python3 - "$config" "$RUNTIME_DIR" 2>&1 <<'PY'
+		/usr/bin/python3 -I - "$config" "$RUNTIME_DIR" 2>&1 <<'PY'
 import sys
 
 config_path = sys.argv[1]

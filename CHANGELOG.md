@@ -20,6 +20,38 @@ still change public APIs and configuration behavior as the project matures.
   available, upgrade both ends of each UDPSEC relation together and check
   UDPSEC ports, as the 0.3.0 compatibility notes describe.
 
+### Fixed
+
+- Runs the OpenWrt `nmea_sproxy` init preflight as `/usr/bin/python3 -I -`.
+  In isolated mode Python keeps the caller's working directory off the import
+  path and ignores `PYTHON*` environment variables and the user site
+  directory while it validates a relation as root, so a module planted in the
+  directory from which an operator runs the init script can no longer be
+  imported. This packaging change lands before the first `0.3.0-r1`
+  publication; the tagged v0.3.0 source is unchanged.
+- Corrects the OpenWrt upgrade guidance in the README and the `nmea_sproxy`
+  guide. The apk upgrade and rollback hooks keep each service's boot state
+  and only run its `start` action, so a stopped service starts, while procd
+  restarts a running one only if its command or a watched configuration file
+  changed, stops it if its start checks now fail, and otherwise leaves it on
+  the old code. After upgrading or rolling back all AISMixer packages
+  together, restart every service that should run and stop again any that
+  should stay stopped. The guidance also covers defaults replaced on upgrade
+  and rollback, `.apk-new` files, saving the package files a rollback needs
+  (on `0.2.1-r4`, before `0.3.0-r1` is published) and checking them with
+  `apk verify`, and that a firmware sysupgrade does not keep AISMixer keys or
+  named `nmea_sproxy` relations automatically. It separates the signed feed
+  index, which covers downloads, from a package file's own signature, which
+  is all `apk add` trusts for a file given by path, and from SHA-256
+  checksums, and it tells operators to use only files that `apk verify`
+  accepts and never to add `--allow-untrusted`.
+- Notes in the `nmea_sproxy` guide that on OpenWrt the package's first start
+  already creates the station identity, so the guide's key-generation command
+  then refuses to overwrite it and suggests `--force`. The guide now says
+  never to use `--force` on a valid identity and to print the public value
+  with `--repair-public`, which leaves the contents of a matching pair
+  unchanged.
+
 ## [0.3.0] - 2026-10-09
 
 ### Added
