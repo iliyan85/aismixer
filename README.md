@@ -249,7 +249,7 @@ packages with procd integration come from one package recipe:
 The Python/shell payload declares `PKGARCH:=all` because its contents are
 architecture-independent. Portability still depends on target-specific
 Python, cryptographic, serial, and other runtime packages. The currently
-built, published, and validated repository target architectures are
+built, signed, and published repository target architectures are
 `x86_64` and `mips_24kc`; that list does not mean the source is designed
 to exclude other OpenWrt targets with suitable dependencies.
 
@@ -258,16 +258,13 @@ to exclude other OpenWrt targets with suitable dependencies.
 | `x86_64` | [`packages.adb`](https://aismixer.net/openwrt/25.12/x86_64/packages.adb) |
 | `mips_24kc` | [`packages.adb`](https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb) |
 
-**Package status.** AISMixer v0.3.0 is a tagged source release, and the
-recipe in this repository is pinned to build `0.3.0-r1` from that tag's
-exact commit. Until `0.3.0-r1` packages are built, validated, and published,
-the `x86_64` and `mips_24kc` feeds above may still offer only `0.2.1-r4`,
-built from the v0.2.1 release. The `0.2.1-r4` packages predate the UDPSECv2
-session continuity described above (key epoch refresh, path migration, and
-liveness recovery), and v0.2.1 and v0.3.0 UDPSEC peers do not interoperate.
-Use one release line on both ends of a UDPSEC relation and, once matching
-packages are available, upgrade both ends together; check the package
-revision and the [changelog](CHANGELOG.md).
+**Package status.** Both feeds above publish signed `0.3.0-r1` packages, a
+package revision of the tagged v0.3.0 source with the UDPSECv2 session
+continuity described above. The older `0.2.1-r4` packages are no longer in the
+feed indexes, but their signed files remain downloadable by exact file name from
+the feed directories. v0.2.1 and v0.3.0 UDPSEC peers do not interoperate: use
+one release line on both ends of a UDPSEC relation, upgrade both ends
+together, and check the package revision and the [changelog](CHANGELOG.md).
 
 Before installation, verify writable overlay space and establish firewall or
 network isolation. OpenWrt's generated package hooks enable and start the
@@ -314,10 +311,13 @@ default saved beside them as `.apk-new`. After either, match every station's
 UDPSEC `output.port` to the mixer's `sec_inputs` `listen_port`. Roll the mixer
 and its stations back together, each device with one `apk add` of the previous
 revision's package files. `apk fetch` saves the newest revision the feed index
-lists, so right after each install or upgrade (on 0.2.1-r4: now, before
-0.3.0-r1 is published) run `mkdir -p /root/aismixer-rollback`, then
+lists, now `0.3.0-r1`, so right after each install or upgrade run
+`mkdir -p /root/aismixer-rollback`, then
 `apk fetch --output /root/aismixer-rollback` with the installed package names,
 and check the file names against `apk list --installed` for the same packages.
+A fetched `0.3.0-r1` file is not a `0.2.1-r4` rollback copy: for the installed
+packages, use r4 files saved before `0.3.0-r1` was published, or archived ones
+downloaded by exact file name.
 `apk add` trusts a file given by path only through its own signature, not the
 signed index or a matching SHA-256 checksum: use only files that `apk verify`
 reports as `OK` when saved and before a rollback, and never add
@@ -380,8 +380,8 @@ Adapt all example addresses, ports, IDs, paths, and policy before use.
 Repository examples are inactive until copied or adapted. The examples use
 port 17778 for plain UDP and 17779 for UDPSEC; both are project-chosen example
 values and remain configurable. The seeded and packaged configurations in the
-current source also use 17779 for UDPSEC; already published packages keep the
-configuration of the release they were built from.
+current source and the `0.3.0-r1` packages also use 17779 for UDPSEC; the older
+`0.2.1-r4` packages still seed 19999 on the mixer and 17777 on stations.
 
 ### 📡 Ingress and forwarders
 
@@ -935,8 +935,8 @@ OpenWrt 25.12 APK пакети с procd интеграция се създава
 Python/shell съдържанието декларира `PKGARCH:=all`, защото не зависи от
 архитектурата. Преносимостта все пак зависи от специфичните за целевата
 платформа Python, криптографски, serial и други runtime пакети. Архитектурите
-на repository target-ите, за които в момента има изградени, публикувани и
-валидирани пакети, са `x86_64` и `mips_24kc`; този списък не означава, че
+на repository target-ите, за които в момента има изградени, подписани и
+публикувани пакети, са `x86_64` и `mips_24kc`; този списък не означава, че
 изходният код умишлено изключва други OpenWrt платформи с подходящи зависимости.
 
 | OpenWrt feed target | Индекс на подписаното хранилище |
@@ -944,18 +944,15 @@ Python/shell съдържанието декларира `PKGARCH:=all`, защ�
 | `x86_64` | [`packages.adb`](https://aismixer.net/openwrt/25.12/x86_64/packages.adb) |
 | `mips_24kc` | [`packages.adb`](https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb) |
 
-**Състояние на пакетите.** AISMixer v0.3.0 е издание на изходния код с
-етикет, а рецептата в това хранилище е фиксирана към точния commit на този
-етикет, за да изгражда `0.3.0-r1`. Докато пакетите `0.3.0-r1` не бъдат
-изградени, валидирани и публикувани, feed-овете за `x86_64` и `mips_24kc`
-по-горе може все още да предлагат само пакети `0.2.1-r4`, изградени от
-изданието v0.2.1. Тези пакети предхождат описаната по-горе непрекъснатост
-на сесиите в UDPSECv2 (опресняване на ключовата епоха, миграция на пътя и
-възстановяване на активността), а UDPSEC страните с v0.2.1 и v0.3.0 не са
-съвместими помежду си. Използвайте една и съща версия от двете страни на
-UDPSEC връзката и, когато има съответстващи пакети, обновете двете страни
-заедно; проверявайте ревизията на пакета и
-[списъка на промените](CHANGELOG.md).
+**Състояние на пакетите.** И двата feed-а по-горе публикуват подписани пакети
+`0.3.0-r1`, пакетна ревизия на изходния код на изданието с етикет v0.3.0,
+която включва описаната по-горе непрекъснатост на сесиите в UDPSECv2.
+По-старите пакети `0.2.1-r4` вече не са в индексите на feed-овете, но
+подписаните им файлове все още могат да се изтеглят по точното име на файла от
+директориите на feed-овете. UDPSEC страните с v0.2.1 и v0.3.0 не са
+съвместими помежду си: използвайте една и съща версия от двете страни на
+UDPSEC връзката, обновявайте двете страни заедно и проверявайте ревизията на
+пакета и [списъка на промените](CHANGELOG.md).
 
 Преди инсталиране проверете свободното записваемо място в overlay и установете
 firewall или мрежова изолация. Генерираните hook скриптове на OpenWrt пакета
@@ -1009,11 +1006,13 @@ Hook скриптовете за обновяване запазват съст�
 `sec_inputs` на mixer-а. Връщайте mixer-а и станциите му към предишна версия
 заедно, като на всяко устройство изпълните една команда `apk add` с пакетните
 файлове на предишната ревизия. `apk fetch` запазва най-новата ревизия, изброена
-в индекса на feed-а, затова веднага след всяко инсталиране или обновяване (при
-0.2.1-r4: сега, преди публикуването на 0.3.0-r1) изпълнете
-`mkdir -p /root/aismixer-rollback`, след това
+в индекса на feed-а, сега `0.3.0-r1`, затова веднага след всяко инсталиране или
+обновяване изпълнете `mkdir -p /root/aismixer-rollback`, след това
 `apk fetch --output /root/aismixer-rollback` с имената на инсталираните пакети
 и сверете имената на файловете с `apk list --installed` за същите пакети.
+Файл `0.3.0-r1`, изтеглен с `apk fetch`, не е копие за връщане към `0.2.1-r4`:
+за инсталираните пакети използвайте файлове r4, запазени преди публикуването
+на `0.3.0-r1`, или архивираните файлове r4, изтеглени по точното име на файла.
 `apk add` приема за доверен файл, посочен с път, само по собствения му подпис,
 а не по подписания индекс или по съвпадаща SHA-256 сума: използвайте само
 файлове, за които `apk verify` показва `OK` при запазването и преди връщането,
@@ -1079,9 +1078,9 @@ forwarders:
 преди употреба. Примерите в хранилището са неактивни, докато не бъдат копирани
 или адаптирани. Примерите използват порт 17778 за plain UDP и 17779 за UDPSEC;
 това са избрани от проекта примерни стойности, които остават конфигурируеми.
-Началните и пакетираните конфигурации в текущия изходен код също използват
-17779 за UDPSEC; вече публикуваните пакети запазват конфигурацията на
-изданието, от което са изградени.
+Началните и пакетираните конфигурации в текущия изходен код и в пакетите
+`0.3.0-r1` също използват 17779 за UDPSEC; по-старите пакети `0.2.1-r4` все
+още задават по подразбиране 19999 при mixer-а и 17777 при станциите.
 
 ### 📡 Входове и UDP цели
 
@@ -1649,7 +1648,7 @@ rețetă de pachet:
 Conținutul Python/shell declară `PKGARCH:=all`, deoarece este
 independent de arhitectură. Portabilitatea depinde totuși de pachetele
 specifice țintei pentru Python, criptografie, serial și alte componente runtime.
-Arhitecturile depozitelor construite, publicate și validate în prezent
+Arhitecturile depozitelor construite, semnate și publicate în prezent
 sunt `x86_64` și `mips_24kc`; lista nu înseamnă că sursa este proiectată să
 excludă alte ținte OpenWrt care au dependențe adecvate.
 
@@ -1658,17 +1657,14 @@ excludă alte ținte OpenWrt care au dependențe adecvate.
 | `x86_64` | [`packages.adb`](https://aismixer.net/openwrt/25.12/x86_64/packages.adb) |
 | `mips_24kc` | [`packages.adb`](https://aismixer.net/openwrt/25.12/mips_24kc/packages.adb) |
 
-**Starea pachetelor.** AISMixer v0.3.0 este o versiune etichetată a codului
-sursă, iar rețeta din acest depozit este fixată pe commit-ul exact al acestei
-etichete pentru a construi `0.3.0-r1`. Până când pachetele `0.3.0-r1` sunt
-construite, validate și publicate, feed-urile `x86_64` și `mips_24kc` de mai
-sus pot oferi în continuare doar pachete `0.2.1-r4`, construite din versiunea
-v0.2.1. Aceste pachete sunt anterioare continuității sesiunilor UDPSECv2
-descrise mai sus (reîmprospătarea epocii de chei, migrarea căii și
-recuperarea liveness), iar capetele UDPSEC cu v0.2.1 și v0.3.0 nu sunt
-compatibile între ele. Folosiți aceeași linie de versiune la ambele capete ale
-unei relații UDPSEC și, când sunt disponibile pachete corespunzătoare,
-actualizați ambele capete împreună; verificați revizia pachetului și
+**Starea pachetelor.** Ambele feed-uri de mai sus publică pachete semnate
+`0.3.0-r1`, o revizie de pachet a codului sursă al versiunii etichetate v0.3.0,
+care include continuitatea sesiunilor UDPSECv2 descrisă mai sus. Pachetele mai
+vechi `0.2.1-r4` nu mai apar în indexurile feed-urilor, dar fișierele lor
+semnate pot fi descărcate în continuare din directoarele feed-urilor, după
+numele exact de fișier. Capetele UDPSEC cu v0.2.1 și v0.3.0 nu sunt compatibile
+între ele: folosiți aceeași linie de versiune la ambele capete ale unei relații
+UDPSEC, actualizați ambele capete împreună și verificați revizia pachetului și
 [lista de modificări](CHANGELOG.md).
 
 Înainte de instalare, verificați spațiul disponibil pentru scriere în overlay și
@@ -1724,12 +1720,15 @@ fiecărei stații cu `listen_port` din `sec_inputs` al mixerului. Readuceți
 împreună la versiunea anterioară mixerul și stațiile sale, rulând pe fiecare
 dispozitiv o singură comandă `apk add` cu fișierele de pachet ale reviziei
 anterioare. `apk fetch` salvează cea mai nouă revizie din indexul feed-ului,
-așa că imediat după fiecare instalare sau actualizare (pentru 0.2.1-r4: acum,
-înainte de publicarea 0.3.0-r1) rulați `mkdir -p /root/aismixer-rollback`, apoi
+acum `0.3.0-r1`, așa că imediat după fiecare instalare sau actualizare rulați
+`mkdir -p /root/aismixer-rollback`, apoi
 `apk fetch --output /root/aismixer-rollback` cu numele pachetelor instalate și
 comparați numele fișierelor cu ieșirea comenzii `apk list --installed` pentru
-aceleași pachete. `apk add` consideră de încredere un fișier specificat prin
-cale doar pe baza propriei sale semnături, nu a indexului semnat sau a unei
+aceleași pachete. Un fișier `0.3.0-r1` obținut cu `apk fetch` nu este o copie
+pentru revenirea la `0.2.1-r4`: folosiți fișiere r4 ale pachetelor instalate,
+fie salvate înainte de publicarea `0.3.0-r1`, fie arhivate și descărcate după
+numele exact de fișier. `apk add` consideră de încredere un fișier specificat
+prin cale doar pe baza propriei sale semnături, nu a indexului semnat sau a unei
 sume SHA-256 identice: folosiți doar fișierele pentru care `apk verify`
 raportează `OK` la salvare și înainte de revenire; nu adăugați niciodată
 `--allow-untrusted`. Pachetele din `bin/` al SDK-ului nu sunt semnate și sunt
@@ -1794,9 +1793,9 @@ Adaptați înainte de utilizare toate adresele, porturile, ID-urile, căile și
 politicile din exemple. Exemplele din depozit sunt inactive până când sunt
 copiate sau adaptate. Exemplele folosesc portul 17778 pentru UDP simplu și
 17779 pentru UDPSEC; acestea sunt valori de exemplu alese de proiect și rămân
-configurabile. În sursa actuală, configurațiile inițiale și cele incluse în
-pachete folosesc, de asemenea, 17779 pentru UDPSEC; pachetele deja publicate
-păstrează configurația versiunii din care au fost construite.
+configurabile. În sursa actuală și în pachetele `0.3.0-r1`, configurațiile
+inițiale și cele incluse în pachete folosesc tot 17779 pentru UDPSEC; pachetele
+mai vechi `0.2.1-r4` folosesc încă implicit 19999 pe mixer și 17777 pe stații.
 
 ### 📡 Intrări și forwardere
 

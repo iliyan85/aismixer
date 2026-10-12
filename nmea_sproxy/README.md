@@ -520,16 +520,17 @@ The OpenWrt recipe produces `aismixer-common`, `aismixer`, and `nmea_sproxy`.
 Its Python/shell payload declares `PKGARCH:=all`, but portability still depends
 on target Python, cryptography, serial, and related packages.
 
-The currently built, published, and validated repository feed targets include
+The currently built, signed, and published repository feed targets include
 `x86_64` and `mips_24kc`; this does not intentionally exclude other targets with
 suitable dependencies. The package recipe pins a fixed source commit, never a
-moving branch, so packaged behavior can lag this guide: it is now pinned to
-build `0.3.0-r1` from the commit of the signed v0.3.0 release tag. Until those
-packages are built, validated, and published, the feeds may still offer only
-`0.2.1-r4`, built from the v0.2.1 release, which predates the UDPSECv2 session
-behaviour described above and does not interoperate with v0.3.0 peers. Pair
-packages only with a mixer from the same release line and, once matching
-packages are available, upgrade the station and its mixer together; check the
+moving branch, so packaged behavior can lag this guide. Both feeds publish
+signed `0.3.0-r1` packages, a package revision built from the commit of the
+signed v0.3.0 release tag, with the UDPSECv2 session behaviour described
+above. The older `0.2.1-r4` packages, built from the v0.2.1 release, are no
+longer in the feed indexes, but their signed files remain downloadable by
+exact file name from the feed directories; they do not interoperate with
+v0.3.0 peers. Pair packages only with a mixer from the same release line and
+upgrade the station and its mixer together; check the
 [root README](../README.md) and [changelog](../CHANGELOG.md).
 
 ### Installation and first configuration
@@ -682,13 +683,23 @@ accepts unsigned or untrusted files.
 `apk fetch` saves the newest revision the feed index lists, not necessarily
 the installed one, and it cannot save a revision the index no longer lists,
 even as `name=version`. Save the packages right after each install or upgrade
-(on 0.2.1-r4: now, before 0.3.0-r1 is published; once the feed index lists
-0.3.0-r1, `apk fetch` saves that instead), then check that `ls` shows a file
-for every version that `apk list --installed` reports; if one is missing, the
-feed index no longer lists that revision and `apk fetch` cannot save it. On a
-device that also runs the mixer, add `aismixer` to the `apk fetch` and
-`apk list` commands, add its saved file to the `apk add` command, and restart
-or stop it as described above:
+(the feed indexes now list only `0.3.0-r1`, so that is what `apk fetch`
+saves), then check that `ls` shows a file for every version that
+`apk list --installed` reports; if one is missing, the feed index no longer
+lists that revision and `apk fetch` cannot save it.
+
+The rollback lines in the example below use `0.2.1-r4` file names, which
+`apk fetch` can no longer save: a fetched `0.3.0-r1` file is not a
+`0.2.1-r4` rollback copy. Use `0.2.1-r4` files saved before `0.3.0-r1` was
+published, or download the archived signed files by exact file name, such as
+`nmea_sproxy-0.2.1-r4.apk`, from the directory of the device's `packages.adb` in
+the [root README](../README.md). Check every file you will add with `apk verify`
+before any `apk add`. If a device's minimal `apk` lacks `verify`, run that
+check with apk-tools 3 on a trusted system that trusts the same feed key, then
+confirm with SHA-256 checksums that the device holds identical copies; never
+skip the check. On a device that also runs the mixer, add `aismixer` to the
+`apk fetch` and `apk list` commands, add its file to the rollback `apk verify`
+and `apk add` commands, and restart or stop it as described above:
 
 ```sh
 mkdir -p /root/aismixer-rollback
@@ -696,8 +707,10 @@ apk fetch --output /root/aismixer-rollback aismixer-common nmea_sproxy
 apk verify /root/aismixer-rollback/*.apk
 apk list --installed aismixer-common nmea_sproxy
 ls /root/aismixer-rollback
-# Later, to roll back (file names shown for 0.2.1-r4):
-apk verify /root/aismixer-rollback/*.apk
+# Later, to roll back to 0.2.1-r4 with saved or archived r4 files
+# placed in /root/aismixer-rollback:
+apk verify /root/aismixer-rollback/aismixer-common-0.2.1-r4.apk \
+  /root/aismixer-rollback/nmea_sproxy-0.2.1-r4.apk &&
 apk add /root/aismixer-rollback/aismixer-common-0.2.1-r4.apk \
   /root/aismixer-rollback/nmea_sproxy-0.2.1-r4.apk
 /etc/init.d/nmea_sproxy restart

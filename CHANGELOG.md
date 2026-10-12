@@ -13,12 +13,14 @@ still change public APIs and configuration behavior as the project matures.
   (`PKG_SOURCE_DATE` 2026-10-09), with a `PKG_MIRROR_HASH` that the OpenWrt
   25.12 SDK generated for that commit's source archive. `0.3.0-r1` is a
   package revision of the v0.3.0 source, not a new source release. This
-  change does not build, validate, or publish packages; those are follow-up
-  steps, and until `0.3.0-r1` packages are published, the `x86_64` and
-  `mips_24kc` feeds may still offer only `0.2.1-r4`, which does not
-  interoperate with v0.3.0 UDPSEC peers. Once matching packages are
-  available, upgrade both ends of each UDPSEC relation together and check
-  UDPSEC ports, as the 0.3.0 compatibility notes describe.
+  change itself does not build, validate, or publish packages. Signed
+  `0.3.0-r1` packages built from this recipe, including the `nmea_sproxy`
+  preflight fix below, have since been published in the `x86_64` and
+  `mips_24kc` feeds. Their indexes no longer list `0.2.1-r4`, whose signed
+  files remain downloadable there by exact file name; `0.2.1-r4` does not
+  interoperate with v0.3.0 UDPSEC peers. Upgrade both ends of each UDPSEC
+  relation together and check UDPSEC ports, as the 0.3.0 compatibility
+  notes describe.
 
 ### Fixed
 
@@ -27,8 +29,9 @@ still change public APIs and configuration behavior as the project matures.
   path and ignores `PYTHON*` environment variables and the user site
   directory while it validates a relation as root, so a module planted in the
   directory from which an operator runs the init script can no longer be
-  imported. This packaging change lands before the first `0.3.0-r1`
-  publication; the tagged v0.3.0 source is unchanged.
+  imported. This packaging change landed after the v0.3.0 tag and before the
+  first `0.3.0-r1` publication, so the published `0.3.0-r1` `nmea_sproxy`
+  packages include it; the tagged v0.3.0 source is unchanged.
 - Corrects the OpenWrt upgrade guidance in the README and the `nmea_sproxy`
   guide. The apk upgrade and rollback hooks keep each service's boot state
   and only run its `start` action, so a stopped service starts, while procd
@@ -38,9 +41,11 @@ still change public APIs and configuration behavior as the project matures.
   together, restart every service that should run and stop again any that
   should stay stopped. The guidance also covers defaults replaced on upgrade
   and rollback, `.apk-new` files, saving the package files a rollback needs
-  (on `0.2.1-r4`, before `0.3.0-r1` is published) and checking them with
-  `apk verify`, and that a firmware sysupgrade does not keep AISMixer keys or
-  named `nmea_sproxy` relations automatically. It separates the signed feed
+  and checking them with `apk verify` (a rollback to `0.2.1-r4`, which
+  `apk fetch` can no longer save, needs files saved before `0.3.0-r1` was
+  published or the archived signed files downloaded by exact file name), and
+  that a firmware sysupgrade does not keep AISMixer keys or named
+  `nmea_sproxy` relations automatically. It separates the signed feed
   index, which covers downloads, from a package file's own signature, which
   is all `apk add` trusts for a file given by path, and from SHA-256
   checksums, and it tells operators to use only files that `apk verify`
