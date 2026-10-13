@@ -24,7 +24,7 @@ GOLDEN = {
 
 # Short factual telemetry example, not copied decoder code. Published by
 # Eric S. Raymond / GPSD project in AIVDM/AIVDO protocol decoding v1.58,
-# sentence-layer section. Project BSD-2-Clause provenance/notice: lab/README.md.
+# sentence-layer section. Project BSD-2-Clause provenance/notice: README.md (repository root).
 # https://gpsd.gitlab.io/gpsd/AIVDM.html#_aivdm_aivdo_sentence_layer
 # https://gitlab.com/gpsd/gpsd/-/raw/master/COPYING
 PUBLISHED_TYPE1 = b"!AIVDM,1,1,,B,177KQJ5000G?tO`K>RA1wUbN0TKH,0*5C\r\n"

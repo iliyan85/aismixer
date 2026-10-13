@@ -428,7 +428,7 @@ void published_fixture_test() {
     // Short factual telemetry fixture from Eric S. Raymond, GPSD project,
     // AIVDM/AIVDO protocol decoding v1.58 (24 June 2023), sentence-layer
     // example. No GPSD implementation code is copied. Project BSD-2-Clause
-    // provenance and notice are recorded in lab/README.md.
+    // provenance and notice are recorded in README.md (repository root).
     // https://gpsd.gitlab.io/gpsd/AIVDM.html#_aivdm_aivdo_sentence_layer
     // https://gitlab.com/gpsd/gpsd/-/raw/master/COPYING
     constexpr std::string_view fixture =

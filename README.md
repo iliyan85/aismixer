@@ -1,12 +1,92 @@
-# AISMixer LAB — B1: CUDA foundation
+# AISMixer Lab — GPU-Accelerated AIS Simulation & Testing
 
-This experimental laboratory belongs to the standalone, orphan-rooted `lab`
-branch. It is independent of the production Python service, station proxy and
-UDPSEC code. Its history is not synchronized with `main` or `website`.
+AISMixer Lab is a standalone research and development laboratory within the
+AISMixer ecosystem. It provides deterministic CUDA scene/event generation,
+native YAML scenario execution, and standards-oriented host-side AIS payload
+and NMEA 0183 encoding. It is independent of the production `aismixer` daemon
+and related services.
+
+The scene runner uses the B2 GPU engine; the B3 AIS codec operates separately
+on explicit message inputs. There is no scene-to-AIS identity/geodetic adapter,
+UDP traffic generator, traffic collector, RF model or production integration
+yet. Logical event intents and `!AIVDM` framing do not establish radio
+transmission, reception or real TDMA scheduling.
+
+The `lab` branch has independent, orphan-rooted history and is not intended to
+be merged or synchronized with `main` or `website`. `main` contains production
+`aismixer` and related services; `website` contains the website. Each branch has
+its own branch-relative `README.md`; this landing page belongs to `lab`.
+
+## Overview and status
+
+| Stage or capability | Current scope | Status |
+| --- | --- | --- |
+| [B1](#b1-cuda-foundation) | GPU cuRAND Philox and native CUDA foundation. | Implemented |
+| [B2](#b2-deterministic-scenes-and-event-intents) | GPU scene engine and deterministic event intents. | Implemented |
+| [B2.1](#b21-native-console-runner-and-yaml-scenarios) | Native YAML scene runner; requires local yaml-cpp ≥ 0.8. | Implemented |
+| [B3](#b3-explicit-ais-model-and-host-only-nmea-encoder) | Host-only AIS model and NMEA framing for Types 1, 4, 9, 18 and base-only 21. | Implemented |
+| Scene-to-AIS identity/geodetic mapping | Explicit scene identities and geographic reference for a future adapter. | Future |
+| UDP traffic generation, collection and production integration | Separate traffic delivery and validation components. | Future |
+| RF model and real TDMA scheduling | Radio propagation, reception and collision behavior. | Future |
+| Full Linux build/CUDA qualification | Qualification of the complete laboratory outside the current Windows build. | Not qualified |
+
+The data boundaries are explicit:
+
+- `actor_id` is a scene identity, not an MMSI.
+- `x_mm/y_mm` are local planar millimetres, not WGS84 longitude/latitude.
+- `random_u32` is diagnostic PRNG output, not an AIS field.
+
+B3 accepts explicit wire-compatible AIS fields, not B2 events. The detailed
+stage sections below retain the contracts, limits, examples and caveats.
+
+## Repository layout
+
+Paths in this overview are relative to the repository root:
+
+| Path | Contents |
+| --- | --- |
+| [lab/cuda/](lab/cuda/) | B1/B2 GPU engines, public APIs and smoke utilities. |
+| [lab/runner/](lab/runner/) | Native console runner, YAML validation and output helpers. |
+| [lab/scenes/](lab/scenes/) | Version 1 YAML scenario examples. |
+| [lab/ais/](lab/ais/) | Host-only AIS model, binary encoder, NMEA framing and diagnostic CLI. |
+| [lab/tests/](lab/tests/) | Host/GPU checks, independent wire oracles and fixture provenance. |
+| [lab/CMakeLists.txt](lab/CMakeLists.txt) | Windows build targets, optional runner and CTest registration. |
+
+Short directory names in the detailed references, such as `cuda/` or `ais/`,
+refer to subdirectories of `lab/`. CLI examples run from the repository root
+unless stated otherwise.
+
+## Getting started
+
+The current top-level CMake project requires native Windows, VS2022 x64 and
+CUDA Toolkit 12.9; its default architecture is Pascal `sm_61`. Begin with the
+[B1 configure/build instructions](#configure-build-and-run). The ignored,
+machine-local `cuda129-pascal` user preset is an alternative for an existing
+setup, not a preset guaranteed to be present in a fresh checkout.
+
+To use the YAML operator application, follow the [B2.1 dependency and opt-in
+build instructions](#isolated-dependency-and-opt-in-build). A local yaml-cpp
+package ≥ 0.8 is required, and `AISMIXER_LAB_BUILD_SCENE_RUNNER=ON` enables the
+runner. The standalone B3 codec has no CUDA/yaml-cpp dependency, but configuring
+the encompassing lab project still requires the Windows/CUDA toolchain.
+
+B1/B2 GPU generation and the runner's GPU/interactive acceptance need a
+compatible NVIDIA device. Host-only AIS codec tests run with CUDA hidden;
+they do not qualify the complete Linux build. Build and test commands must use
+the same configured directory, as shown in the detailed instructions.
+
+Recorded B3 acceptance on Windows 11 / VS2022 / CUDA 12.9 / Pascal `sm_61` was
+**9/9 Release CTests**, with the YAML runner and Python acceptance harness
+enabled. That result applies to that configuration. The full nine-test suite
+requires local yaml-cpp, the runner option and Python 3; it is not available
+with `AISMIXER_LAB_BUILD_SCENE_RUNNER=OFF`.
+
+## B1: CUDA foundation
+
 B1 establishes a native Windows CUDA C++17 engine and a GPU smoke executable.
 It does not generate AIS/NMEA traffic or send network packets.
 
-## Toolchain and Pascal compatibility
+### Toolchain and Pascal compatibility
 
 The B1 baseline is Windows 11, Visual Studio Build Tools 2022 with the C++ desktop
 workload, MSVC v143, a Windows SDK, CMake 3.24 or newer, and **CUDA Toolkit 12.9**.
@@ -18,7 +98,7 @@ For example, driver 582.78 can report CUDA 13.0 while the installed compiler is
 `nvcc V12.9.86`. Use `nvcc --version` to identify the toolkit. A newer compatible
 driver does not require installing a newer toolkit.
 
-## Configure, build and run
+### Configure, build and run
 
 Run these PowerShell commands from the repository root, with CMake, CTest and
 CUDA 12.9's `bin` directory available on `PATH`:
@@ -84,7 +164,7 @@ architecture, or a quoted list such as `-DCMAKE_CUDA_ARCHITECTURES="61;75"`.
 The selected architectures must be supported by CUDA 12.9 and the actual GPU.
 B1 does not automatically upgrade the toolkit.
 
-## Smoke interface and deterministic output
+### Smoke interface and deterministic output
 
 The Release executable is `lab/build/Release/aismixer_lab_gpu_smoke.exe`.
 
@@ -135,7 +215,7 @@ the output. A successful
 configure/build alone does not demonstrate GPU execution; the probe and
 self-test must run on an available compatible NVIDIA GPU.
 
-## Engine boundary and limitations
+### Engine boundary and limitations
 
 `cuda/engine_api.h` exposes CUDA-free C++ types and host-callable device probing
 and bounded batch generation. `cuda/engine.cu` owns device operations and CUDA
@@ -163,7 +243,7 @@ driver compatibility and the configured architecture. The reported failure is
 an error, not a skipped or passed GPU test. Free memory varies with other GPU
 users; the bounded batch is deliberately conservative for a 4 GB GTX 1050 Ti.
 
-## Future architecture — documentation only
+### Future architecture — documentation only
 
 Later stages may simulate Class A/B vessels, base stations, AtoN, SAR and
 emergency devices; channels, TDMA slots, reception and collisions; and network
@@ -729,7 +809,7 @@ was crosschecked for armoring, sentence framing and a published Type 1 data
 fixture. It is an informative implementation reference, not a normative AIS
 standard. Its armoring table is followed; prose ASCII-number typos are not.
 Only the short fixture sentence is reused, with provenance and upstream BSD
-notice in [AIS_FIXTURE_LICENSE.txt](tests/AIS_FIXTURE_LICENSE.txt); no GPSD or
+notice in [AIS_FIXTURE_LICENSE.txt](lab/tests/AIS_FIXTURE_LICENSE.txt); no GPSD or
 GPL decoder code is copied. [IEC 61162-1:2024 edition 6 catalog](https://webstore.iec.ch/en/publication/72729)
 was reviewed for scope/version; full paid VDM clauses were not available for
 inspection. This work is not a claim of formal ITU/IEC equipment certification.
