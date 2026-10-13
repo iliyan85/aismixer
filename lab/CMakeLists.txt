@@ -142,6 +142,19 @@ else()
     message(STATUS "B2.1 runner disabled (AISMIXER_LAB_BUILD_SCENE_RUNNER=OFF); enable explicitly with a local yaml-cpp package")
 endif()
 
+add_library(aismixer_lab_ais_codec STATIC
+    ais/ais_bits.cpp ais/ais_encoder.cpp ais/nmea0183.cpp)
+target_include_directories(aismixer_lab_ais_codec PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/ais")
+set_target_properties(aismixer_lab_ais_codec PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aismixer_lab_ais_codec PRIVATE /utf-8 /W4)
+
+add_executable(aismixer_lab_ais_smoke ais/ais_smoke_main.cpp)
+target_link_libraries(aismixer_lab_ais_smoke PRIVATE aismixer_lab_ais_codec)
+set_target_properties(aismixer_lab_ais_smoke PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aismixer_lab_ais_smoke PRIVATE /utf-8 /W4)
+
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME aismixer_lab_gpu_self_test COMMAND aismixer_lab_gpu_smoke --self-test)
@@ -179,6 +192,26 @@ if(BUILD_TESTING)
         else()
             message(WARNING "B2.1 CLI acceptance tests are NOT configured: a local Python 3 interpreter is required for the test harness. The native runner itself does not depend on Python.")
         endif()
+    endif()
+
+    add_executable(aismixer_lab_ais_codec_tests tests/ais_codec_tests.cpp)
+    target_link_libraries(aismixer_lab_ais_codec_tests PRIVATE aismixer_lab_ais_codec)
+    set_target_properties(aismixer_lab_ais_codec_tests PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_options(aismixer_lab_ais_codec_tests PRIVATE /utf-8 /W4)
+    add_test(NAME aismixer_lab_ais_codec_test COMMAND aismixer_lab_ais_codec_tests)
+    add_test(NAME aismixer_lab_ais_smoke_test COMMAND aismixer_lab_ais_smoke --self-test)
+    set_tests_properties(aismixer_lab_ais_codec_test aismixer_lab_ais_smoke_test
+        PROPERTIES LABELS "host;AIS" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME aismixer_lab_ais_wire_oracle_test
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ais_wire_oracle.py"
+            --exe $<TARGET_FILE:aismixer_lab_ais_smoke>)
+        set_tests_properties(aismixer_lab_ais_wire_oracle_test
+            PROPERTIES LABELS "host;AIS" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+    else()
+        message(WARNING "AIS independent wire oracle is NOT configured: a local Python 3 interpreter is required for the standard-library-only test. The codec itself does not depend on Python.")
     endif()
 endif()
 

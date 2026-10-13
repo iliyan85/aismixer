@@ -1,7 +1,8 @@
 # AISMixer LAB — B1: CUDA foundation
 
-This experimental laboratory belongs to the repository's `main` branch. It is
-independent of the production Python service, station proxy and UDPSEC code.
+This experimental laboratory belongs to the standalone, orphan-rooted `lab`
+branch. It is independent of the production Python service, station proxy and
+UDPSEC code. Its history is not synchronized with `main` or `website`.
 B1 establishes a native Windows CUDA C++17 engine and a GPU smoke executable.
 It does not generate AIS/NMEA traffic or send network packets.
 
@@ -328,8 +329,8 @@ self-test reports that launch-shape validation was not run.
 B2 generates no AIS/NMEA encoding, MMSI validation, radio message types, standards
 based schedules, TDMA slots, VHF propagation or reception, RF collision outcomes,
 network traffic, UDPSEC integration or Python control layer. Its scene/event
-boundary can support later B3 message abstractions and schedule fidelity; B3 is
-not implemented here.
+boundary can support later message abstractions and schedule fidelity. The
+standalone B3 codec below does not adapt scene events to AIS messages.
 
 ## B2.1: native console runner and YAML scenarios
 
@@ -338,7 +339,8 @@ not implemented here.
 the unchanged B2 `generate_event_intents(...)` API for GPU execution. CLI parsing,
 YAML parsing, interaction, digest/CSV formatting and file I/O are host work.
 Event intents still do not represent AIS frames, RF transmissions, reception or
-standards-based AIS reporting schedules. B3 is not implemented.
+standards-based AIS reporting schedules. The standalone B3 codec is separate;
+the scene runner has no AIS output mode or geographic/identity adapter.
 
 ### Isolated dependency and opt-in build
 
@@ -557,3 +559,186 @@ If yaml-cpp is absent, runner compilation and all runner functional/interactive
 checks are **NOT RUN**, even when the independent host and B1/B2 GPU tests pass.
 A successful helper build or static review does not demonstrate YAML parsing or
 operator-app GPU execution. Report each category of check separately.
+
+## B3: explicit AIS model and host-only NMEA encoder
+
+The codec constructs AIS payloads from explicit message objects and encapsulates
+them as `!AIVDM`. It has no dependency on CUDA, yaml-cpp or the scene engine.
+`actor_id` is not MMSI, local `x_mm/y_mm` are not geographic coordinates, and
+`random_u32` supplies no AIS field. The B2/B2.1 API, menus, schema version 1 and
+six-category scenes are unchanged. There is no `--format nmea` scene-runner mode.
+
+### API boundary and supported families
+
+All codec headers live in `ais/` and use `aismixer::lab::ais`:
+
+| Component | Responsibility |
+| --- | --- |
+| `ais_message.h` | Explicit `Mmsi`, `RadioState19/20`, typed `Type1/4/9/18/21` and the closed `Message` variant. |
+| `ais_bits.h/.cpp` | Bounded MSB-first unsigned/signed field serialization, widths 1 through 64. |
+| `ais_encoder.h/.cpp` | Complete input validation, exact payload bits and six-bit armoring. |
+| `nmea0183.h/.cpp` | Channel/sequence validation, checksums, fragmentation and stream writing. |
+| `ais_smoke_main.cpp` | CPU diagnostic application with explicit synthetic message objects. |
+
+`encode(const Message&)` and the typed overloads return `EncodedPayload` with
+the unpadded 0/1 bit vector, armored payload and fill count. `encode_aivdm` or
+`format_aivdm` returns every ordered sentence for one message. `write_sentences`
+validates the complete vector before writing to a caller-selected `std::ostream`.
+Invalid fields throw `std::invalid_argument` naming the field. No output is
+written by encoding itself and no input is clamped or automatically populated.
+
+| Type | Explicit input | Payload bits |
+| --- | --- | --- |
+| 1 | Class A position report, without Type 2/3 scheduling variations. | 168 |
+| 18 | Standard Class B report, with explicit SO/CS flags and state. | 168 |
+| 4 | Base station geographic position and supplied/unavailable UTC. | 168 |
+| 9 | SAR **aircraft** report, not a generic SAR actor mapping. | 168 |
+| 21 | Aids-to-navigation base report; no optional name extension. | 272 |
+
+No generic Emergency actor is encoded automatically. AIS-SART, MOB and EPIRB
+profiles/identities require separate explicit future specifications. Type 1
+status 14 can be supplied as a legal wire value but does not make this codec an
+AIS-SART simulator. Types 2/3, 5/6/8/12/14/19/24 and binary application protocols
+are not implemented.
+
+### Wire units, markers and validation
+
+MMSI must be exactly nine ASCII decimal digits. Leading zeros are retained by
+the identity object; the numeric value is checked against the 30-bit field.
+`000000000` is rejected by this codec's identity policy. Nine digits can be at
+most `999999999`, already below the 30-bit ceiling; larger representations are
+rejected before narrowing. No prefix/allocation validity is inferred.
+
+Model numeric fields use `int64_t` so negative or excessive unsigned-field
+inputs remain visible to validation. Boolean fields represent only their two
+wire states. The core wire path needs no floating-point conversion:
+
+| Field | Units, admitted values and unavailable/default marker |
+| --- | --- |
+| Longitude / latitude | Signed 1/10000 minute; limits ±108000000 / ±54000000. Only positive 108600000 / 54600000 are unavailable markers. |
+| Speed, Types 1/18 | Tenths of a knot: 0..1022; 1022 is the saturation code, 1023 unavailable. |
+| Speed, Type 9 | **Whole knots**: 0..1022, 1022 saturated, 1023 unavailable. |
+| Course | Tenths of a degree, 0..3599; 3600 unavailable; 3601..4095 rejected. |
+| True heading | Whole degrees, 0..359; 511 unavailable; 360..510 rejected. |
+| Type 1 ROT | Signed eight-bit AIS nonlinear code -128..127; -128 unavailable; ±127 special turn indicators. No deg/min converter. |
+| Type 9 altitude | Metres, 0..4094; 4094 saturated, 4095 unavailable; explicit GNSS/barometric flag. |
+| Position-report second | 0..59 UTC; 60 unavailable, 61 manual input, 62 estimated position, 63 positioning system inoperative. CS Type 18 allows only 0..60. |
+| Type 4 UTC | Year 0..9999, month 0..12, day 0..31; zero means unavailable. Hour 24, minute/second 60 unavailable; impossible known dates rejected, with Gregorian leap-year checks. |
+| Repeat / navigation | Repeat 0..3. Type 1 navigation 0..8,11,12,14,15; 9/10/13 reserved and rejected. Status 15 is undefined. |
+| Position fixing | Explicit EPFS code 0..9 or 12..15; 10/11 reserved. Default 0 undefined; 15 internal GNSS. |
+| Type 21 dimensions/status | A/B 0..511 m; C/D 0..63 m; regional/application status raw 0..255. |
+
+Defaults use unavailable position/motion/time markers, repeat 0, undefined
+navigation/fixing codes and zero flags; Type 9 DTE defaults to not ready. Date
+and communication state never come from the wall clock. Constructors for Types
+1/4 require explicit `RadioState19`, and Types 9/18 require `RadioState20`;
+these classes have no default state. The latter's high bit is the selector and
+low 19 bits are the state. Raw states are width-checked; slot/time interpretation
+and operational TDMA validity remain the caller's responsibility. CS Type 18
+additionally requires repeat 0 and combined state `0xE0006` (selector 1 plus the
+standard fixed 19-bit pattern). No live communication state is manufactured.
+
+Type 21 name is 0..20 characters from ASCII 0x20..0x5F, with literal `@`
+rejected because it is the text terminator. There is no case conversion or
+Unicode normalization. Short names are padded with `@` codes to exactly 120
+bits, independently of NMEA armoring. Empty name is permitted. Virtual aids and
+reference points require all dimensions zero. Physical dimension orientation,
+floating-aid geometry and regional/IALA status profiles are not synthesized or
+qualified. The explicit off-position flag is preserved; a receiver considers
+it meaningful only when the timestamp is 0..59.
+
+### Wire framing, bounds and deterministic examples
+
+Every spare/reserved bit in supported layouts is written as zero. Signed values
+use defined two's-complement bit serialization; object layout, endian order and
+padding are never dumped. Armoring maps six-bit values 0..39 to ASCII 48..87
+and 40..63 to ASCII 96..119. Final zero fill is `(6 - bit_count % 6) % 6`, not
+AIS radio byte padding. Fixed reports have fill 0; the 272-bit Type 21 has fill 4.
+
+Channel A/B is explicit and asserts no RF transmission. Single-fragment output
+has total/part 1 and a blank sequence field. Fragment capacity is derived from
+the actual header, fill and checksum/CRLF overhead, with a maximum of **82 bytes
+including CRLF**. Multipart output requires a caller-supplied decimal ID 0..9,
+uses at most nine fragments, and places nonzero fill only on the final fragment.
+There are no global sequence counters. Bit/armor helpers cap input at 4096 bits;
+NMEA rejects inputs requiring more than nine fragments. Under these headers the
+single capacity is 61 armor characters and multipart capacity is 60; these are
+derived results, not fixed slicing constants. No TAG blocks or AIVDO are added.
+
+The five diagnostic vectors are synthetic, independently checked examples with
+explicit identities, coordinates, flags, time and communication-state values:
+
+```text
+Type 1:  !AIVDM,1,1,,A,1Amg=5EmQso>f;LFGd5DlSoo7D<Q,0*2B
+Type 4:  !AIVDM,1,1,,A,4P1;FQivPfosrk81`0kOqP?P2SAF,0*26
+Type 9:  !AIVDM,1,1,,A,9ib4N?DlU1dovH1<P6P>3w`2>ckN,0*43
+Type 18: !AIVDM,1,1,,A,B>eq`d@3wk?8mP=18D3Q3wvCuD<Q,0*20
+Type 21: !AIVDM,1,1,,A,ENk`A<S60Q@64ST:@HHP0000000Owwwwwwwwh91AISuJFP,4*59
+```
+
+The displayed lines omit their literal CRLF. Wire lengths are 49 bytes for
+Types 1/4/9/18 and 67 for Type 21. The AtoN example is a physical light with
+sectors, and the aircraft example explicitly selects barometric altitude.
+None of the example metadata is borrowed from scene actors.
+
+### Existing preset build and CPU checks
+
+From the repository root, use the existing ignored preset without editing it:
+
+```powershell
+cmake --preset cuda129-pascal -S lab
+cmake --build lab/build/vscode-cuda129-preset --config Release
+.\lab\build\vscode-cuda129-preset\Release\aismixer_lab_ais_smoke.exe --help
+.\lab\build\vscode-cuda129-preset\Release\aismixer_lab_ais_smoke.exe --demo
+.\lab\build\vscode-cuda129-preset\Release\aismixer_lab_ais_smoke.exe --self-test
+ctest --test-dir lab/build/vscode-cuda129-preset -C Release --output-on-failure
+$env:CUDA_VISIBLE_DEVICES = '-1'
+ctest --test-dir lab/build/vscode-cuda129-preset -C Release -L AIS --output-on-failure
+Remove-Item Env:CUDA_VISIBLE_DEVICES
+```
+
+The diagnostic defaults to `--demo`; options are mutually exclusive. Exit 2
+means invalid CLI; exit 1 means codec/validation/I/O failure. Each demo header
+reports type, exact bit count, armor and fill, then the complete sentence bytes.
+Stdout uses binary mode on Windows to preserve CRLF. Library callers must also
+use binary streams on translating hosts, e.g. `std::ofstream(path,
+std::ios::binary)`; arbitrary ostream failures cannot roll back bytes already
+written. There is no socket, file export or YAML input in this diagnostic.
+
+`aismixer_lab_ais_codec_test` checks independent full bit vectors/field offsets,
+individual flags, all sentinels, field limits, dates/text, every armor value and
+fill count, fragmentation/reconstruction and prevalidation before output.
+`aismixer_lab_ais_wire_oracle_test` uses only Python's standard library to decode
+actual smoke bytes independently, recompute XOR, verify exact lengths/CRLF,
+and check repeat/execution-order stability. AIS CTests set the GPU-hidden
+environment themselves. Their native targets link only the standard C++ runtime
+and this codec. The encompassing existing project still requires Windows
+VS2022/CUDA 12.9 configuration; Linux portability is not qualified by B3.
+
+### References, provenance and limits of the claims
+
+Payload definitions were checked against [ITU-R M.1371-6 (02/2026)](https://www.itu.int/dms_pubrec/itu-r/rec/m/R-REC-M.1371-6-202602-I!!PDF-E.pdf),
+Annex 7 Tables 46 (Type 1), 49 (Type 4), 57 (Type 9), 68 (Type 18) and 71/72
+(Type 21). The diagnostic vectors/oracles were synthesized independently from
+those facts. M.1371-6 assigns transmit-power bits at Type 1 offset 147 and Type
+18 offset 139, and updates EPFS/aid codes. These definitions take precedence
+over older summaries that label those bits spare or regional reserved.
+
+[GPSD AIVDM/AIVDO protocol decoding v1.58, 24 June 2023](https://gpsd.gitlab.io/gpsd/AIVDM.html)
+was crosschecked for armoring, sentence framing and a published Type 1 data
+fixture. It is an informative implementation reference, not a normative AIS
+standard. Its armoring table is followed; prose ASCII-number typos are not.
+Only the short fixture sentence is reused, with provenance and upstream BSD
+notice in [AIS_FIXTURE_LICENSE.txt](tests/AIS_FIXTURE_LICENSE.txt); no GPSD or
+GPL decoder code is copied. [IEC 61162-1:2024 edition 6 catalog](https://webstore.iec.ch/en/publication/72729)
+was reviewed for scope/version; full paid VDM clauses were not available for
+inspection. This work is not a claim of formal ITU/IEC equipment certification.
+
+Regional manoeuvre code 3 and raw AtoN status are permitted explicit values
+without regional profile interpretation. Radio state internals, physical aid
+geometry/orientation, identity allocation and regulatory report scheduling need
+separate profiles/qualification. Older downstream decoders may not interpret
+new M.1371-6 flag/code meanings. Future B3.x can add an opt-in, versioned AIS
+identity/geodetic scene mapping and adapter; current local coordinates and
+schema version 1 remain untouched. No such adapter, RF/TDMA model, network
+dispatcher, collector or production-process orchestration is implemented.
