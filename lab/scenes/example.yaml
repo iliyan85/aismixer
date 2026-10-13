@@ -1,0 +1,33 @@
+schema_version: 1
+name: local-planar-phase-example
+simulation:
+  seed: 2026
+  start_tick: 5
+  tick_count: 12
+  tick_seconds: 3
+# Local millimetres only. These report schedules do not model AIS regulations.
+actors:
+  - actor_id: 7
+    category: ClassB
+    x_mm: -20000
+    y_mm: 5000
+    vx_mm_per_s: 80
+    vy_mm_per_s: -30
+    report_interval_ticks: 4
+    phase_ticks: 1
+  - actor_id: 80
+    category: AtoN
+    x_mm: 12000
+    y_mm: -6000
+    vx_mm_per_s: 0
+    vy_mm_per_s: 0
+    report_interval_ticks: 5
+    phase_ticks: 2
+  - actor_id: 900
+    category: SAR
+    x_mm: 0
+    y_mm: 0
+    vx_mm_per_s: -400
+    vy_mm_per_s: 200
+    report_interval_ticks: 3
+    phase_ticks: 0

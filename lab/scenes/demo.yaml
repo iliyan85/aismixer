@@ -1,0 +1,57 @@
+schema_version: 1
+name: b2-reference-demo
+simulation:
+  seed: 42
+  start_tick: 0
+  tick_count: 8
+  tick_seconds: 2
+# Exactly the B2 fixed demo. Categories and intervals are scenario choices.
+actors:
+  - actor_id: 60
+    category: Emergency
+    x_mm: -100
+    y_mm: 200
+    vx_mm_per_s: 100
+    vy_mm_per_s: -50
+    report_interval_ticks: 1
+    phase_ticks: 0
+  - actor_id: 30
+    category: BaseStation
+    x_mm: 7000
+    y_mm: -8000
+    vx_mm_per_s: 0
+    vy_mm_per_s: 0
+    report_interval_ticks: 3
+    phase_ticks: 1
+  - actor_id: 10
+    category: ClassA
+    x_mm: 1000
+    y_mm: -2000
+    vx_mm_per_s: 250
+    vy_mm_per_s: -100
+    report_interval_ticks: 2
+    phase_ticks: 0
+  - actor_id: 50
+    category: SAR
+    x_mm: 0
+    y_mm: 100
+    vx_mm_per_s: -300
+    vy_mm_per_s: 500
+    report_interval_ticks: 2
+    phase_ticks: 1
+  - actor_id: 20
+    category: ClassB
+    x_mm: -500
+    y_mm: 600
+    vx_mm_per_s: -50
+    vy_mm_per_s: 25
+    report_interval_ticks: 3
+    phase_ticks: 2
+  - actor_id: 40
+    category: AtoN
+    x_mm: -9000
+    y_mm: 10000
+    vx_mm_per_s: 0
+    vy_mm_per_s: 0
+    report_interval_ticks: 4
+    phase_ticks: 0

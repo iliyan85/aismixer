@@ -1,0 +1,4 @@
+/build/
+
+# Local CMake configuration (machine-specific)
+CMakeUserPresets.json

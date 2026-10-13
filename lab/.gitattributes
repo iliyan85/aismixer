@@ -1,0 +1,6 @@
+# AISMixer Lab — cross-platform line endings
+* text=auto eol=lf
+
+# Windows command scripts, if introduced
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -1,0 +1,14 @@
+# Local editor configuration
+.vscode/
+
+# Private keys
+aismixer_private.key
+nmea_sproxy/station_private.key
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Temporary test directories
+.pytest-tmp/
+.pytest_cache/
