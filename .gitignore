@@ -1,4 +1,5 @@
 .env
+.vscode/
 aismixer_private.key
 __pycache__/
 nmea_sproxy/__pycache__/
