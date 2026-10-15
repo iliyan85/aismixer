@@ -155,6 +155,64 @@ set_target_properties(aismixer_lab_ais_smoke PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 target_compile_options(aismixer_lab_ais_smoke PRIVATE /utf-8 /W4)
 
+# B3.1 retains B2 unchanged; only the new geography engine uses device select.
+add_library(aismixer_lab_geo_host STATIC geo/geo_host.cpp)
+target_include_directories(aismixer_lab_geo_host PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/geo" "${CMAKE_CURRENT_SOURCE_DIR}/cuda")
+target_link_libraries(aismixer_lab_geo_host PRIVATE bcrypt)
+set_target_properties(aismixer_lab_geo_host PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aismixer_lab_geo_host PRIVATE /utf-8 /W4)
+
+add_library(aismixer_lab_geo_engine STATIC geo/geo_engine.cu)
+target_link_libraries(aismixer_lab_geo_engine PUBLIC aismixer_lab_geo_host CUDA::cudart)
+set_target_properties(aismixer_lab_geo_engine PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES CUDA_EXTENSIONS NO
+    CUDA_RUNTIME_LIBRARY Shared)
+target_compile_options(aismixer_lab_geo_engine PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+add_library(aismixer_lab_geo_ais STATIC geo/geo_ais.cpp)
+target_link_libraries(aismixer_lab_geo_ais PUBLIC aismixer_lab_geo_host aismixer_lab_ais_codec)
+set_target_properties(aismixer_lab_geo_ais PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aismixer_lab_geo_ais PRIVATE /utf-8 /W4)
+
+add_library(aismixer_lab_geo_output STATIC geo/geo_output.cpp)
+target_link_libraries(aismixer_lab_geo_output PUBLIC aismixer_lab_geo_ais)
+set_target_properties(aismixer_lab_geo_output PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aismixer_lab_geo_output PRIVATE /utf-8 /W4)
+
+option(AISMIXER_LAB_BUILD_GEO_RUNNER "Build B3.1 offline geographic YAML operator (requires local yaml-cpp >= 0.8)" OFF)
+if(AISMIXER_LAB_BUILD_GEO_RUNNER)
+    if(NOT _lab_yaml_target)
+        find_package(yaml-cpp 0.8 CONFIG QUIET)
+        if(TARGET yaml-cpp::yaml-cpp)
+            set(_lab_yaml_target yaml-cpp::yaml-cpp)
+        elseif(TARGET yaml-cpp)
+            set(_lab_yaml_target yaml-cpp)
+        else()
+            message(FATAL_ERROR "B3.1 geographic operator requires locally provisioned yaml-cpp >= 0.8. See README.md (repository root). No dependency is downloaded.")
+        endif()
+    endif()
+    add_library(aismixer_lab_geo_config STATIC geo/geo_config.cpp)
+    target_link_libraries(aismixer_lab_geo_config PUBLIC aismixer_lab_geo_host PRIVATE ${_lab_yaml_target})
+    set_target_properties(aismixer_lab_geo_config PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_options(aismixer_lab_geo_config PRIVATE /utf-8 /W4)
+    add_executable(aismixer_lab_geo geo/geo_cli_main.cpp runner/scene_yaml.cpp)
+    target_link_libraries(aismixer_lab_geo PRIVATE aismixer_lab_geo_config
+        aismixer_lab_geo_engine aismixer_lab_geo_output aismixer_lab_scene_host ${_lab_yaml_target})
+    set_target_properties(aismixer_lab_geo PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_options(aismixer_lab_geo PRIVATE /utf-8 /W4)
+    string(REPLACE ";" "," _lab_geo_architectures "${CMAKE_CUDA_ARCHITECTURES}")
+    target_compile_definitions(aismixer_lab_geo PRIVATE
+        AISMIXER_LAB_GEO_BUILD_INFO="MSVC_${CMAKE_CXX_COMPILER_VERSION}_CUDA_${CMAKE_CUDA_COMPILER_VERSION}_arch_${_lab_geo_architectures}")
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME aismixer_lab_gpu_self_test COMMAND aismixer_lab_gpu_smoke --self-test)
@@ -212,6 +270,68 @@ if(BUILD_TESTING)
             PROPERTIES LABELS "host;AIS" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
     else()
         message(WARNING "AIS independent wire oracle is NOT configured: a local Python 3 interpreter is required for the standard-library-only test. The codec itself does not depend on Python.")
+    endif()
+    target_compile_definitions(aismixer_lab_geo_engine PRIVATE AISMIXER_LAB_GEO_TESTING)
+    add_executable(aismixer_lab_geo_host_tests tests/geo_host_tests.cpp)
+    target_link_libraries(aismixer_lab_geo_host_tests PRIVATE aismixer_lab_geo_ais)
+    set_target_properties(aismixer_lab_geo_host_tests PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_options(aismixer_lab_geo_host_tests PRIVATE /utf-8 /W4)
+    add_test(NAME aismixer_lab_geo_host_test COMMAND aismixer_lab_geo_host_tests)
+    set_tests_properties(aismixer_lab_geo_host_test PROPERTIES
+        LABELS "host;geo" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+
+    target_compile_definitions(aismixer_lab_geo_output PRIVATE AISMIXER_LAB_GEO_OUTPUT_TESTING)
+    add_executable(aismixer_lab_geo_output_tests tests/geo_output_tests.cpp)
+    target_compile_definitions(aismixer_lab_geo_output_tests PRIVATE AISMIXER_LAB_GEO_OUTPUT_TESTING)
+    target_link_libraries(aismixer_lab_geo_output_tests PRIVATE aismixer_lab_geo_output)
+    set_target_properties(aismixer_lab_geo_output_tests PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_options(aismixer_lab_geo_output_tests PRIVATE /utf-8 /W4)
+    add_test(NAME aismixer_lab_geo_output_test COMMAND aismixer_lab_geo_output_tests
+        "${CMAKE_CURRENT_BINARY_DIR}/geo-output-tests")
+    set_tests_properties(aismixer_lab_geo_output_test PROPERTIES
+        LABELS "host;geo;AIS" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+
+    add_executable(aismixer_lab_geo_gpu_tests tests/geo_gpu_tests.cpp)
+    target_compile_definitions(aismixer_lab_geo_gpu_tests PRIVATE AISMIXER_LAB_GEO_TESTING)
+    target_link_libraries(aismixer_lab_geo_gpu_tests PRIVATE
+        aismixer_lab_geo_engine aismixer_lab_scene_engine)
+    set_target_properties(aismixer_lab_geo_gpu_tests PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_options(aismixer_lab_geo_gpu_tests PRIVATE /utf-8 /W4)
+    add_test(NAME aismixer_lab_geo_gpu_test COMMAND aismixer_lab_geo_gpu_tests)
+    set_tests_properties(aismixer_lab_geo_gpu_test PROPERTIES LABELS "GPU;geo" TIMEOUT 180)
+    add_test(NAME aismixer_lab_geo_unavailable_test COMMAND aismixer_lab_geo_gpu_tests --expect-no-gpu)
+    set_tests_properties(aismixer_lab_geo_unavailable_test PROPERTIES
+        LABELS "host;geo" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+    if(AISMIXER_LAB_BUILD_GEO_RUNNER)
+        add_executable(aismixer_lab_geo_config_tests tests/geo_config_tests.cpp)
+        target_link_libraries(aismixer_lab_geo_config_tests PRIVATE aismixer_lab_geo_config)
+        set_target_properties(aismixer_lab_geo_config_tests PROPERTIES
+            CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+        target_compile_options(aismixer_lab_geo_config_tests PRIVATE /utf-8 /W4)
+        add_test(NAME aismixer_lab_geo_config_test COMMAND aismixer_lab_geo_config_tests
+            "${CMAKE_CURRENT_SOURCE_DIR}/geo/profiles" "${CMAKE_CURRENT_BINARY_DIR}/geo-config-tests")
+        set_tests_properties(aismixer_lab_geo_config_test PROPERTIES
+            LABELS "host;geo" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+    endif()
+    if(AISMIXER_LAB_BUILD_GEO_RUNNER AND Python3_Interpreter_FOUND)
+        add_test(NAME aismixer_lab_geo_wire_oracle_test
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/geo_wire_oracle.py"
+            --exe $<TARGET_FILE:aismixer_lab_geo>
+            --domain "${CMAKE_CURRENT_SOURCE_DIR}/geo/profiles/black_sea_demo.yaml"
+            --source-dir "${CMAKE_CURRENT_SOURCE_DIR}"
+            --work-dir "${CMAKE_CURRENT_BINARY_DIR}/geo-tests")
+        set_tests_properties(aismixer_lab_geo_wire_oracle_test PROPERTIES
+            LABELS "GPU;geo;AIS" TIMEOUT 180)
+        add_test(NAME aismixer_lab_geo_cli_closure_test
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/geo_cli_closure_tests.py"
+            --exe $<TARGET_FILE:aismixer_lab_geo>
+            --source-dir "${CMAKE_CURRENT_SOURCE_DIR}"
+            --work-dir "${CMAKE_CURRENT_BINARY_DIR}/geo-cli-tests")
+        set_tests_properties(aismixer_lab_geo_cli_closure_test PROPERTIES
+            LABELS "GPU;geo;AIS" TIMEOUT 180)
     endif()
 endif()
 

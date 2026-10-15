@@ -6,10 +6,11 @@ native YAML scenario execution, and standards-oriented host-side AIS payload
 and NMEA 0183 encoding. It is independent of the production `aismixer` daemon
 and related services.
 
-The scene runner uses the B2 GPU engine; the B3 AIS codec operates separately
-on explicit message inputs. There is no scene-to-AIS identity/geodetic adapter,
-UDP traffic generator, traffic collector, RF model or production integration
-yet. Logical event intents and `!AIVDM` framing do not establish radio
+The original scene runner uses the B2 GPU engine; the B3 AIS codec accepts
+explicit message inputs. B3.1 adds a separate GPU geospatial path and an offline
+Class A/B AIS bridge with explicit synthetic identities. UDP traffic generation,
+traffic collection, RF modeling and production integration remain future work.
+Logical event intents and `!AIVDM` framing do not establish radio
 transmission, reception or real TDMA scheduling.
 
 The `lab` branch has independent, orphan-rooted history and is not intended to
@@ -25,7 +26,8 @@ its own branch-relative `README.md`; this landing page belongs to `lab`.
 | [B2](#b2-deterministic-scenes-and-event-intents) | GPU scene engine and deterministic event intents. | Implemented |
 | [B2.1](#b21-native-console-runner-and-yaml-scenarios) | Native YAML scene runner; requires local yaml-cpp ≥ 0.8. | Implemented |
 | [B3](#b3-explicit-ais-model-and-host-only-nmea-encoder) | Host-only AIS model and NMEA framing for Types 1, 4, 9, 18 and base-only 21. | Implemented |
-| Scene-to-AIS identity/geodetic mapping | Explicit scene identities and geographic reference for a future adapter. | Future |
+| [B3.1](#b31-gpu-first-geospatial-foundation) | CUDA placement, bounded geographic motion, polygon filtering, stable compaction and offline Type 1/18 bridge. | Implemented; qualified acceptance below |
+| Broader scene-to-AIS mapping | Additional identity/category mappings and larger-distance geography. | Future |
 | UDP traffic generation, collection and production integration | Separate traffic delivery and validation components. | Future |
 | RF model and real TDMA scheduling | Radio propagation, reception and collision behavior. | Future |
 | Full Linux build/CUDA qualification | Qualification of the complete laboratory outside the current Windows build. | Not qualified |
@@ -49,6 +51,8 @@ Paths in this overview are relative to the repository root:
 | [lab/runner/](lab/runner/) | Native console runner, YAML validation and output helpers. |
 | [lab/scenes/](lab/scenes/) | Version 1 YAML scenario examples. |
 | [lab/ais/](lab/ais/) | Host-only AIS model, binary encoder, NMEA framing and diagnostic CLI. |
+| [lab/geo/](lab/geo/) | B3.1 GPU geographic engine, optional YAML operator and replaceable domain/overlay/receiver profiles. |
+| [lab/docs/](lab/docs/) | GPU-first architecture, precision limits and recorded acceptance measurements. |
 | [lab/tests/](lab/tests/) | Host/GPU checks, independent wire oracles and fixture provenance. |
 | [lab/CMakeLists.txt](lab/CMakeLists.txt) | Windows build targets, optional runner and CTest registration. |
 
@@ -77,9 +81,11 @@ the same configured directory, as shown in the detailed instructions.
 
 Recorded B3 acceptance on Windows 11 / VS2022 / CUDA 12.9 / Pascal `sm_61` was
 **9/9 Release CTests**, with the YAML runner and Python acceptance harness
-enabled. That result applies to that configuration. The full nine-test suite
-requires local yaml-cpp, the runner option and Python 3; it is not available
-with `AISMIXER_LAB_BUILD_SCENE_RUNNER=OFF`.
+enabled. This is the historical **pre-B3.1** acceptance, not the current full
+suite. Initial B3.1 acceptance had 14 tests; the corrective closure passed
+**16/16 Release CTests**, plus **4/4** GPU-hidden host AIS tests. See
+[B31_ACCEPTANCE.md](lab/docs/B31_ACCEPTANCE.md) for evidence. Full runner/operator coverage requires local yaml-cpp,
+both opt-in runner options and Python 3; disabled options reduce coverage.
 
 ## B1: CUDA foundation
 
@@ -425,7 +431,8 @@ the scene runner has no AIS output mode or geographic/identity adapter.
 ### Isolated dependency and opt-in build
 
 The runner requires a **local yaml-cpp CMake package, version 0.8 or newer**;
-the provisioning baseline is yaml-cpp 0.8.0. This is a C++ YAML library, separate
+0.8.0 is the minimum documented source version. B3.1 corrective closure uses
+the already-installed 0.9.0 package. This is a C++ YAML library, separate
 from the VS/CUDA toolchain and not supplied by CUDA. Only the runner links it.
 There is no FetchContent download, package installation or global tool change.
 
@@ -773,7 +780,7 @@ cmake --build lab/build/vscode-cuda129-preset --config Release
 .\lab\build\vscode-cuda129-preset\Release\aismixer_lab_ais_smoke.exe --self-test
 ctest --test-dir lab/build/vscode-cuda129-preset -C Release --output-on-failure
 $env:CUDA_VISIBLE_DEVICES = '-1'
-ctest --test-dir lab/build/vscode-cuda129-preset -C Release -L AIS --output-on-failure
+ctest --test-dir lab/build/vscode-cuda129-preset -C Release -L AIS -LE GPU --output-on-failure
 Remove-Item Env:CUDA_VISIBLE_DEVICES
 ```
 
@@ -790,8 +797,11 @@ individual flags, all sentinels, field limits, dates/text, every armor value and
 fill count, fragmentation/reconstruction and prevalidation before output.
 `aismixer_lab_ais_wire_oracle_test` uses only Python's standard library to decode
 actual smoke bytes independently, recompute XOR, verify exact lengths/CRLF,
-and check repeat/execution-order stability. AIS CTests set the GPU-hidden
-environment themselves. Their native targets link only the standard C++ runtime
+and check repeat/execution-order stability. The B3 host AIS CTests set the
+GPU-hidden environment themselves. The B3.1 host output test also has the `AIS`
+label. Its geographic wire oracle and CLI acceptance tests require actual CUDA
+execution (`GPU;geo;AIS`); `-LE GPU` excludes both from the GPU-hidden host
+recipe. The native B3 host targets link only the standard C++ runtime
 and this codec. The encompassing existing project still requires Windows
 VS2022/CUDA 12.9 configuration; Linux portability is not qualified by B3.
 
@@ -818,7 +828,86 @@ Regional manoeuvre code 3 and raw AtoN status are permitted explicit values
 without regional profile interpretation. Radio state internals, physical aid
 geometry/orientation, identity allocation and regulatory report scheduling need
 separate profiles/qualification. Older downstream decoders may not interpret
-new M.1371-6 flag/code meanings. Future B3.x can add an opt-in, versioned AIS
-identity/geodetic scene mapping and adapter; current local coordinates and
-schema version 1 remain untouched. No such adapter, RF/TDMA model, network
-dispatcher, collector or production-process orchestration is implemented.
+new M.1371-6 flag/code meanings. The standalone B3 codec has no scene adapter;
+B3.1's separate geographic path below adds an explicit Class A/B adapter.
+Existing B2 local coordinates and scene schema version 1 retain their meaning.
+RF/TDMA, network dispatch, collection and production-process orchestration
+remain future work.
+
+## B3.1: GPU-first geospatial foundation
+
+B3.1 provides a separate CUDA-native geographic path; the original B2 API and
+the standalone B3 codec described above retain their contracts. CUDA performs
+Philox placement, absolute-tick motion/report scheduling, exact polygon tests
+and stable CUB selection. Only accepted records and small counters cross back
+to the host. The offline bridge explicitly maps Class A/B to Types 1/18 with a
+deterministically generated synthetic MMSI catalog and deliberately supplied
+test radio states. The CLI regenerates population-rank identities per run; it
+does not persist a catalog. Changing population membership can change ranks.
+
+The replaceable [Black Sea demonstration profile](lab/geo/profiles/black_sea_demo.yaml)
+uses coarse Wikidata settlement positions with [recorded provenance and precision
+limits](lab/geo/profiles/PROVENANCE.md), not a coastline/water mask or navigational
+chart. Geographic anchors refer to actor tick zero, independently
+of initial B2 local x/y. The WGS84 tangent approximation is limited to 1 km
+radial displacement and +/-70-degree latitude. Boundaries are inclusive;
+outside scheduled reports are counted as rejected. Passive receiver catalogs
+are configuration only. No RF, TDMA, live playback or network dispatch exists.
+
+The YAML operator is opt-in with a locally provisioned yaml-cpp >=0.8. The
+core geographic libraries/tests add no yaml-cpp requirement to B1/B2:
+
+```powershell
+cmake --preset cuda129-pascal -S lab -DAISMIXER_LAB_BUILD_GEO_RUNNER=ON
+cmake --build lab/build/vscode-cuda129-preset --config Release
+ctest --test-dir lab/build/vscode-cuda129-preset -C Release --output-on-failure
+```
+
+The ignored local preset is optional. For a fresh external build directory,
+use the same documented VS2022 x64/CUDA 12.9 setup and add
+`-DAISMIXER_LAB_BUILD_GEO_RUNNER=ON`; supply the existing local yaml-cpp package
+or toolchain. Use that same directory for build, tests and executable paths.
+
+```powershell
+# Binary CRLF AIVDM to an explicitly named offline file; replay metadata on stderr.
+$geoOutputDir = Join-Path (Resolve-Path lab/build/vscode-cuda129-preset).Path 'offline-output'
+New-Item -ItemType Directory -Path $geoOutputDir -Force | Out-Null
+$geoDemoNmea = Join-Path $geoOutputDir ("demo-{0}.nmea" -f [guid]::NewGuid().ToString('N'))
+lab/build/vscode-cuda129-preset/Release/aismixer_lab_geo.exe --demo --domain lab/geo/profiles/black_sea_demo.yaml --seed 42 --nmea $geoDemoNmea
+# Fresh OS seed is printed; replay it later using --seed <recorded-value>.
+$geoFreshNmea = Join-Path $geoOutputDir ("fresh-{0}.nmea" -f [guid]::NewGuid().ToString('N'))
+lab/build/vscode-cuda129-preset/Release/aismixer_lab_geo.exe --demo --domain lab/geo/profiles/black_sea_demo.yaml --fresh-seed --nmea $geoFreshNmea
+# Existing schema-version-1 scene, separate tick-zero overlay, geographic CSV.
+lab/build/vscode-cuda129-preset/Release/aismixer_lab_geo.exe --scene lab/scenes/demo.yaml --overlay lab/geo/profiles/scene_demo_overlay.yaml --domain lab/geo/profiles/black_sea_demo.yaml --receivers lab/geo/profiles/receivers_demo.yaml
+# 1000 / 100000 / 1000000 candidates, CUDA stage and transfer measurements.
+lab/build/vscode-cuda129-preset/Release/aismixer_lab_geo.exe --benchmark --domain lab/geo/profiles/black_sea_demo.yaml --seed 42
+```
+
+The output directory stays under ignored build output. Generate a new filename
+for each export: existing destinations are refused. Publication uses a unique
+same-directory temporary file and a no-replace final operation; handled failures
+clean up the temporary file. Forced termination can leave a uniquely named
+temporary file, and arbitrary stdout writes cannot be rolled back.
+
+Simulation ticks determine physical motion, execution time measures calculation,
+and future playback acceleration A will control delivery only. Future population
+P and receiver multiplicity D define separate workload axes. Synthetic ingress
+stress is distinct from physically constrained RF experiments. Seed/replay,
+precision, memory/batch and future RF/network contracts are in
+[GPU_FIRST_ARCHITECTURE.md](lab/docs/GPU_FIRST_ARCHITECTURE.md); actual qualification
+and benchmark results are recorded in [B31_ACCEPTANCE.md](lab/docs/B31_ACCEPTANCE.md).
+
+Recorded B3.1 acceptance on Windows / VS2022 / CUDA 12.9.86 / GTX 1050 Ti
+`sm_61` initially passed **14/14 Release CTests**, including the historical nine,
+with both YAML operators and Python enabled. Corrective closure passed
+**16/16** with the same options, including permanent Unicode paths, checked
+CSV output, no-clobber NMEA publication, mixed compaction, independent Philox
+and profile-pin/alternate-profile checks. The independent ECEF/ENU oracle observed 0.245858 m maximum
+discrepancy against the 0.30 m tested-envelope budget. This is predominantly
+linear-tangent versus ECEF/ENU model discrepancy, plus rounding, rather than
+observed GPU numerical error. Qualified builds use CUDA `--fmad=false`; floating
+point results/digests are not promised across arbitrary flags or toolchains.
+The million-candidate
+benchmark accepted 375000 reports, transferred 24 MB of compact records and
+measured 51.8214 ms median steady wall time (three runs after warmup). These
+are measurements for that configuration, without a CPU speedup claim.

@@ -1,0 +1,35 @@
+schema_version: 1
+profile_id: black_sea_illustrative_wikidata_v1
+provenance: >-
+  COARSE ILLUSTRATIVE DEMO from community-maintained Wikidata P625 settlement
+  records retrieved 2026-10-14, rounded to 0.01 degree. Original coordinates,
+  pinned revisions, selection policy and varying source precision are recorded
+  in geo/profiles/PROVENANCE.md. These are representative settlement points,
+  not surveyed shoreline positions, a coastline, a water mask, a navigational
+  chart, or evidence of geographic accuracy. Source precision is not improved
+  by encoding coordinates as integer nanodegrees.
+coordinate_units: nanodegrees
+coordinate_order: longitude_latitude
+datum: WGS84
+ring_closure: explicit
+boundary: inclusive
+# Straight longitude/latitude edges can include land and exclude real water.
+# Sources and rounding are recorded in PROVENANCE.md; closure repeats Durankulak.
+ring:
+  - {label: Durankulak, longitude_ndeg: 28530000000, latitude_ndeg: 43690000000}
+  - {label: Shabla, longitude_ndeg: 28530000000, latitude_ndeg: 43540000000}
+  - {label: Kavarna, longitude_ndeg: 28340000000, latitude_ndeg: 43440000000}
+  - {label: Balchik, longitude_ndeg: 28170000000, latitude_ndeg: 43410000000}
+  - {label: Varna, longitude_ndeg: 27910000000, latitude_ndeg: 43210000000}
+  - {label: Burgas, longitude_ndeg: 27470000000, latitude_ndeg: 42500000000}
+  - {label: Istanbul, longitude_ndeg: 28960000000, latitude_ndeg: 41010000000}
+  - {label: Trabzon, longitude_ndeg: 39720000000, latitude_ndeg: 41010000000}
+  - {label: Batumi, longitude_ndeg: 41640000000, latitude_ndeg: 41650000000}
+  - {label: Sochi, longitude_ndeg: 39720000000, latitude_ndeg: 43590000000}
+  - {label: Novorossiysk, longitude_ndeg: 37770000000, latitude_ndeg: 44720000000}
+  - {label: Sevastopol, longitude_ndeg: 33520000000, latitude_ndeg: 44610000000}
+  - {label: Odesa, longitude_ndeg: 30730000000, latitude_ndeg: 46480000000}
+  - {label: Sulina, longitude_ndeg: 29650000000, latitude_ndeg: 45160000000}
+  - {label: Constanta, longitude_ndeg: 28650000000, latitude_ndeg: 44180000000}
+  - {label: Mangalia, longitude_ndeg: 28580000000, latitude_ndeg: 43820000000}
+  - {label: Durankulak, longitude_ndeg: 28530000000, latitude_ndeg: 43690000000}

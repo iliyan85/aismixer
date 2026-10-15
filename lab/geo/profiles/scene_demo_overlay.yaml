@@ -1,0 +1,16 @@
+schema_version: 1
+coordinate_units: nanodegrees
+coordinate_order: longitude_latitude
+datum: WGS84
+projection: wgs84_tangent_linear_v1
+anchor_reference: actor_tick_zero
+# Synthetic tick-zero locations for every actor in scenes/demo.yaml.
+# East/north displacement is vx/vy * absolute_tick * tick_seconds. Original
+# local x_mm/y_mm remain B2 state; they are not added to these anchors again.
+anchors:
+  - {actor_id: 10, longitude_ndeg: 32000000000, latitude_ndeg: 43000000000}
+  - {actor_id: 20, longitude_ndeg: 32001000000, latitude_ndeg: 43001000000}
+  - {actor_id: 30, longitude_ndeg: 32002000000, latitude_ndeg: 43002000000}
+  - {actor_id: 40, longitude_ndeg: 32003000000, latitude_ndeg: 43003000000}
+  - {actor_id: 50, longitude_ndeg: 32004000000, latitude_ndeg: 43004000000}
+  - {actor_id: 60, longitude_ndeg: 32005000000, latitude_ndeg: 43005000000}

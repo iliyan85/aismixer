@@ -1,0 +1,12 @@
+schema_version: 1
+coordinate_units: nanodegrees
+coordinate_order: longitude_latitude
+datum: WGS84
+height_datum: WGS84_ellipsoid
+# Unverified synthetic passive sites, not actual AIS receiver installations.
+# Antenna values are antenna-point heights above the WGS84 ellipsoid, not
+# above-ground heights or mean-sea-level heights. No RF/coverage is computed.
+receivers:
+  - {receiver_id: 1, longitude_ndeg: 27950000000, latitude_ndeg: 43200000000, antenna_height_mm: 25000}
+  - {receiver_id: 2, longitude_ndeg: 28630000000, latitude_ndeg: 44180000000, antenna_height_mm: 30000}
+  - {receiver_id: 3, longitude_ndeg: 39730000000, latitude_ndeg: 43600000000, antenna_height_mm: 15000}
