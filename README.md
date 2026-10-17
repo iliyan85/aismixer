@@ -911,3 +911,14 @@ The million-candidate
 benchmark accepted 375000 reports, transferred 24 MB of compact records and
 measured 51.8214 ms median steady wall time (three runs after warmup). These
 are measurements for that configuration, without a CPU speedup claim.
+
+## R0: recorded runtime foundation (opt-in)
+
+R0 adds exact simulation time, causal event ordering, a bounded portable journal,
+per-receiver recorded NMEA playback and output contracts. Its separate operator
+is enabled with `-DAISMIXER_LAB_BUILD_RUNTIME_RUNNER=ON`. Only an explicitly
+labeled synthetic infrastructure fixture is generated; AIS radio/TDMA,
+cylinder placement and UDP remain future work. The test-only CUDA bridge checks
+real transfer/compaction without calculating RF outcomes. Build commands,
+journal wire format, CLI examples and resource limits are in
+[R0_RUNTIME_FOUNDATION.md](lab/docs/R0_RUNTIME_FOUNDATION.md).

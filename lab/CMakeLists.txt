@@ -213,8 +213,51 @@ if(AISMIXER_LAB_BUILD_GEO_RUNNER)
         AISMIXER_LAB_GEO_BUILD_INFO="MSVC_${CMAKE_CXX_COMPILER_VERSION}_CUDA_${CMAKE_CUDA_COMPILER_VERSION}_arch_${_lab_geo_architectures}")
 endif()
 
+# R0 is additive: the host runtime validates finalized NMEA bytes without an
+# encoder or CUDA/YAML backend. The synthetic device bridge is test-only.
+add_library(aismixer_lab_runtime STATIC
+    runtime/time.cpp runtime/event.cpp runtime/scheduler.cpp runtime/fixture.cpp
+    runtime/journal.cpp runtime/output.cpp runtime/playback.cpp runtime/rf_contract.cpp)
+target_include_directories(aismixer_lab_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
+set_target_properties(aismixer_lab_runtime PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aismixer_lab_runtime PRIVATE /utf-8 /W4)
+option(AISMIXER_LAB_BUILD_RUNTIME_RUNNER "Build the R0 synthetic fixture/recorded playback operator (no RF or networking)" OFF)
+if(AISMIXER_LAB_BUILD_RUNTIME_RUNNER)
+    add_executable(aismixer_lab_runtime_runner runtime/cli_main.cpp)
+    target_link_libraries(aismixer_lab_runtime_runner PRIVATE aismixer_lab_runtime)
+    set_target_properties(aismixer_lab_runtime_runner PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_options(aismixer_lab_runtime_runner PRIVATE /utf-8 /W4)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
+    target_compile_definitions(aismixer_lab_runtime PRIVATE AISMIXER_LAB_RUNTIME_JOURNAL_TESTING)
+    foreach(_runtime_test core journal playback rf_contract)
+        add_executable(aismixer_lab_runtime_${_runtime_test}_tests tests/runtime_${_runtime_test}_tests.cpp)
+        target_link_libraries(aismixer_lab_runtime_${_runtime_test}_tests PRIVATE aismixer_lab_runtime)
+        set_target_properties(aismixer_lab_runtime_${_runtime_test}_tests PROPERTIES
+            CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+        target_compile_options(aismixer_lab_runtime_${_runtime_test}_tests PRIVATE /utf-8 /W4)
+        add_test(NAME aismixer_lab_runtime_${_runtime_test}_test
+            COMMAND aismixer_lab_runtime_${_runtime_test}_tests "${CMAKE_CURRENT_BINARY_DIR}/runtime-${_runtime_test}-tests")
+        set_tests_properties(aismixer_lab_runtime_${_runtime_test}_test PROPERTIES
+            LABELS "host;runtime" TIMEOUT 120 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+    endforeach()
+    target_compile_definitions(aismixer_lab_runtime_journal_tests PRIVATE AISMIXER_LAB_RUNTIME_JOURNAL_TESTING)
+    add_executable(aismixer_lab_runtime_cuda_bridge_tests tests/runtime_cuda_bridge_tests.cu)
+    target_link_libraries(aismixer_lab_runtime_cuda_bridge_tests PRIVATE aismixer_lab_runtime CUDA::cudart)
+    set_target_properties(aismixer_lab_runtime_cuda_bridge_tests PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO
+        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES CUDA_EXTENSIONS NO CUDA_RUNTIME_LIBRARY Shared)
+    target_compile_options(aismixer_lab_runtime_cuda_bridge_tests PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+    # CUDA's VS task appends its own host warning flag after AdditionalOptions.
+    # Set its metadata too, so the default inherited /W1 cannot override /W4.
+    set_property(SOURCE tests/runtime_cuda_bridge_tests.cu PROPERTY VS_SETTINGS "Warning=W4")
+    add_test(NAME aismixer_lab_runtime_cuda_bridge_test COMMAND aismixer_lab_runtime_cuda_bridge_tests)
+    set_tests_properties(aismixer_lab_runtime_cuda_bridge_test PROPERTIES LABELS "GPU;runtime" TIMEOUT 60)
     add_test(NAME aismixer_lab_gpu_self_test COMMAND aismixer_lab_gpu_smoke --self-test)
     set_tests_properties(aismixer_lab_gpu_self_test PROPERTIES LABELS GPU TIMEOUT 120)
     # Launch-shape control exists only for the B2 validation build, not its API.
@@ -263,6 +306,14 @@ if(BUILD_TESTING)
         PROPERTIES LABELS "host;AIS" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        if(AISMIXER_LAB_BUILD_RUNTIME_RUNNER)
+            add_test(NAME aismixer_lab_runtime_cli_oracle_test
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_cli_oracle.py"
+                --exe $<TARGET_FILE:aismixer_lab_runtime_runner>
+                --work-dir "${CMAKE_CURRENT_BINARY_DIR}/runtime-cli-tests")
+            set_tests_properties(aismixer_lab_runtime_cli_oracle_test PROPERTIES
+                LABELS "host;runtime" TIMEOUT 120 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+        endif()
         add_test(NAME aismixer_lab_ais_wire_oracle_test
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ais_wire_oracle.py"
             --exe $<TARGET_FILE:aismixer_lab_ais_smoke>)
