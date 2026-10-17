@@ -430,3 +430,406 @@ identity, full tuple fields and canonical host sorting matched. This measures
 only a synthetic transfer/compaction contract; it establishes no RF accuracy
 or CPU/GPU speedup. Remaining radio/protocol/geography/network behavior and
 the explicit bounded-identity limits above require subsequent milestones.
+
+## R0.1 contract closure: decisions frozen before implementation
+
+Initial branch `lab`, clean HEAD `01288cfac2e4cff14a44e7c4dbde8e69f980daf5`.
+The existing Release baseline passed 22/22 before edits (27.68 s). This addendum
+supersedes R0's requirement to partition long traffic histories **only for the
+explicit opt-in StreamingV2 profile**. LegacyV1 remains the default.
+
+| Decision | Implemented in this closure | Deferred / reason |
+| --- | --- | --- |
+| D1 identity | StreamingV2 requires injective `tx:<producer>:<counter>` / `rx:<producer>:<counter>` IDs; producer equals creation-event source, uses <=32 ASCII letters/digits/underscore/dot/hyphen, counter is canonical positive u64 and strictly increases separately for TX/RX. At most 1024 stable producers retain highwaters forever; only active correlations retire. | Arbitrary-string v1 retains its original finite identity catalog; bounded RAM cannot prove arbitrary historical string uniqueness without an index. No ID recycling or probabilistic hash proof. |
+| D2 watermark | Half-open event commit W remains irreversible. A separate stateful RF input/result horizon tracks registered in-flight context, finite coverage obligations and materialized feedback. Explicit resolution closes correlations only after TX end, coverage completion and output disposition. | RF physics and choosing scientifically valid resolution horizons. |
+| D3 local knowledge | Typed receiver role/owner registry and router admit observations only to an enabled transceiver radio's own station. Passive terrestrial interfaces never produce station-decision input. Journal events are not protocol-input tokens. | Durable ownership proof/catalog is not claimed by v1 or the narrow StreamingV2 identity profile; a future separately versioned ownership profile is required. |
+| D4 producers | Bounded producer hold/release in availability/phase/semantic-key order assigns event sequences at release. Scheduler rejects enqueue phase inversions and offers pending-time inspection; RF barriers reject unresolved/unmaterialized feedback. | Actual decentralized station machines and TDMA decisions. |
+| D5 RF geometry | Document immutable TX-time snapshots, registry lifetimes/deltas, position time, units, power and height datums; keep existing 64-byte CUDA bridge compatible. | Physical parameter schema and real computation await RF implementation; no ellipsoid/AMSL equivalence or 20 km B3.1 extension. |
+| D6 persistence | Existing v1 bytes, framing and fixture stay unchanged. Opt-in envelope/segment version 2 with manifest profile tag 2 selects event schema 2 and shared streaming validation. Checkpoint/CRC/FNV algorithms remain unchanged; reader accepts both and rejects mixed/future versions. | General format redesign, database index and resumable writer are unnecessary for this bounded correction. |
+
+Streaming schema 2 extends TransmissionStart with an explicit bounded coverage
+roster and a finite latest-availability horizon. New typed records represent
+no-reception dispositions, successful reception with explicitly omitted output,
+and final TX resolution. Resolution is bookkeeping phase 6 after existing phases
+0..5, never a radio decision. Active TX/RX, pair obligations and typed anchors
+have explicit capacities; live lifecycle/TX/reception/reservation anchors survive
+the generic 4096-event recent window. Arbitrary old unanchored causes still fail.
+Retirement never substitutes an elapsed TTL or a count threshold for completion.
+
+NMEA hardening binds the first observed canonical AIS payload bits per active
+TX and compares subsequent receiver outputs, allowing receiver-local fragment
+presentation differences. It verifies TX channel and cross-receiver content;
+it does **not** claim equality with unseen external `payload_reference` bits.
+No actual RF, TDMA, UDP, cylinder, GIS or new geographic model is authorized.
+
+### R0.1 executable invariants and source map
+
+D1: [event.h](../runtime/event.h), [event.cpp](../runtime/event.cpp) define both
+profiles. The domain prefix plus colon-free producer and canonical decimal u64
+is an injective encoding. A creation event's source must equal its ID producer;
+its TX or RX counter must exceed that producer's retained highwater. Separate
+TX/RX counters and event source highwaters persist for the entire run and are
+never evicted. At most 1024 stable producers are permitted. Reusing an old ID
+after active retirement therefore fails without an all-history identity set.
+The independent reader reconstructs the same proof from the beginning across
+every segment. Writer resume/append to an existing run remains unsupported.
+
+Streaming active limits are 1024 TX, 4096 receptions, 65536 TX/receiver pairs,
+512 sorted unique receiver IDs per TX coverage, 4096 lifecycle/map/reservation
+entries per catalog, and 4096 generic recent events. Typed anchors retain
+current lifecycle, open correlation, map/reset and reservation evidence beyond
+that recent window. The latest carrier anchor for a TX/receiver supersedes its
+older carrier anchor; older arbitrary references then use the recent-window
+policy. A typed anchor is created only from a validated published event, never
+from a caller-supplied dangling ID. TX end removes the per-station open-TX
+index, not the remaining reception obligations. Final resolution removes active
+TX, results, pair evidence and their typed anchors together only after every
+candidate pair has a final disposition and every successful RX has NMEA or an
+explicit `ReceptionNoOutput`. Zero decoded receptions is a valid closed result.
+Coverage horizons bound RF availability; they are not elapsed-time retirement.
+Metrics report active/anchor counts and recent history separately, not RSS.
+
+D2/D4: [scheduler.h](../runtime/scheduler.h),
+[scheduler.cpp](../runtime/scheduler.cpp),
+[rf_contract.h](../runtime/rf_contract.h),
+[rf_contract.cpp](../runtime/rf_contract.cpp). The source enqueue guard compares
+the same time/phase/source/sequence order as canonical drain, so a phase
+inversion fails before insertion and leaves earlier valid queued work usable.
+`next_pending_time()` is observational. `accepted_event(id)` returns an exact
+bounded pending/retained snapshot copy; pending acceptance is not proof of
+publication. `has_dispatched(id)` supplies a bounded source progress query for
+private known-enqueued producer tokens; because sequence gaps are legal, it is
+not an arbitrary EventId membership oracle.
+
+`RfCausalBoundary::attach` installs a state-backed producer barrier before the
+first advance and before registering RF work. Fresh TX must start at/after
+event W and RF H. Its ID/start snapshot, interval, channel, payload reference,
+coverage and horizon must match the Scheduler's actual accepted TX start;
+the end anchor must match its accepted TX end. A registered context can then
+span multiple RF slices with start < W. `context(id)` supplies that same
+immutable work; it never republishes a TransmissionStart. Context retirement
+preserves producer highwaters and requires end, closed obligations, materialized
+discoveries and H strictly beyond its coverage deadline (or explicit terminal).
+
+H is a monotonic half-open **no more discoveries with availability < H**
+producer assertion, distinct from event W. `resolve_before(H)` rejects overdue
+missing final dispositions; all pending discoveries below a proposed W must
+be materialized before Scheduler can advance. Late discoveries fail. Final
+dispositions are Decoded, Failed, NotAudible or NotScheduled; missing evaluation
+is an open obligation, never an implicit failure/success. Pending discoveries
+are bounded at 65536 and sorted by availability, phase, receiver, TX,
+disposition and stable semantic key before event/RX sequences are assigned.
+The public barrier checks before and after phase feedback; failure after any
+published prefix seals the scheduler. Terminal handling includes INT64_MAX.
+
+For example, the synthetic contract test registers one TX [0,100] with known
+coverage, carries the same context across W=20/50 and later slices, delivers an
+own-radio carrier at 25, and enqueues its explicitly injected phase-3 decision
+at the same instant after phase 1. It then closes final pair dispositions at
+110 and resolves at 120 before W=121. Reversed discovery order and alternate
+event-watermark boundaries produce the same canonical bytes. These are symbolic units,
+not propagation or AIS scheduling predictions. An RF producer must stop at
+each feedback frontier before extending H if that feedback may create a new
+TX. An arbitrary whole-minute RF assertion is not a valid substitute.
+
+D3: `ReceiverRegistry`, `ReleasedRfObservation`, `LocalObservationRouter` and
+`LocalRfObservation` in [rf_contract.h](../runtime/rf_contract.h). The bounded
+immutable registry requires a registered owner for TransceiverRadio and no
+owner for PassiveTerrestrial. The router accepts only a privately minted
+producer token bound to that exact catalog and Scheduler, after semantic
+dispatch, at/after availability, for the enabled radio's exact owner. Passive,
+disabled, cross-owner, pending and no-evaluation injections fail. Its local
+result exposes only owner, RX interface, availability, disposition, an opaque
+causal receipt and (only on decode) the immutable decoded payload reference.
+It exposes no global Event, TX identity or ground-truth journal interface.
+The attached Scheduler must stay alive and unmoved for all token/router calls. This is an
+in-memory ownership boundary, not durable owner proof in either current format.
+
+D5: the future RF physical schema must specify `tx_position_time_units` and an
+immutable registry revision/snapshot retained until final RF resolution;
+WGS84 longitude/latitude in nanodegrees; station altitude in ellipsoidal mm;
+antenna offset and explicit ellipsoid/AMSL/AGL datum; transmit power/EIRP with
+declared units (proposed milli-dBm), antenna gain/pattern/polarization/reference
+frame, losses, receiver sensitivity/noise bandwidth/channel and enabled
+timeline. Conducted power plus gains/losses must not be counted twice as EIRP.
+Motion interpolation endpoints and position timestamps must be explicit.
+Propagation/processing delays need a versioned deterministic quantization to
+9830400 units/s, with a strictly positive representable carrier delay. The
+one-unit minimum here asserts ordering only, not a physical signal speed.
+Persistent GPU registry state and changed H2D snapshots are the intended
+boundary. None of these physical fields/calculations is implemented by current
+`RfTransmissionWork` schema 1 or the additive schema-2 causal boundary. B3.1's
+<=1 km approximation is not a 10-20 km placement method.
+
+D6: [journal.h](../runtime/journal.h), [journal.cpp](../runtime/journal.cpp).
+LegacyV1 is still the default; its fixture source and wire bytes are unchanged.
+The four correctness fixes apply to legacy validation too, including channel
+and cross-receiver AIS-bit consistency. Previously accepted contradictory
+records are errors; no valid historical golden is redefined. First observed
+finalized NMEA binds observed TX bits, not unseen external payload bytes.
+
+StreamingV2 explicitly uses envelope and segment version u16=2, unchanged
+magic/names/LE framing/timebase, and initial manifest **profile tag u32=2 before
+the old status byte**. Remaining metadata, checkpoint64 and terminal33 payloads
+are unchanged. Every event must have schema u32=2. Kind10 appends roster-count
+u32, receiver strs and resolution-horizon i64 after the existing payload
+reference; there is no optional flag on wire. Kind17 is TX str, receiver str,
+NoReceptionReason u8 (1 NotAudible / 2 NotScheduled), detail str. Kind18 is
+receiver str, reception str, TX str, reason str. Kind19 is TX str, horizon i64.
+Kinds17/18 use phases2/5; kind19 uses bookkeeping phase6. V1 rejects these
+extensions. Reader rejects mixed schemas/versions, unknown profile tags and
+future versions. CRC32C, logical FNV, chain and publication remain unchanged.
+`finish()` now publishes valid buffered records/checkpoint before terminal
+validation; unfinished RF/TX/output leaves an inspectable INCOMPLETE prefix,
+never a false COMPLETE.
+
+Future durable ownership sketch (unsupported new profile tag, not a v2
+extension accepted today): receiver ID, role u8, optional owner station ID,
+catalog revision, station catalog, effective simulation time and versioned
+lifecycle/ownership deltas, bound to the model/registry snapshot. Such metadata
+must be versioned and validated on replay before claiming durable local-owner
+proof. Current v1 `local_station_id` strings do not provide that proof.
+
+Multi-receiver playback remains one logical stream per receiver/endpoint. A
+future synchronized dispatcher must scan one journal using **one shared clock
+origin/deadline mapping for all receivers**, with independent bounded sinks.
+Running separate single-receiver CLI processes is not synchronized fan-out.
+The full multi-sink player and UDP remain deferred. Five-hour playback checks
+use an injected clock; no five-hour actual wall wait is claimed.
+
+### R0.1 acceptance evidence (2026-10-17)
+
+The final environment was native Windows 11, Visual Studio 2022 x64,
+MSVC 19.44.35229.0, CUDA 12.9.86, Pascal sm_61 and an actual NVIDIA GeForce
+GTX 1050 Ti with 4 GB VRAM. Existing `/utf-8`, `/W4`, toolchain, local YAML
+dependency and private presets were retained. Both build directories were
+freshly configured for this closure. No packages were installed.
+
+| Executed gate | Result |
+| --- | --- |
+| Initial existing R0 Release suite | PASS 22/22, 27.68 s, before edits |
+| Primary fresh Release build and full CTest | PASS 27/27, 126.30 s |
+| Primary host label with `CUDA_VISIBLE_DEVICES=-1` | PASS 19/19, 99.16 s |
+| Independent fresh build, runtime label | PASS 11/11, 109.98 s |
+| Legacy CLI oracle across both fresh executables | PASS logical history and identical physical v1 bundle |
+| StreamingV2 independent Python oracle across both fresh executables | PASS logical history, receiver SHA256 and identical physical v2 bundle |
+| Short actual `SteadyPlaybackClock` playback of pre-existing R0 recording at x100 | PASS exact 49-byte R1 stdout, empty stderr, successful exit |
+| Five-hour actual wall-clock playback | NOT RUN; full five-hour x1/x10 tests use injected clocks |
+| Actual RF/TDMA/UDP or scientific radio validation | NOT RUN; outside this infrastructure closure |
+
+The full Release suite executed the following exact CTest names. H means also
+executed in the CUDA-hidden host gate; R means also executed in the independent
+runtime gate. Every listed test passed; a dash means outside that selected gate.
+
+| Exact CTest name | H | R |
+| --- | --- | --- |
+| `aismixer_lab_runtime_core_test` | PASS | PASS |
+| `aismixer_lab_runtime_journal_test` | PASS | PASS |
+| `aismixer_lab_runtime_playback_test` | PASS | PASS |
+| `aismixer_lab_runtime_rf_contract_test` | PASS | PASS |
+| `aismixer_lab_runtime_journal_v2_test` | PASS | PASS |
+| `aismixer_lab_runtime_rf_boundary_test` | PASS | PASS |
+| `aismixer_lab_runtime_streaming_test` | PASS | PASS |
+| `aismixer_lab_runtime_contract_test` | PASS | PASS |
+| `aismixer_lab_runtime_cuda_bridge_test` | - | PASS |
+| `aismixer_lab_gpu_self_test` | - | - |
+| `aismixer_lab_scene_self_test` | - | - |
+| `aismixer_lab_scene_host_test` | PASS | - |
+| `aismixer_lab_scene_cli_host_test` | PASS | - |
+| `aismixer_lab_scene_cli_gpu_test` | - | - |
+| `aismixer_lab_scene_cli_interactive_test` | - | - |
+| `aismixer_lab_ais_codec_test` | PASS | - |
+| `aismixer_lab_ais_smoke_test` | PASS | - |
+| `aismixer_lab_runtime_cli_oracle_test` | PASS | PASS |
+| `aismixer_lab_runtime_streaming_oracle_test` | PASS | PASS |
+| `aismixer_lab_ais_wire_oracle_test` | PASS | - |
+| `aismixer_lab_geo_host_test` | PASS | - |
+| `aismixer_lab_geo_output_test` | PASS | - |
+| `aismixer_lab_geo_gpu_test` | - | - |
+| `aismixer_lab_geo_unavailable_test` | PASS | - |
+| `aismixer_lab_geo_config_test` | PASS | - |
+| `aismixer_lab_geo_wire_oracle_test` | - | - |
+| `aismixer_lab_geo_cli_closure_test` | - | - |
+
+Targeted acceptance mapping (test file names map directly to CTest names above):
+
+| Requirement | Executed coverage |
+| --- | --- |
+| T1 enqueue phase inversion | `runtime_contract_tests.cpp`: immediate rejection, legal phase progression and subsequent usable queue; existing core phase-group regressions retained |
+| T2 accepted incomplete prefix | `runtime_journal_tests.cpp` and `runtime_journal_v2_tests.cpp`: open TX, multiple accepted records, segment limits 1/default, no COMPLETE, verified incomplete reader and no-clobber |
+| T3 NMEA/TX consistency | `runtime_contract_tests.cpp`: wrong channel, changed payload/fill, fragment reassembly/order and valid receiver presentation differences; old B3/v1 independent oracles |
+| T4 positive carrier availability | `runtime_rf_contract_tests.cpp` and `runtime_rf_boundary_tests.cpp`: equality rejection, +1 success, decode-before-end, negative/MAX arithmetic |
+| T5 in-flight context | `runtime_rf_boundary_tests.cpp`: registered TX spanning slices, one start, later result, retroactive/unregistered/snapshot mismatch rejection |
+| T6 simultaneous TX | `runtime_rf_boundary_tests.cpp`: two same-channel TX, independent explicit failed dispositions, reversed discovery order; ordering only |
+| T7 causal feedback/release | `runtime_rf_boundary_tests.cpp`: own-radio carrier causes an injected same-instant phase-3 decision, late feedback/barrier bypass rejection, alternate event-watermark steps give equal bytes |
+| T8 continuous five hours | `runtime_streaming_tests.cpp` and `runtime_streaming_oracle.py`: one validator/writer per run, 10800 TX/32400 RX, bounded streaming, x1/x10 injected-clock playback |
+| T9 retired identity reuse | `runtime_contract_tests.cpp` and `runtime_journal_v2_tests.cpp`: TX/RX reuse after retirement/segment boundaries, independent reader rejects valid-CRC semantic forgeries and reorder |
+| T10 local ownership | `runtime_rf_boundary_tests.cpp`: exact owner/registry binding, passive/cross-owner/disabled/pending/global injection rejection, filtered local result type |
+| T11 legacy compatibility | `runtime_cli_oracle.py`, old journal tests and manual playback of pre-existing v1 recording; v1 bytes/digest unchanged |
+| T12 full/host/GPU | All 27 tests above; CUDA-hidden host 19; actual bridge block64/block256 |
+| T13 segments/builds | Native 127/coarse, 4096/fine, 127/fine recordings; independent Python reads and cross-build bundle comparison |
+| T14 timeline/terminal/output | Existing core/playback/CLI tests plus signed-endpoint RF tests: negative/MAX, terminal drain, simultaneous phases and closed stdout |
+
+The five-hour fixture in [streaming_fixture.cpp](../runtime/streaming_fixture.cpp)
+is loudly labeled **INFRASTRUCTURE TEST -- NOT AIS RF SIMULATION**. Symbolic
+station A emits every 10 simulation seconds and B every 2 seconds, solely as
+load examples. Every TX has three scripted successful receptions and outputs;
+these are neither AIS reporting rules nor RF predictions. The generator holds
+at most two TX/eighteen draft events in each two-second window, assigns source
+sequences after canonical sorting, and never resets a run to evade capacity.
+
+| Observed quantity | Result |
+| --- | --- |
+| Continuous simulation duration | 18000 s (5 h) |
+| Run-global unique TX / reception IDs | 10800 / 32400 |
+| Canonical records | 97210 |
+| Segment-record limit 127 | 766 segments, 1534 total files, 19067015 bytes |
+| Segment-record limit 4096 | 24 segments, 50 total files, 18969071 bytes |
+| Peak validator active TX / RX / receiver pairs | 2 / 6 / 6 |
+| Peak validator typed anchors | 15 |
+| Retained generic recent-event cache | 4096 |
+| Output per each of three passive receivers | 10800 NMEA records, 529200 bytes |
+| Logical FNV64, new StreamingV2 golden | `7805b698778edaca` |
+| Per-receiver NMEA FNV64 | `c022d14ec8edd1d5` |
+
+These metrics instrument validator objects, not process RSS or device memory.
+Both Scheduler and journal validation are exercised; the reader reconstructs
+the same bounded identity/causal rules. The independent Python oracle uses
+standard-library parsing, its own CRC32C and structural checks, literal NMEA
+goldens and bounded live correlation state. Its `active_peak=8` counts TX+RX,
+so it is a different metric from native typed-anchor count. It does not call
+the native decoder or encoder to compute expected bits/bytes.
+
+Changing valid watermark steps left all physical files identical at the same
+segment limit. Changing segmentation left canonical event bytes/digest and
+receiver output unchanged. Two independently built executables also produced
+identical physical bundles at limit 4096. Bundle hash construction remains
+sorted ASCII filename + NUL + file bytes, concatenated:
+
+```text
+StreamingV2 logical FNV64: 7805b698778edaca
+StreamingV2 bundle SHA256: bffbd8ece5c0086923c09916fa989a4ad89817cee4677cf1c30acec33f9dca1d
+Each receiver SHA256:     dd9054ad8b67b02a421c7aedb4dcfdae5cecb6a6444c0e510bfcf60ec438eab9
+LegacyV1 logical FNV64:   728b400ac805d49b
+LegacyV1 bundle SHA256:   a7b1cec81abca2a99be19268f955d9e19cf0dd11636bb3056d377f827e9692f3
+```
+
+The v1 reference source `fixture.cpp`, its old CLI oracle and its existing
+recording were not edited. The new CLI still reads that old recording. B1
+`d3901485badba404`, B2 `7aad5e9c764012e3` (23 events), all five B3 complete
+bit/NMEA goldens (Types 1/4/9/18/21), and qualified B3.1
+`48dec953d3129a2d` with exact 392-byte NMEA passed unchanged. The real CUDA
+bridge again matched blocks 64/256: H2D 36936 bytes, compact D2H 21888 bytes
+plus 4-byte count, 513 candidates/342 selected. This measures transfer and
+compaction only; no physical RF behavior or speedup claim follows.
+
+Commands used for configuration and acceptance (from repository root; the
+existing private preset was used without modification):
+
+```powershell
+$r01CMake = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+$r01CTest = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe'
+& $r01CMake --preset cuda129-pascal -S lab -B lab/build/codex-r01-runtime -DAISMIXER_LAB_BUILD_GEO_RUNNER=ON -DAISMIXER_LAB_BUILD_RUNTIME_RUNNER=ON -DBUILD_TESTING=ON
+& $r01CMake --build lab/build/codex-r01-runtime --config Release --parallel 4
+& $r01CMake --preset cuda129-pascal -S lab -B lab/build/codex-r01-runtime-independent -DAISMIXER_LAB_BUILD_GEO_RUNNER=ON -DAISMIXER_LAB_BUILD_RUNTIME_RUNNER=ON -DBUILD_TESTING=ON
+& $r01CMake --build lab/build/codex-r01-runtime-independent --config Release --parallel 4 --target aismixer_lab_runtime_runner aismixer_lab_runtime_core_tests aismixer_lab_runtime_journal_tests aismixer_lab_runtime_playback_tests aismixer_lab_runtime_rf_contract_tests aismixer_lab_runtime_journal_v2_tests aismixer_lab_runtime_rf_boundary_tests aismixer_lab_runtime_streaming_tests aismixer_lab_runtime_contract_tests aismixer_lab_runtime_cuda_bridge_tests
+& $r01CTest --test-dir lab/build/codex-r01-runtime -C Release --output-on-failure --output-log lab/build/codex-r01-runtime/r01-full-ctest.log
+& $r01CTest --test-dir lab/build/codex-r01-runtime-independent -C Release -L runtime --output-on-failure --output-log lab/build/codex-r01-runtime-independent/r01-runtime-ctest.log
+$env:CUDA_VISIBLE_DEVICES = '-1'
+& $r01CTest --test-dir lab/build/codex-r01-runtime -C Release -L host --output-on-failure --output-log lab/build/codex-r01-runtime/r01-host-ctest.log
+python lab/tests/runtime_cli_oracle.py --exe lab/build/codex-r01-runtime/Release/aismixer_lab_runtime_runner.exe --other-exe lab/build/codex-r01-runtime-independent/Release/aismixer_lab_runtime_runner.exe --work-dir lab/build/codex-r01-runtime/cross-v1-build-tests
+python lab/tests/runtime_streaming_oracle.py --exe lab/build/codex-r01-runtime/Release/aismixer_lab_runtime_runner.exe --other-exe lab/build/codex-r01-runtime-independent/Release/aismixer_lab_runtime_runner.exe --work-dir lab/build/codex-r01-runtime/cross-v2-build-tests
+lab/build/codex-r01-runtime/Release/aismixer_lab_runtime_runner.exe --play lab/build/codex-r0-runtime/r0-acceptance-fixture --receiver receiver.R1 --speed 100
+```
+
+The last command was captured by a Python subprocess assertion, including exact
+stdout bytes, empty stderr and exit status. No duration threshold was imposed.
+Recordings refuse existing destinations; use a new ignored directory to rerun
+either oracle. Full detailed output is preserved at
+`lab/build/codex-r01-runtime/r01-full-detail.log`; suite summaries are the
+three `r01-*-ctest.log` files named above. All generated artifacts remain under
+ignored build directories.
+
+### R0.1 final worktree and continuation decision
+
+Initial inspection found branch `lab` at
+`01288cfac2e4cff14a44e7c4dbde8e69f980daf5`, with empty status, empty diff and
+no untracked files. Final branch/HEAD are unchanged. No staging, commit, push,
+merge, branch switch, synchronization or remote operation was performed.
+There are exactly 16 modified tracked files and 7 new untracked source files:
+
+```text
+ M README.md
+ M lab/CMakeLists.txt
+ M lab/docs/R0_RUNTIME_FOUNDATION.md
+ M lab/runtime/cli_main.cpp
+ M lab/runtime/event.cpp
+ M lab/runtime/event.h
+ M lab/runtime/journal.cpp
+ M lab/runtime/journal.h
+ M lab/runtime/playback.cpp
+ M lab/runtime/rf_contract.cpp
+ M lab/runtime/rf_contract.h
+ M lab/runtime/scheduler.cpp
+ M lab/runtime/scheduler.h
+ M lab/tests/runtime_core_tests.cpp
+ M lab/tests/runtime_journal_tests.cpp
+ M lab/tests/runtime_rf_contract_tests.cpp
+?? lab/runtime/streaming_fixture.cpp
+?? lab/runtime/streaming_fixture.h
+?? lab/tests/runtime_contract_tests.cpp
+?? lab/tests/runtime_journal_v2_tests.cpp
+?? lab/tests/runtime_rf_boundary_tests.cpp
+?? lab/tests/runtime_streaming_oracle.py
+?? lab/tests/runtime_streaming_tests.cpp
+```
+
+The README change is two lines in the R0 section linking this addendum. CMake
+adds the fixture source and named acceptance gates. Existing tests keep their
+qualification assertions: the core test's formerly inconsistent B-channel TX
+with A-channel NMEA now uses A; its unsupported-schema test now uses 3 because
+2 is supported. No historical golden was changed. Baseline SHA256 comparison
+of all 81 tracked files plus both private configuration files found only the
+16 intended existing paths changed, no deletions, and 67 files byte-identical.
+Production, website, B1-B3.1 code/data, fixture license, old fixture, old CLI
+oracle, old CUDA bridge test and private config remain untouched.
+Final `git diff --check`, separate new-file whitespace checks, UTF-8/no-BOM/LF
+checks for the seven new files, and generated-file/scope checks passed. Nothing
+is staged. No build artifacts exist among the seven untracked source additions.
+
+Remaining limitations, ordered by impact on the next milestone:
+
+1. **Real radio/protocol correctness is still unimplemented.** No Class A
+   SOTDMA/ITDMA/RATDMA, RF interference/capture/path loss, cylinder placement,
+   extended geography, GIS, Inland AIS/ADN or UDP was built. Synthetic successes
+   cannot qualify an operating AIS network. The next milestone must independently
+   validate physical models and decentralized station behavior.
+2. **Future RF producers must honor the causal horizon assertion.** Current
+   barriers reject missing/unmaterialized known obligations and late feedback;
+   they cannot prove an external backend honestly supplied every relevant
+   interferer. Advance H at feedback frontiers, retain registry snapshots and
+   declare finite coverage before publication. The current CUDA bridge is not
+   that RF backend.
+3. **Ownership and RF geometry are not durable proofs yet.** The immutable
+   host registry/router is enforced now; either journal profile lacks a durable
+   owner/physical-state catalog. A future explicitly versioned profile must bind
+   those catalogs/deltas before replay can claim ownership/geometry validation.
+   The attached Scheduler must remain alive and unmoved for local token/router use.
+4. **Capacity and recovery limits remain explicit.** Streaming requires bounded
+   stable producers and the active limits above; it rejects overflow rather
+   than dropping observations. LegacyV1 retains its original finite arbitrary-ID
+   catalogs. Writer restart/resume, exhaustive power-loss behavior, authentication
+   and process RSS bounds are not established by these tests.
+5. **Live fan-out and timing qualification remain future work.** The one-clock
+   multi-receiver contract is specified, but the full multi-sink live player and
+   networking are deferred. Five-hour wall-clock operation and cross-GPU physical
+   bitwise equivalence were not tested.
+
+Recommendation: **CONTINUE** to a separately scoped real Class A/RF milestone
+using the bounded identity, ownership and causal boundaries here. Require that
+milestone's physical/TDMA/registry acceptance before describing the product as
+an AIS network simulator. No remaining R0.1 blocker was observed in the executed
+gates; operator review and any commit remain separate.
+
+Suggested concise commit message, **OPERATOR USE ONLY**:
+`lab: close R0 runtime identity and causal contracts`.

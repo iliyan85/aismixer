@@ -18,6 +18,12 @@ inline constexpr std::size_t kMaxEventTextBytes = 4096;
 inline constexpr std::size_t kMaxEventSources = 1024;
 inline constexpr std::size_t kCausalHistoryCapacity = 4096;
 inline constexpr std::size_t kLifecycleCapacity = 4096;
+inline constexpr std::size_t kMaxCoverageReceivers = 512;
+inline constexpr std::size_t kMaxActiveTransmissions = 1024;
+inline constexpr std::size_t kMaxActiveReceptions = 4096;
+inline constexpr std::size_t kMaxActiveReceiverPairs = 65536;
+
+enum class ValidationProfile : std::uint32_t { LegacyV1 = 1, StreamingV2 = 2 };
 
 struct ReceiverId { std::string value; };
 struct TransmissionId { std::string value; };
@@ -34,7 +40,8 @@ enum class EventKind : std::uint16_t {
     SlotMapInit = 5, SlotMapReset = 6, SlotReserve = 7, SlotRelease = 8,
     TdmaDecision = 9, TransmissionStart = 10, TransmissionEnd = 11,
     RfObservation = 12, ReceptionSuccess = 13, ReceptionFailure = 14,
-    ReceiverNmea = 15, OutputError = 16
+    ReceiverNmea = 15, OutputError = 16, RfNoReception = 17,
+    ReceptionNoOutput = 18, TransmissionResolved = 19
 };
 struct StationLifecycle { std::string station_id; };
 struct ReceiverLifecycle { ReceiverId receiver_id; };
@@ -45,12 +52,17 @@ struct SlotMapChange {
     std::string reason;
 };
 struct TdmaDecision { std::string station_id; std::string decision; };
+struct TransmissionCoverage {
+    std::vector<ReceiverId> candidate_receivers;
+    SimulationInstant resolution_horizon;
+};
 struct TransmissionStart {
     TransmissionId transmission_id;
     std::string station_id;
     std::uint8_t channel = 0;
     SimulationInstant end_time;
     std::string payload_reference;  // Immutable external payload identity, not NMEA.
+    std::optional<TransmissionCoverage> coverage;
 };
 struct TransmissionEnd { TransmissionId transmission_id; };
 struct RfObservation {
@@ -75,9 +87,27 @@ struct ReceiverNmea {
     std::vector<std::string> sentences;  // Exact finalized, ordered CRLF bytes.
 };
 struct OutputError { ReceiverId receiver_id; std::string code; std::string detail; };
+enum class NoReceptionReason : std::uint8_t { NotAudible = 1, NotScheduled = 2 };
+struct RfNoReception {
+    TransmissionId transmission_id;
+    ReceiverId receiver_id;
+    NoReceptionReason reason = NoReceptionReason::NotAudible;
+    std::string detail;
+};
+struct ReceptionNoOutput {
+    ReceiverId receiver_id;
+    ReceptionId reception_id;
+    TransmissionId transmission_id;
+    std::string reason;
+};
+struct TransmissionResolved {
+    TransmissionId transmission_id;
+    SimulationInstant resolution_horizon;
+};
 using EventPayload = std::variant<StationLifecycle, ReceiverLifecycle, SlotMapChange,
     TdmaDecision, TransmissionStart, TransmissionEnd, RfObservation,
-    ReceptionResult, ReceiverNmea, OutputError>;
+    ReceptionResult, ReceiverNmea, OutputError, RfNoReception, ReceptionNoOutput,
+    TransmissionResolved>;
 struct Event {
     std::uint32_t schema_version = kEventSchemaVersion;
     SimulationInstant time;
@@ -90,7 +120,8 @@ struct Event {
 };
 
 // Phase 0 lifecycle; 1 TX end/RF; 2 receptions; 3 station-local slot/TDMA;
-// 4 simultaneous TX starts; 5 NMEA/output. Same-phase events cannot be causes
+// 4 simultaneous TX starts; 5 NMEA/output; 6 schema2 resolution bookkeeping.
+// Same-phase events cannot be causes
 // of one another at the same instant, regardless of their display sort order.
 std::uint8_t causal_phase(EventKind kind);
 struct CanonicalLess { bool operator()(const Event& a, const Event& b) const; };
@@ -98,14 +129,29 @@ std::optional<ReceiverId> event_receiver(const Event& event);
 void validate_identity(const std::string& identity, const char* field);
 void validate_event(const Event& event);  // Shape, ranges and exact NMEA framing.
 void validate_receiver_nmea(const ReceiverNmea& output);
+TransmissionId make_transmission_id(const std::string& producer, std::uint64_t counter);
+ReceptionId make_reception_id(const std::string& producer, std::uint64_t counter);
 
-// Streaming bounded validator. References older than the 4096-event retained
-// window explicitly fail. Source sequences are positive and strictly increase.
-// Retained TX/reception and lifecycle catalogs have explicit 4096-entry bounds;
-// callers must partition runs rather than silently discard identity evidence.
+struct ValidatorStats {
+    std::size_t active_transmissions = 0;
+    std::size_t active_receptions = 0;
+    std::size_t active_receiver_pairs = 0;
+    std::size_t typed_anchors = 0;
+    std::size_t peak_active_transmissions = 0;
+    std::size_t peak_active_receptions = 0;
+    std::size_t peak_active_receiver_pairs = 0;
+    std::size_t peak_typed_anchors = 0;
+};
+
+// Profile1 preserves its4096-per-run TX/RX identity bounds and generic4096-event
+// cause window. Opt-in profile2 retains only active correlations and live typed
+// anchors, with run-global injective producer counters surviving retirement.
+// The latest carrier anchor per active TX/receiver supersedes an earlier one;
+// older arbitrary references remain subject to the generic recent window.
+// Source sequences are positive and strictly increase in canonical release order.
 class EventValidator {
 public:
-    EventValidator();
+    explicit EventValidator(ValidationProfile profile = ValidationProfile::LegacyV1);
     ~EventValidator();
     EventValidator(EventValidator&&) noexcept;
     EventValidator& operator=(EventValidator&&) noexcept;
@@ -115,6 +161,9 @@ public:
     void finish();
     std::size_t retained_history() const noexcept;
     std::size_t source_count() const noexcept;
+    ValidatorStats stats() const noexcept;
+    ValidationProfile profile() const noexcept;
+    std::optional<Event> retained_event(const EventId& event_id) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -1,6 +1,7 @@
 #include "rf_contract.h"
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
@@ -28,11 +29,31 @@ int main() {
                                          25000, "WGS84_ellipsoid"});
         r::validate_rf_submission(work);
         r::CompletedRfObservation carrier{{"rf:model", 1}, {"tx:A:1"}, {"receiver:R2"},
-            std::nullopt, r::from_seconds(0), r::DecodeDisposition::Undecoded, std::nullopt, "station:A"};
+            std::nullopt, {1}, r::DecodeDisposition::Undecoded, std::nullopt, "station:A"};
         r::CompletedRfObservation decoded{{"rf:model", 2}, {"tx:A:1"}, {"receiver:R1"},
             r::ReceptionId{"reception:T1:R1"}, r::from_seconds(1), r::DecodeDisposition::Decoded,
             "payload:1", std::nullopt};
         r::validate_rf_completion(work, {carrier, decoded});
+        invalid([&] { auto x=carrier; x.availability_time={0}; r::validate_rf_completion(work,{x}); }, "strictly after");
+        // Signed endpoints require no physical signal-speed assumption. One
+        // representable unit is the minimum allowed positive availability.
+        auto negative = work;
+        negative.commit_watermark = {std::numeric_limits<std::int64_t>::min()};
+        negative.transmissions[0].start = {std::numeric_limits<std::int64_t>::min()};
+        negative.transmissions[0].end = {-1};
+        auto negative_carrier = carrier;
+        negative_carrier.availability_time = {std::numeric_limits<std::int64_t>::min()+1};
+        r::validate_rf_completion(negative,{negative_carrier});
+        invalid([&] { auto x=negative_carrier; x.availability_time=negative.transmissions[0].start;
+            r::validate_rf_completion(negative,{x}); }, "strictly after");
+        auto maximum = work;
+        maximum.transmissions[0].start = {std::numeric_limits<std::int64_t>::max()-1};
+        maximum.transmissions[0].end = {std::numeric_limits<std::int64_t>::max()};
+        auto maximum_carrier = carrier;
+        maximum_carrier.availability_time = maximum.transmissions[0].end;
+        r::validate_rf_completion(maximum,{maximum_carrier});
+        invalid([&] { auto w=maximum; w.transmissions[0].start=w.transmissions[0].end;
+            r::validate_rf_completion(w,{maximum_carrier}); }, "interval");
         auto second_receiver = decoded;
         second_receiver.observation_id.sequence = 3;
         second_receiver.receiver_id = {"receiver:R2"};

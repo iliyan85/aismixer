@@ -48,7 +48,8 @@ void emit_event(std::ostream& diagnostics, const Event& event) {
     constexpr const char* names[]{"invalid", "station_on", "station_off", "receiver_on", "receiver_off",
         "slot_map_init", "slot_map_reset", "slot_reserve", "slot_release", "tdma_decision",
         "transmission_start", "transmission_end", "rf_observation", "reception_success",
-        "reception_failure", "receiver_nmea", "output_error"};
+        "reception_failure", "receiver_nmea", "output_error", "rf_no_reception",
+        "reception_no_output", "transmission_resolved"};
     const auto code = static_cast<unsigned>(event.kind);
     if (code == 0 || code >= sizeof(names) / sizeof(names[0])) throw std::invalid_argument("unsupported console event kind");
     std::ostringstream row;
@@ -140,9 +141,11 @@ ConsoleCategory console_category(EventKind kind) {
         case EventKind::SlotReserve: case EventKind::SlotRelease: return ConsoleCategory::SlotMap;
         case EventKind::TdmaDecision: return ConsoleCategory::Tdma;
         case EventKind::TransmissionStart: case EventKind::TransmissionEnd:
-        case EventKind::RfObservation: return ConsoleCategory::Rf;
-        case EventKind::ReceptionSuccess: case EventKind::ReceptionFailure: return ConsoleCategory::Reception;
-        case EventKind::ReceiverNmea: case EventKind::OutputError: return ConsoleCategory::Output;
+        case EventKind::RfObservation: case EventKind::TransmissionResolved: return ConsoleCategory::Rf;
+        case EventKind::ReceptionSuccess: case EventKind::ReceptionFailure:
+        case EventKind::RfNoReception: return ConsoleCategory::Reception;
+        case EventKind::ReceiverNmea: case EventKind::OutputError:
+        case EventKind::ReceptionNoOutput: return ConsoleCategory::Output;
     }
     throw std::invalid_argument("unrecognized runtime event kind for display");
 }

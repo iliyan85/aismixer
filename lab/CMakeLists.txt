@@ -217,7 +217,8 @@ endif()
 # encoder or CUDA/YAML backend. The synthetic device bridge is test-only.
 add_library(aismixer_lab_runtime STATIC
     runtime/time.cpp runtime/event.cpp runtime/scheduler.cpp runtime/fixture.cpp
-    runtime/journal.cpp runtime/output.cpp runtime/playback.cpp runtime/rf_contract.cpp)
+    runtime/journal.cpp runtime/output.cpp runtime/playback.cpp runtime/rf_contract.cpp
+    runtime/streaming_fixture.cpp)
 target_include_directories(aismixer_lab_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
 set_target_properties(aismixer_lab_runtime PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
@@ -234,7 +235,7 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
     target_compile_definitions(aismixer_lab_runtime PRIVATE AISMIXER_LAB_RUNTIME_JOURNAL_TESTING)
-    foreach(_runtime_test core journal playback rf_contract)
+    foreach(_runtime_test core journal playback rf_contract journal_v2 rf_boundary streaming contract)
         add_executable(aismixer_lab_runtime_${_runtime_test}_tests tests/runtime_${_runtime_test}_tests.cpp)
         target_link_libraries(aismixer_lab_runtime_${_runtime_test}_tests PRIVATE aismixer_lab_runtime)
         set_target_properties(aismixer_lab_runtime_${_runtime_test}_tests PROPERTIES
@@ -245,6 +246,7 @@ if(BUILD_TESTING)
         set_tests_properties(aismixer_lab_runtime_${_runtime_test}_test PROPERTIES
             LABELS "host;runtime" TIMEOUT 120 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
     endforeach()
+    set_tests_properties(aismixer_lab_runtime_streaming_test PROPERTIES LABELS "host;runtime;stress" TIMEOUT 300)
     target_compile_definitions(aismixer_lab_runtime_journal_tests PRIVATE AISMIXER_LAB_RUNTIME_JOURNAL_TESTING)
     add_executable(aismixer_lab_runtime_cuda_bridge_tests tests/runtime_cuda_bridge_tests.cu)
     target_link_libraries(aismixer_lab_runtime_cuda_bridge_tests PRIVATE aismixer_lab_runtime CUDA::cudart)
@@ -313,6 +315,12 @@ if(BUILD_TESTING)
                 --work-dir "${CMAKE_CURRENT_BINARY_DIR}/runtime-cli-tests")
             set_tests_properties(aismixer_lab_runtime_cli_oracle_test PROPERTIES
                 LABELS "host;runtime" TIMEOUT 120 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+            add_test(NAME aismixer_lab_runtime_streaming_oracle_test
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_streaming_oracle.py"
+                --exe $<TARGET_FILE:aismixer_lab_runtime_runner>
+                --work-dir "${CMAKE_CURRENT_BINARY_DIR}/runtime-streaming-cli-tests")
+            set_tests_properties(aismixer_lab_runtime_streaming_oracle_test PROPERTIES
+                LABELS "host;runtime;stress" TIMEOUT 300 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
         endif()
         add_test(NAME aismixer_lab_ais_wire_oracle_test
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ais_wire_oracle.py"

@@ -32,7 +32,14 @@ constexpr std::size_t kSegmentOverhead = kSegmentHeader + 4;
 constexpr std::uint64_t kFnvOffset = UINT64_C(14695981039346656037);
 
 [[noreturn]] void invalid(std::string_view reason) {
-    throw std::invalid_argument("Journal v1: " + std::string(reason));
+    throw std::invalid_argument("Journal: " + std::string(reason));
+}
+std::uint16_t file_version(ValidationProfile profile) {
+    switch (profile) {
+        case ValidationProfile::LegacyV1: return 1;
+        case ValidationProfile::StreamingV2: return 2;
+    }
+    invalid("unsupported validation profile");
 }
 class Crc {
 public:
@@ -127,6 +134,7 @@ void utf8_text(const std::string& value, std::size_t limit, const char* field) {
     }
 }
 void validate_metadata(JournalMetadata& metadata) {
+    (void)file_version(metadata.validation_profile);
     utf8_text(metadata.provenance, 4096, "provenance");
     utf8_text(metadata.model_version, 128, "model_version");
     utf8_text(metadata.codec_version, 128, "codec_version");
@@ -138,8 +146,22 @@ void validate_metadata(JournalMetadata& metadata) {
         if (index != 0 && metadata.receivers[index - 1] == metadata.receivers[index]) invalid("duplicate manifest receiver");
     }
 }
+void validate_catalog_event(const JournalMetadata& metadata, const Event& event) {
+    const auto known = [&](const ReceiverId& receiver) {
+        if (!std::binary_search(metadata.receivers.begin(), metadata.receivers.end(), receiver,
+            [](const ReceiverId& a, const ReceiverId& b) { return a.value < b.value; }))
+            invalid("event receiver absent from manifest catalog");
+    };
+    if (const auto receiver = event_receiver(event)) known(*receiver);
+    if (event.kind == EventKind::TransmissionStart) {
+        const auto& start = std::get<TransmissionStart>(event.payload);
+        if (start.coverage) for (const auto& receiver : start.coverage->candidate_receivers) known(receiver);
+    }
+}
 Bytes metadata_bytes(const JournalMetadata& metadata, const JournalOptions& options) {
     Bytes bytes;
+    if (metadata.validation_profile == ValidationProfile::StreamingV2)
+        number(bytes, static_cast<std::uint32_t>(metadata.validation_profile), 4);
     number(bytes, 0, 1);  // INCOMPLETE.
     text(bytes, metadata.provenance);
     number(bytes, metadata.effective_seed ? 1 : 0, 1);
@@ -163,10 +185,10 @@ std::string numbered(const char* prefix, std::uint64_t index) {
     if (digits.size() > 10) invalid("segment number overflow");
     return std::string(prefix) + std::string(10 - digits.size(), '0') + digits + ".bin";
 }
-Bytes envelope(std::uint16_t kind, const Bytes& payload) {
+Bytes envelope(std::uint16_t kind, const Bytes& payload, std::uint16_t version) {
     if (payload.size() > kMetadataLimit) invalid("manifest/checkpoint exceeds bounded metadata size");
     Bytes bytes{'A','I','S','J','R','0','F','1'};
-    number(bytes, 1, 2);
+    number(bytes, version, 2);
     number(bytes, kind, 2);
     number(bytes, static_cast<std::uint64_t>(kUnitsPerSecond), 8);
     number(bytes, payload.size(), 4);
@@ -182,7 +204,9 @@ void require_end(std::ifstream& input) {
     char extra = 0;
     if (input.get(extra) || !input.eof()) invalid("trailing bytes or committed file read error");
 }
-Bytes read_envelope(const std::filesystem::path& path, std::uint16_t expected_kind, std::uint64_t* hash = nullptr) {
+Bytes read_envelope(const std::filesystem::path& path, std::uint16_t expected_kind,
+                    std::uint64_t* hash = nullptr, std::uint16_t required_version = 0,
+                    std::uint16_t* detected_version = nullptr) {
     std::ifstream input(path, std::ios::binary);
     if (!input) invalid("missing committed manifest/checkpoint: " + path.u8string());
     Bytes header(24);
@@ -190,8 +214,11 @@ Bytes read_envelope(const std::filesystem::path& path, std::uint16_t expected_ki
     if (std::string(header.begin(), header.begin() + 8) != "AISJR0F1") invalid("unknown file magic");
     Bytes fields(header.begin() + 8, header.end());
     Cursor cursor(fields);
-    if (cursor.number(2) != 1 || cursor.number(2) != expected_kind ||
+    const auto version = cursor.number(2);
+    if ((version != 1 && version != 2) || (required_version != 0 && version != required_version) ||
+        cursor.number(2) != expected_kind ||
         cursor.number(8) != static_cast<std::uint64_t>(kUnitsPerSecond)) invalid("unsupported file/schema/timebase version");
+    if (detected_version) *detected_version = static_cast<std::uint16_t>(version);
     const auto size = cursor.number(4);
     if (size > kMetadataLimit) invalid("oversized manifest/checkpoint");
     Bytes payload(static_cast<std::size_t>(size));
@@ -370,7 +397,14 @@ std::vector<std::uint8_t> encode_event(const Event& event) {
         }
         case EventKind::TdmaDecision: { const auto& p = std::get<TdmaDecision>(event.payload); text(bytes, p.station_id); text(bytes, p.decision); break; }
         case EventKind::TransmissionStart: {
-            const auto& p = std::get<TransmissionStart>(event.payload); text(bytes, p.transmission_id.value); text(bytes, p.station_id); number(bytes, p.channel, 1); signed_number(bytes, p.end_time.units); text(bytes, p.payload_reference); break;
+            const auto& p = std::get<TransmissionStart>(event.payload); text(bytes, p.transmission_id.value); text(bytes, p.station_id); number(bytes, p.channel, 1); signed_number(bytes, p.end_time.units); text(bytes, p.payload_reference);
+            if (event.schema_version == 2) {
+                const auto& coverage = *p.coverage;
+                number(bytes, coverage.candidate_receivers.size(), 4);
+                for (const auto& receiver : coverage.candidate_receivers) text(bytes, receiver.value);
+                signed_number(bytes, coverage.resolution_horizon.units);
+            }
+            break;
         }
         case EventKind::TransmissionEnd: text(bytes, std::get<TransmissionEnd>(event.payload).transmission_id.value); break;
         case EventKind::RfObservation: {
@@ -383,6 +417,18 @@ std::vector<std::uint8_t> encode_event(const Event& event) {
             const auto& p = std::get<ReceiverNmea>(event.payload); text(bytes, p.receiver_id.value); text(bytes, p.reception_id.value); text(bytes, p.transmission_id.value); number(bytes, p.sentences.size(), 4); for (const auto& line : p.sentences) text(bytes, line); break;
         }
         case EventKind::OutputError: { const auto& p = std::get<OutputError>(event.payload); text(bytes, p.receiver_id.value); text(bytes, p.code); text(bytes, p.detail); break; }
+        case EventKind::RfNoReception: {
+            const auto& p = std::get<RfNoReception>(event.payload); text(bytes, p.transmission_id.value);
+            text(bytes, p.receiver_id.value); number(bytes, static_cast<std::uint8_t>(p.reason), 1); text(bytes, p.detail); break;
+        }
+        case EventKind::ReceptionNoOutput: {
+            const auto& p = std::get<ReceptionNoOutput>(event.payload); text(bytes, p.receiver_id.value);
+            text(bytes, p.reception_id.value); text(bytes, p.transmission_id.value); text(bytes, p.reason); break;
+        }
+        case EventKind::TransmissionResolved: {
+            const auto& p = std::get<TransmissionResolved>(event.payload); text(bytes, p.transmission_id.value);
+            signed_number(bytes, p.resolution_horizon.units); break;
+        }
         default: invalid("unsupported event kind");
     }
     if (bytes.size() > kMaxJournalRecordBytes) invalid("event exceeds65536-byte record bound");
@@ -405,7 +451,16 @@ Event decode_event(const std::vector<std::uint8_t>& bytes) {
         }
         case EventKind::TdmaDecision: { TdmaDecision p; p.station_id = cursor.text(kMaxIdentityBytes); p.decision = cursor.text(); event.payload = std::move(p); break; }
         case EventKind::TransmissionStart: {
-            TransmissionStart p; p.transmission_id = {cursor.text(kMaxIdentityBytes)}; p.station_id = cursor.text(kMaxIdentityBytes); p.channel = static_cast<std::uint8_t>(cursor.number(1)); p.end_time = {cursor.signed_number()}; p.payload_reference = cursor.text(); event.payload = std::move(p); break;
+            TransmissionStart p; p.transmission_id = {cursor.text(kMaxIdentityBytes)}; p.station_id = cursor.text(kMaxIdentityBytes); p.channel = static_cast<std::uint8_t>(cursor.number(1)); p.end_time = {cursor.signed_number()}; p.payload_reference = cursor.text();
+            if (event.schema_version == 2) {
+                TransmissionCoverage coverage;
+                const auto count = cursor.number(4);
+                if (count > kMaxCoverageReceivers) invalid("coverage roster exceeds512receivers");
+                for (std::uint64_t index = 0; index < count; ++index)
+                    coverage.candidate_receivers.push_back({cursor.text(kMaxIdentityBytes)});
+                coverage.resolution_horizon = {cursor.signed_number()}; p.coverage = std::move(coverage);
+            }
+            event.payload = std::move(p); break;
         }
         case EventKind::TransmissionEnd: event.payload = TransmissionEnd{{cursor.text(kMaxIdentityBytes)}}; break;
         case EventKind::RfObservation: {
@@ -418,6 +473,20 @@ Event decode_event(const std::vector<std::uint8_t>& bytes) {
             ReceiverNmea p; p.receiver_id = {cursor.text(kMaxIdentityBytes)}; p.reception_id = {cursor.text(kMaxIdentityBytes)}; p.transmission_id = {cursor.text(kMaxIdentityBytes)}; const auto count = cursor.number(4); if (count == 0 || count > 9) invalid("NMEA fragment count outside1..9"); for (std::uint64_t index = 0; index < count; ++index) p.sentences.push_back(cursor.text(82)); event.payload = std::move(p); break;
         }
         case EventKind::OutputError: { OutputError p; p.receiver_id = {cursor.text(kMaxIdentityBytes)}; p.code = cursor.text(); p.detail = cursor.text(); event.payload = std::move(p); break; }
+        case EventKind::RfNoReception: {
+            RfNoReception p; p.transmission_id = {cursor.text(kMaxIdentityBytes)};
+            p.receiver_id = {cursor.text(kMaxIdentityBytes)}; p.reason = static_cast<NoReceptionReason>(cursor.number(1));
+            p.detail = cursor.text(); event.payload = std::move(p); break;
+        }
+        case EventKind::ReceptionNoOutput: {
+            ReceptionNoOutput p; p.receiver_id = {cursor.text(kMaxIdentityBytes)};
+            p.reception_id = {cursor.text(kMaxIdentityBytes)}; p.transmission_id = {cursor.text(kMaxIdentityBytes)};
+            p.reason = cursor.text(); event.payload = std::move(p); break;
+        }
+        case EventKind::TransmissionResolved: {
+            TransmissionResolved p; p.transmission_id = {cursor.text(kMaxIdentityBytes)};
+            p.resolution_horizon = {cursor.signed_number()}; event.payload = std::move(p); break;
+        }
         default: invalid("unsupported event kind/version");
     }
     cursor.end(); validate_event(event); return event;
@@ -426,8 +495,10 @@ Event decode_event(const std::vector<std::uint8_t>& bytes) {
 struct JournalWriter::Impl {
     Impl(const std::filesystem::path& requested, JournalMetadata initial,
          JournalOptions configured, Hooks injected = {})
-        : metadata(std::move(initial)), options(configured), hooks(std::move(injected)) {
+        : metadata(std::move(initial)), options(configured), hooks(std::move(injected)),
+          validator(metadata.validation_profile) {
         validate_metadata(metadata); validate_options(options);
+        version = file_version(metadata.validation_profile);
         if (requested.empty()) invalid("run directory is empty");
         std::error_code error;
         directory = std::filesystem::absolute(requested, error).lexically_normal();
@@ -436,15 +507,13 @@ struct JournalWriter::Impl {
             if (!error || error == std::errc::file_exists) invalid("run directory already exists; refusing overwrite");
             throw std::runtime_error("Cannot exclusively create journal run directory: " + error.message());
         }
-        const auto initial_file = envelope(1, metadata_bytes(metadata, options));
+        const auto initial_file = envelope(1, metadata_bytes(metadata, options), version);
         publish(directory / "manifest-incomplete.bin", initial_file, hooks, ++publications);
         chain = fingerprint(initial_file);
     }
 
     void catalog(const Event& event) const {
-        const auto receiver = event_receiver(event);
-        if (receiver && !std::binary_search(metadata.receivers.begin(), metadata.receivers.end(), *receiver,
-            [](const ReceiverId& a, const ReceiverId& b) { return a.value < b.value; })) invalid("event receiver absent from manifest catalog");
+        validate_catalog_event(metadata, event);
     }
 
     void flush_segment() {
@@ -452,7 +521,7 @@ struct JournalWriter::Impl {
         if (statistics.segments >= kSegmentLimit) invalid("run exceeds1000000segments");
         const auto index = statistics.segments + 1;
         Bytes header{'A','I','S','J','R','0','S','1'};
-        number(header, 1, 2); number(header, kSegmentHeader, 2); number(header, index, 8);
+        number(header, version, 2); number(header, kSegmentHeader, 2); number(header, index, 8);
         number(header, buffer_records, 4); number(header, buffer.size(), 4);
         number(header, static_cast<std::uint64_t>(kUnitsPerSecond), 8);
         Crc crc; crc.update(header.data(), header.size()); crc.update(buffer.data(), buffer.size());
@@ -462,7 +531,7 @@ struct JournalWriter::Impl {
             hooks, ++publications);
         Checkpoint checkpoint{index, buffer_records, header.size() + buffer.size() + footer.size(),
             crc.value(), statistics.records, statistics.logical_digest, chain, first_time, last_time};
-        const auto checkpoint_file = envelope(2, checkpoint_bytes(checkpoint));
+        const auto checkpoint_file = envelope(2, checkpoint_bytes(checkpoint), version);
         publish(directory / numbered("checkpoint-", index), checkpoint_file, hooks, ++publications);
         chain = fingerprint(checkpoint_file);
         statistics.segments = index;
@@ -473,11 +542,14 @@ struct JournalWriter::Impl {
         if (failed || complete) invalid("writer is failed or already COMPLETE");
         try {
             auto bytes = encode_event(event);
+            if (event.schema_version != version) invalid("event schema does not match journal validation profile");
             const auto framed_size = bytes.size() + 8;
             const auto body_limit = options.max_segment_bytes - kSegmentOverhead;
             if (framed_size > body_limit) invalid("event cannot fit configured segment byte limit");
             catalog(event);
             validator.append(event);
+            statistics.validator = validator.stats();
+            statistics.retained_recent_events = validator.retained_history();
             if (buffer_records == options.max_records_per_segment || framed_size > body_limit - buffer.size()) flush_segment();
             const auto required = buffer.size() + framed_size;
             if (required > buffer.capacity()) {
@@ -504,13 +576,17 @@ struct JournalWriter::Impl {
     void finish() {
         if (failed || complete) invalid("writer is failed or already COMPLETE");
         try {
-            validator.finish();
+            // Every append already passed the nonterminal validator. Preserve
+            // that accepted prefix even when terminal obligations remain open.
             flush_segment();
+            validator.finish();
+            statistics.validator = validator.stats();
+            statistics.retained_recent_events = validator.retained_history();
             if (hooks.fault == Fault::BeforeComplete) throw std::runtime_error("Injected interruption before COMPLETE publication");
             Bytes payload; number(payload, 1, 1);
             number(payload, statistics.segments, 8); number(payload, statistics.records, 8);
             number(payload, statistics.logical_digest, 8); number(payload, chain, 8);
-            const auto terminal = envelope(3, payload);
+            const auto terminal = envelope(3, payload, version);
             publish(directory / "manifest-complete.bin", terminal, hooks, ++publications);
             complete = true;
         } catch (...) { failed = true; throw; }
@@ -526,6 +602,7 @@ struct JournalWriter::Impl {
     std::uint32_t buffer_records = 0;
     std::int64_t first_time = 0, last_time = 0;
     std::uint64_t chain = 0, publications = 0;
+    std::uint16_t version = 1;
     bool failed = false, complete = false;
 };
 
@@ -567,8 +644,13 @@ struct JournalReader::Impl {
         std::error_code error;
         directory = std::filesystem::absolute(requested, error).lexically_normal();
         if (requested.empty() || error || !std::filesystem::is_directory(directory)) invalid("run directory is missing");
-        auto initial = read_envelope(directory / "manifest-incomplete.bin", 1, &initial_chain);
+        auto initial = read_envelope(directory / "manifest-incomplete.bin", 1, &initial_chain, 0, &version);
         Cursor cursor(initial);
+        if (version == 2) {
+            if (cursor.number(4) != static_cast<std::uint32_t>(ValidationProfile::StreamingV2))
+                invalid("unsupported version 2 validation profile tag");
+            metadata.validation_profile = ValidationProfile::StreamingV2;
+        }
         if (cursor.number(1) != 0) invalid("initial manifest must be INCOMPLETE");
         metadata.provenance = cursor.text();
         if (cursor.boolean()) metadata.effective_seed = cursor.number(8);
@@ -582,7 +664,7 @@ struct JournalReader::Impl {
         cursor.end(); validate_metadata(metadata); validate_options(options);
 
         if (std::filesystem::exists(directory / "manifest-complete.bin")) {
-            const auto terminal = read_envelope(directory / "manifest-complete.bin", 3, &terminal_hash);
+            const auto terminal = read_envelope(directory / "manifest-complete.bin", 3, &terminal_hash, version);
             Cursor end(terminal);
             if (end.number(1) != 1) invalid("terminal manifest must be COMPLETE");
             expected.segments = end.number(8); expected.records = end.number(8);
@@ -594,7 +676,7 @@ struct JournalReader::Impl {
             const auto largest = checkpoint_count(directory);
             expected.segments = largest;
             if (largest != 0) {
-                const auto checkpoint = checkpoint_from(read_envelope(directory / numbered("checkpoint-", largest), 2, &expected_chain));
+                const auto checkpoint = checkpoint_from(read_envelope(directory / numbered("checkpoint-", largest), 2, &expected_chain, version));
                 expected.records = checkpoint.total_records; expected.logical_digest = checkpoint.logical_digest;
             } else { expected.logical_digest = kFnvOffset; expected_chain = initial_chain; }
         }
@@ -604,19 +686,19 @@ struct JournalReader::Impl {
 
     void scan(const std::function<void(const Event&)>& callback) const {
         std::uint64_t current_initial = 0;
-        (void)read_envelope(directory / "manifest-incomplete.bin", 1, &current_initial);
+        (void)read_envelope(directory / "manifest-incomplete.bin", 1, &current_initial, version);
         if (current_initial != initial_chain) invalid("initial manifest changed after opening");
         if (state == JournalStatus::Complete) {
             std::uint64_t current_terminal = 0;
-            (void)read_envelope(directory / "manifest-complete.bin", 3, &current_terminal);
+            (void)read_envelope(directory / "manifest-complete.bin", 3, &current_terminal, version);
             if (current_terminal != terminal_hash || checkpoint_count(directory) != expected.segments) invalid("COMPLETE manifest/checkpoints changed after opening");
         }
-        EventValidator validator;
+        EventValidator validator(metadata.validation_profile);
         auto chain = initial_chain;
         JournalStats observed;
         for (std::uint64_t segment = 1; segment <= expected.segments; ++segment) {
             std::uint64_t next_chain = 0;
-            const auto checkpoint = checkpoint_from(read_envelope(directory / numbered("checkpoint-", segment), 2, &next_chain));
+            const auto checkpoint = checkpoint_from(read_envelope(directory / numbered("checkpoint-", segment), 2, &next_chain, version));
             if (checkpoint.index != segment || checkpoint.prior_chain != chain || checkpoint.records == 0 ||
                 checkpoint.records > options.max_records_per_segment || checkpoint.file_bytes > options.max_segment_bytes ||
                 checkpoint.file_bytes < kSegmentOverhead) invalid("checkpoint metadata/chain/resource mismatch");
@@ -625,7 +707,7 @@ struct JournalReader::Impl {
             Bytes header(kSegmentHeader); read_exact(input, header.data(), header.size());
             if (std::string(header.begin(), header.begin() + 8) != "AISJR0S1") invalid("unknown segment magic");
             Bytes fields(header.begin() + 8, header.end()); Cursor h(fields);
-            if (h.number(2) != 1 || h.number(2) != kSegmentHeader || h.number(8) != segment ||
+            if (h.number(2) != version || h.number(2) != kSegmentHeader || h.number(8) != segment ||
                 h.number(4) != checkpoint.records) invalid("segment schema/index/count mismatch");
             const auto body_bytes = h.number(4);
             if (body_bytes + kSegmentOverhead != checkpoint.file_bytes || h.number(8) != static_cast<std::uint64_t>(kUnitsPerSecond)) invalid("segment length/timebase mismatch");
@@ -643,9 +725,8 @@ struct JournalReader::Impl {
                 segment_crc.update(length.data(), length.size()); segment_crc.update(record.data(), record.size()); segment_crc.update(suffix.data(), suffix.size());
                 hash_bytes(observed.logical_digest, length.data(), length.size()); hash_bytes(observed.logical_digest, record.data(), record.size());
                 auto event = decode_event(record);
-                const auto receiver = event_receiver(event);
-                if (receiver && !std::binary_search(metadata.receivers.begin(), metadata.receivers.end(), *receiver,
-                    [](const ReceiverId& a, const ReceiverId& b) { return a.value < b.value; })) invalid("event receiver absent from manifest catalog");
+                if (event.schema_version != version) invalid("event schema does not match journal validation profile");
+                validate_catalog_event(metadata, event);
                 validator.append(event);
                 if (index == 0) first_time = event.time.units;
                 last_time = event.time.units;
@@ -661,6 +742,8 @@ struct JournalReader::Impl {
             chain = next_chain; ++observed.segments;
         }
         if (state == JournalStatus::Complete) validator.finish();
+        observed.validator = validator.stats();
+        observed.retained_recent_events = validator.retained_history();
         if (observed.records != expected.records || observed.logical_digest != expected.logical_digest || chain != expected_chain) invalid("terminal manifest content mismatch");
         statistics = observed;
     }
@@ -672,6 +755,7 @@ struct JournalReader::Impl {
     JournalStats expected;
     mutable JournalStats statistics;
     std::uint64_t initial_chain = 0, expected_chain = 0, terminal_hash = 0;
+    std::uint16_t version = 1;
 };
 
 JournalReader::JournalReader(const std::filesystem::path& path, bool allow_incomplete)

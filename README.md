@@ -922,3 +922,5 @@ cylinder placement and UDP remain future work. The test-only CUDA bridge checks
 real transfer/compaction without calculating RF outcomes. Build commands,
 journal wire format, CLI examples and resource limits are in
 [R0_RUNTIME_FOUNDATION.md](lab/docs/R0_RUNTIME_FOUNDATION.md).
+Its R0.1 addendum documents the opt-in continuous-run validation profile,
+causal RF barriers and receiver ownership contract; these remain infrastructure.

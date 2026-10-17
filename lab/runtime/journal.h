@@ -25,6 +25,8 @@ struct JournalMetadata {
     std::string model_version;
     std::string codec_version;
     std::vector<ReceiverId> receivers;
+    // Opt-in durable validation rules. LegacyV1 preserves existing file bytes.
+    ValidationProfile validation_profile = ValidationProfile::LegacyV1;
 };
 struct JournalOptions {
     std::uint32_t max_records_per_segment = 4096;
@@ -36,6 +38,9 @@ struct JournalStats {
     std::uint64_t segments = 0;
     std::uint64_t logical_digest = UINT64_C(14695981039346656037);
     std::size_t peak_buffer_bytes = 0;
+    // Diagnostic retention snapshot/high-water marks, never journal wire data.
+    ValidatorStats validator;
+    std::size_t retained_recent_events = 0;
 };
 
 namespace testing { struct JournalHooks; }
@@ -44,8 +49,9 @@ namespace testing { struct JournalHooks; }
 // ones. Integrity diagnostics only; this is not authentication or encryption.
 std::uint32_t crc32c(const std::uint8_t* bytes, std::size_t count);
 
-// Portable canonical Event bytes (without journal framing/CRC). The schema is
-// versioned explicitly; raw C++ object representation is never serialized.
+// Portable canonical Event bytes (without journal framing/CRC). Schema 1 bytes
+// remain unchanged; schema 2 adds the explicit streaming coverage/closure data.
+// Raw C++ object representation is never serialized.
 std::vector<std::uint8_t> encode_event(const Event& event);
 Event decode_event(const std::vector<std::uint8_t>& bytes);
 

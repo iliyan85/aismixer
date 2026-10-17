@@ -2,6 +2,7 @@
 #include "journal.h"
 #include "playback.h"
 #include "scheduler.h"
+#include "streaming_fixture.h"
 
 #include <charconv>
 #include <filesystem>
@@ -26,6 +27,7 @@ namespace {
 namespace r = aismixer::lab::runtime;
 struct Arguments {
     bool help = false;
+    bool streaming_fixture = false, fine_steps = false;
     std::optional<std::filesystem::path> fixture, play, output;
     std::optional<r::ReceiverId> receiver;
     r::JournalOptions journal;
@@ -47,7 +49,12 @@ Arguments parse(const std::vector<std::string>& args) {
             return args[index];
         };
         if (option == "--help") result.help = true;
-        else if (option == "--fixture") result.fixture = std::filesystem::u8path(value());
+        else if (option == "--fixture" || option == "--streaming-fixture") {
+            if (result.fixture) throw std::invalid_argument("choose only one fixture profile");
+            result.fixture = std::filesystem::u8path(value());
+            result.streaming_fixture = option == "--streaming-fixture";
+        }
+        else if (option == "--fine-steps") result.fine_steps = true;
         else if (option == "--play") result.play = std::filesystem::u8path(value());
         else if (option == "--output") result.output = std::filesystem::u8path(value());
         else if (option == "--receiver") result.receiver = r::ReceiverId{value()};
@@ -72,6 +79,8 @@ Arguments parse(const std::vector<std::string>& args) {
     if (result.fixture.has_value() == result.play.has_value()) {
         throw std::invalid_argument("choose exactly --fixture NEW_RUN_DIR or --play COMPLETE_RUN_DIR");
     }
+    if (result.fine_steps && !result.streaming_fixture)
+        throw std::invalid_argument("fine-steps applies only to the streaming infrastructure fixture");
     if (result.fixture && (seen.count("--receiver") || seen.count("--speed") || seen.count("--output") ||
                            seen.count("--events") || seen.count("--view"))) {
         throw std::invalid_argument("fixture generation accepts only --fixture and optional --segment-records");
@@ -88,6 +97,8 @@ void help() {
     std::cout << "AISMixer Lab R0 recorded runtime; no RF, TDMA or network implementation\n"
               << "--fixture NEW_RUN_DIR [--segment-records 1..65536]\n"
               << "  SYNTHETIC INFRASTRUCTURE TEST (NOT AIS RADIO SIMULATION).\n"
+              << "--streaming-fixture NEW_RUN_DIR [--segment-records 1..65536] [--fine-steps]\n"
+              << "  Five simulation hours; INFRASTRUCTURE TEST -- NOT AIS RF SIMULATION.\n"
               << "--play COMPLETE_RUN_DIR [--receiver ID] [--speed 0.5|1|2|10|100|fast]\n"
               << "  [--events disabled|all|lifecycle,slotmap,tdma,rf,reception,output,metrics]\n"
               << "  [--view all|ID] [--output NEW_FILE]\n"
@@ -103,6 +114,19 @@ int run(const std::vector<std::string>& args) {
     const auto options = parse(args);
     if (options.help) { help(); return 0; }
     if (options.fixture) {
+        if (options.streaming_fixture) {
+            const auto stats = r::record_streaming_fixture(*options.fixture, options.journal, options.fine_steps);
+            std::cerr << "INFRASTRUCTURE TEST -- NOT AIS RF SIMULATION\n"
+                      << "status=COMPLETE profile=StreamingV2 simulation_seconds=" << r::kStreamingFixtureSeconds
+                      << " transmissions=" << r::kStreamingFixtureTransmissions
+                      << " receptions=" << r::kStreamingFixtureReceptions
+                      << " records=" << stats.records << " segments=" << stats.segments
+                      << " logical_digest=" << std::hex << std::setfill('0') << std::setw(16)
+                      << stats.logical_digest << std::dec << std::setfill(' ') << '\n';
+            std::cerr.flush();
+            if (!std::cerr) throw std::runtime_error("runtime fixture diagnostic flush failed");
+            return 0;
+        }
         const auto fixture = r::make_synthetic_fixture();
         r::JournalMetadata metadata;
         metadata.provenance = fixture.provenance;

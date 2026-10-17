@@ -176,7 +176,7 @@ void portable_event_codec(const Fixture& fixture) {
     for (std::size_t kind = 1; kind <= 16; ++kind) require(kinds[kind], "missing typed payload family in wire tests");
     for (std::size_t size = 0; size < expected.size(); ++size)
         rejects([&] { (void)decode_event(Bytes(expected.begin(), expected.begin() + static_cast<std::ptrdiff_t>(size))); });
-    auto bad = expected; bad[0] = 2; rejects([&] { (void)decode_event(bad); }, "schema");
+    auto bad = expected; bad[0] = 3; rejects([&] { (void)decode_event(bad); }, "schema");
     bad = expected; bad[12] = 255; rejects([&] { (void)decode_event(bad); }, "kind");
     bad = expected; bad[37] = 2; rejects([&] { (void)decode_event(bad); }, "boolean");
     bad = expected; bad[14] = 255; bad[15] = 255; rejects([&] { (void)decode_event(bad); }, "string");
@@ -323,6 +323,40 @@ void incomplete_and_faults(const Scratch& scratch, const Fixture& fixture) {
     require(JournalReader(rejected, true).stats().records == 1, "rejected event changed committed prefix");
 }
 
+void unfinished_terminal_preserves_prefix(const Scratch& scratch, const Fixture& fixture) {
+    std::vector<Event> accepted;
+    for (const auto& event : fixture.events) {
+        accepted.push_back(event);
+        if (event.kind == EventKind::TransmissionStart) break;
+    }
+    require(accepted.size() > 2 && accepted.back().kind == EventKind::TransmissionStart,
+            "unfinished terminal fixture must contain a proven open TX");
+    for (const auto limit : {std::uint32_t{1}, std::uint32_t{4096}}) {
+        const auto directory = scratch / ("unfinished-terminal-" + std::to_string(limit));
+        JournalWriter writer(directory, metadata(fixture), {limit, kMaxJournalSegmentBytes});
+        for (const auto& event : accepted) writer.append(event);
+        rejects([&] { writer.finish(); }, "unfinished");
+        require(!fs::exists(directory / "manifest-complete.bin"), "unfinished TX marked COMPLETE");
+        rejects([&] { writer.finish(); }, "failed");
+        rejects([&] { writer.append(fixture.events.back()); }, "failed");
+        rejects([&] { JournalReader complete(directory); }, "INCOMPLETE");
+        JournalReader inspected(directory, true);
+        require(inspected.stats().records == accepted.size() &&
+                inspected.stats().logical_digest == logical_digest(accepted),
+                "terminal validation lost accepted buffered prefix");
+        std::size_t index = 0;
+        inspected.for_each([&](const Event& event) {
+            require(index < accepted.size() && encode_event(event) == encode_event(accepted[index++]),
+                    "terminal failure prefix changed canonical bytes");
+        });
+        require(index == accepted.size(), "terminal failure prefix ended early");
+        const auto initial = read(directory / "manifest-incomplete.bin");
+        rejects([&] { JournalWriter clobber(directory, metadata(fixture)); }, "exists");
+        require(read(directory / "manifest-incomplete.bin") == initial, "terminal failure run overwritten");
+        no_temporary(directory);
+    }
+}
+
 void integrity_rejections(const Scratch& scratch, const Fixture& fixture) {
     const auto original = scratch / "integrity-original";
     save_fixture(original, fixture, {1, 2048});
@@ -407,6 +441,7 @@ int main(int argc, char** argv) {
         portable_event_codec(fixture);
         round_trip_and_bounds(scratch, fixture);
         incomplete_and_faults(scratch, fixture);
+        unfinished_terminal_preserves_prefix(scratch, fixture);
         integrity_rejections(scratch, fixture);
         bounded_stress(scratch, fixture);
         std::cout << "runtime journal: portable wire/CRC, all typed payloads, exact NMEA, immutable checkpoints, no-clobber faults, "

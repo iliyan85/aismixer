@@ -146,7 +146,7 @@ void event_shape_and_causality() {
     auto sample = find_kind(fixture, EventKind::ReceiverNmea);
     for (const std::string identity : {std::string{}, std::string(65, 'a'), std::string("with space"), std::string("\xc3\xa9")})
         rejects([&] { validate_identity(identity, "test identity"); }, "identity");
-    { auto value = sample; value.schema_version = 2; rejects([&] { validate_event(value); }, "schema"); }
+    { auto value = sample; value.schema_version = 3; rejects([&] { validate_event(value); }, "schema"); }
     { auto value = sample; value.kind = static_cast<EventKind>(99); rejects([&] { validate_event(value); }, "unknown event kind"); }
     { auto value = sample; value.event_id.source_id = "other"; rejects([&] { validate_event(value); }, "match envelope"); }
     { auto value = sample; value.event_id.sequence = 0; rejects([&] { validate_event(value); }, "positive"); }
@@ -234,7 +234,7 @@ void typed_observation_boundary() {
                    TdmaDecision{s, "Synthetic typed-schema test; not a computed TDMA decision"}};
     validator.append(decision);
     Event start{1, {10}, EventKind::TransmissionStart, s, s, {s, 7}, EventId{s, 1},
-                TransmissionStart{{"typed.tx"}, s, 1, {20}, "fixture.payload"}};
+                TransmissionStart{{"typed.tx"}, s, 0, {20}, "fixture.payload"}};
     validator.append(start);
     Event observation{1, {11}, EventKind::RfObservation, r, r, {r, 2}, start.event_id,
                       RfObservation{{"typed.tx"}, {r}, {11}, false, s, "Synthetic undecoded carrier tuple; no propagation"}};
