@@ -1,0 +1,60 @@
+schema_version: 1
+kind: world_scenario
+profile_id: w1_black_sea_world_v1
+provenance: >-
+  WORLD STATE / LIFECYCLE ONLY - NO AIS TDMA OR RF RECEPTION SIMULATED.
+  Unqualified illustrative settlement-to-settlement routes may cross land.
+  Power and abstract effective reach are independent schedules.
+duration_seconds: 18000
+seed: {mode: fixed, value: 42}
+waypoint_catalog: black_sea_waypoints_v1.yaml
+receiver_regions: black_sea_regions_v1.yaml
+vessels:
+  - id: 101
+    equipment_id: 201
+    radio_id: 301
+    name: World vessel A
+    route:
+      initial: {mode: fixed, waypoint_id: 5}
+      first_destination: {mode: fixed, waypoint_id: 4}
+      subsequent_destination: {mode: subset, waypoint_ids: [1, 4, 5, 6]}
+    speed: {knots: [10.000, 20.000], hold_seconds: [100, 200]}
+    navigation:
+      - {status: UNDER_WAY_USING_ENGINE, weight: 6, duration_seconds: [100, 200]}
+      - {status: AT_ANCHOR, weight: 2, duration_seconds: [100, 200]}
+      - {status: RESTRICTED_MANOEUVRABILITY, weight: 2, duration_seconds: [100, 200]}
+    restricted_speed_cap_knots: 4.000
+    power:
+      initial_delay_seconds: [0, 10]
+      online_duration_seconds: [100, 1000]
+      offline_duration_seconds: [10, 300]
+    antenna:
+      height_above_waterline_m: 18.000
+      waterline:
+        height_datum: unresolved
+        provenance: Sea surface ellipsoidal height is unresolved; no geoid or tide data supplied
+    reach: {radius_km: [10.000000, 60.000000], hold_seconds: [100, 200]}
+  - id: 102
+    equipment_id: 202
+    radio_id: 302
+    name: World vessel B
+    route:
+      initial: {mode: subset, waypoint_ids: [6, 7]}
+      first_destination: {mode: subset, waypoint_ids: [8, 9]}
+      subsequent_destination: {mode: all}
+    speed: {knots: [12.000, 18.000], hold_seconds: [100, 200]}
+    navigation:
+      - {status: UNDER_WAY_USING_ENGINE, weight: 8, duration_seconds: [100, 200]}
+      - {status: AT_ANCHOR, weight: 1, duration_seconds: [100, 200]}
+      - {status: RESTRICTED_MANOEUVRABILITY, weight: 1, duration_seconds: [100, 200]}
+    restricted_speed_cap_knots: 3.000
+    power:
+      initial_delay_seconds: [0, 10]
+      online_duration_seconds: [100, 1000]
+      offline_duration_seconds: [10, 300]
+    antenna:
+      height_above_waterline_m: 15.000
+      waterline:
+        height_datum: unresolved
+        provenance: Sea surface ellipsoidal height is unresolved; no geoid or tide data supplied
+    reach: {radius_km: [20.000000, 80.000000], hold_seconds: [110, 210]}

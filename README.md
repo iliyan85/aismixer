@@ -924,3 +924,11 @@ journal wire format, CLI examples and resource limits are in
 [R0_RUNTIME_FOUNDATION.md](lab/docs/R0_RUNTIME_FOUNDATION.md).
 Its R0.1 addendum documents the opt-in continuous-run validation profile,
 causal RF barriers and receiver ownership contract; these remain infrastructure.
+
+W1 adds a separate deterministic maritime world and lifecycle engine. Enable
+`-DAISMIXER_LAB_BUILD_WORLD=ON` for the native `aismixer_lab_world` operator,
+strict YAML world profiles, coupled Class A equipment power, independent vessel
+navigation/reach schedules and production CUDA WGS84 position/receiver sampling.
+It produces world-state traces, with no AIS TDMA or RF reception simulation.
+Build commands, configuration, numerical qualification and acceptance evidence
+are in [W1_WORLD_LIFECYCLE.md](lab/docs/W1_WORLD_LIFECYCLE.md).

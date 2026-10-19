@@ -1,0 +1,35 @@
+schema_version: 1
+kind: world_receiver_regions
+profile_id: w1_black_sea_receiver_candidates_v1
+provenance: >-
+  Unqualified synthetic candidate regions near coarse Varna and Balchik
+  settlement coordinates. These are examples, not measured receiver sites.
+  No DEM, coastline, terrain suitability or land-only qualification is applied.
+coordinate_units: nanodegrees
+coordinate_order: longitude_latitude
+datum: WGS84
+regions:
+  - id: 11
+    name: Varna illustrative candidate region
+    center: {longitude_ndeg: 27910000000, latitude_ndeg: 43210000000}
+    radius_km: 20.000000
+    count: [1, 10]
+    antenna_elevation_m: [10.000, 300.000]
+    height_datum: AMSL
+    provenance: Unqualified synthetic candidate; may be offshore or on unsuitable terrain; AMSL unresolved for RF ellipsoid geometry
+    power:
+      initial_delay_seconds: [0, 10]
+      online_duration_seconds: [100, 1000]
+      offline_duration_seconds: [10, 300]
+  - id: 12
+    name: Balchik illustrative candidate region
+    center: {longitude_ndeg: 28170000000, latitude_ndeg: 43410000000}
+    radius_km: 10.000000
+    count: [1, 5]
+    antenna_elevation_m: [10.000, 200.000]
+    height_datum: AMSL
+    provenance: Unqualified synthetic candidate; may be offshore or on unsuitable terrain; AMSL unresolved for RF ellipsoid geometry
+    power:
+      initial_delay_seconds: [0, 10]
+      online_duration_seconds: [100, 1000]
+      offline_duration_seconds: [10, 300]
