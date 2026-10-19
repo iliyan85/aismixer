@@ -1,5 +1,7 @@
 # A0 research, review and acceptance record
 
+> Historical A0 account: the original counts, HEAD/status, execution results and readiness statements below record A0 before commit `964c2a149d1de2fae128c1c6d950cce3622b3d20`. They are not current A0.1 counts or worktree results. The distinct A0.1 addendum at the end controls the present limited-profile decisions. The explicit false source-sign claim is corrected in place with its cause identified.
+
 Review date: **2026-10-19**. Milestone: **analysis/documentation only**. Starting branch `lab`; HEAD `2f4bdfc0a0407916ddbb173dfd8f23c12d55ecb0`, subject `lab: add W1 maritime world and lifecycle engine`. Starting working tree/index clean; no untracked files and no existing A0 directory. No branch synchronization, staging, commit or push is authorized or performed.
 
 **Outcome: documentation review package, with explicit open interpretations. A1 design freeze and a sustained closed-loop pilot remain NO-GO.** This is not an AIS simulation validation or completed SOTDMA implementation. Source availability is verified; unresolved current-source questions are retained rather than replaced by guessed algorithms.
@@ -51,7 +53,7 @@ Access reviewer actually viewed rendered zero-based PDF indices18-23,30,32-34,36
 | State and Message5 | Tables18-20,46-48,50; printed48-50,105-110 |19-bit semantic state;3 usesITDMA;5 is424 data bits/two slots; NMEA separate |
 | ClassA24B | A7-3.22, printed140 | Within12min startup/every24h; missing codec/metadata is duration-dependent blocker |
 | Wire envelope | A2-3.2.2, printed23-27, Table12/Fig8; Table6, printed14 | Nominal slot, modulation and RF tail differ; non-integral1ms timing/profile remains open |
-| Source inconsistencies | Actual PDF Fig10/Table14/Table16/Fig15 plus corresponding prose | Comparator, numeric and timeout issues verified visually; PDF/DOCX sign discrepancy retained |
+| Source inconsistencies | Actual PDF Fig10/Table14/Table16/Fig15 plus corresponding prose | Comparator, numeric and timeout issues verified visually; A0.1 correction: both formats print minus25, while flattened Word text omitted Symbol F02D. The contradiction is internal to the table/formula, not between PDF and DOCX |
 | Exact OFF / normal end | Baseline runtime event.cpp phases and validator; W1 lifecycle declarations | Current schema cannot encode all required cuts or exact-end tie; no fake end/validator relaxation proposed |
 
 The targeted2014 comparison read old Annex1/Table1, Annex2 startup/access and Table20, old Annex8 position Table48, Message5 Table52 and Message24 section3.22. It was **not a complete edition redline**. Current Table1 adds no-speed and anchor-motion conditions absent from the old table. Current position layout uses two spare bits plus transmit-power bit where old Table48 had three spare bits; existing B3 already models current bit147 explicitly. Current Message5 indicator3 identifies M.1371-6+, whereas the old table reserved it for future editions. Current ClassA24B startup/24h duty is explicit; the old section inspected had the interrogation response but not that duty. Extended ITDMA slot-count codes5..7/+8192 already existed in2014; they are not called a2026 addition. Both editions inspected retain the observation/ITDMA startup sequence; no historical B3 code or acceptance baseline is changed.
@@ -123,3 +125,94 @@ Validation record is completed by the final documentation-integrity check below.
 - Acquire/review actual external editions for identity, CRC, presentation and any claimed conformance scope.
 - Review requirement/test coverage and preserve the distinction between unit fixtures, physical RF evidence and later playback.
 - Retain operator control of staging/commit/push. Suggested commit message only: `lab: specify normative Class A AIS protocol for A1`.
+
+## A0.1 addendum - 2026-10-19
+
+This addendum is the **current** documentation correction and limited-profile record. Its starting and ending baseline is branch `lab`, HEAD `964c2a149d1de2fae128c1c6d950cce3622b3d20`, subject `lab: specify normative Class A AIS protocol for A1`. Starting worktree/index were clean. The historical A0 counts/status/results above remain historical, except the explicit false PDF-versus-Word sign statement corrected in place. No older executed result is changed or relabelled as an A0.1 execution.
+
+**D0 documentation: GO**, subject to the final integrity result recorded below. **D1: CONDITIONAL GO for isolated A1-S1 codec/state units only. D2 five-hour RF-closed-loop UDP: NO-GO. Full ITU/IEC Class A conformance: NOT CLAIMED.** The frozen feature boundary and eight decisions are `LCP-CLASSA-AUTO-TERR-v1`, not a certified or fully frozen end-to-end FSM. A0-ISS-003 still blocks the affected A1-S4 first-frame interpretation/acceptance, including the anchored startup path. It is not silently waived to obtain D1.
+
+### Input review versus independently checked evidence
+
+The operator supplied independent Claude findings CL-A0-001..007 and a reported conditional-GO recommendation. Those are **reported review input**, not Codex-performed inspection or an official ITU erratum. Codex performed the focused verification below before applying them. A0.1 did not repeat a broad reading campaign or claim a fresh complete edition redline.
+
+The official record was freshly opened and the current English PDF and Word were freshly downloaded from the exact official links in the source manifest. Both downloaded byte counts and SHA-256 hashes match the historical manifest and hash-matched cached copies exactly: PDF3464843/`126025db40f545454bbfc192c85353bd24bded48016f853ec184ef46f704a1dd`; Word2132560/`f75379e3a0725b1c096ba06a049fc4fcb00ddd81355ba97883a35382933b2d42`. **No network fallback or source-access failure occurred.** External IEC/ISO/identity authorities were not reacquired and remain gated for their corresponding claims; no substituted source edition is used.
+
+Focused source inspection used original Word XML (including `w:sym`, not only `w:t`), source figure images and Windows.Data.Pdf rendering. The source reviewer visually inspected zero-based PDF indices9,10,28,30,32-37,39-44,49,53-58,109-111,125-126,141-142; other navigational context was not claimed as new conformance coverage. The primary additionally inspected current PDF indices10,34,49,57,110,111,141 and the original Word Symbol node. Printed page remains index minus one. The checked scope was Table1/A1-4, A2-3.3.1.2/Figures9/20, Tables14-16/Figures10/11, A2-3.3.5.4/Figure15/Tables18-19, A2-4.3.1, Message5 and ClassA24B. This is focused evidence, distinct from the historical complete-source log.
+
+New full-source copies, symbol proof, rendered images, focused notes and scratch scripts are only in ignored `lab/build/a01-research/`; old `a0-research/` material was read and preserved. No full source, figure, source-extraction transcript or helper script is tracked. Source paraphrases/short numeric derivations and precise references are used, not long copyrighted passages.
+
+| Finding | Independently checked evidence and A0.1 adjudication | Current atom / oracle |
+|---|---|---|
+| CL-A0-001: hidden minus | Table14 printed33 has minus25 in both formats. Original Word has Symbol `w:sym char=F02D` immediately before25; flattened `w:t` dropped it. The maximum column25 and100/4 disagree with that note, while priority1/0 conflicts with the four levels in A2-4.2.3 printed53. RTPI's printed bounds also do not prescribe rational rounding. Delete the nonexistent inter-format discrepancy; retain internal source defects. | A0-MAC-041 stays unresolved; P04/A0-SIM-012 supplies explicit representation. T09/T19: equality,26/101, fractions and no source-bound clamp. |
+| CL-A0-002: own adjacency | Figures9/20, printed29/56, support j-1,j,j+1 exclusion. In Fig20 own B10 excludes A9/10/11; A8 is still a lower-priority candidate due to base B8, while A12 has its own-channel base exclusion. | A0-MAC-040 becomes derived; P05/A0-SIM-013. T05/T08/T19 check j-2..j+2 and wrap with unrelated reservations separated. |
+| CL-A0-003: timeout | Figure15 printed42 has one decrement before zero; prose printed42-43 mentions it twice. Table18 printed48 defines remaining frames/zero last use. The reviewed continuous-domain reading advertises3->2,1,0 and7->6..0; new reservation timeout does not replace the expiring old-slot zero. | A0-MAC-037 becomes derived; P02/A0-SIM-010. T06/T08/T17/T19 independent countdown/offset evidence; no official correction claimed. |
+| CL-A0-004: RATDMA comparator | Prose printed31 says sum<4; Fig10 printed32 draws>4. The latter can fail peer-loss replenishment or loop without progress. Adopt the bounded prose reading, retaining both printed locations. | A0-MAC-036 becomes derived; P03/A0-SIM-011. T09/T19 sums3/4/5, peer loss without attempt, real candidates only and unchanged absolute RTES. |
+| CL-A0-005: SI | Table16/Fig11 printed35-37 give exact rational half-width NI/10. For allowed autonomous NI75/125/225/375, integer centers give floor windows of15/25/45/75. NI375/NS1000 includes+37 but excludes+38. | A0-MAC-039 becomes derived only in that domain; P01/A0-SIM-009. T05/T08/T19/T20 include signed wrap and deferred assigned37.5. |
+| CL-A0-006: NI maximum | Table16 printed35 retains1225, while2250/Rr withRr>=2 gives1125. Table15 printed34 and Message16/Table65 printed125 corroborate1125 in their distinct FATDMA/assignment contexts; they are not assumed identical to SOTDMA. LCP autonomous maximum is375. | A0-MAC-035 becomes formula-derived with literal discrepancy retained; T05/T19. No ITU erratum or unrestricted assigned-mode solution claimed. |
+| CL-A0-007: low rates | A2-3.3.4.1/Table16 note2 and A2-4.3 disagree for[1,2)reports/min. Ordinary anchored1/3/min is below both thresholds. | A0-MAC-038/A0-RF-016 stay unresolved; disputed assignment/Message23 excluded, anchor retained. T10/T19/T29 positive anchor and negative out-of-profile cases. |
+
+The additional source checks confirm that Table1 overlaps exactly14kn, A2-4.3.1.2 distinguishes faster/slower than2kn without equality, and the circular mean/undefined resultant is not prescribed. A1-4 establishes ordinary Type5 six-minute/amendment/request duties without an explicit startup first-due origin; A7-3.22 explicitly establishes ClassA24B within12min and every24h. These limits are not erased by project decisions.
+
+### Versioned decisions and remaining gates
+
+The full decision records (scope, preconditions, rule, reason, exclusions, independent oracle and change condition) are in [the specification](A0_NORMATIVE_CLASS_A_SPEC.md). All eight new policy atoms are `SIMULATION_POLICY`; where a policy adopts a reviewed derivation, that derivation remains a separate MAC atom.
+
+| Decision | Atom | Source versus project status / frozen scope |
+|---|---|---|
+| LCP-P01 | A0-SIM-009 | Applies derived MAC039 integer autonomous floor windows; assigned/fractional/general endpoints and first-frame origins are not solved. |
+| LCP-P02 | A0-SIM-010 | Applies derived MAC037 single pre-check continuous decrement; preserves repeated-prose conflict and excludes other countdown modes. |
+| LCP-P03 | A0-SIM-011 | Applies derived MAC036 prose<4; finite actual-candidate scans, pending/exhausted decisions and immutable RTES are explicit pilot policy. |
+| LCP-P04 | A0-SIM-012 | Exact pre-update rational recurrence, uniform integer0..100, inclusive comparison and no bound-clamping are numerical policy. At25,26 of101 values pass. Printed table defects remain unresolved source facts. |
+| LCP-P05 | A0-SIM-013 | Applies derived MAC040 j-1/j/j+1 in both directions/wrap; shared TX and independent reservations remain. |
+| LCP-P06 | A0-SIM-014 | Policy at exactly14kn/lower band and exactly2kn/no new heading-driven increase; unit-vector COG mean, rho<=2^-40 undefined and signed-angle convention. No fabricated HDG/ROT or override of source-valid<2kn default reversion. |
+| LCP-P07 | A0-SIM-015 | Policy ON-epoch first Type5<=ON+360s; source first24B<=ON+720s; subsequent confirmed-physical-TX anchors and short-ON handling explicit. Queue after actual first-frame without moving deadlines. Blocked/missed is not successful TX;24h is beyond five hours. |
+| LCP-P08 | A0-SIM-016 | Separately versioned semantic Philox4x32-10, unbiased bounded rejection and independent station/purpose/epoch ledger are project choices; no W1-purpose reuse, actual RNG code or seed-serialization acceptance delivered. |
+
+Two minimal new issue atoms preserve missing distinctions: **A0-ISS-005** for Type5's unspecified first-due origin and **A0-ISS-006** for24B relevant epoch/short-ON/recurrence applicability. Existing A0-ISS-001 and A0-RF-019 already cover the14kn,2kn and circular-angle source gaps, so no duplicate issue IDs were added for those topics. Those issues remain source-unspecified despite policy choices. All map to meaningful existing tests and the exact reverse index.
+
+The limited profile is explicitly non-conformant as a full-ClassA capability claim: two one-TX/two-RX stations on AIS1/2, own-only W1/clock/EPFS inputs with provenance, unique synthetic syntax-valid MMSIs, one designated independent passive acceptance receiver, local knowledge and independent overlapping requests. It excludes satellite/commands/assignment/polling/base/degraded clocks/repeater/silent controls/transport/full IEC integration. Type2 and24A are optional later, not A1-S1 gates; existing4/9/18/21 are not substituted ClassA duties. A later UDP endpoint must be operator-approved loopback/isolated and synthetic-labelled. No traffic is generated here.
+
+The historical W1 YAML and digest are untouched. A future separate versioned long-ON configuration recommends guaranteed>=30min ON spans with varied OFF, plus an optional independently controlled continuously-ON five-simulation-hour fixture. Its seed, interval bounds, applicability and datum manifest are explicit; extended ON ensures deadlines are reached, not that legal candidates/physical success exist. Future RF1 must use declared synthetic ellipsoid heights or a justified geoid/tide conversion, never treat antenna offset/AMSL as surveyed WGS84 height. Five hours reaches Type5 recurrence and initial24B, not24h recurrence.
+
+All23 gap IDs remain. A0-GAP-023 now records reviewed restricted readings, not a blanket bar to isolated coding. Entries001-012 are **12 implementation dependencies**, not a prohibition on engineering;013-018 remain six capability/duration/output entries (014 and018 apply to this pilot);019-022 are four open/external/review entries;023 is one reviewed-profile entry with residual conflicts. A0-ISS-003 remains pilot-critical for S4. Other unresolved assigned-rate/fractional/no-UTC and external claims stay excluded/gated. RF1/FCS, I1 live ownership/epochs/abort/journal and P1 playback gates remain separate.
+
+| Gate | Current result / boundary |
+|---|---|
+| D0 documentation | **GO** after the actual checks below; only the limited feature boundary and reviewed decisions are frozen, not an invented complete FSM. |
+| D1 A1-S1 isolated coding | **CONDITIONAL GO** for separately staged Type3/5/ClassA24B and semantic ITDMA/SOTDMA state with independent bit oracles, existingType1 retained. No Type2/24A/RF/FCS requirement is smuggled into this slice. |
+| A1-S4 first-frame freeze/acceptance | **NO-GO** until ISS003 gets an annotated staggered-channel/anchored low-rate trace and operator/reviewer adjudication. S1 codec work does not resolve this rule. |
+| D2 five-hour RF-closed-loop UDP | **NO-GO** until actual codecs/FSM/RF/FCS, datum-valid geometry, live ownership, interrupted-frame/additive journal semantics, causal feedback, playback and receiver-specific isolated UDP tests pass. Existing StationOff/open-TX validation is not loosened. |
+| Full ITU/IEC conformity | **NOT CLAIMED**; excluded capabilities and external authorities remain necessary for any later full claim. |
+
+### Current counts and document validation
+
+The current CSV has **138** unique requirements: **89 explicit + 7 derived + 31 policies + 11 unresolved = 138**; source-backed count is96. Historical A0 was128=89+2+23+14. Five original unresolved MAC atoms035/036/037/039/040 become derived:2+5=7 and14-5=9. Adding eight policy atoms and two unresolved issue atoms gives23+8=31,9+2=11,128+10=138. No other original status changed.
+
+All128 original requirement IDs, all29 original test headings (including mandatory01-18), all23 original gap IDs and all15 CSV columns are preserved. Original source URLs are unchanged; applicable table/page/derivation evidence is extended. The21 amended original atoms are SIM002/008; ISS001/003/004; MAC014/019/021/024/027/035/036/037/038/039/040/041; RF016/019; MSG015; INT012. Their changes correct findings or downstream profile/trace wording;107 original records are otherwise unchanged. Exactly10 IDs are added: ISS005/006 and SIM009..016. No new test heading or gap row is padded into the count.
+
+Documentation-only checks actually executed on2026-10-19:
+
+- `python lab/build/a01-research/check_a01.py`: **PASS**. It strictly parses/byte-roundtrips RFC4180 CSV; compares the original15-column order,128 IDs, unchanged rows/source URLs and status math; checks29 original tests/all18 mandatory,23 gap rows, no dangling requirement/test/gap refs, every requirement-to-test relation and exact inverse index; checks local Markdown links, official PDF URL/page anchors, UTF-8/no BOM, per-file newline conventions and trailing whitespace/final newline.
+- Focused source acquisition/hash/XML/render checks: **PASS**, as recorded above. Source URLs were actually fetched, not merely pattern-checked; row page fragments were range-checked and altered printed references visually/source-checked. External sources remain unreviewed, as stated.
+- `python lab/build/a01-research/reference_checks.py`: **PASS** for independent SI set widths/wrap/1037-versus1038, remaining-count sequences, exact rational thresholds,101-value probability cardinality,32-bit rejection threshold, circular-resultant examples and the original Word Symbol node. The historical2014 source URLs also returned HTTP200 to HEAD requests; no new2014 source reading is claimed. A normalized exact26-word source-window scan found no matches in the five outputs, alongside manual review for short paraphrases/no copied figures or long quotations. These are document-oracle/source checks, not execution of any future A0-T/A1/RF test or protocol engine.
+- `git diff --check`: **PASS**. CSV is deliberately CRLF exactly as the committed working-copy baseline; Markdown remains LF. Git may report its existing CRLF-to-LF normalization notice; no Git configuration was changed and the working-copy CSV convention is preserved.
+- Scope/hash checks: **PASS**. Exactly the five authorized tracked documents differ, no new tracked/untracked deliverable, no staged/index diff, branch/HEAD unchanged. All109 other tracked files hash-identical to preflight, including W1 YAML/README/runtime/codecs/tests/build/goldens; old source PDF/Word hashes still match. No implementation or binary/package/configuration change, staging, commit, push or output traffic occurred.
+
+<!-- A01_FINAL_SCOPE -->
+
+Final `git diff --stat` is restricted to **five files changed**. Exact ending `git status --short --untracked-files=all`:
+
+```text
+ M lab/docs/A0_CLASS_A/A0_A1_INTERFACE_AND_GAP_REGISTER.md
+ M lab/docs/A0_CLASS_A/A0_NORMATIVE_CLASS_A_SPEC.md
+ M lab/docs/A0_CLASS_A/A0_REQUIREMENTS_TRACEABILITY.csv
+ M lab/docs/A0_CLASS_A/A0_REVIEW_AND_ACCEPTANCE.md
+ M lab/docs/A0_CLASS_A/A0_TEST_MATRIX.md
+```
+
+`git diff --cached --name-only` is empty. Branch is still `lab`; ending HEAD is still `964c2a149d1de2fae128c1c6d950cce3622b3d20`. No sixth tracked document or untracked deliverable was added; research/check material is ignored under `lab/build/a01-research/`. D0's final scope/trace checks pass against this state.
+
+**Build/CTest: NOT RUN. Historical regression suites: NOT RUN. A1/RF1/I1/P1 tests: NOT RUN.** No physical transmission, decoded RF/FCS result, NMEA/UDP delivery or performance measurement was produced. The test matrix remains future design, with separate SOURCE-DERIVED, POLICY and unresolved/out-of-profile expectations.
+
+Remaining operator/reviewer work before later slices includes ISS003's first-frame trace, concrete future synthetic metadata/clock/duration/datum choices, A1-S3 RNG serialization, external RF/FCS authorities and I1 power/abort/version design. These do not waive independent acceptance evidence. Recommended next engineering scope is **A1-S1 only**, under D1; no A1 code is part of this patch. Suggested **operator-only** commit message: `lab: reconcile A0 Class A rules and freeze autonomous terrestrial pilot profile`.
