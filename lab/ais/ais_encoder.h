@@ -28,6 +28,9 @@ EncodedPayload encode(const Type4& message);
 EncodedPayload encode(const Type9& message);
 EncodedPayload encode(const Type18& message);
 EncodedPayload encode(const Type21& message);
+EncodedPayload encode(const Type3& message);
+EncodedPayload encode(const Type5& message);
+EncodedPayload encode(const ClassAType24B& message);
 EncodedPayload encode(const Message& message);
 
 }  // namespace aismixer::lab::ais

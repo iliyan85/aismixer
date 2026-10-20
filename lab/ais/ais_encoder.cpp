@@ -110,6 +110,58 @@ void validate_name(const std::string& name) {
     }
 }
 
+void validate_text(const std::string& text, std::size_t maximum,
+                   std::string_view field) {
+    if (text.size() > maximum) {
+        throw std::invalid_argument(std::string(field) + ": maximum length is " +
+                                    std::to_string(maximum) + " ASCII characters");
+    }
+    for (const unsigned char character : text) {
+        if (character < 32 || character > 95 || character == '@') {
+            throw std::invalid_argument(std::string(field) +
+                ": expected AIS uppercase ASCII 32..95 excluding @ terminator");
+        }
+    }
+}
+
+void append_text(BitWriter& writer, const std::string& text,
+                 std::size_t characters, std::string_view field) {
+    for (std::size_t index = 0; index < characters; ++index) {
+        const unsigned char character = index < text.size()
+            ? static_cast<unsigned char>(text[index]) : static_cast<unsigned char>('@');
+        writer.append_unsigned(character >= 64 ? character - 64u : character, 6, field);
+    }
+}
+
+void validate_ship_type(std::int64_t ship_type) {
+    // Table 50 permits explicit regional codes 100..199; their assignment is
+    // not verified here. Table 51's future-reserved codes remain prohibited.
+    require_range(ship_type, 0, 199, "Type5.ship_type");
+    switch (ship_type) {
+    case 8: case 10: case 15: case 16: case 25: case 26: case 27: case 28:
+    case 47: case 48: case 68: case 87: case 88: case 95: case 96: case 97: case 98:
+        throw std::invalid_argument("Type5.ship_type: value is reserved for future use");
+    default:
+        break;
+    }
+}
+
+void validate_eta(const Type5& message) {
+    require_range(message.eta_month, 0, 12, "Type5.eta_month");
+    require_range(message.eta_day, 0, 31, "Type5.eta_day");
+    require_range(message.eta_hour, 0, 24, "Type5.eta_hour");
+    require_range(message.eta_minute, 0, 60, "Type5.eta_minute");
+    // ETA has no year. February 29 is representable; each unavailable component
+    // remains independent, as in Table 50's component-specific zero markers.
+    if (message.eta_month != 0 && message.eta_day != 0) {
+        constexpr int days_by_month[] = {0, 31, 29, 31, 30, 31, 30,
+                                        31, 31, 30, 31, 30, 31};
+        if (message.eta_day > days_by_month[static_cast<std::size_t>(message.eta_month)]) {
+            throw std::invalid_argument("Type5.eta_day: impossible day for supplied ETA month");
+        }
+    }
+}
+
 }  // namespace
 
 EncodedPayload armor_bits(const std::vector<std::uint8_t>& bits) {
@@ -308,6 +360,110 @@ EncodedPayload encode(const Type21& message) {
     append_flag(writer, message.assigned_mode, "Type21.assigned_mode");
     writer.append_unsigned(0, 1, "Type21.spare");
     return finish(writer, 272);
+}
+
+// M.1371-6 Annex 7 Tables 46/47 (printed 105..107) distinguish Type 3's
+// ITDMA state even though its positioning fields share Type 1's wire offsets.
+EncodedPayload encode(const Type3& message) {
+    require_range(message.repeat_indicator, 0, 3, "Type3.repeat_indicator");
+    require_range(message.navigation_status, 0, 15, "Type3.navigation_status");
+    if (message.navigation_status == 9 || message.navigation_status == 10 ||
+        message.navigation_status == 13) {
+        throw std::invalid_argument("Type3.navigation_status: value is reserved for future use");
+    }
+    require_range(message.rot_wire, -128, 127, "Type3.rot_wire");
+    require_range(message.sog_tenths_knots, 0, 1023, "Type3.sog_tenths_knots");
+    validate_position(message.longitude, message.latitude, "Type3");
+    require_range(message.cog_tenths_degrees, 0, 3600, "Type3.cog_tenths_degrees");
+    validate_heading(message.true_heading_degrees, "Type3.true_heading_degrees");
+    require_range(message.utc_second, 0, 63, "Type3.utc_second");
+    require_range(message.special_manoeuvre, 0, 3, "Type3.special_manoeuvre");
+
+    BitWriter writer;
+    append_header(writer, 3, message.repeat_indicator, message.mmsi);
+    append_number(writer, message.navigation_status, 4, "Type3.navigation_status");
+    writer.append_signed(message.rot_wire, 8, "Type3.rot_wire");
+    append_number(writer, message.sog_tenths_knots, 10, "Type3.sog_tenths_knots");
+    append_flag(writer, message.position_accuracy, "Type3.position_accuracy");
+    writer.append_signed(message.longitude, 28, "Type3.longitude");
+    writer.append_signed(message.latitude, 27, "Type3.latitude");
+    append_number(writer, message.cog_tenths_degrees, 12, "Type3.cog_tenths_degrees");
+    append_number(writer, message.true_heading_degrees, 9, "Type3.true_heading_degrees");
+    append_number(writer, message.utc_second, 6, "Type3.utc_second");
+    append_number(writer, message.special_manoeuvre, 2, "Type3.special_manoeuvre");
+    writer.append_unsigned(0, 2, "Type3.spare");
+    append_flag(writer, message.low_transmit_power, "Type3.low_transmit_power");
+    append_flag(writer, message.raim, "Type3.raim");
+    writer.append_unsigned(message.radio_state.raw().value(), 19, "Type3.radio_state");
+    return finish(writer, 168);
+}
+
+// Table 50 (printed 109..110), Table 51 (111..114), Figure 38 (115).
+EncodedPayload encode(const Type5& message) {
+    require_range(message.repeat_indicator, 0, 3, "Type5.repeat_indicator");
+    require_range(message.imo_or_flag_state_number, 1000000, 0x3fffffff,
+                  "Type5.imo_or_flag_state_number");
+    validate_text(message.call_sign, 7, "Type5.call_sign");
+    validate_text(message.name, 20, "Type5.name");
+    validate_ship_type(message.ship_type);
+    require_range(message.dimension_a, 0, 511, "Type5.dimension_a");
+    require_range(message.dimension_b, 0, 511, "Type5.dimension_b");
+    require_range(message.dimension_c, 0, 63, "Type5.dimension_c");
+    require_range(message.dimension_d, 0, 63, "Type5.dimension_d");
+    validate_epfs(message.position_fixing_device, "Type5.position_fixing_device");
+    validate_eta(message);
+    require_range(message.draught_tenths_m, 0, 255, "Type5.draught_tenths_m");
+    validate_text(message.destination, 20, "Type5.destination");
+
+    BitWriter writer;
+    append_header(writer, 5, message.repeat_indicator, message.mmsi);
+    append_number(writer, Type5::ais_version_indicator, 2, "Type5.ais_version_indicator");
+    append_number(writer, message.imo_or_flag_state_number, 30, "Type5.imo_or_flag_state_number");
+    append_text(writer, message.call_sign, 7, "Type5.call_sign");
+    append_text(writer, message.name, 20, "Type5.name");
+    append_number(writer, message.ship_type, 8, "Type5.ship_type");
+    append_number(writer, message.dimension_a, 9, "Type5.dimension_a");
+    append_number(writer, message.dimension_b, 9, "Type5.dimension_b");
+    append_number(writer, message.dimension_c, 6, "Type5.dimension_c");
+    append_number(writer, message.dimension_d, 6, "Type5.dimension_d");
+    append_number(writer, message.position_fixing_device, 4, "Type5.position_fixing_device");
+    append_number(writer, message.eta_month, 4, "Type5.eta_month");
+    append_number(writer, message.eta_day, 5, "Type5.eta_day");
+    append_number(writer, message.eta_hour, 5, "Type5.eta_hour");
+    append_number(writer, message.eta_minute, 6, "Type5.eta_minute");
+    append_number(writer, message.draught_tenths_m, 8, "Type5.draught_tenths_m");
+    append_text(writer, message.destination, 20, "Type5.destination");
+    append_flag(writer, message.dte_not_ready, "Type5.dte_not_ready");
+    writer.append_unsigned(0, 1, "Type5.spare");
+    return finish(writer, 424);
+}
+
+// Class A restriction: A7-3.22, printed 140; Table 77, 140..141; Table 78, 142.
+EncodedPayload encode(const ClassAType24B& message) {
+    require_range(message.repeat_indicator, 0, 3, "ClassAType24B.repeat_indicator");
+    // A moved-from identification remains a valid C++ object, but its string
+    // need not retain three characters. Recheck before serializing any bits.
+    if (message.manufacturer_id.vendor_id().size() != 3) {
+        throw std::invalid_argument(
+            "ClassAType24B.vendor_id: exactly three AIS ASCII characters are required");
+    }
+    validate_text(message.manufacturer_id.vendor_id(), 3, "ClassAType24B.vendor_id");
+    require_range(message.manufacturer_id.model_code(), 1, 15, "ClassAType24B.model_code");
+    require_range(message.manufacturer_id.serial_number(), 0, 0xfffff,
+                  "ClassAType24B.serial_number");
+
+    BitWriter writer;
+    append_header(writer, 24, message.repeat_indicator, message.mmsi);
+    writer.append_unsigned(1, 2, "ClassAType24B.part_number");
+    writer.append_unsigned(0, 8, "ClassAType24B.ship_type_unavailable");
+    append_text(writer, message.manufacturer_id.vendor_id(), 3, "ClassAType24B.vendor_id");
+    writer.append_unsigned(message.manufacturer_id.model_code(), 4, "ClassAType24B.model_code");
+    writer.append_unsigned(message.manufacturer_id.serial_number(), 20, "ClassAType24B.serial_number");
+    writer.append_unsigned(0, 42, "ClassAType24B.call_sign_unavailable");
+    writer.append_unsigned(0, 30, "ClassAType24B.dimensions_unavailable");
+    writer.append_unsigned(0, 4, "ClassAType24B.epfs_unavailable");
+    writer.append_unsigned(0, 2, "ClassAType24B.vdes_ais_only");
+    return finish(writer, 168);
 }
 
 EncodedPayload encode(const Message& message) {

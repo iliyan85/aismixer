@@ -143,7 +143,7 @@ else()
 endif()
 
 add_library(aismixer_lab_ais_codec STATIC
-    ais/ais_bits.cpp ais/ais_encoder.cpp ais/nmea0183.cpp)
+    ais/ais_bits.cpp ais/ais_encoder.cpp ais/nmea0183.cpp ais/communication_state.cpp)
 target_include_directories(aismixer_lab_ais_codec PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/ais")
 set_target_properties(aismixer_lab_ais_codec PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
@@ -341,6 +341,14 @@ if(BUILD_TESTING)
     add_test(NAME aismixer_lab_ais_smoke_test COMMAND aismixer_lab_ais_smoke --self-test)
     set_tests_properties(aismixer_lab_ais_codec_test aismixer_lab_ais_smoke_test
         PROPERTIES LABELS "host;AIS" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+    add_executable(aismixer_lab_classa_payload_tests tests/classa_payload_tests.cpp)
+    target_link_libraries(aismixer_lab_classa_payload_tests PRIVATE aismixer_lab_ais_codec)
+    set_target_properties(aismixer_lab_classa_payload_tests PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_options(aismixer_lab_classa_payload_tests PRIVATE /utf-8 /W4)
+    add_test(NAME aismixer_lab_classa_payload_test COMMAND aismixer_lab_classa_payload_tests)
+    set_tests_properties(aismixer_lab_classa_payload_test PROPERTIES
+        LABELS "host;AIS;classa" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         if(AISMIXER_LAB_BUILD_RUNTIME_RUNNER)
@@ -362,6 +370,11 @@ if(BUILD_TESTING)
             --exe $<TARGET_FILE:aismixer_lab_ais_smoke>)
         set_tests_properties(aismixer_lab_ais_wire_oracle_test
             PROPERTIES LABELS "host;AIS" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+        add_test(NAME aismixer_lab_classa_wire_oracle_test
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/classa_wire_oracle.py"
+            --exe $<TARGET_FILE:aismixer_lab_classa_payload_tests>)
+        set_tests_properties(aismixer_lab_classa_wire_oracle_test PROPERTIES
+            LABELS "host;AIS;classa" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
     else()
         message(WARNING "AIS independent wire oracle is NOT configured: a local Python 3 interpreter is required for the standard-library-only test. The codec itself does not depend on Python.")
     endif()
