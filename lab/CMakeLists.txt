@@ -232,6 +232,31 @@ if(AISMIXER_LAB_BUILD_RUNTIME_RUNNER)
     target_compile_options(aismixer_lab_runtime_runner PRIVATE /utf-8 /W4)
 endif()
 
+# A1-S2 reuses W1's actual host canonicalization, without the optional YAML
+# loader/operator or device engine. Keep that shared host library available.
+add_library(aismixer_lab_world_host STATIC world/world.cpp)
+target_include_directories(aismixer_lab_world_host PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/world")
+target_link_libraries(aismixer_lab_world_host PUBLIC aismixer_lab_runtime PRIVATE bcrypt)
+set_target_properties(aismixer_lab_world_host PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aismixer_lab_world_host PRIVATE /utf-8 /W4)
+
+add_library(aismixer_lab_classa_inputs STATIC
+    classa/station_config.cpp classa/station_inputs.cpp)
+target_include_directories(aismixer_lab_classa_inputs PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/classa" "${CMAKE_CURRENT_SOURCE_DIR}/world")
+target_link_libraries(aismixer_lab_classa_inputs PUBLIC aismixer_lab_ais_codec aismixer_lab_runtime)
+set_target_properties(aismixer_lab_classa_inputs PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aismixer_lab_classa_inputs PRIVATE /utf-8 /W4)
+
+add_library(aismixer_lab_classa_assembly STATIC classa/station_assembly.cpp)
+target_link_libraries(aismixer_lab_classa_assembly PUBLIC
+    aismixer_lab_classa_inputs aismixer_lab_world_host)
+set_target_properties(aismixer_lab_classa_assembly PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aismixer_lab_classa_assembly PRIVATE /utf-8 /W4)
+
 option(AISMIXER_LAB_BUILD_WORLD "Build the W1 world/lifecycle CUDA operator (requires local yaml-cpp >= 0.8)" OFF)
 if(AISMIXER_LAB_BUILD_WORLD)
     if(NOT _lab_yaml_target)
@@ -244,9 +269,6 @@ if(AISMIXER_LAB_BUILD_WORLD)
             message(FATAL_ERROR "W1 requires locally provisioned yaml-cpp >= 0.8. See README.md (repository root). No dependency is downloaded.")
         endif()
     endif()
-    add_library(aismixer_lab_world_host STATIC world/world.cpp)
-    target_include_directories(aismixer_lab_world_host PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/world")
-    target_link_libraries(aismixer_lab_world_host PUBLIC aismixer_lab_runtime PRIVATE bcrypt)
     add_library(aismixer_lab_world_config STATIC world/config.cpp)
     target_link_libraries(aismixer_lab_world_config PUBLIC aismixer_lab_world_host PRIVATE ${_lab_yaml_target})
     add_library(aismixer_lab_world_engine STATIC world/cuda_engine.cu world/world_session.cpp)
@@ -258,7 +280,7 @@ if(AISMIXER_LAB_BUILD_WORLD)
     set_property(SOURCE world/cuda_engine.cu PROPERTY VS_SETTINGS "Warning=W4")
     add_executable(aismixer_lab_world world/cli_main.cpp)
     target_link_libraries(aismixer_lab_world PRIVATE aismixer_lab_world_config aismixer_lab_world_engine)
-    foreach(_w1_target aismixer_lab_world_host aismixer_lab_world_config aismixer_lab_world_engine aismixer_lab_world)
+    foreach(_w1_target aismixer_lab_world_config aismixer_lab_world_engine aismixer_lab_world)
         set_target_properties(${_w1_target} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
         target_compile_options(${_w1_target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/W4>)
     endforeach()
@@ -349,6 +371,14 @@ if(BUILD_TESTING)
     add_test(NAME aismixer_lab_classa_payload_test COMMAND aismixer_lab_classa_payload_tests)
     set_tests_properties(aismixer_lab_classa_payload_test PROPERTIES
         LABELS "host;AIS;classa" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+    add_executable(aismixer_lab_classa_station_tests tests/classa_station_tests.cpp)
+    target_link_libraries(aismixer_lab_classa_station_tests PRIVATE aismixer_lab_classa_assembly)
+    set_target_properties(aismixer_lab_classa_station_tests PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_options(aismixer_lab_classa_station_tests PRIVATE /utf-8 /W4)
+    add_test(NAME aismixer_lab_classa_station_test COMMAND aismixer_lab_classa_station_tests)
+    set_tests_properties(aismixer_lab_classa_station_test PROPERTIES
+        LABELS "host;AIS;classa;station" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         if(AISMIXER_LAB_BUILD_RUNTIME_RUNNER)
@@ -375,6 +405,11 @@ if(BUILD_TESTING)
             --exe $<TARGET_FILE:aismixer_lab_classa_payload_tests>)
         set_tests_properties(aismixer_lab_classa_wire_oracle_test PROPERTIES
             LABELS "host;AIS;classa" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+        add_test(NAME aismixer_lab_classa_station_oracle_test
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/classa_station_oracle.py"
+            --exe $<TARGET_FILE:aismixer_lab_classa_station_tests>)
+        set_tests_properties(aismixer_lab_classa_station_oracle_test PROPERTIES
+            LABELS "host;AIS;classa;station" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
     else()
         message(WARNING "AIS independent wire oracle is NOT configured: a local Python 3 interpreter is required for the standard-library-only test. The codec itself does not depend on Python.")
     endif()
