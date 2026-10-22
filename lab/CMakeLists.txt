@@ -257,6 +257,18 @@ set_target_properties(aismixer_lab_classa_assembly PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 target_compile_options(aismixer_lab_classa_assembly PRIVATE /utf-8 /W4)
 
+# A1-S3: station-local two-channel maps, directory, restricted candidate
+# engine, generic RATDMA arithmetic and the CLASSA-PHILOX-v1 semantic RNG.
+# Host-only, CUDA/yaml-cpp/network free; no transmitter, RF model or UDP.
+add_library(aismixer_lab_classa_knowledge STATIC
+    classa/philox_protocol.cpp classa/generic_ratdma_policy.cpp classa/local_directory.cpp
+    classa/local_slot_map.cpp classa/candidate_policy.cpp classa/scenario_seed.cpp
+    classa/station_knowledge.cpp)
+target_link_libraries(aismixer_lab_classa_knowledge PUBLIC aismixer_lab_classa_assembly)
+set_target_properties(aismixer_lab_classa_knowledge PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aismixer_lab_classa_knowledge PRIVATE /utf-8 /W4)
+
 option(AISMIXER_LAB_BUILD_WORLD "Build the W1 world/lifecycle CUDA operator (requires local yaml-cpp >= 0.8)" OFF)
 if(AISMIXER_LAB_BUILD_WORLD)
     if(NOT _lab_yaml_target)
@@ -379,6 +391,16 @@ if(BUILD_TESTING)
     add_test(NAME aismixer_lab_classa_station_test COMMAND aismixer_lab_classa_station_tests)
     set_tests_properties(aismixer_lab_classa_station_test PROPERTIES
         LABELS "host;AIS;classa;station" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+    # The UNIT_FIXTURE evidence accessor exists only in this test build.
+    add_executable(aismixer_lab_classa_knowledge_tests tests/classa_knowledge_tests.cpp)
+    target_compile_definitions(aismixer_lab_classa_knowledge_tests PRIVATE AISMIXER_LAB_CLASSA_UNIT_FIXTURE)
+    target_link_libraries(aismixer_lab_classa_knowledge_tests PRIVATE aismixer_lab_classa_knowledge)
+    set_target_properties(aismixer_lab_classa_knowledge_tests PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_options(aismixer_lab_classa_knowledge_tests PRIVATE /utf-8 /W4)
+    add_test(NAME aismixer_lab_classa_knowledge_test COMMAND aismixer_lab_classa_knowledge_tests)
+    set_tests_properties(aismixer_lab_classa_knowledge_test PROPERTIES
+        LABELS "host;AIS;classa;knowledge" TIMEOUT 60 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         if(AISMIXER_LAB_BUILD_RUNTIME_RUNNER)
@@ -410,6 +432,11 @@ if(BUILD_TESTING)
             --exe $<TARGET_FILE:aismixer_lab_classa_station_tests>)
         set_tests_properties(aismixer_lab_classa_station_oracle_test PROPERTIES
             LABELS "host;AIS;classa;station" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
+        add_test(NAME aismixer_lab_classa_knowledge_oracle_test
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/classa_knowledge_oracle.py"
+            --exe $<TARGET_FILE:aismixer_lab_classa_knowledge_tests>)
+        set_tests_properties(aismixer_lab_classa_knowledge_oracle_test PROPERTIES
+            LABELS "host;AIS;classa;knowledge" TIMEOUT 60 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
     else()
         message(WARNING "AIS independent wire oracle is NOT configured: a local Python 3 interpreter is required for the standard-library-only test. The codec itself does not depend on Python.")
     endif()
