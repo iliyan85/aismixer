@@ -216,3 +216,155 @@ Final `git diff --stat` is restricted to **five files changed**. Exact ending `g
 **Build/CTest: NOT RUN. Historical regression suites: NOT RUN. A1/RF1/I1/P1 tests: NOT RUN.** No physical transmission, decoded RF/FCS result, NMEA/UDP delivery or performance measurement was produced. The test matrix remains future design, with separate SOURCE-DERIVED, POLICY and unresolved/out-of-profile expectations.
 
 Remaining operator/reviewer work before later slices includes ISS003's first-frame trace, concrete future synthetic metadata/clock/duration/datum choices, A1-S3 RNG serialization, external RF/FCS authorities and I1 power/abort/version design. These do not waive independent acceptance evidence. Recommended next engineering scope is **A1-S1 only**, under D1; no A1 code is part of this patch. Suggested **operator-only** commit message: `lab: reconcile A0 Class A rules and freeze autonomous terrestrial pilot profile`.
+
+## A0.2 addendum - 2026-10-23
+
+This addendum is the **current** documentation record for the operator-approved first-frame policy. The historical A0 and A0.1 sections above (counts, HEADs, source downloads, tool output, executed checks and NO-GO decisions) are unchanged. Staged history: A0 (128 requirements) -> A0.1 (138 requirements, D1 conditional for isolated A1-S1 only) -> A1-S1/S2/S3 isolated host-unit acceptance -> A1-S4.0 documentation adjudication -> A0.2 (140 requirements; a bounded policy enables S4-A engineering after S3.1).
+
+### A. Baseline and change scope
+
+Starting and ending branch `lab`, HEAD `caa43f05027bb4ce6839e944656fbc6e52b11442`, subject `lab: adjudicate A1-S4.0 first-frame rules and freeze the S4 causal contract`, exactly the expected baseline. Starting worktree and index were clean. Exactly five tracked documents are edited: [A0_NORMATIVE_CLASS_A_SPEC.md](A0_NORMATIVE_CLASS_A_SPEC.md), [A0_REQUIREMENTS_TRACEABILITY.csv](A0_REQUIREMENTS_TRACEABILITY.csv), [A0_TEST_MATRIX.md](A0_TEST_MATRIX.md), [A0_A1_INTERFACE_AND_GAP_REGISTER.md](A0_A1_INTERFACE_AND_GAP_REGISTER.md) and this file. No sixth tracked file, no change to the three A1-S4.0 documents, no code, test, CMake, profile, golden, README or branch-history change. Private scripts, the pre-edit baseline copies of the five documents and the tracked-file SHA-256 inventory live only in ignored `lab/build/a0-2-research/`.
+
+### B. Source lineage
+
+Authority for A0.2 is the reviewed A1-S4.0 research: [first-frame normative adjudication](../A1_CLASS_A/A1_S4_0_FIRST_FRAME_NORMATIVE_ADJUDICATION.md), [causal event and interface contract](../A1_CLASS_A/A1_S4_0_CAUSAL_EVENT_AND_INTERFACE_CONTRACT.md) and [review and gate](../A1_CLASS_A/A1_S4_0_REVIEW_AND_GATE.md). A0.2 inherits their recorded source evidence for ITU-R M.1371-6 (02/2026): PDF SHA-256 `126025db40f545454bbfc192c85353bd24bded48016f853ec184ef46f704a1dd` and Word SHA-256 `f75379e3a0725b1c096ba06a049fc4fcb00ddd81355ba97883a35382933b2d42`, the record page status "Approved 2026-02-19, in force", figures read from the Word embedded images and the explicit limit that the PDF figure pixels were not rasterized (A1-S4.0 FF-20 UNVERIFIED). No official file was re-downloaded for A0.2; this is a transcription and cross-index campaign, not a fresh source verification. No older edition was consulted and no figure or long passage was reproduced.
+
+### C. Reviewed choice and preserved uncertainty
+
+A1-S4.0 Interpretation II (per-channel first-frame ITDMA chains, each anchored at that channel's first NTS, with a per-channel terminal Message 3 of effective increment zero at NTS_first + 2 250, keep TRUE) is recorded as SIMULATION_POLICY `CLASSA-FIRST-FRAME-v1`, new atom A0-SIM-017, limited to two-channel autonomous Rr in {6, 10, 18, 30}. The source-explicit parts (60 s elapsed observation, Message 3 first, channel-scoped ITDMA state, entry exempt from the probability gate, keep during the first frame, continuous SOTDMA after the zero) and the derived parts (anchor at the first NTS, one-frame duration of 2 250 slots) keep their own markings in the specification addendum. A0-ISS-003 remains `UNSPECIFIED_OR_CONFLICT` with its test mapping intact and a minimal cross-reference added; the Rr < 2 execution question is split into the new unresolved atom A0-ISS-007. The policy is not LCP-P09, not an ITU addendum and no conformance claim; LCP-P01..P08 are unchanged.
+
+### D. Why low rate remains a substantive blocker
+
+The anchored/moored 3 min interval is a Table 1 source obligation and periodic ITDMA below two reports per minute is a normative classification, so the obligation is not waived. The source gives no low-rate entry/first-frame execution: the selection window lies outside the frozen LCP-P01 integer domain (the Table 16 formula would give +/- 675 slots at NI 6 750, which the S3 `selection_interval` rejects by design), the NSS/NTS forward reach exceeds one frame, keep semantics over 3 min same-channel intervals are undefined, Figure 14's terminal zero presupposes a same-channel NTS inside one frame, the [1,2)/min threshold texts conflict (A0-MAC-038/A0-RF-016), and LCP-P07 duties can fall due before a late first opportunity. The limited implementation must therefore return `blocked_low_rate_policy_absent` and no intent at Rr < 2 until a separately operator-approved, versioned `CLASSA-LOWRATE-ITDMA-v1` and an LCP-P01 revision exist; the A1-S4.0 Section 7.3 draft values are a non-adopted research proposal.
+
+### E. Integration gates
+
+S3.1 (side-effect-free rejection in `StationKnowledge::accept_evidence`, explicit station-local `synchronize` at the phase-2/phase-3 boundaries, tests for post-horizon expiry/capacity and post-synchronize throws) is GO TO IMPLEMENT in a separate campaign and is not PASS. S4-A (intent-only entry and per-channel first frame at Rr in {6, 10, 18, 30}) is CONDITIONAL GO TO IMPLEMENT only after S3.1 and this policy cross-index; it is not S4-A acceptance and not a real sender. Full A1-S4, RF1, I1, S5, P1 and the five-hour RF-closed-loop UDP pilot (D2) stay NO-GO. Full ITU/IEC Class A conformance is not claimed.
+
+### F. Counts and cross-file integrity actually run
+
+The CSV now has **140** unique requirements: **89 explicit + 7 derived + 32 policies + 12 unresolved = 140** (A0.1 had 138 = 89 + 7 + 31 + 11). Exactly two IDs were added, A0-SIM-017 and A0-ISS-007; no original ID was removed, renumbered, duplicated or reclassified; among the 138 originals only the `expected_behavior` field of A0-ISS-003 changed (cross-reference), and its status and test mapping are intact. All 29 test headings (18 mandatory), all 23 gap rows and all 15 CSV columns are preserved; the `## Requirement coverage index` was regenerated from the final CSV in CSV row order and the two new IDs appear in the A0-T03/T10/T19 and A0-T10/T19/T29 rows respectively. Working-copy line endings: the CSV is written LF to match its committed (index) convention `text=auto eol=lf`; Markdown remains LF.
+
+Documentation-only checker executed on 2026-10-23 from the repository root (ignored, not a tracked test): `python lab/build/a0-2-research/check_a02.py`. It parses the CSV with `csv.DictReader` (UTF-8, `newline=''`), verifies the 15-column order, unique IDs, the 140-atom and 89/7/32/12 counts, the RFC4180 fully-quoted byte roundtrip, non-empty mandatory fields, `test_ids` syntax, the exact two-ID addition against the pre-edit baseline copy, unchanged original statuses and fields, the A0-ISS-003/A0-ISS-007/A0-SIM-017 statuses; the 29 unchanged test headings and the two-way equality of the coverage index with the CSV inverse; the 23 gap rows and the A0-GAP-019 cross-reference; the A0.2 markers in A0-T03/T10/T19/T29, the policy statements in the specification and the preserved historical A0/A0.1 sentences; every relative link in the four Markdown documents; UTF-8 without BOM, LF only, final newline, no trailing whitespace and no NUL in all five files; `git diff --check`; branch, HEAD, empty index, exactly five modified files and byte-identical SHA-256 for every other tracked file against the preflight inventory. Its final output is recorded below (section I).
+
+### G. Decisions
+
+- **D0 A0.2 documentation: PASS** on the basis of the checker result in section I; a failing check would have made D0 NOT PASS without editing away the check.
+- **D1 S3.1: GO TO IMPLEMENT** in a separate campaign; not already PASS.
+- **D1 S4-A: CONDITIONAL GO TO IMPLEMENT** only for isolated intent-only engineering at Rr in {6, 10, 18, 30} once the S3.1 prerequisite and the policy cross-index are satisfied; not a real sender and not S4-A acceptance.
+- **Rr < 2: NO-GO** until a separately reviewed and adopted low-rate policy and an LCP-P01 extension exist; the standard's low-rate ITDMA obligation is not waived.
+- **D2 five-hour RF-closed-loop UDP pilot: NO-GO. Full ITU/IEC Class A conformance: NOT CLAIMED.**
+
+### H. What was and was not run
+
+Run: the documentation checker above, `git diff --check`, `git status`, `git diff --cached`, `git ls-files`/SHA-256 inventory comparison and the index regeneration script. NOT run: any build, CTest, CUDA, S1/S2/S3 suites or oracles, RF1, I1, P1, NMEA/UDP activity, PDF rasterization or any five-hour radio pilot. No compiler, test or source-execution PASS is claimed for A0.2; the A0 test designs A0-T01..T35 and the A1-S4.0 cases T4-01..T4-20 remain DESIGN ONLY.
+
+### I. Final Git scope and checker output
+
+Command (repository root, 2026-10-23): `python lab/build/a0-2-research/check_a02.py`, exit code 0, 87 PASS lines and 0 FAIL lines. This is the third run. Run 1 reported one failure because the specification sentence had bold markers inside the phrase `not retroactively LCP-P09`; the sentence was re-bolded with its meaning unchanged. Run 2 crashed inside the checker itself: its inventory reader expected the two-space `sha256sum` text format while the preflight inventory uses the binary-mode `digest *path` format; the checker was corrected and no document was changed for it. Recorded output of run 3:
+
+```text
+PASS CSV has exactly the 15 original columns in order
+PASS every CSV row has exactly 15 fields
+PASS CSV requirement IDs are unique
+PASS CSV has 140 atoms (found 140)
+PASS status counts 89/7/32/12 (found {'NORMATIVE_EXPLICIT': 89, 'SIMULATION_POLICY': 32, 'NORMATIVE_DERIVED': 7, 'UNSPECIFIED_OR_CONFLICT': 12})
+PASS RFC4180 fully-quoted LF byte roundtrip of the CSV
+PASS no empty mandatory CSV field
+PASS every test_ids field parses
+PASS baseline CSV had 138 atoms
+PASS exactly A0-SIM-017 and A0-ISS-007 were added (found ['A0-SIM-017', 'A0-ISS-007'])
+PASS all 138 original IDs retained in order, none renamed
+PASS only A0-ISS-003.expected_behavior changed among originals (found [('A0-ISS-003', ['expected_behavior'])])
+PASS original 138 statuses unchanged
+PASS A0-ISS-003 stays UNSPECIFIED_OR_CONFLICT
+PASS A0-ISS-007 is UNSPECIFIED_OR_CONFLICT
+PASS A0-SIM-017 is SIMULATION_POLICY with a blank source_url
+PASS A0-ISS-003 test mapping intact
+PASS A0-ISS-003 cross-references A0-SIM-017 and A0-ISS-007
+PASS 29 unique test headings (found 29)
+PASS test headings unchanged from baseline
+PASS all 18 mandatory scenarios present
+PASS every CSV test ID is a matrix heading and vice versa
+PASS coverage index equals the CSV inverse relation exactly (both directions, CSV order)
+PASS A0-SIM-017 appears in T03/T10/T19 index rows
+PASS A0-ISS-007 appears in T10/T19/T29 index rows
+PASS A0-T03 carries an A0.2-labelled addition
+PASS A0-T10 carries an A0.2-labelled addition
+PASS A0-T19 carries an A0.2-labelled addition
+PASS A0-T29 carries an A0.2-labelled addition
+PASS matrix labels the A1-S4.0 T4 cases DESIGN ONLY
+PASS exactly the 23 original gap rows in order (found 23)
+PASS A0-GAP-019 mentions A0-ISS-007
+PASS gap register names the explicit low-rate block status
+PASS gap register describes the S3.1 prerequisite and the intents-only seam
+PASS spec records the policy and both new atoms
+PASS spec states the policy is not LCP-P09
+PASS review has an A0.2 addendum
+PASS spec keeps the historical A0.1 D1 sentence
+PASS review keeps the historical A0.1 138-count sentence
+PASS review keeps the historical A0 128-count sentence
+PASS review keeps the historical A0.1 check record
+PASS spec keeps the eight LCP-P01..P08 decision headings
+PASS matrix index has mandatory rows
+PASS spec: all relative links resolve ([])
+PASS spec: references checked
+PASS matrix: all relative links resolve ([])
+PASS matrix: references checked
+PASS gaps: all relative links resolve ([])
+PASS gaps: references checked
+PASS review: all relative links resolve ([])
+PASS review: references checked
+PASS spec links an A1-S4.0 document
+PASS matrix links an A1-S4.0 document
+PASS gaps links an A1-S4.0 document
+PASS review links an A1-S4.0 document
+PASS spec: no BOM
+PASS spec: LF only
+PASS spec: final newline
+PASS spec: no NUL
+PASS spec: no trailing whitespace (lines [])
+PASS csv: no BOM
+PASS csv: LF only
+PASS csv: final newline
+PASS csv: no NUL
+PASS csv: no trailing whitespace (lines [])
+PASS matrix: no BOM
+PASS matrix: LF only
+PASS matrix: final newline
+PASS matrix: no NUL
+PASS matrix: no trailing whitespace (lines [])
+PASS gaps: no BOM
+PASS gaps: LF only
+PASS gaps: final newline
+PASS gaps: no NUL
+PASS gaps: no trailing whitespace (lines [])
+PASS review: no BOM
+PASS review: LF only
+PASS review: final newline
+PASS review: no NUL
+PASS review: no trailing whitespace (lines [])
+PASS HEAD unchanged
+PASS branch lab
+PASS git status lists exactly the five documents as modified ([' M lab/docs/A0_CLASS_A/A0_A1_INTERFACE_AND_GAP_REGISTER.md', ' M lab/docs/A0_CLASS_A/A0_NORMATIVE_CLASS_A_SPEC.md', ' M lab/docs/A0_CLASS_A/A0_REQUIREMENTS_TRACEABILITY.csv', ' M lab/docs/A0_CLASS_A/A0_REVIEW_AND_ACCEPTANCE.md', ' M lab/docs/A0_CLASS_A/A0_TEST_MATRIX.md'])
+PASS index empty
+PASS git diff --check passes
+PASS tracked file set unchanged (150 files)
+PASS all 145 other tracked files byte-identical to the preflight inventory ([])
+
+RESULT: ALL CHECKS PASS
+```
+
+After this output was inserted into this file the checker was run a fourth time and produced byte-identical output.
+
+Ending `git status --short --untracked-files=all`:
+
+```text
+ M lab/docs/A0_CLASS_A/A0_A1_INTERFACE_AND_GAP_REGISTER.md
+ M lab/docs/A0_CLASS_A/A0_NORMATIVE_CLASS_A_SPEC.md
+ M lab/docs/A0_CLASS_A/A0_REQUIREMENTS_TRACEABILITY.csv
+ M lab/docs/A0_CLASS_A/A0_REVIEW_AND_ACCEPTANCE.md
+ M lab/docs/A0_CLASS_A/A0_TEST_MATRIX.md
+```
+
+`git diff --cached --name-only` is empty; branch `lab`; ending HEAD `caa43f05027bb4ce6839e944656fbc6e52b11442`. Nothing was staged, committed, tagged, pushed, fetched, merged or reset. Suggested **operator-only** commit subject: `lab: record A0.2 first-frame policy and low-rate Class A gap`.
