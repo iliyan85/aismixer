@@ -496,3 +496,65 @@ committed. `git status --short --untracked-files=all`:
 
 Suggested commit subject (not executed):
 `lab: implement A1-S3 station-local AIS maps and semantic Philox`.
+
+## A1-S3.1 addendum - evidence acceptance atomicity (2026-10-23)
+
+Baseline `lab` HEAD `4095e9e0defc32229bd01ea05459f0d54132864d`. The sections
+above are the historical A1-S3 record (committed by the operator as
+`b9558b97eb674d1b7aea37615b9d582d81f99337`): their counts (847 assertions,
+157 negatives in 46 categories), hashes, build narratives, policy readings,
+change inventory and decisions are preserved verbatim and were true of that
+commit; the behaviour described here did not exist in it. Full statement,
+mechanism, tests, cost and validation:
+[A1_S3_1_EVIDENCE_ACCEPTANCE_ATOMICITY.md](A1_S3_1_EVIDENCE_ACCEPTANCE_ATOMICITY.md).
+
+Amended guarantee (EVIDENCE-ACCEPTANCE-ATOMICITY-v1, `SIMULATION_POLICY`):
+`accept_evidence` is transactional. Invariant 3 above ("all before any
+mutation") now holds for the whole operation including the time advance: a
+rejected or throwing call leaves every S3-owned observable unchanged (both
+maps with their instants and records, the directory, reuse exclusions, the
+receipt, disclosure and decision frontiers, draw watermarks, ledger,
+revision and `now_index`), consumes no receipt identity and performs no slot
+advance; S3-TIE-ORDER-v1 item 1 (reception precedes decision at an equal
+instant) is unchanged and a late token is rejected without side effect. The
+reversed-time guard mirrors the owning gate's clock: `check_own` advances it
+once the gate accepted the revalidation, as A1-S3 did through `synchronize`,
+so a power notice or decision earlier than a revalidation is refused by S2
+and S3 alike even after a rejected delivery.
+Validation and the complete application run on staged copies of the
+containers the token would change, and the commit is a sequence of
+non-throwing moves. Capacity, horizon and lineage rules are judged on the
+post-advance, post-supersession staged state, so a re-observation of an
+already garbled slot, an in-place lineage refresh and a superseded
+allocation no longer consume capacity, and records that expire at the
+delivery instant no longer block legal evidence; the three conservative
+pre-checks of the committed code are replaced by those exact checks.
+Everything else in the evidence boundary section (Tables 18-20
+application, typed `unresolved` outcomes, Message 20 deferral, supersession
+reporting) is unchanged. The transaction copies the containers it may
+change, a cost linear in the station's retained records and measured in the
+S3.1 report.
+
+S2 revalidation boundary: the owning `StationInputGate::revalidate` still
+runs inside every call (invariant 6) and advances the gate's own monotonic
+clock before the token is examined; that S2 side effect is intentional and
+is not rolled back. S3.1 claims nothing about S2 state.
+
+Explicit synchronize discipline: `synchronize(own_now, T)` is unchanged and
+remains the intentional time transition that S4 performs at the start of
+each phase-2 delivery group and phase-3 decision group (A1-S4.0 contract,
+Section 3); the state after that explicit call, not the state before the
+phase, is the rollback baseline for tokens delivered at `T`. The decision
+operations (`reserve_own`, `release_own`, `candidates`, the draws) keep
+their A1-S3 behaviour of synchronizing first.
+
+Evidence (final host run; the complete matrix including the main Release
+pipeline is in the S3.1 report): `A1-S3 synthetic local-knowledge tests
+PASS: 1070 assertions, 207 categorized invalid fixtures rejected` (the 46
+categories above keep their counts; 50 new rejections in fourteen
+`atomic ...` categories), oracle PASS with the unchanged 461 rows and
+vectors SHA256 `28faaace53aa323bd83667e6af02200557f4b8c6c0db554f5221b2ed7530524d`
+(44 886 bytes) from both the host wrapper and the main Release build. The
+same test file built against the committed A1-S3 `station_knowledge.cpp`
+fails at its first rejection-isolation assertion, which is the before/after
+witness.

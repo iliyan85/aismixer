@@ -44,6 +44,25 @@ namespace aismixer::lab::classa {
 //     power generation; S4 owns the counters, S3 rejects any replay.
 //  5. The draw ledger is immutable and bounded: when full, further draws are
 //     rejected explicitly until drain_ledger() exports the entries.
+//
+// EVIDENCE-ACCEPTANCE-ATOMICITY-v1 (A1-S3.1, SIMULATION_POLICY): accept_evidence
+// is transactional. Validation and the complete application run on staged
+// copies of the containers the token would change; only then are they
+// installed by non-throwing moves. A rejected or throwing acceptance leaves
+// every observable field unchanged (snapshot(), both maps with their
+// instants and records, the directory, reuse exclusions, the receipt,
+// disclosure and decision frontiers, draw watermarks and the ledger), does
+// not consume the receipt identity and performs no slot advance; its only
+// side effects are the owning StationInputGate's monotonic revalidation clock
+// (S2 authority, not rolled back) and this object's mirror of that clock, the
+// reversed-time guard that check_own advances once the gate accepted the
+// revalidation (as A1-S3 did through synchronize). A valid token at a later own UTC slot
+// advances both maps, expires the directory and the reuse exclusions exactly
+// as synchronize would and then records the evidence, in one commit with the
+// same revision increments (advance plus evidence); capacity, horizon and
+// lineage rules are judged on that post-advance state. Callers may still
+// synchronize explicitly at the start of a delivery or decision group: that
+// explicit transition, not a rejected delivery, is the rollback baseline.
 inline constexpr std::uint32_t kStationKnowledgeVersion = 1;
 inline constexpr const char* kStationKnowledgeId = "OWN-LOCAL-KNOWLEDGE-v1";
 inline constexpr std::size_t kProtocolPurposeCount = 5;  // Purposes 101..105.
@@ -131,7 +150,10 @@ public:
     // Revalidate the inputs through the owning gate and advance both maps and
     // the directory horizon to the owner's current UTC slot.
     std::int64_t synchronize(const QualifiedOwnInputs& own_now, runtime::SimulationInstant now);
-    // Closed boundary: only owned evidence tokens; validation precedes mutation.
+    // Closed boundary: only owned evidence tokens. Transactional since A1-S3.1
+    // (EVIDENCE-ACCEPTANCE-ATOMICITY-v1 above): validation and the complete
+    // application precede any visible mutation; a rejection changes no S3-owned
+    // observable (the gate clock and its mirror are the documented exceptions).
     EvidenceAcceptance accept_evidence(const OwnedRadioEvidence& evidence,
                                        const QualifiedOwnInputs& own_now, runtime::SimulationInstant now);
     // Own intentions: local expectations, never exclusive grants or permission to transmit.

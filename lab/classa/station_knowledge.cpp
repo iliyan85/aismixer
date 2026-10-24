@@ -1,7 +1,9 @@
 #include "station_knowledge.h"
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -124,6 +126,12 @@ void StationKnowledge::check_own(const QualifiedOwnInputs& own_now, runtime::Sim
     require(fresh.current_slot().utc_minute == own_now.current_slot().utc_minute &&
             fresh.current_slot().slot == own_now.current_slot().slot,
             "Class A knowledge: revalidated UTC slot differs from the presented inputs");
+    // The reversed-time guard mirrors the owning gate's monotonic clock: once
+    // the gate accepted this revalidation, `now` is the station's time frontier
+    // even if the token presented afterwards is rejected (A1-S3 reached the
+    // same point through synchronize), so power notices and decisions earlier
+    // than a revalidation are refused by both objects alike.
+    latest_time_ = now;
 }
 
 LocalSlotMap& StationKnowledge::map_for(Channel channel) {
@@ -157,7 +165,33 @@ std::int64_t StationKnowledge::synchronize(const QualifiedOwnInputs& own_now, ru
 EvidenceAcceptance StationKnowledge::accept_evidence(const OwnedRadioEvidence& evidence,
                                                      const QualifiedOwnInputs& own_now,
                                                      runtime::SimulationInstant now) {
-    const auto now_index = synchronize(own_now, now);
+    // EVIDENCE-ACCEPTANCE-ATOMICITY-v1 (A1-S3.1, SIMULATION_POLICY). Phase 1
+    // revalidates the own inputs through the owning gate, derives the own slot
+    // index WITHOUT synchronize, validates the token against that index and
+    // prepares the complete result on staged copies of exactly the containers
+    // the acceptance would change. Phase 2 installs the staged state with
+    // non-throwing moves. A rejected or throwing call therefore leaves every
+    // S3-owned observable unchanged and consumes no receipt identity; the owning
+    // S2 gate's monotonic revalidation clock and its mirror in check_own (the
+    // reversed-time guard) are the documented exceptions. A
+    // valid token at a later slot performs the same advance as synchronize
+    // followed by acceptance (both maps, directory expiry, reuse exclusions,
+    // one advance increment) in the same commit, and every capacity, horizon
+    // and lineage rule is evaluated on the post-advance, post-supersession
+    // state, never on counts that would have expired at `now`.
+    check_own(own_now, now);
+    const auto now_index = absolute_index(slot_from_utc(own_now.current_slot()));
+    require(!now_index_ || now_index >= *now_index_, "Class A knowledge: own UTC slot regressed");
+    const bool advancing = !now_index_ || now_index != *now_index_;
+    // Every precondition that LocalSlotMap::advance evaluates for this index
+    // is established here, before any copy or mutation: a regressing slot keeps
+    // its A1-S3 rejection position and the staged advance below can only fail
+    // for a reason already reported here (stored records were range-checked
+    // when they were recorded). The commit itself performs only noexcept moves.
+    const auto earliest = offset_index(now_index, -limits_.map.past_frames * kSlotsPerFrame);
+    const auto horizon_last = offset_index(now_index, limits_.map.future_frames * kSlotsPerFrame);
+    require((!ais1_.advanced() || now_index >= ais1_.now_index()) && (!ais2_.advanced() || now_index >= ais2_.now_index()),
+            "Class A knowledge: map instant would regress");
     const auto& observation = evidence.observation();
     require(observation.provenance == EvidenceProvenance::UnitFixture,
             "Class A knowledge: unknown evidence provenance");
@@ -187,7 +221,6 @@ EvidenceAcceptance StationKnowledge::accept_evidence(const OwnedRadioEvidence& e
     require(last_index >= received_index && last_index - received_index < kMaxBlockLength,
             "Class A knowledge: physical interval slot span is malformed");
     require(received_index <= now_index, "Class A knowledge: evidence received in a future slot");
-    const auto earliest = offset_index(now_index, -limits_.map.past_frames * kSlotsPerFrame);
     require(received_index >= earliest, "Class A knowledge: evidence older than the local past horizon");
     const auto span = static_cast<std::uint8_t>(last_index - received_index + 1);
 
@@ -197,12 +230,52 @@ EvidenceAcceptance StationKnowledge::accept_evidence(const OwnedRadioEvidence& e
     acceptance.received_index = received_index;
     acceptance.span_slots = span;
     acceptance.disposition = observation.disposition;
-    auto& map = map_for(observation.channel);
+    LocalSlotMap& target = map_for(observation.channel);
+    LocalSlotMap& other_target = map_for(other_channel(observation.channel));
+
+    // Staged copies: the evidence channel's map always; the other map, the
+    // directory and the reuse exclusions only when the slot index advances
+    // (the directory also for decoded evidence, below). Staging runs after the
+    // last token-level check of each branch, so a rejected token pays no copy;
+    // copying and advancing may throw there, still before any visible mutation.
+    std::optional<LocalSlotMap> staged_map;
+    std::optional<LocalSlotMap> staged_other;
+    std::optional<PeerDirectory> staged_directory;
+    std::vector<ReuseExclusion> staged_exclusions;
+    const auto stage = [&]() {
+        staged_map.emplace(target);
+        if (!advancing) return;
+        staged_map->advance(now_index);
+        staged_other.emplace(other_target);
+        staged_other->advance(now_index);
+        staged_directory.emplace(directory_);
+        (void)staged_directory->expire_stale(earliest, now_index);
+        staged_exclusions = reuse_exclusions_;
+        staged_exclusions.erase(std::remove_if(staged_exclusions.begin(), staged_exclusions.end(),
+            [&](const ReuseExclusion& exclusion) { return exclusion.excluded_until_index <= now_index; }),
+            staged_exclusions.end());
+    };
+    // Phase 2: installation by non-throwing moves and scalar assignments only
+    // (the static assertions after this function establish the noexcept moves).
+    const auto commit = [&]() noexcept {
+        target = std::move(*staged_map);
+        if (staged_other) other_target = std::move(*staged_other);
+        if (staged_directory) directory_ = std::move(*staged_directory);
+        if (advancing) {
+            reuse_exclusions_ = std::move(staged_exclusions);
+            revision_ += 1;
+        }
+        now_index_ = now_index;
+        last_receipt_id_ = observation.receipt_id;
+        last_disclosed_at_ = observation.disclosed_at;
+        revision_ += 1;
+    };
 
     if (observation.disposition != ObservationDisposition::Decoded) {
         require(!observation.decoded.has_value(), "Class A knowledge: undecoded evidence cannot carry decoded facts");
-        require(map.garble_count() + span <= limits_.map.max_garble,
-                "Class A knowledge: bounded garble capacity would be exceeded");
+        stage();
+        // The staged map enforces the bounded garble store exactly, after the
+        // advance and with in-place replacement of an already garbled slot.
         for (std::int64_t index = received_index; index <= last_index; ++index) {
             GarbleRecord record;
             record.channel = observation.channel;
@@ -211,12 +284,10 @@ EvidenceAcceptance StationKnowledge::accept_evidence(const OwnedRadioEvidence& e
             record.receipt_id = observation.receipt_id;
             record.disposition = observation.disposition;
             record.provenance = observation.provenance;
-            map.record_garble(record);
+            staged_map->record_garble(record);
         }
-        last_receipt_id_ = observation.receipt_id;
-        last_disclosed_at_ = observation.disclosed_at;
-        revision_ += 1;
         acceptance.status = "garble_recorded_no_identity";
+        commit();
         return acceptance;
     }
 
@@ -241,7 +312,6 @@ EvidenceAcceptance StationKnowledge::accept_evidence(const OwnedRadioEvidence& e
         require(facts.raw_communication_state >= 0 && facts.raw_communication_state <= 0x7ffff,
                 "Class A knowledge: malformed remote communication state");
     const auto frame = frame_of_index(received_index);
-    const auto horizon_last = offset_index(now_index, limits_.map.future_frames * kSlotsPerFrame);
     const auto allocation = [&](std::int64_t first, std::uint8_t block, AllocationBasis basis, std::int64_t through) {
         ExternalAllocation value;
         value.channel = observation.channel;
@@ -286,12 +356,12 @@ EvidenceAcceptance StationKnowledge::accept_evidence(const OwnedRadioEvidence& e
                 allocations.front().reserved_through_minute = frame + 1;
             }
             if (!itdma->no_further_allocation()) {
-                const auto target = offset_index(received_index, itdma->effective_increment());
+                const auto target_index = offset_index(received_index, itdma->effective_increment());
                 const auto block = static_cast<std::uint8_t>(itdma->slot_count());
-                if (target > horizon_last)
-                    unresolved.push_back("itdma_block_beyond_local_horizon:" + std::to_string(target));
+                if (target_index > horizon_last)
+                    unresolved.push_back("itdma_block_beyond_local_horizon:" + std::to_string(target_index));
                 else
-                    allocations.push_back(allocation(target, block, AllocationBasis::ItdmaIncrement, frame_of_index(target)));
+                    allocations.push_back(allocation(target_index, block, AllocationBasis::ItdmaIncrement, frame_of_index(target_index)));
             }
         } else if (sotdma) {
             carries_sync = true;
@@ -300,13 +370,13 @@ EvidenceAcceptance StationKnowledge::accept_evidence(const OwnedRadioEvidence& e
             const auto submessage = sotdma->submessage();
             if (const auto* offset = std::get_if<ais::SotdmaSlotOffset>(&submessage)) {
                 if (offset->offset > 0) {
-                    const auto target = offset_index(received_index, offset->offset);
-                    if (frame_of_index(target) != frame + 1)
+                    const auto target_index = offset_index(received_index, offset->offset);
+                    if (frame_of_index(target_index) != frame + 1)
                         unresolved.push_back("sotdma_offset_not_next_frame:" + std::to_string(offset->offset));
-                    else if (target > horizon_last)
-                        unresolved.push_back("sotdma_offset_beyond_local_horizon:" + std::to_string(target));
+                    else if (target_index > horizon_last)
+                        unresolved.push_back("sotdma_offset_beyond_local_horizon:" + std::to_string(target_index));
                     else
-                        allocations.push_back(allocation(target, 1, AllocationBasis::SotdmaNextFrameOffset, frame + 1));
+                        allocations.push_back(allocation(target_index, 1, AllocationBasis::SotdmaNextFrameOffset, frame + 1));
                 }
             } else {
                 if (const auto* current = std::get_if<ais::SotdmaCurrentSlot>(&submessage)) {
@@ -323,14 +393,18 @@ EvidenceAcceptance StationKnowledge::accept_evidence(const OwnedRadioEvidence& e
             }
         }
     }
-    require(directory_.would_fit(facts.source_mmsi),
+    // Every token-level check has passed: stage now. The directory is staged
+    // for every decoded token: the peer record is derived from the post-expiry
+    // copy, so a peer that expired at `now` is re-learned as a fresh record
+    // exactly as after an explicit synchronize.
+    stage();
+    if (!staged_directory) staged_directory.emplace(directory_);
+    require(staged_directory->would_fit(facts.source_mmsi),
             "Class A knowledge: bounded peer directory capacity would be exceeded");
-    require(map.external_count() + allocations.size() <= limits_.map.max_external,
-            "Class A knowledge: bounded external allocation capacity would be exceeded");
 
     PeerRecord record;
     bool existing_record = false;
-    if (const auto* existing = directory_.find(facts.source_mmsi)) {
+    if (const auto* existing = staged_directory->find(facts.source_mmsi)) {
         record = *existing;
         existing_record = true;
     } else {
@@ -381,12 +455,12 @@ EvidenceAcceptance StationKnowledge::accept_evidence(const OwnedRadioEvidence& e
         return PeerAnnouncedReservation{value.channel, value.first_index, value.block_length, value.announced_minute,
                                         value.reserved_through_minute, value.basis, value.receipt_id, value.announced_index};
     };
-    require(record.reservations.size() + allocations.size() <= kMaxPeerReservations,
-            "Class A knowledge: bounded per-peer reservation cache would be exceeded");
 
-    // All validation passed: mutate the maps first, then the directory.
+    // Apply to the staged map and record: the map enforces horizon, lineage
+    // recency and the bounded external store exactly, after the advance and
+    // after supersession; a failure at any record discards the whole staging.
     for (const auto& value : allocations) {
-        if (map.record_external(value)) {
+        if (staged_map->record_external(value)) {
             acceptance.allocations.push_back(value);
             record.reservations.push_back(reservation_of(value));
         } else {
@@ -397,15 +471,22 @@ EvidenceAcceptance StationKnowledge::accept_evidence(const OwnedRadioEvidence& e
         [](const PeerAnnouncedReservation& a, const PeerAnnouncedReservation& b) {
             return a.channel != b.channel ? a.channel < b.channel : a.first_index < b.first_index;
         });
-    directory_.upsert(record);
-    last_receipt_id_ = observation.receipt_id;
-    last_disclosed_at_ = observation.disclosed_at;
-    revision_ += 1;
+    require(record.reservations.size() <= kMaxPeerReservations,
+            "Class A knowledge: bounded per-peer reservation cache would be exceeded");
+    staged_directory->upsert(record);
     acceptance.peer = facts.source_mmsi;
     acceptance.unresolved = std::move(unresolved);
     acceptance.status = deferred ? "decoded_base_message_deferred" : "decoded_peer_evidence_accepted";
+    commit();
     return acceptance;
 }
+
+// The S3.1 commit installs staged containers by move assignment and returns
+// the prepared result by move; both must be unable to throw.
+static_assert(std::is_nothrow_move_assignable_v<LocalSlotMap>, "S3.1 commit needs a non-throwing LocalSlotMap move");
+static_assert(std::is_nothrow_move_assignable_v<PeerDirectory>, "S3.1 commit needs a non-throwing PeerDirectory move");
+static_assert(std::is_nothrow_move_assignable_v<std::vector<ReuseExclusion>>, "S3.1 commit needs a non-throwing exclusion move");
+static_assert(std::is_nothrow_move_constructible_v<EvidenceAcceptance>, "S3.1 result must be returnable without throwing");
 
 OwnReservation StationKnowledge::reserve_own(const OwnReservationRequest& request,
                                              const QualifiedOwnInputs& own_now,

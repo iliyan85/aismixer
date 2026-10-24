@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -1413,6 +1414,580 @@ void fast_peer_refresh() {
 }
 
 // ---------------------------------------------------------------------------
+// A1-S3.1 evidence acceptance atomicity. `observe` renders every S3-owned
+// observable (both maps with their instants and full records, the directory with
+// full peer records and announcements, reuse exclusions, draw watermarks, the
+// ledger with every proposal, receipt/decision frontiers, revision, power
+// epoch) so that two states compare by exact value and order, not by counts.
+// The private time, disclosure and epoch frontiers have no accessor; a
+// rejection's effect on them is probed behaviourally (receipt identity and
+// disclosure frontier not consumed: S31-03, S31-06, S31-07).
+template <class T> std::string optional_text(const std::optional<T>& value) {
+    return value ? std::to_string(*value) : std::string("-");
+}
+std::string instant_text(const std::optional<r::SimulationInstant>& value) {
+    return value ? std::to_string(value->units) : std::string("-");
+}
+std::string allocation_text(const c::ExternalAllocation& value) {
+    std::ostringstream out;
+    out << c::channel_name(value.channel) << ':' << value.first_index << ':' << static_cast<unsigned>(value.block_length) << ':' << value.mmsi << ':'
+        << static_cast<unsigned>(value.kind) << ':' << static_cast<unsigned>(value.basis) << ':' << value.announced_minute << ':' << value.announced_index
+        << ':' << value.reserved_through_minute << ':' << value.last_use_minute << ':' << value.receipt_id << ':' << value.power_generation << ':'
+        << static_cast<unsigned>(value.provenance);
+    return out.str();
+}
+std::string observe(const c::StationKnowledge& knowledge) {
+    const auto snap = knowledge.snapshot();
+    if (snap.knowledge_revision != knowledge.knowledge_revision() || snap.power_generation != knowledge.power_generation() ||
+        snap.equipment_on != knowledge.equipment_on() || snap.ledger_issued != knowledge.ledger_issued() ||
+        snap.ledger_drained != knowledge.ledger_drained() || knowledge.ready_for_tx())
+        throw std::runtime_error("snapshot disagrees with the accessors");
+    std::ostringstream out;
+    out << "generation=" << snap.power_generation << " on=" << snap.equipment_on << " now=" << optional_text(snap.now_index) << " revision="
+        << snap.knowledge_revision << " decided=" << instant_text(snap.last_decision_at) << " receipt=" << snap.last_receipt_id << " ledger="
+        << snap.ledger_entries << '/' << snap.ledger_issued << '/' << snap.ledger_drained << " counts=" << snap.external_ais1 << ',' << snap.external_ais2
+        << ',' << snap.garble_ais1 << ',' << snap.garble_ais2 << " own=" << snap.own_ais1.size() << ',' << snap.own_ais2.size() << '\n';
+    for (const auto channel : {c::Channel::Ais1, c::Channel::Ais2}) {
+        const auto& map = knowledge.map(channel);
+        out << c::channel_name(channel) << " advanced=" << map.advanced() << " instant=" << map.now_index() << '\n';
+        for (const auto& own : map.own_reservations())
+            out << " own " << own.first_index << ':' << static_cast<unsigned>(own.block_length) << ':' << static_cast<unsigned>(own.kind) << ':'
+                << static_cast<unsigned>(own.timeout_frames) << ':' << own.keep << ':' << own.power_generation << ':' << own.decided_at.units << ':'
+                << own.decision_id << ':' << own.cause << '\n';
+        for (const auto& value : map.external_allocations()) out << " ext " << allocation_text(value) << '\n';
+        for (const auto& garble : map.garbles())
+            out << " garble " << garble.index << ':' << garble.disclosed_at.units << ':' << garble.receipt_id << ':' << static_cast<unsigned>(garble.disposition)
+                << ':' << static_cast<unsigned>(garble.provenance) << '\n';
+    }
+    out << "directory " << knowledge.directory().size() << '/' << knowledge.directory().capacity() << '\n';
+    for (const auto& peer : knowledge.directory().snapshot()) {
+        out << " peer " << peer.mmsi << ':' << static_cast<unsigned>(peer.kind) << ':' << static_cast<unsigned>(peer.last_message) << ':'
+            << c::channel_name(peer.last_channel) << ':' << peer.last_heard_index << ':' << peer.last_disclosed_at.units << ':' << peer.first_receipt_id << ':'
+            << peer.last_receipt_id << ':' << peer.receipts << ':' << peer.position_available << ':' << peer.position_in_geodesic_domain << ':'
+            << peer.longitude_ais << ':' << peer.latitude_ais << ':' << peer.position.longitude_ndeg << ':' << peer.position.latitude_ndeg << ':'
+            << static_cast<long long>(peer.sync_state) << ':' << optional_text(peer.received_station_count) << ':' << optional_text(peer.utc_hour) << ':'
+            << optional_text(peer.utc_minute_field) << ':' << peer.navigation_status << ':' << peer.learned_generation << ':'
+            << static_cast<unsigned>(peer.provenance) << '\n';
+        auto reservations = peer.reservations;  // Printed on a total key: the stored order is only (channel, first_index).
+        std::sort(reservations.begin(), reservations.end(), [](const c::PeerAnnouncedReservation& x, const c::PeerAnnouncedReservation& y) {
+            return std::tie(x.channel, x.first_index, x.basis, x.announced_index, x.receipt_id) <
+                   std::tie(y.channel, y.first_index, y.basis, y.announced_index, y.receipt_id);
+        });
+        for (const auto& reservation : reservations)
+            out << "  res " << c::channel_name(reservation.channel) << ':' << reservation.first_index << ':' << static_cast<unsigned>(reservation.block_length)
+                << ':' << reservation.announced_minute << ':' << reservation.reserved_through_minute << ':' << static_cast<unsigned>(reservation.basis) << ':'
+                << reservation.receipt_id << ':' << reservation.announced_index << '\n';
+    }
+    for (const auto& exclusion : knowledge.reuse_exclusions()) out << " exclusion " << exclusion.mmsi << ':' << exclusion.excluded_until_index << '\n';
+    for (const auto& watermark : snap.draw_watermarks)
+        out << " watermark " << static_cast<unsigned>(watermark.purpose) << ':' << watermark.episode << ':' << watermark.draw_index << '\n';
+    for (const auto& entry : knowledge.ledger()) {
+        out << " ledger " << entry.protocol_version << ':' << entry.key.scenario_seed << ':' << entry.key.equipment_id << ':' << entry.key.power_generation << ':'
+            << static_cast<unsigned>(entry.key.purpose) << ':' << entry.key.episode << ':' << entry.key.draw_index << ':' << entry.minimum << ':' << entry.maximum
+            << ':' << entry.span << ':' << entry.acceptance_limit << ':' << entry.rejections << ':' << entry.accepted_word << ':' << entry.value << ':'
+            << entry.input_digest << ':' << entry.outcome;
+        for (const auto& proposal : entry.proposals)
+            out << ' ' << proposal.rejection_index << '=' << proposal.words[0] << ',' << proposal.words[1] << ',' << proposal.words[2] << ','
+                << proposal.words[3] << (proposal.accepted ? "+" : "-");
+        out << '\n';
+    }
+    return out.str();
+}
+std::string acceptance_text(const c::EvidenceAcceptance& value) {
+    std::ostringstream out;
+    out << value.receipt_id << ':' << c::channel_name(value.channel) << ':' << value.received_index << ':' << static_cast<unsigned>(value.span_slots) << ':'
+        << static_cast<unsigned>(value.disposition) << ':' << optional_text(value.peer) << ':' << value.status;
+    for (const auto& allocation : value.allocations) out << " a=" << allocation_text(allocation);
+    for (const auto& allocation : value.superseded) out << " s=" << allocation_text(allocation);
+    for (const auto& text : value.unresolved) out << " u=" << text;
+    return out.str();
+}
+
+void evidence_acceptance_atomicity() {
+    const auto position = [](const Station& station) { return peer_at(station.location, 90000000000LL, 20000.0); };
+    // A Type 1 whose SOTDMA submessage matches its timeout (Table 18); timeout 0 announces the same slot next frame.
+    const auto type1 = [](const Station& station, c::Channel channel, std::uint64_t receipt, std::int64_t index, std::uint32_t mmsi,
+                          std::int64_t timeout, std::optional<w::Point> where) {
+        return observation(station, channel, receipt, index, sotdma_facts(mmsi, sotdma_for_timeout(timeout, c::frame_slot(index)), where));
+    };
+    // A rejection must leave the exact observable state unchanged, including both map instants.
+    const auto rejected = [](const char* category, Station& station, const c::OwnRadioObservation& value, const c::QualifiedOwnInputs& inputs,
+                             r::SimulationInstant now) {
+        const auto before = observe(station.knowledge);
+        invalid(category, [&] { (void)station.knowledge.accept_evidence(mint(value), inputs, now); });
+        require(observe(station.knowledge) == before, "rejected evidence left the exact S3 state unchanged");
+    };
+    {
+        // S31-01 REJECT-LATER-FRAME: every rejection class delivered one frame later advances nothing.
+        Pair pair;
+        auto& station = pair.a;
+        const auto t0 = at_slot(100);
+        const auto inputs0 = station.qualify(t0);
+        const auto accepted = station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 1, 90, 2, 3, position(station))), inputs0, t0);
+        require(accepted.allocations.size() == 1 && station.knowledge.snapshot().now_index == 100, "peer established at slot 90, instant 100");
+        const auto t1 = at_slot(kFrame + 100);
+        const auto inputs1 = station.qualify(t1);
+        const auto established = observe(station.knowledge);
+        require(established.find("now=100 ") != std::string::npos, "observation records the pre-rejection instant");
+        auto token = [&](auto mutate) { auto value = type1(station, c::Channel::Ais1, 2, kFrame + 90, 2, 3, position(station)); mutate(value); return value; };
+        rejected("atomic owner", station, token([](auto& o) { o.owner.vessel_id = {12}; }), inputs1, t1);
+        rejected("atomic owner", station, token([](auto& o) { o.receiver = {32}; }), inputs1, t1);
+        rejected("atomic replay", station, token([](auto& o) { o.receipt_id = 1; }), inputs1, t1);
+        rejected("atomic epoch", station, token([](auto& o) { o.power_generation = 2; }), inputs1, t1);
+        rejected("atomic catalog", station, token([](auto& o) { o.catalog_revision = 18; }), inputs1, t1);
+        rejected("atomic time", station, token([&](auto& o) { o.disclosed_at = r::add_units(t1, 1); }), inputs1, t1);
+        rejected("atomic time", station, token([](auto& o) { o.physical_start = {-1}; o.physical_end = {5}; }), inputs1, t1);
+        rejected("atomic malformed", station, token([](auto& o) { o.decoded->navigation_status = 16; }), inputs1, t1);
+        rejected("atomic malformed", station, token([](auto& o) { o.decoded->longitude = 108000001; }), inputs1, t1);
+        rejected("atomic malformed", station, token([](auto& o) { o.decoded->raw_communication_state = -1; }), inputs1, t1);
+        rejected("atomic malformed", station, token([](auto& o) { o.disposition = c::ObservationDisposition::EnergyOnly; }), inputs1, t1);
+        rejected("atomic channel", station, token([](auto& o) { o.channel = static_cast<c::Channel>(2); }), inputs1, t1);
+        rejected("atomic owner", station, token([](auto& o) { o.owner.equipment_id = {22}; }), inputs1, t1);
+        rejected("atomic epoch", station, token([](auto& o) { o.power_generation = 0; }), inputs1, t1);
+        rejected("atomic identity", station, token([](auto& o) { o.decoded->source_mmsi = 1; }), inputs1, t1);  // Own MMSI.
+        rejected("atomic identity", station, token([](auto& o) { o.decoded->source_mmsi = 0; }), inputs1, t1);
+        rejected("atomic identity", station, token([](auto& o) { o.decoded->source_mmsi = 0x40000000u; }), inputs1, t1);
+        rejected("atomic malformed", station, token([](auto& o) { o.decoded->kind = static_cast<c::DecodedMessageKind>(5); }), inputs1, t1);
+        rejected("atomic malformed", station, token([](auto& o) { o.decoded.reset(); }), inputs1, t1);
+        rejected("atomic time", station, token([](auto& o) { o.physical_end = o.physical_start; }), inputs1, t1);
+        rejected("atomic time", station, token([](auto& o) { o.disclosed_at = o.physical_start; }), inputs1, t1);
+        rejected("atomic time", station, token([](auto& o) { o.physical_end = {(kFrame + 90) * kSlotUnits + 6 * kSlotUnits}; o.disclosed_at = o.physical_end; }), inputs1, t1);
+        rejected("atomic inputs", station, token([](auto&) {}), pair.b.qualify(t1), t1);  // Foreign qualified inputs.
+        rejected("atomic inputs", station, token([](auto&) {}), inputs0, t1);             // Inputs qualified at another instant.
+        require(observe(station.knowledge) == established && station.knowledge.map(c::Channel::Ais1).now_index() == 100 &&
+                station.knowledge.map(c::Channel::Ais2).now_index() == 100 && station.knowledge.snapshot().now_index == 100,
+                "no rejection advanced the instant, the revision or either map");
+        // Positive control: the unmutated token is valid and accepted (receipt 2 was never consumed).
+        require(station.knowledge.accept_evidence(mint(token([](auto&) {})), inputs1, t1).peer == 2u, "the base token of every rejection class is itself accepted");
+        // A decision at t1 is an intentional advance; a token disclosed at or before it is late and changes nothing further.
+        (void)station.knowledge.draw_timeout(0, 0, inputs1, t1);
+        require(observe(station.knowledge) != established && station.knowledge.snapshot().now_index == kFrame + 100 &&
+                station.knowledge.snapshot().last_decision_at == t1, "the comparator is sensitive; the control and the decision advanced the state");
+        rejected("atomic late", station, type1(station, c::Channel::Ais1, 3, kFrame + 90, 2, 3, position(station)), inputs1, t1);
+        auto tardy = type1(station, c::Channel::Ais1, 3, kFrame + 90, 2, 3, position(station));
+        tardy.disclosed_at = t1;
+        rejected("atomic late", station, tardy, inputs1, t1);
+    }
+    {
+        // S31-02 REJECT-PAST-HORIZON: a token older than the past horizon, delivered five frames later, prunes nothing;
+        // the explicit synchronize at that instant is the intentional pruning.
+        Pair pair;
+        auto& station = pair.a;
+        const auto t0 = at_slot(100);
+        const auto accepted = station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 1, 90, 2, 0, position(station))), station.qualify(t0), t0);
+        require(accepted.allocations.size() == 2 && station.knowledge.map(c::Channel::Ais1).external_count() == 1 && station.knowledge.directory().find(2),
+                "peer 2 with its present slot and a next-frame announcement (one lineage record)");
+        const auto t5 = at_slot(5 * kFrame + 100);
+        const auto inputs5 = station.qualify(t5);
+        auto ancient = type1(station, c::Channel::Ais1, 2, 100, 2, 3, position(station));
+        ancient.disclosed_at = t5;
+        rejected("atomic horizon", station, ancient, inputs5, t5);
+        require(station.knowledge.map(c::Channel::Ais1).external_count() == 1 && station.knowledge.directory().find(2) &&
+                station.knowledge.snapshot().now_index == 100 && station.knowledge.map(c::Channel::Ais1).now_index() == 100,
+                "records that the A1-S3 code pruned before rejecting are retained");
+        const auto revision = station.knowledge.knowledge_revision();
+        require(station.knowledge.synchronize(inputs5, t5) == 5 * kFrame + 100 && station.knowledge.knowledge_revision() == revision + 1, "explicit advance");
+        require(station.knowledge.map(c::Channel::Ais1).external_count() == 0 && !station.knowledge.directory().find(2) &&
+                station.knowledge.map(c::Channel::Ais2).now_index() == 5 * kFrame + 100, "pruned and expired by the explicit synchronize");
+        rejected("atomic horizon", station, ancient, inputs5, t5);
+    }
+    {
+        // S31-03 EXPLICIT-ADVANCE-THEN-REJECT: after an explicit synchronize, rejected tokens add no mutation and no revision.
+        Pair pair;
+        auto& station = pair.a;
+        const auto t0 = at_slot(100);
+        (void)station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 1, 90, 2, 3, position(station))), station.qualify(t0), t0);
+        const auto t5 = at_slot(5 * kFrame + 100);
+        const auto inputs5 = station.qualify(t5);
+        (void)station.knowledge.synchronize(inputs5, t5);
+        const auto advanced = observe(station.knowledge);
+        require(advanced.find("now=" + std::to_string(5 * kFrame + 100) + " ") != std::string::npos && advanced.find(" decided=- ") != std::string::npos,
+                "explicit synchronize sets the instant without a decision");
+        auto foreign = type1(station, c::Channel::Ais1, 2, 5 * kFrame + 90, 2, 3, position(station));
+        foreign.owner.vessel_id = {12};
+        rejected("atomic owner", station, foreign, inputs5, t5);
+        rejected("atomic replay", station, type1(station, c::Channel::Ais1, 1, 5 * kFrame + 90, 2, 3, position(station)), inputs5, t5);
+        auto outside = type1(station, c::Channel::Ais1, 2, 90, 2, 3, position(station));
+        outside.disclosed_at = t5;
+        rejected("atomic horizon", station, outside, inputs5, t5);
+        require(observe(station.knowledge) == advanced, "the explicit synchronize is the only transition");
+        // The rejected `outside` token was disclosed at t5; this valid one is disclosed earlier (at the end of its own
+        // slot), which the disclosure frontier would refuse as non-monotonic had the rejection consumed it. Evidence
+        // before decision: it is accepted, then a decision follows, then evidence disclosed at t5 is late.
+        auto between = type1(station, c::Channel::Ais1, 2, 5 * kFrame + 90, 3, 3, position(station));
+        require(between.disclosed_at < t5 && station.knowledge.accept_evidence(mint(between), inputs5, t5).peer == 3u,
+                "a rejection consumes neither the receipt identity nor the disclosure frontier");
+        (void)station.knowledge.draw_timeout(0, 0, inputs5, t5);
+        auto late = type1(station, c::Channel::Ais1, 3, 5 * kFrame + 91, 3, 3, position(station));
+        late.disclosed_at = t5;
+        rejected("atomic late", station, late, inputs5, t5);
+    }
+    {
+        // S31-04 VALID-POST-EXPIRY-PEER-CAPACITY: capacity is judged on the post-expiry directory.
+        Pair pair;
+        c::KnowledgeLimits limits;
+        limits.peer_capacity = 1;
+        Station station(pair.configs[0], pair.seed, limits);
+        station.on({0}, 1);
+        const auto t0 = at_slot(100);
+        (void)station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 1, 90, 2, 0, position(station))), station.qualify(t0), t0);
+        const auto t1 = at_slot(kFrame + 100);
+        const auto inputs1 = station.qualify(t1);
+        rejected("atomic directory capacity", station, type1(station, c::Channel::Ais1, 2, kFrame + 95, 3, 3, position(station)), inputs1, t1);
+        const auto t5 = at_slot(5 * kFrame + 100);
+        const auto inputs5 = station.qualify(t5);
+        const auto revision = station.knowledge.knowledge_revision();
+        const auto accepted = station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 2, 5 * kFrame + 95, 3, 3, position(station))), inputs5, t5);
+        require(accepted.status == "decoded_peer_evidence_accepted" && accepted.peer == 3u, "accepted against the post-expiry directory");
+        const auto peers = station.knowledge.directory().snapshot();
+        require(peers.size() == 1 && peers.front().mmsi == 3 && peers.front().first_receipt_id == 2 && peers.front().receipts == 1 &&
+                !station.knowledge.directory().find(2) && station.knowledge.snapshot().now_index == 5 * kFrame + 100 &&
+                station.knowledge.knowledge_revision() == revision + 2 && station.knowledge.map(c::Channel::Ais1).external_count() == 1 &&
+                station.knowledge.map(c::Channel::Ais2).now_index() == 5 * kFrame + 100,
+                "old peer gone, new peer present, both maps advanced, one advance and one evidence increment");
+        // An expired peer re-heard at the delivery instant is re-learned as a fresh record from the post-expiry directory,
+        // exactly as after an explicit synchronize (a lookup in the live directory would merge the expired record instead).
+        Pair twin_direct;
+        Pair twin_explicit;
+        auto& direct = twin_direct.a;
+        auto& explicit_sync = twin_explicit.a;
+        for (Station* s : {&direct, &explicit_sync})
+            (void)s->knowledge.accept_evidence(mint(type1(*s, c::Channel::Ais1, 1, 90, 2, 3, position(*s))), s->qualify(t0), t0);
+        const auto in_direct = direct.qualify(t5);
+        const auto in_explicit = explicit_sync.qualify(t5);
+        (void)explicit_sync.knowledge.synchronize(in_explicit, t5);
+        const auto reheard = direct.knowledge.accept_evidence(mint(type1(direct, c::Channel::Ais1, 2, 5 * kFrame + 95, 2, 3, position(direct))), in_direct, t5);
+        const auto reheard_explicit = explicit_sync.knowledge.accept_evidence(mint(type1(explicit_sync, c::Channel::Ais1, 2, 5 * kFrame + 95, 2, 3, position(explicit_sync))), in_explicit, t5);
+        const auto* fresh_record = direct.knowledge.directory().find(2);
+        require(fresh_record && fresh_record->first_receipt_id == 2 && fresh_record->receipts == 1 && fresh_record->reservations.size() == 1 &&
+                fresh_record->reservations.front().first_index == 5 * kFrame + 95 && acceptance_text(reheard) == acceptance_text(reheard_explicit) &&
+                observe(direct.knowledge) == observe(explicit_sync.knowledge), "an expired peer is re-learned from the post-expiry directory");
+    }
+    {
+        // S31-05 VALID-POST-EXPIRY-MAP-CAPACITY: bounded stores are judged after the advance; replacement never consumes capacity.
+        Pair pair;
+        c::KnowledgeLimits limits;
+        limits.map.max_external = 2;
+        limits.map.max_garble = 2;
+        Station station(pair.configs[0], pair.seed, limits);
+        station.on({0}, 1);
+        const auto t0 = at_slot(100);
+        const auto inputs0 = station.qualify(t0);
+        (void)station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 1, 90, 2, 3, position(station))), inputs0, t0);
+        (void)station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 2, 91, 3, 3, position(station))), inputs0, t0);
+        auto noise = observation(station, c::Channel::Ais2, 3, 95, std::nullopt, c::ObservationDisposition::EnergyOnly);
+        noise.physical_end = {95 * kSlotUnits + 2 * kSlotUnits};
+        noise.disclosed_at = noise.physical_end;
+        require(station.knowledge.accept_evidence(mint(noise), inputs0, t0).span_slots == 2 && station.knowledge.map(c::Channel::Ais2).garble_count() == 2,
+                "both stores full");
+        const auto t1 = at_slot(kFrame + 100);
+        const auto inputs1 = station.qualify(t1);
+        rejected("atomic map capacity", station, type1(station, c::Channel::Ais1, 4, kFrame + 95, 4, 3, position(station)), inputs1, t1);
+        rejected("atomic map capacity", station, observation(station, c::Channel::Ais2, 4, kFrame + 95, std::nullopt, c::ObservationDisposition::FailedFcs), inputs1, t1);
+        // Exact post-supersession accounting: refreshing peer 2's lineage (frame slot 90) at capacity is accepted and replaces the record.
+        const auto refreshed = station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 4, kFrame + 90, 2, 3, position(station))), inputs1, t1);
+        require(refreshed.allocations.size() == 1 && station.knowledge.map(c::Channel::Ais1).external_count() == 2 &&
+                station.knowledge.map(c::Channel::Ais1).external_allocations().back().first_index == kFrame + 90 &&
+                station.knowledge.directory().find(2)->reservations.size() == 1 && station.knowledge.directory().find(2)->reservations.front().first_index == kFrame + 90,
+                "an in-place lineage refresh at capacity is accepted; the superseded record frees its slot");
+        const auto t8 = at_slot(8 * kFrame + 100);
+        const auto inputs8 = station.qualify(t8);
+        const auto accepted = station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 5, 8 * kFrame + 90, 4, 3, position(station))), inputs8, t8);
+        const auto second = station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 6, 8 * kFrame + 91, 5, 3, position(station))), inputs8, t8);
+        require(accepted.allocations.size() == 1 && second.allocations.size() == 1, "two new records accepted at the post-advance capacity");
+        const auto records = station.knowledge.map(c::Channel::Ais1).external_allocations();
+        require(records.size() == 2 && records[0].mmsi == 4 && records[0].first_index == 8 * kFrame + 90 && records[1].mmsi == 5 &&
+                records[1].first_index == 8 * kFrame + 91 && station.knowledge.directory().size() == 2 && !station.knowledge.directory().find(2) &&
+                station.knowledge.map(c::Channel::Ais2).garble_count() == 0 && station.knowledge.map(c::Channel::Ais2).now_index() == 8 * kFrame + 100,
+                "old records removed, new ones retained, the other channel advanced");
+        auto fresh_noise = observation(station, c::Channel::Ais2, 7, 8 * kFrame + 95, std::nullopt, c::ObservationDisposition::FailedFcs);
+        fresh_noise.physical_end = {(8 * kFrame + 95) * kSlotUnits + 2 * kSlotUnits};
+        fresh_noise.disclosed_at = fresh_noise.physical_end;
+        require(station.knowledge.accept_evidence(mint(fresh_noise), inputs8, t8).span_slots == 2 &&
+                station.knowledge.map(c::Channel::Ais2).garbles().front().index == 8 * kFrame + 95, "garble store reused after expiry");
+        auto again = observation(station, c::Channel::Ais2, 8, 8 * kFrame + 95, std::nullopt, c::ObservationDisposition::EnergyOnly);
+        again.disclosed_at = t8;  // Disclosure stays monotonic after the wider span disclosed two slots later.
+        require(station.knowledge.accept_evidence(mint(again), inputs8, t8).status == "garble_recorded_no_identity" &&
+                station.knowledge.map(c::Channel::Ais2).garble_count() == 2 && station.knowledge.map(c::Channel::Ais2).garbles().front().receipt_id == 8,
+                "re-observing a garbled slot at capacity replaces the record instead of being rejected");
+    }
+    {
+        // S31-06 PARTIAL-APPLY-ROLLBACK: when a later staged record or the directory update fails, no earlier record remains.
+        Pair pair;
+        c::KnowledgeLimits limits;
+        limits.map.max_external = 1;
+        limits.map.max_garble = 1;
+        Station station(pair.configs[0], pair.seed, limits);
+        station.on({0}, 1);
+        const auto t0 = at_slot(100);
+        const auto inputs0 = station.qualify(t0);
+        const auto two_lineages = [&](std::uint64_t receipt, std::int64_t index) {
+            return observation(station, c::Channel::Ais1, receipt, index,
+                               itdma_facts(2, a::ItdmaState19::from_effective(a::SyncState::UtcDirect, 37, 2, false), position(station)));
+        };
+        rejected("atomic partial apply", station, two_lineages(1, 90), inputs0, t0);
+        require(station.knowledge.map(c::Channel::Ais1).external_count() == 0 && station.knowledge.directory().size() == 0 &&
+                station.knowledge.snapshot().last_receipt_id == 0 && !station.knowledge.snapshot().now_index && !station.knowledge.map(c::Channel::Ais1).advanced(),
+                "nothing of the two-record decode remains, not even the instant");
+        require(station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais1, 1, 90, 2, 3, position(station))), inputs0, t0).allocations.size() == 1,
+                "a one-record decode with the same receipt id fits");
+        // A rejection after staging consumes neither the receipt identity nor the disclosure frontier: this token is
+        // disclosed at t0, later than everything accepted so far, and fails at its first staged record (store full).
+        auto later_disclosed = two_lineages(2, 95);
+        later_disclosed.disclosed_at = t0;
+        rejected("atomic partial apply", station, later_disclosed, inputs0, t0);
+        const auto between = observation(station, c::Channel::Ais2, 2, 92, std::nullopt, c::ObservationDisposition::EnergyOnly);
+        require(between.disclosed_at < t0 && station.knowledge.accept_evidence(mint(between), inputs0, t0).status == "garble_recorded_no_identity",
+                "a token disclosed before the rejected one is still accepted: the frontier was not consumed");
+        for (int span = 2; span <= 5; ++span) {
+            auto garble = observation(station, c::Channel::Ais1, 3, 93, std::nullopt, c::ObservationDisposition::FailedFcs);
+            garble.physical_end = {93 * kSlotUnits + span * kSlotUnits};
+            garble.disclosed_at = garble.physical_end;
+            rejected("atomic partial apply", station, garble, inputs0, t0);
+            require(station.knowledge.map(c::Channel::Ais1).garble_count() == 0, "no partial garble span");
+        }
+        // The per-peer announcement bound is hit by the 65th one-shot ITDMA block: the staged map already held both
+        // records of that decode when the directory bound failed, the real map and directory hold neither.
+        Pair bound;
+        auto& wide = bound.a;
+        const auto tb = at_slot(2 * kFrame + 1000);
+        const auto inputs_b = wide.qualify(tb);
+        for (std::uint64_t n = 0; n < 64; ++n) {
+            const auto index = 2 * kFrame + 100 + static_cast<std::int64_t>(n) * 10;
+            auto value = observation(wide, c::Channel::Ais1, n + 1, index,
+                                     itdma_facts(7, a::ItdmaState19::from_effective(a::SyncState::UtcDirect, 1000 + static_cast<std::int64_t>(n), 1, false), position(wide)));
+            require(wide.knowledge.accept_evidence(mint(value), inputs_b, tb).allocations.size() == 2, "each announcement adds an observed use and a one-shot block");
+        }
+        require(wide.knowledge.directory().find(7)->reservations.size() == 128 && wide.knowledge.map(c::Channel::Ais1).external_count() == 128, "per-peer cache full");
+        auto extra = observation(wide, c::Channel::Ais1, 65, 2 * kFrame + 740,
+                                 itdma_facts(7, a::ItdmaState19::from_effective(a::SyncState::UtcDirect, 1064, 1, false), position(wide)));
+        rejected("atomic partial apply", wide, extra, inputs_b, tb);
+        require(wide.knowledge.map(c::Channel::Ais1).external_count() == 128 && wide.knowledge.snapshot().last_receipt_id == 64, "no record of the 65th decode survives");
+        // Exact per-peer accounting: a re-announcement that refreshes two existing lineages adds no reservation and is
+        // accepted at the bound (the removed conservative pre-check would have rejected it).
+        auto refresh = observation(wide, c::Channel::Ais1, 65, 2 * kFrame + 110,
+                                   itdma_facts(7, a::ItdmaState19::from_effective(a::SyncState::UtcDirect, 990, 1, false), position(wide)));
+        refresh.disclosed_at = tb;
+        const auto refreshed = wide.knowledge.accept_evidence(mint(refresh), inputs_b, tb);
+        require(refreshed.allocations.size() == 2 && wide.knowledge.directory().find(7)->reservations.size() == 128 &&
+                wide.knowledge.map(c::Channel::Ais1).external_count() == 128, "refreshing two lineages at the per-peer bound is accepted and consumes nothing");
+        // An advancing delivery rejected after staging: the staged advance expired every peer, pruned a record and dropped
+        // the reuse exclusion on the COPIES; the real knowledge keeps all of them and both instants.
+        Pair held;
+        c::KnowledgeLimits held_limits;
+        held_limits.map.max_garble = 1;
+        Station keeper(held.configs[0], held.seed, held_limits);
+        keeper.on({0}, 1);
+        const auto k0 = at_slot(100);
+        (void)keeper.knowledge.accept_evidence(mint(type1(keeper, c::Channel::Ais1, 1, 80, 2, 0, position(keeper))), keeper.qualify(k0), k0);  // Lineage record at 2330.
+        const auto k1 = at_slot(kFrame + 50);
+        const auto k_inputs1 = keeper.qualify(k1);
+        std::uint64_t k_receipt = 1;
+        const auto far = peer_at(keeper.location, 0, 60000.0);
+        for (std::int64_t index = 2340; index <= 2354; ++index) {
+            if (index == 2344 || index == 2352) continue;
+            auto value = observation(keeper, c::Channel::Ais1, ++k_receipt, index - kFrame,
+                                     sotdma_facts(index == 2348 ? 90u : 60 + static_cast<std::uint32_t>(index - 2340),
+                                                  a::SotdmaState19::received_stations(a::SyncState::UtcDirect, 3, 0),
+                                                  index == 2348 ? std::optional<w::Point>(far) : std::nullopt));
+            (void)keeper.knowledge.accept_evidence(mint(value), k_inputs1, k1);
+        }
+        const auto report = keeper.knowledge.candidates(c::Channel::Ais1, c::selection_interval(kFrame + 97, 75), 1, std::nullopt, k_inputs1, k1);
+        require(report.candidates.size() == 3, "two free plus one reusable candidate");
+        std::uint64_t episode = 0;
+        while (c::choose_candidate(report, keeper.knowledge.draw_key(c::ProtocolPurpose::CandidateChoice, episode, 0)).candidate.first_index != 2348) ++episode;
+        (void)keeper.knowledge.choose_candidate(report, episode, 0, k_inputs1, k1);
+        require(keeper.knowledge.reuse_exclusions().size() == 1 && keeper.knowledge.reuse_exclusions().front().excluded_until_index == 2 * kFrame + 50,
+                "reuse exclusion held until the next frame");
+        const auto k2 = at_slot(kFrame + 250);
+        const auto k_inputs2 = keeper.qualify(k2);
+        require(keeper.knowledge.accept_evidence(mint(observation(keeper, c::Channel::Ais2, ++k_receipt, kFrame + 150, std::nullopt, c::ObservationDisposition::FailedFcs)), k_inputs2, k2).span_slots == 1 &&
+                keeper.knowledge.map(c::Channel::Ais2).garble_count() == 1, "garble store full");
+        const auto k5 = at_slot(5 * kFrame + 100);
+        const auto k_inputs5 = keeper.qualify(k5);
+        const auto held_state = observe(keeper.knowledge);
+        rejected("atomic partial apply", keeper, observation(keeper, c::Channel::Ais2, k_receipt + 1, 5 * kFrame + 90, std::nullopt, c::ObservationDisposition::FailedFcs), k_inputs5, k5);
+        require(observe(keeper.knowledge) == held_state && keeper.knowledge.directory().size() == 14 && keeper.knowledge.directory().find(2) &&
+                keeper.knowledge.map(c::Channel::Ais1).view(2330).state == c::SlotState::ExternalObserved && keeper.knowledge.reuse_exclusions().size() == 1 &&
+                keeper.knowledge.snapshot().now_index == kFrame + 250 && keeper.knowledge.map(c::Channel::Ais2).now_index() == kFrame + 250,
+                "expiry, pruning and exclusion dropping happened only on the staged copies");
+    }
+    {
+        // S31-07 CORRECTED-RETRY: a rejected receipt id is not consumed; the corrected token is accepted exactly as on a clean station.
+        Pair tainted;
+        Pair clean;
+        const auto t0 = at_slot(100);
+        auto wrong = type1(tainted.a, c::Channel::Ais1, 1, 90, 2, 3, position(tainted.a));
+        wrong.decoded->navigation_status = 16;
+        rejected("atomic malformed", tainted.a, wrong, tainted.a.qualify(t0), t0);
+        const auto t1 = at_slot(kFrame + 100);
+        const auto fixed_tainted = tainted.a.knowledge.accept_evidence(mint(type1(tainted.a, c::Channel::Ais1, 1, 90, 2, 3, position(tainted.a))), tainted.a.qualify(t1), t1);
+        const auto fixed_clean = clean.a.knowledge.accept_evidence(mint(type1(clean.a, c::Channel::Ais1, 1, 90, 2, 3, position(clean.a))), clean.a.qualify(t1), t1);
+        require(acceptance_text(fixed_tainted) == acceptance_text(fixed_clean) && fixed_tainted.receipt_id == 1 &&
+                observe(tainted.a.knowledge) == observe(clean.a.knowledge), "same receipt id accepted later with the semantics of a clean station");
+        Pair same;
+        const auto inputs_same = same.a.qualify(t0);
+        auto bad = type1(same.a, c::Channel::Ais1, 1, 90, 2, 3, position(same.a));
+        bad.owner.vessel_id = {12};
+        rejected("atomic owner", same.a, bad, inputs_same, t0);
+        require(same.a.knowledge.accept_evidence(mint(type1(same.a, c::Channel::Ais1, 1, 90, 2, 3, position(same.a))), inputs_same, t0).receipt_id == 1,
+                "corrected at the same instant");
+    }
+    {
+        // S31-08 SUCCESS-REVISION-AND-CONTENT: explicit synchronize then accept equals accept with the internal advance.
+        for (int kind = 0; kind < 6; ++kind) {
+            Pair explicit_pair;
+            Pair internal_pair;
+            auto& p = explicit_pair.a;
+            auto& q = internal_pair.a;
+            const auto setup = [&](Station& s) {
+                const auto t0 = at_slot(100);
+                const auto in0 = s.qualify(t0);
+                (void)s.knowledge.accept_evidence(mint(type1(s, c::Channel::Ais1, 1, 90, 2, 3, position(s))), in0, t0);
+                (void)s.knowledge.accept_evidence(mint(observation(s, c::Channel::Ais2, 2, 95, std::nullopt, c::ObservationDisposition::EnergyOnly)), in0, t0);
+                (void)s.knowledge.draw_timeout(0, 0, in0, t0);
+            };
+            setup(p);
+            setup(q);
+            const auto t1 = at_slot(kFrame + 100);
+            const auto make = [&](const Station& s, std::uint64_t receipt) -> c::OwnRadioObservation {
+                switch (kind) {
+                case 0: return type1(s, c::Channel::Ais1, receipt, kFrame + 90, 3, 3, position(s));
+                case 1: return observation(s, c::Channel::Ais2, receipt, kFrame + 91, itdma_facts(4, a::ItdmaState19::from_effective(a::SyncState::UtcDirect, 37, 2, true), position(s)));
+                case 2: {
+                    auto value = observation(s, c::Channel::Ais1, receipt, kFrame + 92, sotdma_facts(8, sotdma_for_timeout(3, 92), std::nullopt, c::DecodedMessageKind::Type20));
+                    value.decoded->raw_communication_state = -1;
+                    return value;
+                }
+                case 3: {
+                    auto value = observation(s, c::Channel::Ais2, receipt, kFrame + 93, std::nullopt, c::ObservationDisposition::FailedFcs);
+                    value.physical_end = {(kFrame + 93) * kSlotUnits + 3 * kSlotUnits};
+                    value.disclosed_at = value.physical_end;
+                    return value;
+                }
+                case 4: return observation(s, c::Channel::Ais1, receipt, kFrame + 94, std::nullopt, c::ObservationDisposition::EnergyOnly);
+                default: return type1(s, c::Channel::Ais1, receipt, kFrame + 90, 2, 3, position(s));
+                }
+            };
+            const auto in_p = p.qualify(t1);
+            const auto in_q = q.qualify(t1);
+            const auto before_p = p.knowledge.knowledge_revision();
+            const auto before_q = q.knowledge.knowledge_revision();
+            (void)p.knowledge.synchronize(in_p, t1);
+            const auto result_p = p.knowledge.accept_evidence(mint(make(p, 3)), in_p, t1);
+            const auto result_q = q.knowledge.accept_evidence(mint(make(q, 3)), in_q, t1);
+            require(acceptance_text(result_p) == acceptance_text(result_q) && p.knowledge.knowledge_revision() == before_p + 2 &&
+                    q.knowledge.knowledge_revision() == before_q + 2, "same acceptance result; one advance plus one evidence increment either way");
+            if (kind == 5) {
+                // An older physical report of the lineage just refreshed is superseded on both stations.
+                auto old_p = type1(p, c::Channel::Ais1, 4, 90, 2, 3, position(p));
+                old_p.disclosed_at = t1;
+                auto old_q = type1(q, c::Channel::Ais1, 4, 90, 2, 3, position(q));
+                old_q.disclosed_at = t1;
+                const auto superseded_p = p.knowledge.accept_evidence(mint(old_p), in_p, t1);
+                const auto superseded_q = q.knowledge.accept_evidence(mint(old_q), in_q, t1);
+                require(superseded_p.superseded.size() == 1 && superseded_p.allocations.empty() && acceptance_text(superseded_p) == acceptance_text(superseded_q),
+                        "superseded older physical report on both");
+            }
+            require(observe(p.knowledge) == observe(q.knowledge) && q.knowledge.snapshot().now_index == kFrame + 100 &&
+                    q.knowledge.map(c::Channel::Ais2).now_index() == kFrame + 100, "identical final state after an explicit or an internal advance");
+        }
+    }
+    {
+        // S31-09 OWNER-ISOLATION: A's receipts and rejections never touch B; OFF clears exactly what A1-S3 cleared.
+        Pair pair;
+        const auto t0 = at_slot(100);
+        const auto inputs_a = pair.a.qualify(t0);
+        const auto b_before = observe(pair.b.knowledge);
+        (void)pair.a.knowledge.accept_evidence(mint(type1(pair.a, c::Channel::Ais1, 1, 90, 2, 3, position(pair.a))), inputs_a, t0);
+        auto bad = type1(pair.a, c::Channel::Ais1, 2, 91, 2, 3, position(pair.a));
+        bad.catalog_revision = 18;
+        rejected("atomic catalog", pair.a, bad, inputs_a, t0);
+        require(observe(pair.b.knowledge) == b_before && !pair.b.knowledge.snapshot().now_index, "B's knowledge is untouched by A's receipts and rejections");
+        require(pair.a.knowledge.map(c::Channel::Ais2).external_count() == 0 && pair.a.knowledge.map(c::Channel::Ais2).now_index() == 100,
+                "the other channel only advanced");
+        (void)pair.a.knowledge.draw_timeout(0, 0, inputs_a, t0);
+        pair.a.off(at_slot(200), 1);
+        const auto cleared = pair.a.knowledge.snapshot();
+        require(!cleared.equipment_on && cleared.peers.empty() && cleared.external_ais1 == 0 && cleared.garble_ais1 == 0 && cleared.own_ais1.empty() &&
+                cleared.reuse_exclusions.empty() && cleared.draw_watermarks.empty() && cleared.last_receipt_id == 0 && !cleared.now_index && !cleared.last_decision_at &&
+                cleared.ledger_entries == 1 && pair.a.knowledge.map(c::Channel::Ais1).external_count() == 0,
+                "OFF clears live knowledge, frontiers and watermarks; the ledger history stays");
+        pair.a.on(at_slot(300), 2);
+        const auto t3 = at_slot(320);
+        const auto inputs3 = pair.a.qualify(t3);
+        auto stale = type1(pair.a, c::Channel::Ais1, 1, 310, 2, 3, position(pair.a));
+        stale.power_generation = 1;
+        rejected("atomic epoch", pair.a, stale, inputs3, t3);
+        require(pair.a.knowledge.accept_evidence(mint(type1(pair.a, c::Channel::Ais1, 1, 310, 2, 3, position(pair.a))), inputs3, t3).receipt_id == 1,
+                "the fresh epoch accepts receipt 1 again");
+    }
+    {
+        // S31-10 BOUNDARIES: same slot, frame boundary, non-zero anchor minute rollover, early/late inputs, out-of-window announcements.
+        Pair pair;
+        auto& station = pair.a;
+        const auto t_sync = at_slot(2350);
+        (void)station.knowledge.synchronize(station.qualify(t_sync), t_sync);
+        const auto revision = station.knowledge.knowledge_revision();
+        const auto t_inside = r::add_units(t_sync, 240000);
+        const auto inputs_inside = station.qualify(t_inside);
+        const auto same_slot = station.knowledge.accept_evidence(mint(observation(station, c::Channel::Ais1, 1, 2350, std::nullopt, c::ObservationDisposition::EnergyOnly)),
+                                                                 inputs_inside, t_inside);
+        require(same_slot.received_index == 2350 && station.knowledge.knowledge_revision() == revision + 1 && station.knowledge.snapshot().now_index == 2350,
+                "evidence in the current slot costs one evidence increment only");
+        const auto t_next = at_slot(2 * kFrame);
+        const auto inputs_next = station.qualify(t_next);
+        const auto crossing = station.knowledge.accept_evidence(mint(type1(station, c::Channel::Ais2, 2, 2 * kFrame - 1, 2, 3, position(station))), inputs_next, t_next);
+        require(crossing.received_index == 2 * kFrame - 1 && station.knowledge.knowledge_revision() == revision + 3 &&
+                station.knowledge.map(c::Channel::Ais2).now_index() == 2 * kFrame && station.knowledge.map(c::Channel::Ais1).now_index() == 2 * kFrame,
+                "frame boundary: both maps advanced once and the evidence recorded");
+        const auto edge_records = station.knowledge.map(c::Channel::Ais2).external_allocations();
+        require(edge_records.size() == 1 && edge_records.front().first_index == 2 * kFrame - 1 && edge_records.front().announced_minute == 1 &&
+                edge_records.front().announced_index == 2 * kFrame - 1 && edge_records.front().reserved_through_minute == 4 &&
+                station.knowledge.map(c::Channel::Ais2).view(2 * kFrame - 1).state == c::SlotState::ExternalObserved &&
+                station.knowledge.map(c::Channel::Ais2).view(3 * kFrame - 1).state == c::SlotState::ExternalObserved &&
+                station.knowledge.map(c::Channel::Ais2).view(2 * kFrame).state == c::SlotState::Free,
+                "the last slot of frame 1 is recorded in frame 1 and repeats at slot 2249 of the retained frames");
+        const auto t_far = at_slot(3 * kFrame + 5);
+        const auto inputs_far = station.qualify(t_far);
+        auto early = type1(station, c::Channel::Ais1, 3, 3 * kFrame, 2, 3, position(station));
+        early.physical_start = {-kSlotUnits};
+        early.physical_end = {0};
+        rejected("atomic time", station, early, inputs_far, t_far);
+        auto later = type1(station, c::Channel::Ais1, 3, 3 * kFrame, 2, 3, position(station));
+        later.disclosed_at = r::add_units(t_far, 1);
+        rejected("atomic time", station, later, inputs_far, t_far);
+        c::KnowledgeLimits narrow_limits;
+        narrow_limits.map.future_frames = 4;
+        Station narrow(pair.configs[1], pair.seed, narrow_limits);
+        narrow.on({0}, 1);
+        const auto t_narrow = at_slot(100);
+        const auto inputs_narrow = narrow.qualify(t_narrow);
+        const auto far_block = narrow.knowledge.accept_evidence(
+            mint(observation(narrow, c::Channel::Ais1, 1, 90, itdma_facts(5, a::ItdmaState19::from_effective(a::SyncState::UtcDirect, 16383, 3, false), position(narrow)))),
+            inputs_narrow, t_narrow);
+        require(far_block.allocations.size() == 1 && far_block.unresolved.size() == 1 && far_block.unresolved.front().rfind("itdma_block_beyond_local_horizon:", 0) == 0 &&
+                narrow.knowledge.map(c::Channel::Ais1).external_count() == 1, "a block beyond the local horizon is reported, never recorded");
+        auto wrong_channel = type1(narrow, c::Channel::Ais1, 2, 91, 2, 3, position(narrow));
+        wrong_channel.channel = static_cast<c::Channel>(2);
+        rejected("atomic channel", narrow, wrong_channel, inputs_narrow, t_narrow);
+        std::vector<c::StationDefinition> definitions{definition(0), definition(1)};
+        for (auto& item : definitions) item.clock.anchor = {1900000000, 0};  // POSIX 1 900 000 000 = UTC minute 31 666 666 plus 40 s = slot 1500 (one shared ideal UTC).
+        const auto anchored = c::assemble_stations(synthetic_world(), kWorldRevision, std::move(definitions));
+        Station rolled(anchored[0], pair.seed);
+        rolled.on({0}, 1);
+        const std::int64_t minute0 = 1900000000 / 60;
+        const auto t_roll = at_slot(750);  // 20 s after instant zero: slot 0 of the next UTC minute.
+        const auto inputs_roll = rolled.qualify(t_roll);
+        const auto rollover = rolled.knowledge.accept_evidence(mint(type1(rolled, c::Channel::Ais1, 1, 749, 2, 3, position(rolled))), inputs_roll, t_roll);
+        require(rollover.received_index == minute0 * kFrame + 2249 && c::frame_slot(rollover.received_index) == 2249 &&
+                rolled.knowledge.snapshot().now_index == (minute0 + 1) * kFrame &&
+                rolled.knowledge.map(c::Channel::Ais1).view(rollover.received_index + kFrame).state == c::SlotState::ExternalObserved,
+                "indices follow the own anchored UTC across the minute boundary");
+    }
+}
+
+// ---------------------------------------------------------------------------
 std::string class_token(const c::ClassifiedSlot& value) {
     switch (value.value) {
     case c::SlotClass::Free1: return "F1";
@@ -1667,6 +2242,7 @@ int main(int argc, char** argv) {
         section("asymmetry_and_isolation", asymmetry_and_isolation); section("candidate_hierarchy", candidate_hierarchy);
         section("knowledge_draws_and_lifecycle", knowledge_draws_and_lifecycle); section("fast_peer_refresh", fast_peer_refresh);
         section("review_regressions", review_regressions);
+        section("evidence_acceptance_atomicity", evidence_acceptance_atomicity);
         unsigned total = 0;
         for (const auto& row : negatives) { std::cout << "NEGATIVE|" << row.first << '|' << row.second << '\n'; total += row.second; }
         std::cout << "A1-S3 synthetic local-knowledge tests PASS: " << assertions << " assertions, " << total
