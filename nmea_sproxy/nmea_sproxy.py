@@ -815,9 +815,11 @@ class _ClientEpochSet:
     def inbound_epoch(self, epoch_selector, now):
         """Resolve a plaintext DATA selector to the
         (server->client key, generation) the client should decrypt under,
-        or None. Current epoch, the pending candidate (a REFRESH_ACK), or
+        or None. Current epoch, the pending candidate (REFRESH_ACK or
+        server shutdown), or
         -- briefly after a commit -- the retiring epoch (a straggler pong
-        for a keepalive ping sent under E1 just before committing)."""
+        for a keepalive ping sent under E1 just before committing).
+        Message-specific authority is checked after authentication."""
         self.expire_retiring(now)
         if epoch_selector == epoch_selector_for_generation(self.generation):
             return (self.server_to_client_key, self.generation)
@@ -833,6 +835,37 @@ class _ClientEpochSet:
                 self._retiring_generation,
             )
         return None
+
+
+class _ClientPingEpochs:
+    """Successful send epochs for the one outstanding logical PING.
+
+    Only the current and unexpired retiring epochs can answer it. Pruning
+    keeps at most two generations even if refresh evidence lets the same
+    unanswered PING survive arbitrarily many epoch changes.
+    """
+
+    __slots__ = ("_generations",)
+
+    def __init__(self):
+        self._generations = set()
+
+    def clear(self):
+        self._generations.clear()
+
+    def prune(self, epochs, now):
+        epochs.expire_retiring(now)
+        self._generations.intersection_update(
+            (epochs.generation, epochs._retiring_generation)
+        )
+
+    def record_success(self, generation, epochs, now):
+        self._generations.add(generation)
+        self.prune(epochs, now)
+
+    def allows(self, generation, epochs, now):
+        self.prune(epochs, now)
+        return generation in self._generations
 
 
 class _ClientEpochRefresh:
@@ -2742,6 +2775,7 @@ def forward_loop(
     last_authenticated_peer = session_started_at
     last_ping_at = session_started_at
     expected_ping_seq = None
+    ping_epochs = _ClientPingEpochs()
     next_ping_seq = 1
     # Liveness recovery state, O(1) per session: when the outstanding
     # logical ping is next retransmitted, and how often it has been sent.
@@ -2801,15 +2835,19 @@ def forward_loop(
         # Every transmission -- first or retransmission -- is a fresh
         # encryption of the ping under the CURRENT epoch, hence a fresh
         # AEAD nonce; ciphertext is never cached or resent.
+        # Capture the actual key/generation pair used by this send, and
+        # grant reply authority only if it returns successfully.
+        sent_generation = epochs.generation
+        sent_key = epochs.client_to_server_key
         try:
             send_ping(
                 out_sock,
                 remote_addr,
-                epochs.client_to_server_key,
+                sent_key,
                 session_locator,
                 config["station_id"],
                 seq,
-                epochs.generation,
+                sent_generation,
             )
         except OSError as exc:
             if not is_transient_network_error(exc):
@@ -2820,12 +2858,14 @@ def forward_loop(
         except Exception as exc:
             print(f"❌ Secure ping error: {exc}")
             return SESSION_END_SOCKET_ERROR
+        ping_epochs.record_success(sent_generation, epochs, time.monotonic())
         note_send_success()
         return None
 
     def start_ping():
         nonlocal expected_ping_seq, next_ping_seq, last_ping_at
         nonlocal ping_retry_at, ping_transmissions
+        ping_epochs.clear()
         expected_ping_seq = next_ping_seq
         next_ping_seq += 1
         ping_transmissions = 1
@@ -2866,6 +2906,7 @@ def forward_loop(
                 f"{ping_transmissions - 1} retransmission(s)."
             )
         expected_ping_seq = None
+        ping_epochs.clear()
         ping_retry_at = None
         ping_transmissions = 0
 
@@ -2902,6 +2943,7 @@ def forward_loop(
             time.monotonic,
         )
         if refresh_result == SERVER_PACKET_REFRESH_COMMITTED:
+            ping_epochs.prune(epochs, now)
             print(
                 "Secure epoch refresh committed; continuing on the new "
                 "epoch without a new session."
@@ -2978,6 +3020,10 @@ def forward_loop(
             reply_generation,
         )
         if result == SERVER_PACKET_AUTHENTICATED:
+            # AEAD and sequence matching are necessary but cannot let an
+            # unused (including pending) epoch answer this logical PING.
+            if not ping_epochs.allows(reply_generation, epochs, now):
+                return None
             last_authenticated_peer = now
             resolve_ping()
             # Diagnostic-only: admit this already-accepted PONG's optional
@@ -2988,6 +3034,12 @@ def forward_loop(
             observed_endpoint.observe_pong(pong_endpoint, pong_generation, now)
             return None
         if result == SERVER_PACKET_PEER_CLOSE:
+            # The authenticated retiring key remains usable for eligible
+            # straggler PONGs, but cannot close the refreshed session. A
+            # pending key can carry shutdown after the server committed
+            # that epoch and its ACK was lost before reaching this client.
+            if reply_generation not in (epochs.generation, epochs.pending_generation):
+                return None
             print("Secure peer closed the current session gracefully.")
             return SESSION_END_PEER_GRACEFUL_CLOSE
         return None

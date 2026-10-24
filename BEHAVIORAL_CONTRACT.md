@@ -1016,8 +1016,13 @@ remote tuple is the baseline peer-liveness signal; a validated in-session
 epoch-refresh control message (see the epoch-refresh subsection) and a
 migration-proof-matched PATH_ACK (see the path-migration subsection) are the
 only other documented exceptions that also advance peer liveness. The pong
-must decrypt under the current server-to-client owner, match the configured
-station identity, and carry the exact sequence of the one outstanding ping.
+must decrypt under a still-accepted server-to-client epoch used by a successful
+transmission of that logical ping, match the configured station identity, and
+carry the exact sequence of the one outstanding ping. Failed sends grant no
+epoch authority. Ownership retains at most the current and unexpired retiring
+generations, is pruned across refresh, and is cleared on ping resolution
+(including PATH_ACK) or a new logical ping. Pending-only pongs are ineligible;
+eligible retiring replies remain subject to the exact existing cutoff.
 No pong is accepted when no ping is outstanding. An accepted pong clears that
 expectation and advances liveness. After it is cleared, a duplicate replay has
 no outstanding sequence to match; the sequence is not reused later in that
@@ -1288,7 +1293,10 @@ the session was established or last promoted at, or -- after a committed
 server-side path migration -- the migrated-to path). The proxy considers it
 only from its pinned remote tuple and leaves the
 current session only after successful decryption and canonical source and shape
-validation. A validated peer close selects normal `reconnect_delay`, not an
+validation. Client admission permits its current or pending epoch, preserving
+shutdown when the server committed E2 but the client has not received its ACK;
+a retiring-epoch close cannot terminate the refreshed session. A validated peer
+close selects normal `reconnect_delay`, not an
 immediate re-handshake. It does not require or carry a ping sequence.
 
 Normal endpoint shutdown sends at most one such close per live relation before
