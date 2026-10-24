@@ -343,8 +343,13 @@ keeps each epoch well under 100,000 packets avoids it. The proxy keeps no
 nonce ledger: it acts on a mixer reply only when the reply matches what it is
 waiting for -- the sequence number of its one outstanding ping, its own
 refresh transaction, or the path challenge it last answered -- and only once.
+A pong must also use an epoch under which that logical ping was successfully
+sent; eligible retiring-epoch replies remain usable only during the existing
+overlap. Only the current and unexpired retiring send epochs are retained.
 A repeated path challenge is answered again but grants nothing, and an
-authenticated close from the mixer ends the session. State is in memory
+authenticated close from the mixer ends the session under the client's current
+or pending epoch. A pending key permits shutdown when the mixer committed the
+refresh but its ACK was lost; a retiring-key close is ignored. State is in memory
 only: restarting either end requires a fresh session.
 
 ### Liveness recovery on the same path
@@ -525,8 +530,10 @@ The currently built, signed, and published repository feed targets include
 suitable dependencies. The package recipe pins a fixed source commit, never a
 moving branch, so packaged behavior can lag this guide. Both feeds publish
 signed `0.3.0-r1` packages, a package revision built from the commit of the
-signed v0.3.0 release tag, with the UDPSECv2 session behaviour described
-above. The older `0.2.1-r4` packages, built from the v0.2.1 release, are no
+signed v0.3.0 release tag. That release source predates the SH-3 PONG
+send-epoch and retiring-epoch CLOSE restrictions described above; those
+subsequent source-level protections must not be attributed to the published
+`0.3.0-r1` binaries. The older `0.2.1-r4` packages, built from the v0.2.1 release, are no
 longer in the feed indexes, but their signed files remain downloadable by
 exact file name from the feed directories; they do not interoperate with
 v0.3.0 peers. Pair packages only with a mixer from the same release line and
