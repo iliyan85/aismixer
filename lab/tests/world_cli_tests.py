@@ -4,6 +4,7 @@ All receivers/routes here are unqualified synthetic examples. This test makes
 no AIS protocol, RF reception, site suitability or coastline assertion.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
@@ -12,6 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 UNITS = 9_830_400
@@ -322,8 +324,18 @@ def main():
             rejected = run(args.exe,"--world",profile,*extra,success=False,hidden=True)
             require(rejected.stdout == b"", "invalid CLI input emitted partial world trace")
         hidden = run(args.exe,"--world",profile,"--duration-seconds","1",success=False,hidden=True)
-        require(hidden.stdout == b"" and b"CUDA" in hidden.stderr, "production operator silently used CPU fallback")
+        require(hidden.stdout == b"" and (b"No CUDA device is available" in hidden.stderr or
+                b"cudaErrorNoDevice" in hidden.stderr), "expected an explicit CUDA no-device failure")
         if args.mode == "host":
+            if sys.platform == "linux":
+                fresh = run(args.exe, "--world", profile, "--validate", "--seed", "fresh", hidden=True)
+                effective = json.loads(fresh.stdout)["effective_seed"]
+                require(type(effective) is int and 0 <= effective <= MASK, "invalid OS-selected seed")
+                replay = run(args.exe, "--world", profile, "--validate", "--seed", effective, hidden=True)
+                require(replay.stdout == fresh.stdout, "host validation lost the effective fresh seed")
+                invalid = run(args.exe, "--world", os.fsdecode(b"invalid-\xff.yaml"), "--validate",
+                              success=False, hidden=True)
+                require(not invalid.stdout and b"invalid UTF-8" in invalid.stderr, "invalid UTF-8 argv reached loader")
             print("PASS W1 host CLI: strict options/validation, actual CUDA-hidden production rejection; no GPU claim")
             return
         baseline = run(args.exe,"--world",profile,"--seed","42","--duration-seconds","18000",
@@ -337,13 +349,16 @@ def main():
         qualified_inputs = (rows[0]["scenario_fnv1a64"], rows[0]["waypoint_fnv1a64"], rows[0]["regions_fnv1a64"]) == (
             "c6208d82cfe68d40", "cece58237503ab93", "809b2625bb9d7cb5")
         require(qualified_inputs, "shipped W1 profile fingerprints changed; review source data and qualification explicitly")
-        qualified_device = (b"gpu=NVIDIA GeForce GTX 1050 Ti sm=6.1 runtime=12090 " in baseline.stderr and
-                            b"build=MSVC_19.44.35229.0_CUDA_12.9.86_sm61_fmad_false" in baseline.stderr)
+        device_line = next(line for line in baseline.stderr.splitlines() if line.startswith(b"gpu="))
+        print(device_line.decode("utf-8"))
+        qualified_device = (os.name == "nt" and
+                            device_line.startswith(b"gpu=NVIDIA GeForce GTX 1050 Ti sm=6.1 runtime=12090 ") and
+                            b"build=MSVC_19.44.35229.0_CUDA_12.9.86_sm61_fmad_false" in device_line.split())
         if qualified_inputs and qualified_device:
             require(rows[-1]["logical_fnv1a64"] == "6328099c89f9a685" and len(rows)-1 == 5319,
                     "qualified W1 five-hour canonical golden changed")
         else:
-            print("W1 qualified numeric golden SKIPPED: non-reference GPU/toolchain; independent semantic checks continue")
+            print("W1 five-hour numeric golden UNQUALIFIED / SKIPPED for this GPU/toolchain")
         alternative = run(args.exe,"--world",profile,"--seed","42","--duration-seconds","18000",
                           "--step-seconds","60","--chunk-seconds","7","--batch-size","1","--block-size","64","--verbose")
         require(alternative.stdout == baseline.stdout, "five-hour canonical trace changed with chunk/batch/block/diagnostics")
@@ -356,6 +371,8 @@ def main():
         require(replay.stdout == fresh.stdout, "fresh effective seed did not replay exact world trace")
         unicode_dir = temporary / "свят 海 profiles"
         shutil.copytree(profile.parent,unicode_dir)
+        for source in unicode_dir.glob("*.yaml"):
+            source.write_bytes(source.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
         short = run(args.exe,"--world",profile,"--seed","42","--duration-seconds","120")
         unicode_input = run(args.exe,"--world",unicode_dir/profile.name,"--seed","42","--duration-seconds","120")
         require(unicode_input.stdout == short.stdout, "UTF8 operator input path changed canonical world state")
@@ -365,14 +382,27 @@ def main():
         before = hashlib.sha256(destination.read_bytes()).digest()
         run(args.exe,"--world",profile,"--output",destination,success=False)
         require(hashlib.sha256(destination.read_bytes()).digest() == before, "existing world trace was overwritten")
+        if sys.platform == "linux":
+            contested = temporary / "contested.ndjson"
+            command = [str(args.exe), "--world", str(profile), "--seed", "42", "--duration-seconds", "120",
+                       "--output", str(contested)]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                writers = [pool.submit(subprocess.run, command, capture_output=True, timeout=120) for _ in range(2)]
+                results = sorted((writer.result() for writer in writers), key=lambda result: result.returncode)
+            winner, loser = results
+            require(winner.returncode == 0 and loser.returncode > 0 and not winner.stdout and not loser.stdout and
+                    (b"already exists" in loser.stderr or b"no-replace publication failed" in loser.stderr) and
+                    contested.read_bytes() == short.stdout and not list(temporary.glob("*.w1-tmp-*")),
+                    "competing publications must leave exactly one complete trace and no temporary file")
         read_fd,write_fd = os.pipe()
         os.close(read_fd)
         try:
-            child = subprocess.Popen([str(args.exe),"--world",str(profile),"--duration-seconds","1"],stdout=write_fd,stderr=subprocess.PIPE)
+            child = subprocess.run([str(args.exe),"--world",str(profile),"--duration-seconds","1"],
+                                   stdout=write_fd, stderr=subprocess.PIPE, timeout=60)
         finally:
             os.close(write_fd)
-        _,diagnostics = child.communicate(timeout=60)
-        require(child.returncode != 0 and diagnostics, "closed stdout falsely reported complete world output")
+        require(child.returncode > 0 and b"W1 error: W1 stdout" in child.stderr,
+                "closed stdout requires a diagnosed write or flush failure")
         print(f"PASS W1 GPU CLI: five hours, {len(rows)-1} canonical records, digest={rows[-1]['logical_fnv1a64']}, independent WGS84 max_error_m={error:.9f}; blocks64/256,batch1/1024,chunk7/300,Unicode,no-clobber,seed replay")
 
 

@@ -21,6 +21,8 @@
 #include <windows.h>
 #include <fcntl.h>
 #include <io.h>
+#else
+#include <csignal>
 #endif
 
 namespace {
@@ -201,5 +203,11 @@ int wmain(int argc, wchar_t** argv) {
     }
 }
 #else
-int main(int argc, char** argv) { return guarded(std::vector<std::string>(argv, argv + argc)); }
+int main(int argc, char** argv) {
+    if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        std::cerr << "R0 runtime failure: cannot configure stdout pipe handling\n";
+        return 3;
+    }
+    return guarded(std::vector<std::string>(argv, argv + argc));
+}
 #endif

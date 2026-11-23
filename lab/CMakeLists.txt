@@ -1,33 +1,46 @@
 cmake_minimum_required(VERSION 3.24)
 
-# B1 deliberately uses the native Windows VS2022 toolchain. Select the CUDA
-# toolset with cmake -T; changing CMAKE_GENERATOR_TOOLSET here is unsupported.
-if(NOT CMAKE_HOST_WIN32 OR NOT CMAKE_GENERATOR STREQUAL "Visual Studio 17 2022")
-    message(FATAL_ERROR "B1 requires native Windows and -G \"Visual Studio 17 2022\" -A x64.")
-endif()
-if(NOT CMAKE_GENERATOR_PLATFORM STREQUAL "x64")
-    message(FATAL_ERROR "B1 requires the x64 platform. Configure with -A x64.")
+if(CMAKE_HOST_WIN32)
+    # Select the VS CUDA toolset with cmake -T.
+    if(NOT CMAKE_GENERATOR STREQUAL "Visual Studio 17 2022")
+        message(FATAL_ERROR "B1 requires native Windows and -G \"Visual Studio 17 2022\" -A x64.")
+    endif()
+    if(NOT CMAKE_GENERATOR_PLATFORM STREQUAL "x64")
+        message(FATAL_ERROR "B1 requires the x64 platform. Configure with -A x64.")
+    endif()
+elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+    if(NOT CMAKE_GENERATOR STREQUAL "Ninja")
+        message(FATAL_ERROR "B1 requires -G Ninja on native Linux.")
+    endif()
+else()
+    message(FATAL_ERROR "B1 requires native Windows with Visual Studio 2022 x64 or native Linux with Ninja.")
 endif()
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 61 CACHE STRING "CUDA architectures (GTX 1050 Ti: 61)")
+    set(CMAKE_CUDA_ARCHITECTURES 61 CACHE STRING "CUDA architectures (Pascal sm_61)")
 endif()
 
 # Pin toolkit discovery to 12.9 instead of CUDA_PATH or the newest installed
 # version. A newer driver reporting CUDA 13.0 does not require toolkit 13.x.
-set(_lab_cuda_root "$ENV{CUDA_PATH_V12_9}")
-if(NOT _lab_cuda_root)
-    set(_lab_cuda_root "$ENV{ProgramFiles}/NVIDIA GPU Computing Toolkit/CUDA/v12.9")
-endif()
-if(CMAKE_GENERATOR_TOOLSET MATCHES "(^|,)cuda=([^,]+)")
-    set(_lab_cuda_selection "${CMAKE_MATCH_2}")
-    if(_lab_cuda_selection MATCHES "^[0-9]+([.][0-9]+)*$")
-        if(NOT _lab_cuda_selection STREQUAL "12.9")
-            message(FATAL_ERROR "B1 requires CUDA 12.9; requested toolset is ${_lab_cuda_selection}. CUDA 13.x cannot compile Pascal. Use -T cuda=12.9 or -T \"cuda=<CUDA 12.9 root>\" in a fresh build tree.")
-        endif()
-    else()
-        set(_lab_cuda_root "${_lab_cuda_selection}")
+if(CMAKE_HOST_WIN32)
+    set(_lab_cuda_root "$ENV{CUDA_PATH_V12_9}")
+    if(NOT _lab_cuda_root)
+        set(_lab_cuda_root "$ENV{ProgramFiles}/NVIDIA GPU Computing Toolkit/CUDA/v12.9")
     endif()
+    if(CMAKE_GENERATOR_TOOLSET MATCHES "(^|,)cuda=([^,]+)")
+        set(_lab_cuda_selection "${CMAKE_MATCH_2}")
+        if(_lab_cuda_selection MATCHES "^[0-9]+([.][0-9]+)*$")
+            if(NOT _lab_cuda_selection STREQUAL "12.9")
+                message(FATAL_ERROR "B1 requires CUDA 12.9; requested toolset is ${_lab_cuda_selection}. CUDA 13.x cannot compile Pascal. Use -T cuda=12.9 or -T \"cuda=<CUDA 12.9 root>\" in a fresh build tree.")
+            endif()
+        else()
+            set(_lab_cuda_root "${_lab_cuda_selection}")
+        endif()
+    endif()
+    set(_lab_nvcc_name nvcc.exe)
+else()
+    set(_lab_cuda_root "/usr/local/cuda-12.9")
+    set(_lab_nvcc_name nvcc)
 endif()
 if(NOT CUDAToolkit_ROOT)
     file(TO_CMAKE_PATH "${_lab_cuda_root}" _lab_cuda_root)
@@ -47,31 +60,60 @@ function(lab_require_cuda_12_9 compiler)
 endfunction()
 
 # Check supplied/cached compilers before CUDA compiler identification can run.
-lab_require_cuda_12_9("${CUDAToolkit_ROOT}/bin/nvcc.exe")
-if(CMAKE_CUDA_COMPILER)
+set(_lab_nvcc "${CUDAToolkit_ROOT}/bin/${_lab_nvcc_name}")
+lab_require_cuda_12_9("${_lab_nvcc}")
+if(CMAKE_HOST_WIN32 AND CMAKE_CUDA_COMPILER)
     lab_require_cuda_12_9("${CMAKE_CUDA_COMPILER}")
 endif()
 
 project(aismixer_lab LANGUAGES CXX)
 
-# CXX initialization reveals the VS-selected toolkit without compiling CUDA.
-# FindCUDAToolkit alone cannot choose a Visual Studio CUDA toolset.
-if(NOT CMAKE_VS_PLATFORM_TOOLSET_CUDA STREQUAL "12.9")
-    message(FATAL_ERROR "Visual Studio selected CUDA toolset '${CMAKE_VS_PLATFORM_TOOLSET_CUDA}', but B1 requires 12.9. If CUDA 12.9 VS integration is missing, use a fresh build tree with -T \"cuda=<CUDA 12.9 root>\"; that root must contain bin/nvcc.exe and extras/visual_studio_integration/MSBuildExtensions. Otherwise use -T cuda=12.9 with installed integration. No CUDA compilation was attempted.")
-endif()
-if(CMAKE_VS_PLATFORM_TOOLSET_CUDA_CUSTOM_DIR)
-    foreach(_file "CUDA 12.9.props" "CUDA 12.9.targets" "Nvda.Build.CudaTasks.v12.9.dll")
-        if(NOT EXISTS "${CMAKE_VS_PLATFORM_TOOLSET_CUDA_CUSTOM_DIR}/extras/visual_studio_integration/MSBuildExtensions/${_file}")
-            message(FATAL_ERROR "CUDA 12.9 VS integration is incomplete: missing ${_file} under the selected toolkit's extras/visual_studio_integration/MSBuildExtensions. Diagnose or repair integration manually; B1 does not install software.")
-        endif()
-    endforeach()
-endif()
-if(NOT MSVC)
-    message(FATAL_ERROR "B1 requires the Visual Studio 2022 MSVC host compiler.")
+if(CMAKE_HOST_WIN32)
+    # CXX initialization reveals the VS-selected toolkit without compiling CUDA.
+    # FindCUDAToolkit alone cannot choose a Visual Studio CUDA toolset.
+    if(NOT CMAKE_VS_PLATFORM_TOOLSET_CUDA STREQUAL "12.9")
+        message(FATAL_ERROR "Visual Studio selected CUDA toolset '${CMAKE_VS_PLATFORM_TOOLSET_CUDA}', but B1 requires 12.9. If CUDA 12.9 VS integration is missing, use a fresh build tree with -T \"cuda=<CUDA 12.9 root>\"; that root must contain bin/nvcc.exe and extras/visual_studio_integration/MSBuildExtensions. Otherwise use -T cuda=12.9 with installed integration. No CUDA compilation was attempted.")
+    endif()
+    if(CMAKE_VS_PLATFORM_TOOLSET_CUDA_CUSTOM_DIR)
+        foreach(_file "CUDA 12.9.props" "CUDA 12.9.targets" "Nvda.Build.CudaTasks.v12.9.dll")
+            if(NOT EXISTS "${CMAKE_VS_PLATFORM_TOOLSET_CUDA_CUSTOM_DIR}/extras/visual_studio_integration/MSBuildExtensions/${_file}")
+                message(FATAL_ERROR "CUDA 12.9 VS integration is incomplete: missing ${_file} under the selected toolkit's extras/visual_studio_integration/MSBuildExtensions. Diagnose or repair integration manually; B1 does not install software.")
+            endif()
+        endforeach()
+    endif()
+    if(NOT MSVC)
+        message(FATAL_ERROR "B1 requires the Visual Studio 2022 MSVC host compiler.")
+    endif()
+else()
+    if(CMAKE_CROSSCOMPILING OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "B1 requires a native Linux build with Ninja.")
+    endif()
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_CXX_COMPILER_VERSION MATCHES "^13([.]|$)")
+        message(FATAL_ERROR "B1 requires GCC 13 on Linux. Set CMAKE_CXX_COMPILER to g++-13 in a fresh build tree.")
+    endif()
+    if(CMAKE_CUDA_COMPILER)
+        lab_require_cuda_12_9("${CMAKE_CUDA_COMPILER}")
+    else()
+        set(CMAKE_CUDA_COMPILER "${_lab_nvcc}")
+    endif()
+    if(NOT CMAKE_CUDA_HOST_COMPILER)
+        set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}")
+    endif()
+    if(NOT "$ENV{CUDAHOSTCXX}" STREQUAL "")
+        message(FATAL_ERROR "Unset CUDAHOSTCXX and configure a fresh build tree with the same g++-13 for CXX and the CUDA host compiler.")
+    endif()
+    file(REAL_PATH "${CMAKE_CXX_COMPILER}" _lab_cxx)
+    file(REAL_PATH "${CMAKE_CUDA_HOST_COMPILER}" _lab_cuda_host)
+    if(NOT _lab_cuda_host STREQUAL _lab_cxx)
+        message(FATAL_ERROR "Set CMAKE_CUDA_HOST_COMPILER to the CMAKE_CXX_COMPILER executable (${CMAKE_CXX_COMPILER}) in a fresh build tree.")
+    endif()
 endif()
 
 # Keep nvcc's normal host-compiler compatibility checks enabled.
 enable_language(CUDA)
+if(NOT CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    message(FATAL_ERROR "B1 requires NVIDIA nvcc as its CUDA compiler.")
+endif()
 if(NOT CMAKE_CUDA_COMPILER_VERSION MATCHES "^12[.]9([.]|$)")
     message(FATAL_ERROR "Detected CUDA compiler ${CMAKE_CUDA_COMPILER_VERSION}; B1 requires 12.9.")
 endif()
@@ -79,6 +121,12 @@ find_package(CUDAToolkit 12.9 REQUIRED)
 if(NOT CUDAToolkit_VERSION MATCHES "^12[.]9([.]|$)")
     message(FATAL_ERROR "Detected CUDA runtime toolkit ${CUDAToolkit_VERSION}; B1 requires 12.9.")
 endif()
+
+if(MSVC)
+    set(_lab_msvc_cxx_options $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+endif()
+set(_lab_toolchain "${CMAKE_CXX_COMPILER_ID}_${CMAKE_CXX_COMPILER_VERSION}_CUDA_${CMAKE_CUDA_COMPILER_VERSION}")
+string(REPLACE ";" "," _lab_architectures "${CMAKE_CUDA_ARCHITECTURES}")
 
 add_library(aismixer_lab_gpu_engine STATIC cuda/engine.cu)
 target_include_directories(aismixer_lab_gpu_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/cuda")
@@ -117,7 +165,7 @@ target_include_directories(aismixer_lab_scene_host PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/runner" "${CMAKE_CURRENT_SOURCE_DIR}/cuda")
 set_target_properties(aismixer_lab_scene_host PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_scene_host PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_scene_host PRIVATE ${_lab_msvc_cxx_options})
 
 if(AISMIXER_LAB_BUILD_SCENE_RUNNER)
     find_package(yaml-cpp 0.8 CONFIG QUIET)
@@ -136,7 +184,7 @@ if(AISMIXER_LAB_BUILD_SCENE_RUNNER)
         aismixer_lab_scene_host aismixer_lab_scene_engine ${_lab_yaml_target})
     set_target_properties(aismixer_lab_scene PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_scene PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_scene PRIVATE ${_lab_msvc_cxx_options})
     message(STATUS "B2.1 runner enabled with local yaml-cpp target ${_lab_yaml_target}")
 else()
     message(STATUS "B2.1 runner disabled (AISMIXER_LAB_BUILD_SCENE_RUNNER=OFF); enable explicitly with a local yaml-cpp package")
@@ -147,22 +195,24 @@ add_library(aismixer_lab_ais_codec STATIC
 target_include_directories(aismixer_lab_ais_codec PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/ais")
 set_target_properties(aismixer_lab_ais_codec PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_ais_codec PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_ais_codec PRIVATE ${_lab_msvc_cxx_options})
 
 add_executable(aismixer_lab_ais_smoke ais/ais_smoke_main.cpp)
 target_link_libraries(aismixer_lab_ais_smoke PRIVATE aismixer_lab_ais_codec)
 set_target_properties(aismixer_lab_ais_smoke PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_ais_smoke PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_ais_smoke PRIVATE ${_lab_msvc_cxx_options})
 
 # B3.1 retains B2 unchanged; only the new geography engine uses device select.
 add_library(aismixer_lab_geo_host STATIC geo/geo_host.cpp)
 target_include_directories(aismixer_lab_geo_host PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/geo" "${CMAKE_CURRENT_SOURCE_DIR}/cuda")
-target_link_libraries(aismixer_lab_geo_host PRIVATE bcrypt)
+if(WIN32)
+    target_link_libraries(aismixer_lab_geo_host PRIVATE bcrypt)
+endif()
 set_target_properties(aismixer_lab_geo_host PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_geo_host PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_geo_host PRIVATE ${_lab_msvc_cxx_options})
 
 add_library(aismixer_lab_geo_engine STATIC geo/geo_engine.cu)
 target_link_libraries(aismixer_lab_geo_engine PUBLIC aismixer_lab_geo_host CUDA::cudart)
@@ -177,13 +227,13 @@ add_library(aismixer_lab_geo_ais STATIC geo/geo_ais.cpp)
 target_link_libraries(aismixer_lab_geo_ais PUBLIC aismixer_lab_geo_host aismixer_lab_ais_codec)
 set_target_properties(aismixer_lab_geo_ais PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_geo_ais PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_geo_ais PRIVATE ${_lab_msvc_cxx_options})
 
 add_library(aismixer_lab_geo_output STATIC geo/geo_output.cpp)
 target_link_libraries(aismixer_lab_geo_output PUBLIC aismixer_lab_geo_ais)
 set_target_properties(aismixer_lab_geo_output PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_geo_output PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_geo_output PRIVATE ${_lab_msvc_cxx_options})
 
 option(AISMIXER_LAB_BUILD_GEO_RUNNER "Build B3.1 offline geographic YAML operator (requires local yaml-cpp >= 0.8)" OFF)
 if(AISMIXER_LAB_BUILD_GEO_RUNNER)
@@ -201,16 +251,15 @@ if(AISMIXER_LAB_BUILD_GEO_RUNNER)
     target_link_libraries(aismixer_lab_geo_config PUBLIC aismixer_lab_geo_host PRIVATE ${_lab_yaml_target})
     set_target_properties(aismixer_lab_geo_config PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_geo_config PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_geo_config PRIVATE ${_lab_msvc_cxx_options})
     add_executable(aismixer_lab_geo geo/geo_cli_main.cpp runner/scene_yaml.cpp)
     target_link_libraries(aismixer_lab_geo PRIVATE aismixer_lab_geo_config
         aismixer_lab_geo_engine aismixer_lab_geo_output aismixer_lab_scene_host ${_lab_yaml_target})
     set_target_properties(aismixer_lab_geo PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_geo PRIVATE /utf-8 /W4)
-    string(REPLACE ";" "," _lab_geo_architectures "${CMAKE_CUDA_ARCHITECTURES}")
+    target_compile_options(aismixer_lab_geo PRIVATE ${_lab_msvc_cxx_options})
     target_compile_definitions(aismixer_lab_geo PRIVATE
-        AISMIXER_LAB_GEO_BUILD_INFO="MSVC_${CMAKE_CXX_COMPILER_VERSION}_CUDA_${CMAKE_CUDA_COMPILER_VERSION}_arch_${_lab_geo_architectures}")
+        AISMIXER_LAB_GEO_BUILD_INFO="${_lab_toolchain}_arch_${_lab_architectures}")
 endif()
 
 # R0 is additive: the host runtime validates finalized NMEA bytes without an
@@ -222,24 +271,27 @@ add_library(aismixer_lab_runtime STATIC
 target_include_directories(aismixer_lab_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
 set_target_properties(aismixer_lab_runtime PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_runtime PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_runtime PRIVATE ${_lab_msvc_cxx_options})
 option(AISMIXER_LAB_BUILD_RUNTIME_RUNNER "Build the R0 synthetic fixture/recorded playback operator (no RF or networking)" OFF)
 if(AISMIXER_LAB_BUILD_RUNTIME_RUNNER)
     add_executable(aismixer_lab_runtime_runner runtime/cli_main.cpp)
     target_link_libraries(aismixer_lab_runtime_runner PRIVATE aismixer_lab_runtime)
     set_target_properties(aismixer_lab_runtime_runner PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_runtime_runner PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_runtime_runner PRIVATE ${_lab_msvc_cxx_options})
 endif()
 
 # A1-S2 reuses W1's actual host canonicalization, without the optional YAML
 # loader/operator or device engine. Keep that shared host library available.
 add_library(aismixer_lab_world_host STATIC world/world.cpp)
 target_include_directories(aismixer_lab_world_host PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/world")
-target_link_libraries(aismixer_lab_world_host PUBLIC aismixer_lab_runtime PRIVATE bcrypt)
+target_link_libraries(aismixer_lab_world_host PUBLIC aismixer_lab_runtime)
+if(WIN32)
+    target_link_libraries(aismixer_lab_world_host PRIVATE bcrypt)
+endif()
 set_target_properties(aismixer_lab_world_host PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_world_host PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_world_host PRIVATE ${_lab_msvc_cxx_options})
 
 add_library(aismixer_lab_classa_inputs STATIC
     classa/station_config.cpp classa/station_inputs.cpp)
@@ -248,14 +300,14 @@ target_include_directories(aismixer_lab_classa_inputs PUBLIC
 target_link_libraries(aismixer_lab_classa_inputs PUBLIC aismixer_lab_ais_codec aismixer_lab_runtime)
 set_target_properties(aismixer_lab_classa_inputs PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_classa_inputs PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_classa_inputs PRIVATE ${_lab_msvc_cxx_options})
 
 add_library(aismixer_lab_classa_assembly STATIC classa/station_assembly.cpp)
 target_link_libraries(aismixer_lab_classa_assembly PUBLIC
     aismixer_lab_classa_inputs aismixer_lab_world_host)
 set_target_properties(aismixer_lab_classa_assembly PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_classa_assembly PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_classa_assembly PRIVATE ${_lab_msvc_cxx_options})
 
 # A1-S3: station-local two-channel maps, directory, restricted candidate
 # engine, generic RATDMA arithmetic and the CLASSA-PHILOX-v1 semantic RNG.
@@ -267,14 +319,14 @@ add_library(aismixer_lab_classa_knowledge STATIC
 target_link_libraries(aismixer_lab_classa_knowledge PUBLIC aismixer_lab_classa_assembly)
 set_target_properties(aismixer_lab_classa_knowledge PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_classa_knowledge PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_classa_knowledge PRIVATE ${_lab_msvc_cxx_options})
 
 # A1-S4-A: autonomous entry and per-channel first-frame LOCAL intents only.
 add_library(aismixer_lab_classa_access STATIC classa/access_engine.cpp)
 target_link_libraries(aismixer_lab_classa_access PUBLIC aismixer_lab_classa_knowledge)
 set_target_properties(aismixer_lab_classa_access PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_options(aismixer_lab_classa_access PRIVATE /utf-8 /W4)
+target_compile_options(aismixer_lab_classa_access PRIVATE ${_lab_msvc_cxx_options})
 
 option(AISMIXER_LAB_BUILD_WORLD "Build the W1 world/lifecycle CUDA operator (requires local yaml-cpp >= 0.8)" OFF)
 if(AISMIXER_LAB_BUILD_WORLD)
@@ -296,16 +348,23 @@ if(AISMIXER_LAB_BUILD_WORLD)
         CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES CUDA_EXTENSIONS NO CUDA_RUNTIME_LIBRARY Shared)
     target_compile_options(aismixer_lab_world_engine PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
-    set_property(SOURCE world/cuda_engine.cu PROPERTY VS_SETTINGS "Warning=W4")
     add_executable(aismixer_lab_world world/cli_main.cpp)
     target_link_libraries(aismixer_lab_world PRIVATE aismixer_lab_world_config aismixer_lab_world_engine)
     foreach(_w1_target aismixer_lab_world_config aismixer_lab_world_engine aismixer_lab_world)
         set_target_properties(${_w1_target} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-        target_compile_options(${_w1_target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+        target_compile_options(${_w1_target} PRIVATE ${_lab_msvc_cxx_options})
     endforeach()
-    target_compile_options(aismixer_lab_world_engine PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+    if(MSVC)
+        target_compile_options(aismixer_lab_world_engine PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+        set_property(SOURCE world/cuda_engine.cu PROPERTY VS_SETTINGS "Warning=W4")
+    endif()
+    if(CMAKE_CUDA_ARCHITECTURES STREQUAL "61")
+        set(_lab_world_arch sm61) # Retain the original single-architecture reference identity.
+    else()
+        set(_lab_world_arch "arch_${_lab_architectures}")
+    endif()
     target_compile_definitions(aismixer_lab_world PRIVATE
-        AISMIXER_LAB_WORLD_BUILD_INFO="MSVC_${CMAKE_CXX_COMPILER_VERSION}_CUDA_${CMAKE_CUDA_COMPILER_VERSION}_sm61_fmad_false")
+        AISMIXER_LAB_WORLD_BUILD_INFO="${_lab_toolchain}_${_lab_world_arch}_fmad_false")
 endif()
 
 include(CTest)
@@ -316,7 +375,7 @@ if(BUILD_TESTING)
         target_link_libraries(aismixer_lab_runtime_${_runtime_test}_tests PRIVATE aismixer_lab_runtime)
         set_target_properties(aismixer_lab_runtime_${_runtime_test}_tests PROPERTIES
             CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-        target_compile_options(aismixer_lab_runtime_${_runtime_test}_tests PRIVATE /utf-8 /W4)
+        target_compile_options(aismixer_lab_runtime_${_runtime_test}_tests PRIVATE ${_lab_msvc_cxx_options})
         add_test(NAME aismixer_lab_runtime_${_runtime_test}_test
             COMMAND aismixer_lab_runtime_${_runtime_test}_tests "${CMAKE_CURRENT_BINARY_DIR}/runtime-${_runtime_test}-tests")
         set_tests_properties(aismixer_lab_runtime_${_runtime_test}_test PROPERTIES
@@ -329,11 +388,13 @@ if(BUILD_TESTING)
     set_target_properties(aismixer_lab_runtime_cuda_bridge_tests PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO
         CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES CUDA_EXTENSIONS NO CUDA_RUNTIME_LIBRARY Shared)
-    target_compile_options(aismixer_lab_runtime_cuda_bridge_tests PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
-    # CUDA's VS task appends its own host warning flag after AdditionalOptions.
-    # Set its metadata too, so the default inherited /W1 cannot override /W4.
-    set_property(SOURCE tests/runtime_cuda_bridge_tests.cu PROPERTY VS_SETTINGS "Warning=W4")
+    if(MSVC)
+        target_compile_options(aismixer_lab_runtime_cuda_bridge_tests PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+        # CUDA's VS task appends its own host warning flag after AdditionalOptions.
+        # Set its metadata too, so the default inherited /W1 cannot override /W4.
+        set_property(SOURCE tests/runtime_cuda_bridge_tests.cu PROPERTY VS_SETTINGS "Warning=W4")
+    endif()
     add_test(NAME aismixer_lab_runtime_cuda_bridge_test COMMAND aismixer_lab_runtime_cuda_bridge_tests)
     set_tests_properties(aismixer_lab_runtime_cuda_bridge_test PROPERTIES LABELS "GPU;runtime" TIMEOUT 60)
     add_test(NAME aismixer_lab_gpu_self_test COMMAND aismixer_lab_gpu_smoke --self-test)
@@ -348,7 +409,7 @@ if(BUILD_TESTING)
     target_link_libraries(aismixer_lab_scene_host_tests PRIVATE aismixer_lab_scene_host)
     set_target_properties(aismixer_lab_scene_host_tests PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_scene_host_tests PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_scene_host_tests PRIVATE ${_lab_msvc_cxx_options})
     add_test(NAME aismixer_lab_scene_host_test COMMAND aismixer_lab_scene_host_tests
         "${CMAKE_CURRENT_BINARY_DIR}/host-tests")
     set_tests_properties(aismixer_lab_scene_host_test PROPERTIES LABELS host TIMEOUT 30)
@@ -377,7 +438,7 @@ if(BUILD_TESTING)
     target_link_libraries(aismixer_lab_ais_codec_tests PRIVATE aismixer_lab_ais_codec)
     set_target_properties(aismixer_lab_ais_codec_tests PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_ais_codec_tests PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_ais_codec_tests PRIVATE ${_lab_msvc_cxx_options})
     add_test(NAME aismixer_lab_ais_codec_test COMMAND aismixer_lab_ais_codec_tests)
     add_test(NAME aismixer_lab_ais_smoke_test COMMAND aismixer_lab_ais_smoke --self-test)
     set_tests_properties(aismixer_lab_ais_codec_test aismixer_lab_ais_smoke_test
@@ -386,7 +447,7 @@ if(BUILD_TESTING)
     target_link_libraries(aismixer_lab_classa_payload_tests PRIVATE aismixer_lab_ais_codec)
     set_target_properties(aismixer_lab_classa_payload_tests PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_classa_payload_tests PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_classa_payload_tests PRIVATE ${_lab_msvc_cxx_options})
     add_test(NAME aismixer_lab_classa_payload_test COMMAND aismixer_lab_classa_payload_tests)
     set_tests_properties(aismixer_lab_classa_payload_test PROPERTIES
         LABELS "host;AIS;classa" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
@@ -394,7 +455,7 @@ if(BUILD_TESTING)
     target_link_libraries(aismixer_lab_classa_station_tests PRIVATE aismixer_lab_classa_assembly)
     set_target_properties(aismixer_lab_classa_station_tests PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_classa_station_tests PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_classa_station_tests PRIVATE ${_lab_msvc_cxx_options})
     add_test(NAME aismixer_lab_classa_station_test COMMAND aismixer_lab_classa_station_tests)
     set_tests_properties(aismixer_lab_classa_station_test PROPERTIES
         LABELS "host;AIS;classa;station" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
@@ -404,7 +465,7 @@ if(BUILD_TESTING)
     target_link_libraries(aismixer_lab_classa_knowledge_tests PRIVATE aismixer_lab_classa_knowledge)
     set_target_properties(aismixer_lab_classa_knowledge_tests PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_classa_knowledge_tests PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_classa_knowledge_tests PRIVATE ${_lab_msvc_cxx_options})
     add_test(NAME aismixer_lab_classa_knowledge_test COMMAND aismixer_lab_classa_knowledge_tests)
     set_tests_properties(aismixer_lab_classa_knowledge_test PROPERTIES
         LABELS "host;AIS;classa;knowledge" TIMEOUT 60 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
@@ -413,7 +474,7 @@ if(BUILD_TESTING)
     target_link_libraries(aismixer_lab_classa_access_tests PRIVATE aismixer_lab_classa_access)
     set_target_properties(aismixer_lab_classa_access_tests PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_classa_access_tests PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_classa_access_tests PRIVATE ${_lab_msvc_cxx_options})
     add_test(NAME aismixer_lab_classa_access_test COMMAND aismixer_lab_classa_access_tests)
     set_tests_properties(aismixer_lab_classa_access_test PROPERTIES
         LABELS "host;AIS;classa;access" TIMEOUT 120 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
@@ -466,7 +527,7 @@ if(BUILD_TESTING)
     target_link_libraries(aismixer_lab_geo_host_tests PRIVATE aismixer_lab_geo_ais)
     set_target_properties(aismixer_lab_geo_host_tests PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_geo_host_tests PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_geo_host_tests PRIVATE ${_lab_msvc_cxx_options})
     add_test(NAME aismixer_lab_geo_host_test COMMAND aismixer_lab_geo_host_tests)
     set_tests_properties(aismixer_lab_geo_host_test PROPERTIES
         LABELS "host;geo" TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
@@ -477,7 +538,7 @@ if(BUILD_TESTING)
     target_link_libraries(aismixer_lab_geo_output_tests PRIVATE aismixer_lab_geo_output)
     set_target_properties(aismixer_lab_geo_output_tests PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_geo_output_tests PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_geo_output_tests PRIVATE ${_lab_msvc_cxx_options})
     add_test(NAME aismixer_lab_geo_output_test COMMAND aismixer_lab_geo_output_tests
         "${CMAKE_CURRENT_BINARY_DIR}/geo-output-tests")
     set_tests_properties(aismixer_lab_geo_output_test PROPERTIES
@@ -489,7 +550,7 @@ if(BUILD_TESTING)
         aismixer_lab_geo_engine aismixer_lab_scene_engine)
     set_target_properties(aismixer_lab_geo_gpu_tests PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-    target_compile_options(aismixer_lab_geo_gpu_tests PRIVATE /utf-8 /W4)
+    target_compile_options(aismixer_lab_geo_gpu_tests PRIVATE ${_lab_msvc_cxx_options})
     add_test(NAME aismixer_lab_geo_gpu_test COMMAND aismixer_lab_geo_gpu_tests)
     set_tests_properties(aismixer_lab_geo_gpu_test PROPERTIES LABELS "GPU;geo" TIMEOUT 180)
     add_test(NAME aismixer_lab_geo_unavailable_test COMMAND aismixer_lab_geo_gpu_tests --expect-no-gpu)
@@ -500,7 +561,7 @@ if(BUILD_TESTING)
         target_link_libraries(aismixer_lab_geo_config_tests PRIVATE aismixer_lab_geo_config)
         set_target_properties(aismixer_lab_geo_config_tests PROPERTIES
             CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-        target_compile_options(aismixer_lab_geo_config_tests PRIVATE /utf-8 /W4)
+        target_compile_options(aismixer_lab_geo_config_tests PRIVATE ${_lab_msvc_cxx_options})
         add_test(NAME aismixer_lab_geo_config_test COMMAND aismixer_lab_geo_config_tests
             "${CMAKE_CURRENT_SOURCE_DIR}/geo/profiles" "${CMAKE_CURRENT_BINARY_DIR}/geo-config-tests")
         set_tests_properties(aismixer_lab_geo_config_test PROPERTIES
@@ -536,7 +597,7 @@ if(BUILD_TESTING AND AISMIXER_LAB_BUILD_WORLD)
             target_link_libraries(aismixer_lab_world_${_w1_test}_tests PRIVATE aismixer_lab_world_host)
         endif()
         set_target_properties(aismixer_lab_world_${_w1_test}_tests PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-        target_compile_options(aismixer_lab_world_${_w1_test}_tests PRIVATE /utf-8 /W4)
+        target_compile_options(aismixer_lab_world_${_w1_test}_tests PRIVATE ${_lab_msvc_cxx_options})
         if(_w1_test STREQUAL "config")
             add_test(NAME aismixer_lab_world_${_w1_test}_test COMMAND aismixer_lab_world_${_w1_test}_tests
                 "${CMAKE_CURRENT_SOURCE_DIR}/world/profiles" "${CMAKE_CURRENT_BINARY_DIR}/world-config-tests")
@@ -567,4 +628,4 @@ if(BUILD_TESTING AND AISMIXER_LAB_BUILD_WORLD)
     endif()
 endif()
 
-message(STATUS "B1 toolchain: CUDA ${CMAKE_CUDA_COMPILER_VERSION}, MSVC ${CMAKE_CXX_COMPILER_VERSION}, architectures ${CMAKE_CUDA_ARCHITECTURES}")
+message(STATUS "B1 toolchain: CUDA ${CMAKE_CUDA_COMPILER_VERSION}, ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}, architectures ${CMAKE_CUDA_ARCHITECTURES}")

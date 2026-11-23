@@ -14,6 +14,10 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#elif defined(__linux__)
+#include <cerrno>
+#include <cstddef>
+#include <sys/random.h>
 #endif
 
 namespace aismixer::lab::geo {
@@ -287,16 +291,26 @@ void validate_run(const std::vector<Actor>& actors, std::uint64_t start_tick,
 Seed select_seed(SeedMode mode, std::uint64_t fixed_value) {
     if (mode == SeedMode::Fixed) return {mode, fixed_value};
     if (mode != SeedMode::Fresh) invalid("seed_mode", "unsupported seed mode");
-#ifdef _WIN32
     Seed selected{mode, 0};
+#ifdef _WIN32
     const NTSTATUS status = BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&selected.value),
                                            static_cast<ULONG>(sizeof(selected.value)),
                                            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     if (status < 0) throw std::runtime_error("Fresh seed: BCryptGenRandom failed; no entropy fallback exists");
-    return selected;
+#elif defined(__linux__)
+    auto* bytes = reinterpret_cast<unsigned char*>(&selected.value);
+    std::size_t remaining = sizeof(selected.value);
+    while (remaining != 0) {
+        const auto count = ::getrandom(bytes, remaining, 0);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) throw std::runtime_error("Fresh seed: getrandom failed");
+        bytes += count;
+        remaining -= static_cast<std::size_t>(count);
+    }
 #else
     throw std::runtime_error("Fresh seed: this build has no qualified OS entropy provider");
 #endif
+    return selected;
 }
 
 std::uint64_t rng_subsequence(RngPurpose purpose, std::uint32_t actor_id) {
