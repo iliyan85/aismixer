@@ -19,19 +19,7 @@
 #include <utility>
 
 namespace aismixer::lab::world {
-namespace {
-constexpr std::size_t kMaxYamlBytes = 1024 * 1024;
-constexpr std::size_t kMaxYamlDepth = 32, kMaxYamlNodes = 100000, kMaxScalarBytes = 4096;
-using Mapping = std::map<std::string, YAML::Node>;
-
-[[noreturn]] void error_at(const std::string& path, const YAML::Mark& mark,
-                         std::string_view field, std::string_view reason) {
-    std::string location = path;
-    if (mark.line >= 0 && mark.column >= 0)
-        location += ':' + std::to_string(mark.line + 1) + ':' + std::to_string(mark.column + 1);
-    throw std::invalid_argument(location + ": " + std::string(field) + ": " + std::string(reason));
-}
-void validate_utf8(std::string_view value, const std::string& path) {
+void validate_utf8(std::string_view value, const std::string& context) {
     for (std::size_t index = 0; index < value.size();) {
         const auto lead = static_cast<unsigned char>(value[index]);
         const std::size_t width = lead < 0x80 ? 1 : lead >= 0xc2 && lead <= 0xdf ? 2 :
@@ -46,9 +34,22 @@ void validate_utf8(std::string_view value, const std::string& path) {
             valid = !(lead == 0xe0 && second < 0xa0) && !(lead == 0xed && second > 0x9f) &&
                     !(lead == 0xf0 && second < 0x90) && !(lead == 0xf4 && second > 0x8f);
         }
-        if (!valid) throw std::invalid_argument(path + ": invalid UTF-8/NUL at byte " + std::to_string(index + 1));
+        if (!valid) throw std::invalid_argument(context + ": invalid UTF-8/NUL at byte " + std::to_string(index + 1));
         index += width;
     }
+}
+
+namespace {
+constexpr std::size_t kMaxYamlBytes = 1024 * 1024;
+constexpr std::size_t kMaxYamlDepth = 32, kMaxYamlNodes = 100000, kMaxScalarBytes = 4096;
+using Mapping = std::map<std::string, YAML::Node>;
+
+[[noreturn]] void error_at(const std::string& path, const YAML::Mark& mark,
+                         std::string_view field, std::string_view reason) {
+    std::string location = path;
+    if (mark.line >= 0 && mark.column >= 0)
+        location += ':' + std::to_string(mark.line + 1) + ':' + std::to_string(mark.column + 1);
+    throw std::invalid_argument(location + ": " + std::string(field) + ": " + std::string(reason));
 }
 
 // Reject graph expansion and excessive nesting while yaml-cpp is still

@@ -2,8 +2,12 @@
 
 #include "world.h"
 #include <filesystem>
+#include <string_view>
 
 namespace aismixer::lab::world {
+
+// Shared by the YAML reader and the native UTF-8 argument entry point.
+void validate_utf8(std::string_view value, const std::string& context);
 
 // Strict schema-1 world scenario plus its two explicitly referenced schema-1
 // catalogue files. References resolve relative to the scenario file. No legacy

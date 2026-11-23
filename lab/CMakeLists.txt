@@ -99,6 +99,14 @@ else()
     if(NOT CMAKE_CUDA_HOST_COMPILER)
         set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}")
     endif()
+    if(NOT "$ENV{CUDAHOSTCXX}" STREQUAL "")
+        message(FATAL_ERROR "Unset CUDAHOSTCXX and configure a fresh build tree with the same g++-13 for CXX and the CUDA host compiler.")
+    endif()
+    file(REAL_PATH "${CMAKE_CXX_COMPILER}" _lab_cxx)
+    file(REAL_PATH "${CMAKE_CUDA_HOST_COMPILER}" _lab_cuda_host)
+    if(NOT _lab_cuda_host STREQUAL _lab_cxx)
+        message(FATAL_ERROR "Set CMAKE_CUDA_HOST_COMPILER to the CMAKE_CXX_COMPILER executable (${CMAKE_CXX_COMPILER}) in a fresh build tree.")
+    endif()
 endif()
 
 # Keep nvcc's normal host-compiler compatibility checks enabled.
@@ -117,6 +125,8 @@ endif()
 if(MSVC)
     set(_lab_msvc_cxx_options $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endif()
+set(_lab_toolchain "${CMAKE_CXX_COMPILER_ID}_${CMAKE_CXX_COMPILER_VERSION}_CUDA_${CMAKE_CUDA_COMPILER_VERSION}")
+string(REPLACE ";" "," _lab_architectures "${CMAKE_CUDA_ARCHITECTURES}")
 
 add_library(aismixer_lab_gpu_engine STATIC cuda/engine.cu)
 target_include_directories(aismixer_lab_gpu_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/cuda")
@@ -248,9 +258,8 @@ if(AISMIXER_LAB_BUILD_GEO_RUNNER)
     set_target_properties(aismixer_lab_geo PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_compile_options(aismixer_lab_geo PRIVATE ${_lab_msvc_cxx_options})
-    string(REPLACE ";" "," _lab_geo_architectures "${CMAKE_CUDA_ARCHITECTURES}")
     target_compile_definitions(aismixer_lab_geo PRIVATE
-        AISMIXER_LAB_GEO_BUILD_INFO="MSVC_${CMAKE_CXX_COMPILER_VERSION}_CUDA_${CMAKE_CUDA_COMPILER_VERSION}_arch_${_lab_geo_architectures}")
+        AISMIXER_LAB_GEO_BUILD_INFO="${_lab_toolchain}_arch_${_lab_architectures}")
 endif()
 
 # R0 is additive: the host runtime validates finalized NMEA bytes without an
@@ -349,8 +358,13 @@ if(AISMIXER_LAB_BUILD_WORLD)
         target_compile_options(aismixer_lab_world_engine PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
         set_property(SOURCE world/cuda_engine.cu PROPERTY VS_SETTINGS "Warning=W4")
     endif()
+    if(CMAKE_CUDA_ARCHITECTURES STREQUAL "61")
+        set(_lab_world_arch sm61) # Retain the original single-architecture reference identity.
+    else()
+        set(_lab_world_arch "arch_${_lab_architectures}")
+    endif()
     target_compile_definitions(aismixer_lab_world PRIVATE
-        AISMIXER_LAB_WORLD_BUILD_INFO="MSVC_${CMAKE_CXX_COMPILER_VERSION}_CUDA_${CMAKE_CUDA_COMPILER_VERSION}_sm61_fmad_false")
+        AISMIXER_LAB_WORLD_BUILD_INFO="${_lab_toolchain}_${_lab_world_arch}_fmad_false")
 endif()
 
 include(CTest)

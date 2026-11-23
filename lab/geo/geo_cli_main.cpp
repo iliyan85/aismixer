@@ -23,6 +23,8 @@
 #include <windows.h>
 #include <fcntl.h>
 #include <io.h>
+#else
+#include <csignal>
 #endif
 
 namespace {
@@ -67,6 +69,7 @@ void metadata(const g::Session& session, const g::Domain& domain,
               << "\nrng=cuRAND_Philox4_32_10\nrng_domain_version=" << g::kRngDomainVersion
               << "\nprojection=wgs84_tangent_linear_v1\ncoordinate_units=nanodegrees"
               << "\nbuild_toolchain=" << AISMIXER_LAB_GEO_BUILD_INFO
+              << "\ncuda_fmad=false"
               << "\nqualification_reference=Windows_MSVC_CUDA12.9_sm61"
               << "\ngpu=" << info.name << "\ncompute_capability=" << info.major << '.' << info.minor
               << "\nruntime_version=" << info.runtime_version
@@ -240,11 +243,17 @@ void run(const Arguments& args) {
         g::write_event_metadata(std::cerr,result.events,identities);
         emit(transmissions,args.nmea);
     } else {
-        std::cout << "absolute_tick,simulation_seconds,actor_id,category,x_mm,y_mm,longitude_ndeg,latitude_ndeg,random_u32\n";
+        // The existing CSV acceptance contract checks the raw CRLF bytes.
+#ifdef _WIN32
+        constexpr auto csv_eol = "\n";  // Translated by the CRT text stream.
+#else
+        constexpr auto csv_eol = "\r\n";
+#endif
+        std::cout << "absolute_tick,simulation_seconds,actor_id,category,x_mm,y_mm,longitude_ndeg,latitude_ndeg,random_u32" << csv_eol;
         for (const auto& e : result.events) std::cout << e.absolute_tick << ',' << e.simulation_seconds
             << ',' << e.actor_id << ',' << static_cast<std::uint32_t>(e.category) << ',' << e.x_mm
             << ',' << e.y_mm << ',' << e.location.longitude_ndeg << ',' << e.location.latitude_ndeg
-            << ',' << e.random_u32 << '\n';
+            << ',' << e.random_u32 << csv_eol;
         std::cout.flush();
         if (!std::cout) throw std::runtime_error("cannot flush complete geographic CSV stdout");
     }
@@ -304,5 +313,11 @@ int wmain(int argc,wchar_t** argv) {
     }
 }
 #else
-int main(int argc,char** argv) { return guarded_run(std::vector<std::string>(argv,argv+argc)); }
+int main(int argc,char** argv) {
+    if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        std::cerr << "B3.1 error: cannot configure stdout pipe handling\n";
+        return 1;
+    }
+    return guarded_run(std::vector<std::string>(argv,argv+argc));
+}
 #endif

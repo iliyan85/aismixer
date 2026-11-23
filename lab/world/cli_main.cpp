@@ -12,12 +12,22 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
+#include <fcntl.h>
+#ifdef _WIN32
 #define NOMINMAX
 #include <Windows.h>
 #include <psapi.h>
-#include <fcntl.h>
 #include <io.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <stdio.h>  // renameat2, RENAME_NOREPLACE
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace {
 namespace w=aismixer::lab::world;
@@ -82,29 +92,79 @@ public:
         if(target_.filename().empty()||!std::filesystem::is_directory(target_.parent_path()))throw std::invalid_argument("W1 output requires an existing parent directory");
         if(std::filesystem::exists(std::filesystem::symlink_status(target_)))throw std::invalid_argument("W1 output destination already exists");
         for(unsigned attempt=0;attempt<64;++attempt){
+#ifdef _WIN32
             temporary_=target_.parent_path()/(target_.filename().native()+L".w1-tmp-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(attempt));
             handle_=CreateFileW(temporary_.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
             if(handle_!=INVALID_HANDLE_VALUE)return;
             if(GetLastError()!=ERROR_FILE_EXISTS&&GetLastError()!=ERROR_ALREADY_EXISTS)throw std::runtime_error("W1 cannot create exclusive temporary output");
+#else
+            temporary_ = target_.native() + ".w1-tmp-" + std::to_string(getpid()) + "-" + std::to_string(attempt);
+            do {
+                fd_ = ::open(temporary_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            } while (fd_ < 0 && errno == EINTR);
+            if (fd_ >= 0) return;
+            if (errno != EEXIST) throw std::system_error(errno, std::generic_category(), "W1 cannot create exclusive temporary output");
+#endif
         }
         temporary_.clear();throw std::runtime_error("W1 output temporary namespace exhausted");
     }
-    ~Output(){if(handle_!=INVALID_HANDLE_VALUE)CloseHandle(handle_);if(!temporary_.empty()){std::error_code ignored;std::filesystem::remove(temporary_,ignored);}}
+    Output(const Output&) = delete;
+    Output& operator=(const Output&) = delete;
+    ~Output() {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+#else
+        if (fd_ >= 0) ::close(fd_);
+#endif
+        if (!temporary_.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary_, ignored);
+        }
+    }
     void write(const std::string& text) {
+#ifdef _WIN32
         if(handle_==INVALID_HANDLE_VALUE){std::cout.write(text.data(),static_cast<std::streamsize>(text.size()));if(!std::cout)throw std::runtime_error("W1 stdout write failed");return;}
         std::size_t position=0;
         while(position<text.size()) {DWORD written=0;const auto count=static_cast<DWORD>(std::min<std::size_t>(text.size()-position,1048576));
             if(!WriteFile(handle_,text.data()+position,count,&written,nullptr)||written==0)throw std::runtime_error("W1 trace file write failed");position+=written;}
+#else
+        const int out = fd_ >= 0 ? fd_ : STDOUT_FILENO;
+        std::size_t position = 0;
+        while (position < text.size()) {
+            const auto written = ::write(out, text.data() + position, text.size() - position);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) throw std::system_error(written < 0 ? errno : EIO, std::generic_category(),
+                fd_ >= 0 ? "W1 trace file write failed" : "W1 stdout write failed");
+            position += static_cast<std::size_t>(written);
+        }
+#endif
     }
     void finish(){
+#ifdef _WIN32
         if(handle_==INVALID_HANDLE_VALUE){std::cout.flush();if(!std::cout)throw std::runtime_error("W1 stdout flush failed");return;}
         if(!FlushFileBuffers(handle_))throw std::runtime_error("W1 trace flush failed");
         if(!CloseHandle(handle_))throw std::runtime_error("W1 trace close failed");handle_=INVALID_HANDLE_VALUE;
         if(!MoveFileExW(temporary_.c_str(),target_.c_str(),MOVEFILE_WRITE_THROUGH))throw std::runtime_error("W1 trace no-replace publication failed");
+#else
+        if (fd_ < 0) return;  // POSIX stdout writes are unbuffered here.
+        while (::fsync(fd_) < 0) {
+            if (errno != EINTR) throw std::system_error(errno, std::generic_category(), "W1 trace flush failed");
+        }
+        // Linux releases the descriptor even if close reports an I/O error.
+        if (::close(std::exchange(fd_, -1)) != 0)
+            throw std::system_error(errno, std::generic_category(), "W1 trace close failed");
+        if (::renameat2(AT_FDCWD, temporary_.c_str(), AT_FDCWD, target_.c_str(), RENAME_NOREPLACE) != 0)
+            throw std::system_error(errno, std::generic_category(), "W1 trace no-replace publication failed");
+#endif
         temporary_.clear();
     }
 private:
-    std::filesystem::path target_,temporary_;HANDLE handle_=INVALID_HANDLE_VALUE;
+    std::filesystem::path target_,temporary_;
+#ifdef _WIN32
+    HANDLE handle_=INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
 };
 class Trace {
 public:
@@ -199,8 +259,6 @@ int run(const std::vector<std::string>& args){
         if(sample==config.duration)break;sample={std::min(config.duration.units,sample.units+step)};
     }
     trace.complete();const auto& metric=cuda.metrics();const auto& host=timeline.metrics();const auto& device=cuda.device_info();
-    PROCESS_MEMORY_COUNTERS_EX memory{};memory.cb=sizeof(memory);
-    const bool memory_available=K32GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),sizeof(memory))!=0;
     std::cerr<<"status=COMPLETE_WORLD_ONLY seed="<<config.effective_seed<<" digest="<<hex64(trace.digest())<<" records="<<trace.records()
         <<"\ngpu="<<device.name<<" sm="<<device.major<<'.'<<device.minor<<" runtime="<<device.runtime_version<<" driver="<<device.driver_version
         <<" build="<<AISMIXER_LAB_WORLD_BUILD_INFO<<"\nsimulation_units="<<config.duration.units<<" vessels="<<host.vessels<<" receivers="<<host.receivers
@@ -211,18 +269,43 @@ int run(const std::vector<std::string>& args){
         <<std::fixed<<std::setprecision(4)<<"\nsetup_ms="<<metric.setup_wall_ms<<" h2d_ms="<<metric.h2d_ms<<" position_kernel_ms="<<metric.position_ms
         <<" sampling_kernel_ms="<<metric.sampling_ms<<" d2h_ms="<<metric.d2h_ms<<" cuda_calls_wall_ms="<<metric.wall_ms
         <<" total_wall_ms="<<std::chrono::duration<double,std::milli>(Clock::now()-started).count()<<'\n';
-    if(memory_available)std::cerr<<"process_peak_working_set_bytes="<<memory.PeakWorkingSetSize<<" process_peak_pagefile_bytes="<<memory.PeakPagefileUsage<<'\n';
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX memory{};memory.cb=sizeof(memory);
+    if(K32GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),sizeof(memory)))
+        std::cerr<<"process_peak_working_set_bytes="<<memory.PeakWorkingSetSize<<" process_peak_pagefile_bytes="<<memory.PeakPagefileUsage<<'\n';
+#else
+    struct rusage usage{};
+    if (::getrusage(RUSAGE_SELF, &usage) == 0)
+        std::cerr << "process_peak_resident_bytes=" << static_cast<std::uint64_t>(usage.ru_maxrss) * 1024 << '\n';
+#endif
     else std::cerr<<"process_peak_memory=UNAVAILABLE\n";
     if(options.verbose)std::cerr<<"trace_format=version1_NDJSON; receiver candidates unqualified; no RF/TDMA/NMEA generated\n";
     return 0;
 }
+#ifdef _WIN32
 std::string utf8(const wchar_t* value){
     const auto count=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,value,-1,nullptr,0,nullptr,nullptr);
     if(count<=0)throw std::invalid_argument("W1 invalid UTF-16 argument");std::string text(static_cast<std::size_t>(count),'\0');
     if(WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,value,-1,text.data(),count,nullptr,nullptr)!=count)throw std::runtime_error("W1 UTF-8 argument conversion failed");text.pop_back();return text;
 }
+#endif
 }  // namespace
+#ifdef _WIN32
 int wmain(int argc,wchar_t** argv){
     try{if(_setmode(_fileno(stdout),_O_BINARY)==-1)throw std::runtime_error("W1 cannot set binary stdout");std::vector<std::string> args;for(int i=0;i<argc;++i)args.push_back(utf8(argv[i]));return run(args);}
     catch(const std::exception& error){std::cerr<<"W1 error: "<<error.what()<<'\n';return 1;}
 }
+#else
+int main(int argc, char** argv) {
+    try {
+        if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+            throw std::system_error(errno, std::generic_category(), "W1 cannot configure stdout pipe handling");
+        std::vector<std::string> args(argv, argv + argc);
+        for (const auto& arg : args) w::validate_utf8(arg, "W1 command-line argument");
+        return run(args);
+    } catch (const std::exception& error) {
+        std::cerr << "W1 error: " << error.what() << '\n';
+        return 1;
+    }
+}
+#endif
