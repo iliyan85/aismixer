@@ -273,7 +273,7 @@ void philox_contract() {
                                                  0x01, 0, 0, 0x66, 0x07, 0, 0, 0x01}};
     require(bytes == expected, "literal little-endian serialization");
     require(c::pack_draw(key, 3).counter[3] == 0x01030007u, "rejection index field");
-    for (const auto generation : {0ULL, 0x1000000ULL, UINT64_MAX}) {
+    for (const auto generation : {UINT64_C(0), UINT64_C(0x1000000), UINT64_MAX}) {
         auto bad = key; bad.power_generation = generation;
         invalid("RNG key domain", [&] { (void)c::pack_draw(bad, 0); });
     }
@@ -2057,8 +2057,10 @@ void emit_vectors() {
         for (const auto purpose : {c::ProtocolPurpose::EntryNominalStartSlot, c::ProtocolPurpose::CandidateChoice, c::ProtocolPurpose::ContinuousTimeout,
                                    c::ProtocolPurpose::GenericRatdmaProbability, c::ProtocolPurpose::IntentionalReusePeer}) {
             for (const auto [seed, equipment, generation, episode, draw] : {
-                     std::tuple{42ULL, 21u, 1ULL, 0ULL, 0ULL}, std::tuple{0x0123456789ABCDEFULL, 21u, 1ULL, 5ULL, 7ULL},
-                     std::tuple{UINT64_MAX, UINT32_MAX, 0xFFFFFFULL, 0xFFFFFFFFULL, 0xFFFFULL}, std::tuple{7ULL, 22u, 2ULL, 3ULL, 1ULL}}) {
+                     std::tuple{UINT64_C(42), 21u, 1ULL, 0ULL, 0ULL},
+                     std::tuple{UINT64_C(0x0123456789ABCDEF), 21u, 1ULL, 5ULL, 7ULL},
+                     std::tuple{UINT64_MAX, UINT32_MAX, 0xFFFFFFULL, 0xFFFFFFFFULL, 0xFFFFULL},
+                     std::tuple{UINT64_C(7), 22u, 2ULL, 3ULL, 1ULL}}) {
                 c::DrawKey key; key.scenario_seed = seed; key.equipment_id = equipment; key.power_generation = generation;
                 key.purpose = purpose; key.episode = episode; key.draw_index = draw; result.push_back(key);
             }

@@ -154,13 +154,13 @@ void arithmetic() {
     for (const auto& fixture : course_cases)
         require(c::quantize_course(fixture.input) == fixture.expected, "literal course quantization/wrap");
     require(c::quantize_course(std::nullopt) == 3600, "unknown COG distinct from valid north");
-    for (const auto value : {-180000000001LL,180000000001LL,INT64_MIN,INT64_MAX})
+    for (const auto value : {-INT64_C(180000000001), INT64_C(180000000001), INT64_MIN, INT64_MAX})
         invalid("coordinate", [=] { (void)c::quantize_longitude(value); });
-    for (const auto value : {-80000000001LL,80000000001LL,INT64_MIN,INT64_MAX})
+    for (const auto value : {-INT64_C(80000000001), INT64_C(80000000001), INT64_MIN, INT64_MAX})
         invalid("coordinate", [=] { (void)c::quantize_latitude(value); });
-    for (const auto value : {-1LL,INT64_MIN})
+    for (const auto value : {-INT64_C(1), INT64_MIN})
         invalid("speed", [=] { (void)c::quantize_speed(value); });
-    for (const auto value : {-1LL,360000000000LL,INT64_MIN,INT64_MAX})
+    for (const auto value : {-INT64_C(1), INT64_C(360000000000), INT64_MIN, INT64_MAX})
         invalid("course", [=] { (void)c::quantize_course(value); });
 }
 
@@ -253,7 +253,8 @@ void configuration_contract() {
     bad_definition("metadata", [](auto& d) { d[0].origin.scenario_id.clear(); });
     bad_definition("metadata", [](auto& d) { d[0].origin.scenario_id="ANOTHER-SCENARIO"; });
     bad_definition("metadata", [](auto& d) { d[0].origin.provenance.clear(); });
-    for (const auto number : {INT64_MIN,-1LL,0LL,1LL,999999LL,1073741824LL,INT64_MAX})
+    for (const auto number : {INT64_MIN, -INT64_C(1), INT64_C(0), INT64_C(1),
+                              INT64_C(999999), INT64_C(1073741824), INT64_MAX})
         bad_definition("Type5 IMO/flag qualified domain", [=](auto& d) { d[0].static_voyage.imo_or_flag_state_number=number; });
     bad_definition("Type5 field", [](auto& d) { d[0].static_voyage.call_sign="TOO-LONG"; });
     bad_definition("Type5 field", [](auto& d) { d[0].static_voyage.name="lowercase"; });
@@ -261,9 +262,9 @@ void configuration_contract() {
     bad_definition("Type5 field", [](auto& d) { d[0].static_voyage.dimension_a=512; });
     for (const auto vendor : {"", "AB", "ABCD", "abC", "A@C"})
         invalid("manufacturer", [=] { (void)a::ManufacturerIdentification(vendor,1,0); });
-    for (const auto model : {0LL,16LL,INT64_MIN,INT64_MAX})
+    for (const auto model : {INT64_C(0), INT64_C(16), INT64_MIN, INT64_MAX})
         invalid("manufacturer", [=] { (void)a::ManufacturerIdentification("LAB",model,0); });
-    for (const auto serial : {-1LL,1048576LL,INT64_MIN,INT64_MAX})
+    for (const auto serial : {-INT64_C(1), INT64_C(1048576), INT64_MIN, INT64_MAX})
         invalid("manufacturer", [=] { (void)a::ManufacturerIdentification("LAB",1,serial); });
     invalid("world revision", [] { (void)c::assemble_stations(synthetic_world(),0,{definition(0)}); });
     invalid("W1 canonical validation", [] { auto world=synthetic_world();world.schema_version=2; (void)c::assemble_stations(world,17,{definition(0)}); });

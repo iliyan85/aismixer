@@ -6,9 +6,15 @@
 #include <set>
 #include <stdexcept>
 #include <tuple>
+#ifdef _WIN32
 #define NOMINMAX
 #include <Windows.h>
 #include <bcrypt.h>
+#elif defined(__linux__)
+#include <cerrno>
+#include <cstddef>
+#include <sys/random.h>
+#endif
 
 namespace aismixer::lab::world {
 namespace {
@@ -172,8 +178,22 @@ Config canonical_config(Config config) {
 }
 std::uint64_t fresh_seed() {
     std::uint64_t seed = 0;
+#ifdef _WIN32
     if (BCryptGenRandom(nullptr,reinterpret_cast<PUCHAR>(&seed),sizeof(seed),BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
         throw std::runtime_error("W1 OS fresh seed acquisition failed");
+#elif defined(__linux__)
+    auto* bytes = reinterpret_cast<unsigned char*>(&seed);
+    std::size_t remaining = sizeof(seed);
+    while (remaining != 0) {
+        const auto count = ::getrandom(bytes, remaining, 0);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) throw std::runtime_error("W1 OS fresh seed acquisition failed");
+        bytes += count;
+        remaining -= static_cast<std::size_t>(count);
+    }
+#else
+    throw std::runtime_error("W1 OS fresh seed acquisition failed");
+#endif
     return seed;
 }
 Config resolve_seed(Config config) {
